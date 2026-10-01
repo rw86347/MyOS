@@ -125,3 +125,24 @@ uint32_t vmm_translate(uint32_t va)
         return 0;
     return FRAME(*pte) | (va & 0xFFF);
 }
+
+int vmm_user_ok(uint32_t va, uint32_t len, int write)
+{
+    if (len == 0)
+        return 1;
+    uint32_t last = va + len - 1;
+    if (last < va || last >= KERNEL_VBASE)
+        return 0;               /* wraps around, or reaches into the kernel */
+
+    uint32_t need = PTE_PRESENT | PTE_USER | (write ? PTE_WRITABLE : 0);
+    for (uint32_t page = va & ~0xFFFu; ; page += PAGE_SIZE) {
+        /* Both levels must allow it: the CPU checks the directory entry
+           and the page table entry. */
+        uint32_t pde = kernel_pd[PDE_INDEX(page)];
+        uint32_t *pte = get_pte(page, 0, 0);
+        if ((pde & need) != need || !pte || (*pte & need) != need)
+            return 0;
+        if (page >= (last & ~0xFFFu))
+            return 1;
+    }
+}

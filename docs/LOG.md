@@ -31,3 +31,33 @@ Short dated notes after each work session: what was done, what broke, what was l
   first-fit kmalloc/kfree at 0xF0000000 with merging. 31 self-tests pass; F10 = NULL deref ->
   page fault with CR2 decoding. klog() = serial-only output (E820 map).
   Next: Step 4 (kernel threads, context switch, time-slot scheduler).
+- 2026-10-01: Step 4a: context switch. switch.asm saves EBP/EBX/ESI/EDI on the old thread's
+  stack, swaps ESP, pops the new thread's registers and `ret`s into it. New threads get a fake
+  frame whose return address is thread_trampoline (calls fn(arg), then thread_exit). kernel/
+  thread.c: thread table, cooperative round-robin thread_yield(). Demo: ping/pong alternate;
+  35 self-tests pass. Dead threads' stacks aren't freed yet (need a reaper).
+  Next: timer-driven preemption, then the slot scheduler.
+- 2026-10-02: Step 4b: preemption. Timer IRQ sets need_resched; interrupt_dispatch calls
+  thread_preempt_check() after the EOI and switches threads on the interrupted thread's own
+  stack (isr.asm already saved everything; it `iret`s when switched back). thread_yield()
+  runs with interrupts off (irq_save/irq_restore); new threads `sti` in the trampoline.
+  Test: two spinners that never yield both count ~7M in 50 ms. 37 self-tests pass.
+  Added docs/gaps.md (known shortcuts and TODOs). Next: the time-slot scheduler.
+- 2026-10-02: Step 4 done (4c: slot scheduler). config/slots.conf (brakes 4 9 14 19,
+  radio 6 16) -> tools/slots2c.awk -> build/gen/slots_conf.c (checks: slots 1/10 reserved,
+  one owner per slot). kernel/sched.c: every tick advances the slot (1..20) and runs its
+  owner; slots 1 and 10 run main; free slots or finished owners run an idle thread (hlt).
+  thread.c is now mechanics only (switch/find/next_ready). Test: tasks note the slot they
+  wake in for 200 ms -> "brakes ran in slots: 4 9 14 19". 40 self-tests pass.
+  Bug found: main noted slot 20 once because the frame started "before slot 1"; now starts
+  at slot 1. Serial lines end in \r\n — grep anchors need [[:space:]]*$.
+  Next: Step 5 (user mode, TSS, int 0x80).
+- 2026-10-02: Step 5 done. TSS in the GDT (entry 5, 0x28; ltr) — ESP0 updated on every thread
+  switch to that thread's kernel stack; no I/O bitmap. int 0x80 gate with DPL 3 (0xEE) ->
+  syscall_dispatch(eax, ebx..ebp), result in saved EAX. Linux numbers: exit 1, write 4,
+  exit_group 252; unknown -> -ENOSYS + serial log. vmm_user_ok() checks user pointers (U bit at
+  both levels, below 0xC0000000). user_enter (usermode.asm) builds a fake ring-3 iret frame.
+  User faults (CS & 3) kill only the program (exit code 139). Programs: user/hello.asm
+  (write + EFAULT check + exit(42)), user/peek.asm (reads kernel memory -> killed); flat
+  binaries at 0x08048000, incbin'd into the kernel. 43 self-tests pass.
+  Next: Step 6 (ELF loader, static musl hello world).

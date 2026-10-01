@@ -12,7 +12,8 @@ struct regs {
     uint32_t edi, esi, ebp, esp_unused, ebx, edx, ecx, eax;  /* pushad */
     uint32_t vector, err_code;                        /* pushed by the stub */
     uint32_t eip, cs, eflags;                         /* pushed by the CPU */
-    /* (the CPU also pushes user ESP and SS when coming from ring 3 — step 5) */
+    uint32_t user_esp, user_ss;   /* pushed by the CPU ONLY when coming from
+                                     ring 3 (check cs & 3 before using them) */
 };
 
 typedef void (*irq_handler_t)(struct regs *r);
@@ -25,6 +26,22 @@ void irq_install(int irq, irq_handler_t handler);
 
 static inline void interrupts_enable(void)  { __asm__ volatile ("sti"); }
 static inline void interrupts_disable(void) { __asm__ volatile ("cli"); }
+
+/* Turn interrupts off and return the old EFLAGS, so irq_restore() can put
+   them back exactly as they were (on or off). Use around code that must not
+   be interrupted halfway, like switching threads. */
+static inline uint32_t irq_save(void)
+{
+    uint32_t flags;
+    __asm__ volatile ("pushfl\n\tpopl %0\n\tcli" : "=r"(flags) : : "memory");
+    return flags;
+}
+
+static inline void irq_restore(uint32_t flags)
+{
+    if (flags & (1 << 9))           /* bit 9 of EFLAGS = IF, interrupts enabled */
+        __asm__ volatile ("sti" : : : "memory");
+}
 
 /* Sleep the CPU until the next interrupt arrives (saves power, too). */
 static inline void cpu_wait(void) { __asm__ volatile ("hlt"); }

@@ -16,7 +16,14 @@
  *   2      0x10      kernel data, ring 0
  *   3      0x1B      user code,   ring 3   (0x18 | RPL 3) — used from step 5
  *   4      0x23      user data,   ring 3   (0x20 | RPL 3)
- *   (a TSS entry joins in step 5, for switching stacks on syscalls)
+ *   5      0x28      TSS (Task State Segment)
+ *
+ * The TSS: when an interrupt or `int 0x80` arrives while a USER program
+ * runs, the CPU switches to ring 0 — and must not keep using the program's
+ * stack (it could point anywhere). So it loads a kernel stack from the TSS:
+ * SS0:ESP0. We give every thread its own kernel stack and update ESP0 on
+ * every thread switch (tss_set_kernel_stack). The TSS can do much more
+ * (hardware task switching) — nobody uses that, Linux included.
  */
 #include <stdint.h>
 #include <gdt.h>
@@ -36,7 +43,18 @@ struct gdt_ptr {
     uint32_t base;          /* address of the table */
 } __attribute__((packed));
 
-static struct gdt_entry gdt[5];
+/* The 32-bit TSS. We only use ss0/esp0 and iomap_base. */
+struct tss {
+    uint32_t prev_task;
+    uint32_t esp0, ss0;             /* stack for entering ring 0 */
+    uint32_t esp1, ss1, esp2, ss2;
+    uint32_t cr3, eip, eflags, eax, ecx, edx, ebx, esp, ebp, esi, edi;
+    uint32_t es, cs, ss, ds, fs, gs, ldt;
+    uint16_t trap, iomap_base;
+} __attribute__((packed));
+
+static struct gdt_entry gdt[6];
+static struct tss tss;
 
 static void set_entry(int i, uint32_t base, uint32_t limit, uint8_t access, uint8_t flags)
 {
@@ -60,6 +78,13 @@ void gdt_init(void)
     set_entry(3, 0, 0xFFFFF, 0xFA, 0xC);
     set_entry(4, 0, 0xFFFFF, 0xF2, 0xC);
 
+    /* TSS descriptor: access 0x89 = present | ring 0 | "32-bit TSS, not busy".
+       iomap_base past the end = no I/O permission bitmap, so user programs
+       can't use in/out on any port. */
+    tss.ss0 = GDT_KERNEL_DATA;
+    tss.iomap_base = sizeof tss;
+    set_entry(5, (uint32_t)(uintptr_t)&tss, sizeof tss - 1, 0x89, 0x0);
+
     struct gdt_ptr ptr = { sizeof gdt - 1, (uint32_t)(uintptr_t)gdt };
 
     /* Load the new table, then reload every segment register so the CPU
@@ -75,4 +100,12 @@ void gdt_init(void)
         "mov %%ax, %%gs\n\t"
         "mov %%ax, %%ss\n\t"
         : : "m"(ptr), "i"(GDT_KERNEL_CODE), "i"(GDT_KERNEL_DATA) : "eax", "memory");
+
+    /* Tell the CPU which GDT entry is the TSS ("load task register"). */
+    __asm__ volatile ("ltr %w0" : : "r"(GDT_TSS));
+}
+
+void tss_set_kernel_stack(uint32_t esp0)
+{
+    tss.esp0 = esp0;
 }

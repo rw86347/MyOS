@@ -45,7 +45,12 @@ C_OBJS  := $(patsubst %.c,$(BUILD)/%.o,$(C_SRCS))
 ASM_SRCS := $(filter-out arch/i386/entry.asm,$(wildcard arch/i386/*.asm))
 ASM_OBJS := $(patsubst %.asm,$(BUILD)/%.o,$(ASM_SRCS))
 # entry.o must be linked first (it holds _start; linker.ld also enforces this)
-OBJS    := $(BUILD)/arch/i386/entry.o $(ASM_OBJS) $(C_OBJS)
+# Generated from config/slots.conf at build time (see below).
+GEN_OBJS := $(BUILD)/gen/slots_conf.o
+# User programs (user/*.asm, flat binaries) embedded in the kernel image.
+USER_BINS := $(patsubst user/%.asm,$(BUILD)/user/%.bin,$(filter-out user/programs.asm,$(wildcard user/*.asm)))
+USER_OBJS := $(BUILD)/user/programs.o
+OBJS    := $(BUILD)/arch/i386/entry.o $(ASM_OBJS) $(C_OBJS) $(GEN_OBJS) $(USER_OBJS)
 
 IMG     := $(BUILD)/myos.img
 USB     := $(BUILD)/usb.img
@@ -69,6 +74,27 @@ $(BUILD)/%.o: %.asm
 	$(NASM) -f elf32 $< -o $@
 
 -include $(C_OBJS:.o=.d)
+
+# --- time-slot table ---------------------------------------------------------
+# The kernel can't read files yet, so config/slots.conf becomes a C array.
+# Write to .tmp first so a config error doesn't leave a half-written file.
+$(BUILD)/gen/slots_conf.c: config/slots.conf tools/slots2c.awk
+	@mkdir -p $(dir $@)
+	awk -f tools/slots2c.awk $< > $@.tmp && mv $@.tmp $@
+
+$(BUILD)/gen/slots_conf.o: $(BUILD)/gen/slots_conf.c include/sched.h include/thread.h
+	$(CC) $(CFLAGS) -c $< -o $@
+
+# --- user programs -----------------------------------------------------------
+# Each user/NAME.asm becomes a flat binary; programs.asm `incbin`s them all.
+# (Real Linux ELF programs built with musl come with the ELF loader, step 6.)
+$(BUILD)/user/%.bin: user/%.asm
+	@mkdir -p $(dir $@)
+	$(NASM) -f bin $< -o $@
+
+$(BUILD)/user/programs.o: user/programs.asm $(USER_BINS)
+	@mkdir -p $(dir $@)
+	$(NASM) -f elf32 $< -o $@
 
 $(BUILD)/kernel.elf: $(OBJS) arch/i386/linker.ld
 	$(CC) $(LDFLAGS) $(OBJS) -o $@ $(LIBS)
@@ -126,6 +152,13 @@ test: $(IMG) $(USB)
 	  grep -q "Self-tests: [0-9]* passed, 0 failed" $$L || { echo "FAIL: disk self-tests"; ok=0; }; \
 	  grep -q "fault)> hi" $$L || { echo "FAIL: keyboard echo"; ok=0; }; \
 	  grep -q "Memory: [0-9]* MiB usable, paging on" $$L || { echo "FAIL: memory init"; ok=0; }; \
+	  grep -q "Context switch: ping pong ping pong ping pong" $$L || { echo "FAIL: context switch"; ok=0; }; \
+	  grep -q "Preemption: spin0 counted [1-9][0-9]*, spin1 counted [1-9]" $$L || { echo "FAIL: preemption"; ok=0; }; \
+	  grep -q "brakes ran in slots: 4 9 14 19[[:space:]]*$$" $$L || { echo "FAIL: slot scheduler (brakes)"; ok=0; }; \
+	  grep -q "main ran in slots: 1 10[[:space:]]*$$" $$L || { echo "FAIL: slot scheduler (main)"; ok=0; }; \
+	  grep -q "Hello from user mode (ring 3), via int 0x80!" $$L || { echo "FAIL: user write()"; ok=0; }; \
+	  grep -q "User mode: hello exited with code 42" $$L || { echo "FAIL: user exit()"; ok=0; }; \
+	  grep -q "peek: killed by CPU exception 14" $$L || { echo "FAIL: user page fault"; ok=0; }; \
 	  grep -q "Kernel read of address 00000000 (page not mapped)" $$L || { echo "FAIL: NULL page fault"; ok=0; }; \
 	  if [ $$ok = 1 ]; then echo "TEST OK"; else echo "TEST FAILED"; exit 1; fi
 

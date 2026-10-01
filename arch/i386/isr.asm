@@ -10,6 +10,10 @@
 ; Vectors we use:
 ;   0-31   CPU exceptions (divide error, page fault, general protection, ...)
 ;   32-47  hardware IRQs 0-15, after the PIC is remapped (see pic.c)
+;   128    (0x80) Linux system calls from user programs
+;
+; From ring 3, the CPU first switches to the kernel stack from the TSS and
+; also pushes the program's SS and ESP (before EFLAGS, CS, EIP).
 ;
 ; Each stub pushes a dummy error code if the CPU didn't push one (so the stack
 ; always looks the same), pushes its vector number, and jumps to common_stub.
@@ -48,6 +52,11 @@ section .text
   %assign i i+1
 %endrep
 
+; int 0x80: system calls. Same shape as the others (no error code).
+global isr_syscall
+isr_syscall:
+    STUB_NOERR 128
+
 common_stub:
     pushad                      ; push EAX, ECX, EDX, EBX, ESP, EBP, ESI, EDI
     push ds
@@ -65,6 +74,8 @@ common_stub:
     push esp                    ; argument: pointer to the saved registers
     call interrupt_dispatch
     add esp, 4
+                                ; (a syscall's return value was written into
+                                ;  the saved EAX, so popad delivers it)
 
     pop gs
     pop fs

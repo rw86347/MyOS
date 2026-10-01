@@ -14,12 +14,12 @@ Mark a step `[x]` only when its "Done when" check works.
 - [x] **3. Memory** — BIOS E820 memory map (read by our MBR), physical page allocator, paging with
   the kernel in the higher half (0xC0000000, Linux's 3G/1G split), kernel heap (`kmalloc`/`kfree`).
   Done when: allocate/free tests pass and paging is on.
-- [ ] **4. Threads & scheduler** — kernel threads, context switch, then the **time-slot scheduler**:
+- [x] **4. Threads & scheduler** — kernel threads, context switch, then the **time-slot scheduler**:
   20 × 1 ms slots, slots 1 and 10 for the system, named tasks assigned to slots from a config file.
   Done when: two named threads print in their assigned slots (e.g. "brakes" in 4,9,14,19).
 
 ## Phase 2 — Running Linux programs
-- [ ] **5. User mode & syscalls** — ring 3, TSS, `int 0x80` handler using **Linux i386 syscall numbers**.
+- [x] **5. User mode & syscalls** — ring 3, TSS, `int 0x80` handler using **Linux i386 syscall numbers**.
   Done when: a user-mode program calls `write()` and `exit()`.
 - [ ] **6. ELF loader** — load static ELF executables.
   Done when: an unmodified static musl "hello world" runs.

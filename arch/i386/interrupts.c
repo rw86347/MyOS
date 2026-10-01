@@ -8,14 +8,19 @@
  *
  * Every vector lands in common_stub (isr.asm), which calls
  * interrupt_dispatch() below with all registers saved:
- *   vectors 0-31   CPU exceptions  -> print what happened and stop
+ *   vectors 0-31   CPU exceptions  -> kernel: print what happened and stop
+ *                                     user program: kill just that program
  *   vectors 32-47  hardware IRQs   -> the driver's handler, then EOI
+ *   vector 128     int 0x80        -> Linux system call (syscall.c)
  */
 #include <gdt.h>
 #include <interrupts.h>
 #include <kprintf.h>
 #include <pic.h>
 #include <stddef.h>
+#include <sched.h>
+#include <syscall.h>
+#include <thread.h>
 
 struct idt_gate {
     uint16_t offset_low;    /* handler address bits 0-15 */
@@ -34,23 +39,28 @@ static struct idt_gate idt[256];
 static irq_handler_t irq_handlers[16];
 
 extern const uint32_t isr_stub_table[48];    /* from isr.asm */
+extern char isr_syscall[];
 
 /* type_attr 0x8E = present | ring 0 | 32-bit interrupt gate.
    An "interrupt gate" turns interrupts off while the handler runs, so a
-   handler is never interrupted halfway by another IRQ. */
-static void set_gate(int vector, uint32_t handler)
+   handler is never interrupted halfway by another IRQ.
+   The ring ("DPL", bits 5-6) is who may trigger the vector with an `int`
+   instruction. Ring 0 for everything except int 0x80, which is ring 3
+   (0xEE): otherwise a user program could fake a page fault or timer tick. */
+static void set_gate(int vector, uint32_t handler, int user_allowed)
 {
     idt[vector].offset_low  = handler & 0xFFFF;
     idt[vector].selector    = GDT_KERNEL_CODE;
     idt[vector].zero        = 0;
-    idt[vector].type_attr   = 0x8E;
+    idt[vector].type_attr   = user_allowed ? 0xEE : 0x8E;
     idt[vector].offset_high = handler >> 16;
 }
 
 void idt_init(void)
 {
     for (int v = 0; v < 48; v++)
-        set_gate(v, isr_stub_table[v]);
+        set_gate(v, isr_stub_table[v], 0);
+    set_gate(0x80, (uint32_t)(uintptr_t)isr_syscall, 1);
     /* Vectors 48-255 stay empty (not present). Using one would cause a
        General Protection fault, which we do catch. */
 
@@ -77,13 +87,30 @@ static const char *const exception_names[32] = {
     "Hypervisor injection", "VMM communication", "Security", "Reserved",
 };
 
+/* A fault in a user program: kill just that program, like Linux's SIGSEGV.
+   The kernel is fine — the program did something it isn't allowed to. */
+static void user_exception(struct regs *r, uint32_t cr2)
+{
+    struct thread *t = thread_current();
+    kprintf("%s: killed by CPU exception %lu (%s) at EIP %08lx",
+            t->name, r->vector, exception_names[r->vector], r->eip);
+    if (r->vector == 14)
+        kprintf(", %s of %08lx (%s)", r->err_code & 2 ? "write" : "read", cr2,
+                r->err_code & 1 ? "kernel-only page" : "not mapped");
+    kprintf("\n");
+    t->exit_code = 128 + 11;        /* what a shell shows for SIGSEGV */
+    thread_exit();                  /* never returns */
+}
+
 /* A CPU exception in the kernel is a bug: show everything we know, then stop
-   (instead of the CPU giving up and rebooting — a "triple fault"). Later,
-   exceptions caused by user programs will kill just that program (SIGSEGV...). */
+   (instead of the CPU giving up and rebooting — a "triple fault"). */
 static void exception(struct regs *r)
 {
     uint32_t cr2;
     __asm__ volatile ("mov %%cr2, %0" : "=r"(cr2));   /* page faults: bad address */
+
+    if (r->cs & 3)                  /* the CPU was in ring 3: a user program */
+        user_exception(r, cr2);
 
     kprintf("\n*** CPU EXCEPTION %lu: %s (error code %lx) ***\n",
             r->vector, exception_names[r->vector], r->err_code);
@@ -113,10 +140,23 @@ void interrupt_dispatch(struct regs *r)
         return;
     }
 
+    if (r->vector == 0x80) {
+        /* Linux i386 convention: number in EAX, arguments in EBX, ECX, EDX,
+           ESI, EDI, EBP; the result goes back in EAX. */
+        r->eax = syscall_dispatch(r->eax, r->ebx, r->ecx, r->edx,
+                                  r->esi, r->edi, r->ebp);
+        sched_preempt_check();      /* the slot may have ended meanwhile */
+        return;
+    }
+
     int irq = r->vector - PIC_IRQ_BASE;
     if (pic_is_spurious(irq))
         return;
     if (irq_handlers[irq])
         irq_handlers[irq](r);
     pic_send_eoi(irq);
+
+    /* If the timer said "time's up", switch threads now. This must come
+       after the EOI: the PIC won't send another tick until it gets one. */
+    sched_preempt_check();
 }

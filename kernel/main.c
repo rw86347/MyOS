@@ -16,9 +16,12 @@
 #include <mem_test.h>
 #include <paging.h>
 #include <pmm.h>
+#include <sched_test.h>
 #include <selftest.h>
 #include <serial.h>
+#include <thread_test.h>
 #include <timer.h>
+#include <user_test.h>
 #include <vga.h>
 
 extern char _start[];       /* first byte of the kernel (entry.asm) */
@@ -101,6 +104,9 @@ void kernel_main(void)
 
     disk_demo();
     mem_selftest();
+    thread_selftest();      /* Step 4: kernel threads + context switch */
+    user_selftest();        /* Step 5: ring 3 programs, int 0x80 write/exit */
+    sched_selftest();       /* Step 4: start the 20 x 1 ms slot scheduler */
     selftest_summary();
 
     kprintf("Type here (F10/F11/F12 = test a CPU fault)> ");

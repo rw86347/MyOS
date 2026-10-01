@@ -22,4 +22,9 @@ uint32_t vmm_unmap(uint32_t va);
 /* The physical address `va` maps to, or 0 if not mapped. */
 uint32_t vmm_translate(uint32_t va);
 
+/* May a user program access [va, va+len)? True only if every page is mapped
+   with the user bit (and writable, if `write`). Check every pointer a
+   syscall gets before touching it. */
+int vmm_user_ok(uint32_t va, uint32_t len, int write);
+
 #endif
