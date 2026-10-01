@@ -1,6 +1,7 @@
 #ifndef SYSCALL_H
 #define SYSCALL_H
 
+#include <errno.h>
 #include <stdint.h>
 
 /*
@@ -11,12 +12,6 @@
 #define NR_exit          1
 #define NR_write         4
 #define NR_exit_group  252
-
-/* Linux errno values. A syscall returns -ERRNO on failure; the C library
-   turns that into -1 and sets errno. */
-#define EBADF    9      /* bad file descriptor */
-#define EFAULT  14      /* bad address */
-#define ENOSYS  38      /* function not implemented */
 
 /* Run system call `nr` with up to 6 arguments; returns the result for EAX.
    Called by the int 0x80 handler (interrupts.c). */

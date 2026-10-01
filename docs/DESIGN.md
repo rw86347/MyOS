@@ -3,12 +3,18 @@
 Decisions that shape later roadmap steps. Add open questions at the bottom of each section.
 
 ## Boot: our own BIOS/MBR bootloader (no GRUB)
-- BIOS loads `arch/i386/boot/mbr.asm` (512 bytes) at 0x7C00 in real mode.
-- MBR reads the kernel from LBA 1.. into 0x10000 via `int 0x13` AH=0x42, enables A20,
-  loads a flat GDT, enters 32-bit protected mode, jumps to `_start` at 0x10000.
-- Limits for now: kernel ≤ 127 sectors (~63 KiB), loaded below 1 MiB, no partition table.
-  When the kernel grows: add a stage-2 loader that reads in a loop and copies above 1 MiB,
-  and gets the BIOS memory map (`int 0x15, E820`) before leaving real mode.
+Two stages; disk layout `[ MBR | stage 2 (8 sectors) | kernel.bin | initrd.cpio ]`.
+- **Stage 1** (`arch/i386/boot/mbr.asm`, 512 bytes): the BIOS loads it at 0x7C00; it loads
+  stage 2 to 0x7E00 with `int 0x13` AH=0x42 and jumps there.
+- **Stage 2** (`arch/i386/boot/stage2.asm`): reads the BIOS memory map (`int 0x15` E820),
+  enables A20, loads the kernel to **1 MiB** and the initramfs right after the kernel's
+  `.bss`, leaves both in `BOOTINFO` (0x1000), enters protected mode, jumps to `_start`.
+- Loading above 1 MiB from real mode: read 32 KiB into a bounce buffer at 0x10000, then
+  copy it up with `int 0x15` AH=0x87. BIOS-only, so it also works from USB/CD on real
+  hardware. No size limit (decided 2026-10-02; Multiboot/GRUB not needed).
+- The Makefile passes the sector numbers and load address to stage 2 with `-D`.
+- The kernel (incl. `.bss`) must end below 4 MiB: `entry.asm` maps only the first 4 MiB
+  (one PSE big page) until `paging.c` maps the rest.
 
 ## Scheduling: fixed time-slot table (time partitioning)
 Like ARINC 653 in avionics: time is divided into a repeating **major frame**.

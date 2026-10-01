@@ -1,9 +1,9 @@
 ; =============================================================================
 ; hello.asm — the first user-mode program (ring 3)
 ; =============================================================================
-; A flat binary, loaded at 0x08048000 (where Linux puts i386 programs) until
-; we have an ELF loader (step 6). It talks to the kernel only through
-; `int 0x80`, exactly like a Linux program:
+; Built as an i386 ELF executable (nasm + i686-elf-ld; Linux puts i386
+; programs at 0x08048000, and so does the linker). It talks to the kernel
+; only through `int 0x80`, exactly like a Linux program:
 ;     EAX = syscall number, EBX, ECX, EDX = arguments, result in EAX.
 ;
 ; 1. write(1, msg, len)              -> prints the message
@@ -13,12 +13,13 @@
 ; =============================================================================
 
 [bits 32]
-[org 0x08048000]
+global _start                   ; the linker makes this the ELF entry point
 
 SYS_exit  equ 1
 SYS_write equ 4
 EFAULT    equ 14
 
+section .text
 _start:
     mov eax, SYS_write
     mov ebx, 1                  ; fd 1 = stdout
@@ -40,5 +41,6 @@ _start:
     mov eax, SYS_exit
     int 0x80
 
+section .rodata
 msg:     db "Hello from user mode (ring 3), via int 0x80!", 10
 msg_len  equ $ - msg

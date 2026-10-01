@@ -7,6 +7,7 @@
 #define PTE_PRESENT  0x001
 #define PTE_WRITABLE 0x002
 #define PTE_USER     0x004
+#define PTE_PS       0x080      /* in a directory entry: a 4 MiB page (PSE) */
 
 /* Map all RAM into the kernel's direct map and remove the low identity map.
    Needs pmm_init() first. */
@@ -26,5 +27,9 @@ uint32_t vmm_translate(uint32_t va);
    with the user bit (and writable, if `write`). Check every pointer a
    syscall gets before touching it. */
 int vmm_user_ok(uint32_t va, uint32_t len, int write);
+
+/* Unmap every user page (below 0xC0000000), free the frames and the page
+   tables. Ends a program's use of memory. */
+void vmm_unmap_user_all(void);
 
 #endif

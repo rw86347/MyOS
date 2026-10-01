@@ -1,10 +1,9 @@
 /*
- * bootinfo.h — what the MBR leaves behind for the kernel
+ * bootinfo.h — what the bootloader leaves behind for the kernel
  *
- * The bootloader (arch/i386/boot/mbr.asm) stores the BIOS E820 memory map
- * at physical address BOOTINFO_PHYS:
- *   u32 count, then `count` 24-byte entries.
- * Keep in sync with BOOTINFO / E820_MAX in mbr.asm.
+ * Stage 2 (arch/i386/boot/stage2.asm) writes this at physical address
+ * BOOTINFO_PHYS: where it loaded the initramfs, and the BIOS E820 memory map.
+ * Keep in sync with BOOTINFO / E820_MAX in arch/i386/boot/layout.inc.
  */
 #ifndef ARCH_I386_BOOTINFO_H
 #define ARCH_I386_BOOTINFO_H
@@ -29,7 +28,9 @@ struct e820_entry {
 } __attribute__((packed));
 
 struct bootinfo {
-    uint32_t count;
+    uint32_t initrd_phys;           /* physical address of the initramfs */
+    uint32_t initrd_size;           /* its size in bytes (0 = none) */
+    uint32_t count;                 /* number of E820 entries */
     struct e820_entry entries[E820_MAX];
 } __attribute__((packed));
 

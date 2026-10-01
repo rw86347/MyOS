@@ -16,7 +16,7 @@
  * always works. DMA (the disk writes to RAM by itself) comes later.
  *
  * "Polling" = we spin reading the status register instead of waiting for an
- * interrupt, because we don't have interrupt handling yet (roadmap step 2).
+ * interrupt (IRQ 14/15). Simpler; switching to IRQs is in docs/gaps.md.
  *
  * Addressing: LBA28 — sector numbers up to 2^28 (128 GiB). Enough for now;
  * LBA48 (bigger disks) is a small addition later.

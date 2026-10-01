@@ -34,8 +34,10 @@ static void test_pmm(void)
 static void test_paging(void)
 {
     check(vmm_translate(0) == 0, "paging: address 0 (NULL) is not mapped");
-    check(vmm_translate(KERNEL_VBASE + 0x10000) == 0x10000,
-          "paging: kernel at 0xC0010000 -> physical 0x10000");
+    check(vmm_translate(KERNEL_VBASE + 0x100000) == 0x100000,
+          "paging: kernel at 0xC0100000 -> physical 0x100000 (4 MiB page)");
+    check(vmm_translate(KERNEL_VBASE + 0x1234567) == 0x1234567,
+          "paging: direct map past the first 4 MiB");
 
     /* Map one frame at two virtual addresses: a write through one must be
        visible through the other — proof the CPU really translates. */

@@ -7,7 +7,9 @@
  *   jumped to the higher half at 0xC0000000) -> kernel_main()
  */
 #include <disk_demo.h>
+#include <fpu.h>
 #include <gdt.h>
+#include <initrd.h>
 #include <interrupts.h>
 #include <kheap.h>
 #include <keyboard.h>
@@ -86,6 +88,7 @@ void kernel_main(void)
     /* Step 2: CPU tables and interrupts. */
     gdt_init();             /* our own segment table */
     idt_init();             /* interrupt table + exception handlers + PIC remap */
+    fpu_init();             /* x87 + SSE on; saved per user thread */
 
     /* Step 3: memory. */
     pmm_init();             /* which physical RAM is free (BIOS memory map) */
@@ -103,6 +106,7 @@ void kernel_main(void)
             pmm_usable_count() / 256, (void *)_start, (void *)KHEAP_START);
 
     disk_demo();
+    initrd_init();          /* Step 7: the initramfs stage 2 loaded */
     mem_selftest();
     thread_selftest();      /* Step 4: kernel threads + context switch */
     user_selftest();        /* Step 5: ring 3 programs, int 0x80 write/exit */

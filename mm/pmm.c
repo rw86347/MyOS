@@ -5,16 +5,18 @@
  * 768 MiB / 4 KiB = 196608 frames -> 24 KiB of bitmap. Simple and small;
  * finding a free frame is a linear scan, which is fine for now.
  *
- * Setup, from the BIOS E820 memory map the MBR saved for us:
+ * Setup, from the BIOS E820 memory map stage 2 saved for us:
  *   1. mark everything USED,
  *   2. mark the "usable RAM" ranges FREE,
  *   3. mark any range that is NOT usable as USED again (E820 entries may
  *      overlap, and when in doubt, don't touch it),
  *   4. reserve the first 1 MiB + the kernel: BIOS data, the boot info,
- *      the kernel image, VGA memory and the BIOS ROM all live down there.
+ *      VGA memory and the BIOS ROM live below 1 MiB, the kernel image
+ *      (and its .bss) right above it,
+ *   5. reserve the initramfs, which stage 2 loaded after the kernel.
  *
  * Frames are always handed out lowest-address first. paging.c relies on
- * that while it builds the page tables (see vmm_init).
+ * that while it builds the direct map (see vmm_init).
  */
 #include <bootinfo.h>
 #include <kprintf.h>
@@ -109,8 +111,11 @@ void pmm_init(void)
     }
 
     /* 4. Low memory + the kernel image (and its .bss). */
-    uint32_t kernel_end = V2P(__kernel_end);
-    mark_range(0, kernel_end > 0x100000 ? kernel_end : 0x100000, 0);
+    mark_range(0, V2P(__kernel_end), 0);
+
+    /* 5. The initramfs: it stays in memory as the root file system. */
+    if (bi->initrd_size)
+        mark_range(bi->initrd_phys, bi->initrd_size, 0);
     search_from = 0;
 }
 

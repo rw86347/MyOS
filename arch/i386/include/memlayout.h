@@ -10,7 +10,8 @@
  *                             Page 0 is never mapped, so NULL derefs fault.
  *   0xC0000000 - 0xEFFFFFFF   "direct map": physical RAM 0..768 MiB mapped
  *                             1:1 at +0xC0000000. The kernel itself lives
- *                             here (physical 0x10000 -> 0xC0010000).
+ *                             here (physical 0x100000 -> 0xC0100000),
+ *                             mapped with 4 MiB pages.
  *   0xF0000000 - 0xFEFFFFFF   kernel heap (kmalloc), mapped page by page
  *   0xFF000000 - 0xFFFFFFFF   unused for now
  *

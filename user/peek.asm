@@ -7,8 +7,9 @@
 ; =============================================================================
 
 [bits 32]
-[org 0x08048000]
+global _start
 
+section .text
 _start:
     mov eax, [0xC0010000]       ; read the kernel's first bytes -> page fault
 

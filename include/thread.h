@@ -1,6 +1,7 @@
 #ifndef THREAD_H
 #define THREAD_H
 
+#include <fpu.h>
 #include <stdint.h>
 
 /* Kernel threads. A thread runs until it calls thread_yield(), returns, or
@@ -18,13 +19,17 @@ struct thread {
     uint32_t esp;                     /* saved stack pointer while paused */
     void *stack;                      /* kmalloc'd stack (NULL for "main") */
     int exit_code;                    /* set by exit() or a fatal fault */
+    int uses_fpu;                     /* user thread: save/restore FPU+SSE */
+    uint8_t fpu_state[FPU_STATE_SIZE] __attribute__((aligned(16)));
 };
 
 /* Turn the code that is running now (kernel_main) into thread 0, "main". */
 void thread_init(void);
 
 /* Create a thread that will run fn(arg). Returns NULL if out of memory or
-   out of thread slots. It starts the next time someone yields to it. */
+   out of thread slots. It starts the next time someone yields to it.
+   May reuse the slot of a DEAD thread: read a dead thread's exit_code
+   before creating the next one. */
 struct thread *thread_create(const char *name, void (*fn)(void *), void *arg);
 
 /* Give up the CPU; the scheduler picks who runs instead. Returns when it's
@@ -35,6 +40,10 @@ void thread_yield(void);
 void thread_exit(void);
 
 struct thread *thread_current(void);
+
+/* The current thread is about to run a user program: give it a clean FPU,
+   and from now on save/restore the FPU registers when it's switched. */
+void thread_start_fpu(void);
 
 /* The thread with this name, or NULL. (Dead threads are skipped.) */
 struct thread *thread_find(const char *name);

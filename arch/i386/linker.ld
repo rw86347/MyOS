@@ -2,13 +2,16 @@
  * linker.ld — memory layout of the kernel image
  *
  * Two addresses for everything:
- *   VMA (virtual)  where the code RUNS once paging is on:  0xC0010000...
- *   LMA (load)     where the MBR PUTS it in physical RAM:  0x10000...
+ *   VMA (virtual)  where the code RUNS once paging is on:  0xC0100000...
+ *   LMA (load)     where stage 2 PUTS it in physical RAM:  0x100000 (1 MiB)
  * "AT(...)" sets the load address. objcopy -O binary lays the file out by
- * load address, so kernel.bin still starts with _start, loaded at 0x10000.
+ * load address, so kernel.bin starts with _start, loaded at 1 MiB.
  *
- * Keep in sync with KERNEL_LOAD in mbr.asm and KERNEL_VBASE in memlayout.h
- * and entry.asm.
+ * The kernel, including .bss, must end below 4 MiB: that's all entry.asm
+ * maps before paging.c sets up the rest.
+ *
+ * Keep in sync with KERNEL_LOAD in boot/layout.inc and KERNEL_VBASE in
+ * memlayout.h and entry.asm.
  */
 ENTRY(_start)
 
@@ -16,7 +19,7 @@ KERNEL_VBASE = 0xC0000000;
 
 SECTIONS
 {
-    . = KERNEL_VBASE + 0x10000;
+    . = KERNEL_VBASE + 0x100000;
 
     .text : AT(ADDR(.text) - KERNEL_VBASE) {
         *(.text.entry)          /* _start — must be first */

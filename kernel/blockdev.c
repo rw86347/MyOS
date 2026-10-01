@@ -1,7 +1,7 @@
 /*
  * blockdev.c — global list of block devices + read/write dispatch.
  *
- * No kmalloc yet (roadmap step 3), so devices live in a fixed-size array.
+ * Devices live in a small fixed-size array: a PC has only a few disks.
  */
 #include <blockdev.h>
 #include <stddef.h>

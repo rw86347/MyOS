@@ -44,15 +44,32 @@ void thread_init(void)
     current->stack = NULL;
 }
 
-struct thread *thread_create(const char *name, void (*fn)(void *), void *arg)
+/* Find a free table slot. A DEAD thread's slot is reused, and its stack
+   freed here: a thread can't free its own stack while it's still running on
+   it (in thread_exit), but once it's dead and someone else is running, it's
+   safe. ("Lazy reaping".) */
+static struct thread *alloc_slot(void)
 {
-    struct thread *t = NULL;
+    for (int i = 0; i < THREAD_MAX; i++)
+        if (threads[i].state == THREAD_UNUSED)
+            return &threads[i];
     for (int i = 0; i < THREAD_MAX; i++) {
-        if (threads[i].state == THREAD_UNUSED) {
-            t = &threads[i];
-            break;
+        struct thread *t = &threads[i];
+        if (t->state == THREAD_DEAD && t != current) {
+            kfree(t->stack);
+            t->stack = NULL;
+            t->state = THREAD_UNUSED;
+            return t;
         }
     }
+    return NULL;
+}
+
+struct thread *thread_create(const char *name, void (*fn)(void *), void *arg)
+{
+    uint32_t flags = irq_save();        /* the scheduler reads the table too */
+    struct thread *t = alloc_slot();
+    irq_restore(flags);
     if (!t)
         return NULL;
 
@@ -74,6 +91,7 @@ struct thread *thread_create(const char *name, void (*fn)(void *), void *arg)
 
     set_name(t, name);
     t->exit_code = 0;
+    t->uses_fpu = 0;
     t->state = THREAD_READY;
     return t;
 }
@@ -99,6 +117,12 @@ void thread_switch(struct thread *next)
        on next's own kernel stack. ("main" never runs user code.) */
     if (next->stack)
         tss_set_kernel_stack((uint32_t)next->stack + THREAD_STACK);
+    /* The FPU/SSE registers aren't part of switch_context: save them
+       separately, for user threads only (the kernel never uses them). */
+    if (prev->uses_fpu)
+        fpu_save(prev->fpu_state);
+    if (next->uses_fpu)
+        fpu_restore(next->fpu_state);
     switch_context(&prev->esp, next->esp);
     /* ...some time later, someone switched back to us. */
 }
@@ -115,8 +139,8 @@ void thread_yield(void)
 
 void thread_exit(void)
 {
-    /* We can't free our own stack — we're standing on it. The table slot
-       and stack stay used for now; a reaper will clean up dead threads later. */
+    /* We can't free our own stack — we're standing on it. thread_create()
+       frees it later, when it reuses this slot. */
     current->state = THREAD_DEAD;
     thread_yield();
     kprintf("thread_exit: no other thread to run!\n");
@@ -135,4 +159,16 @@ struct thread *thread_find(const char *name)
         if (threads[i].state == THREAD_READY && strcmp(threads[i].name, name) == 0)
             return &threads[i];
     return NULL;
+}
+
+void thread_start_fpu(void)
+{
+    /* Interrupts off: a switch between "load clean registers" and
+       "uses_fpu = 1" would not save them, and we'd come back to whatever
+       the other thread left in the FPU. */
+    uint32_t flags = irq_save();
+    fpu_clean_state(current->fpu_state);
+    fpu_restore(current->fpu_state);
+    current->uses_fpu = 1;
+    irq_restore(flags);
 }

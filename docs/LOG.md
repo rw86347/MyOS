@@ -61,3 +61,31 @@ Short dated notes after each work session: what was done, what broke, what was l
   (write + EFAULT check + exit(42)), user/peek.asm (reads kernel memory -> killed); flat
   binaries at 0x08048000, incbin'd into the kernel. 43 self-tests pass.
   Next: Step 6 (ELF loader, static musl hello world).
+- 2026-10-02: Step 6a: ELF loader. kernel/elf.c checks the header (ELF32, LSB, ET_EXEC,
+  EM_386) and every PT_LOAD (offsets inside the file, addresses in user space, not page 0),
+  maps pages writable only if PF_W, copies filesz and zeroes the rest (.bss). usermode.c
+  builds the Linux start-up stack: argc, argv, envp (empty), auxv (PHDR, PHENT, PHNUM,
+  PAGESZ, ENTRY, UID/GID, SECURE, RANDOM). vmm_unmap_user_all() frees all user pages and
+  page tables. User programs are now ELF (nasm + i686-elf-ld). New user/args.asm prints its
+  argv. 5 broken-ELF cases refused. 50 self-tests pass. Gotcha: nasm doesn't expand %1
+  inside "strings" — use %defstr/%strcat.
+- 2026-10-02: FPU/SSE fix (found in the performance review, docs/performance.md). FPU state
+  was never saved on thread switches. arch/i386/fpu.c: CR0 EM/TS off, MP/NE on, CR4 OSFXSR
+  (+OSXMMEXCPT) if supported, fninit, clean-state template; fxsave/fxrstor (fnsave/frstor on
+  CPUs without FXSR). Each thread has a 512-byte save area; only user threads (uses_fpu,
+  set by thread_start_fpu before entering ring 3) are saved/restored, eagerly. Kernel built
+  with -mgeneral-regs-only. Test: user/fpu.asm keeps st0/xmm0 while a kernel "wiper" thread
+  clobbers them under preemption -> exit 0; with save/restore removed it exits 1 (verified).
+  Also: lazy thread reaping (thread_create reuses DEAD slots), stale comments fixed,
+  docs/performance.md written. 51 self-tests pass.
+- 2026-10-02: Step 7a: two-stage boot. MBR now only loads stage 2 (8 sectors at 0x7E00).
+  stage2.asm: E820 map, A20, loads kernel to 1 MiB and initrd.cpio after the kernel's .bss
+  in 32 KiB chunks (int 0x13 AH=0x42 into a bounce buffer at 0x10000, then int 0x15 AH=0x87
+  copies it above 1 MiB), BOOTINFO = {initrd_phys, initrd_size, e820 count, entries},
+  protected mode, jump. Makefile passes LBAs/sizes/INITRD_LOAD (from __kernel_end via nm)
+  with -D. Kernel relinked at 0xC0100000. PSE: entry.asm maps the first 4 MiB with one big
+  page (no boot page table); vmm_init maps all RAM with 4 MiB pages (one page table for the
+  partial last 4 MiB). pmm reserves the initramfs. initramfs/ -> cpio newc (bsdcpio -H newc
+  -R 0:0) + generated data/numbers.txt (110 KB, 4 load chunks). kernel/initrd.c checks
+  magic, trailer, reservation. Booted first try; 55 self-tests pass.
+  Next: 7b, cpio reader + VFS (open/read/close/stat).

@@ -23,7 +23,8 @@ Mark a step `[x]` only when its "Done when" check works.
   Done when: a user-mode program calls `write()` and `exit()`.
 - [ ] **6. ELF loader** — load static ELF executables.
   Done when: an unmodified static musl "hello world" runs.
-- [ ] **7. VFS + initramfs** — virtual file system, cpio initramfs loaded as a Multiboot module.
+- [ ] **7. VFS + initramfs** — virtual file system, cpio initramfs loaded by our stage-2 loader.
+  - [x] 7a: stage-2 loader (kernel at 1 MiB, initramfs after it, no size limit), 4 MiB pages.
   Done when: `open`/`read`/`close`/`stat` work on initramfs files.
 - [ ] **8. Processes & TTY** — `fork`, `execve`, `wait4`, `pipe`, `dup2`, signals, TTY line discipline.
   Done when: **a BusyBox shell runs** and `ls`, `cat`, `echo | wc` work. (Big milestone!)
