@@ -28,6 +28,9 @@ Mark a step `[x]` only when its "Done when" check works.
   Done when: **a BusyBox shell runs** and `ls`, `cat`, `echo | wc` work. (Big milestone!)
 - [ ] **9. Disk & ext2** — ATA/IDE PIO driver, ext2 read then write.
   Done when: files survive a reboot.
+  - [x] Done early (polling, in-kernel): block device layer, ATA PIO read/write, MBR partitions,
+    FAT32 read-only (long names, path lookup, file reads). Test disk: `make usb`; `make test`.
+  - [ ] FAT32 write, ext2, plug into the VFS (step 7), IRQ-driven I/O (after step 2).
 
 ## Phase 3 — Networking & beyond
 - [ ] **10. PCI & network** — PCI enumeration, e1000 or RTL8139 driver, TCP/IP (lwIP port), BSD sockets syscalls.

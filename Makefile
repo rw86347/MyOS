@@ -7,7 +7,11 @@
 #                   serial goes to build/serial.log). Quit: Esc then 2, type "quit".
 #   make debug      like run, but paused at the first instruction; then in another
 #                   terminal: gdb build/kernel.elf -ex "target remote localhost:1234"
+#   make test       boot headless, print the serial log, fail unless self-tests pass
+#   make usb        (re)build build/usb.img, the FAT32 test disk (needs mtools)
 #   make clean      delete build/
+#
+# QEMU gets two IDE disks:  hda = myos.img (boot)   hdb = usb.img (FAT32 data)
 #
 # How the image is put together:
 #   kernel/*.c + drivers/*.c + arch/i386/entry.asm  --link-->  build/kernel.elf
@@ -25,24 +29,30 @@ BUILD   := build
 
 # Freestanding: no host OS, no C library. Only compiler-provided headers like
 # <stdint.h> and <stddef.h> are available.
+# -fno-tree-loop-distribute-patterns: stop GCC from turning our memcpy/memset
+# loops into calls to memcpy/memset — inside memcpy itself that would recurse.
 CFLAGS  := -std=c11 -ffreestanding -O2 -Wall -Wextra -g \
+           -fno-tree-loop-distribute-patterns \
            -Iinclude -Iarch/i386/include
 # --no-warn-rwx-segments: the kernel is one read/write/execute blob for now;
 # we'll split code and data permissions once paging is on (roadmap step 3).
 LDFLAGS := -T arch/i386/linker.ld -nostdlib -ffreestanding -O2 -Wl,--no-warn-rwx-segments
 LIBS    := -lgcc    # gcc's helper routines (e.g. 64-bit division on i386)
 
-C_SRCS  := $(wildcard kernel/*.c drivers/*.c)
+C_SRCS  := $(wildcard kernel/*.c drivers/*.c fs/*.c)
 C_OBJS  := $(patsubst %.c,$(BUILD)/%.o,$(C_SRCS))
 # entry.o must be linked first (it holds _start; linker.ld also enforces this)
 OBJS    := $(BUILD)/arch/i386/entry.o $(C_OBJS)
 
 IMG     := $(BUILD)/myos.img
-QEMU_FLAGS := -drive format=raw,file=$(IMG) -m 64M
+USB     := $(BUILD)/usb.img
+QEMU_FLAGS := -m 64M \
+              -drive format=raw,file=$(IMG),index=0,media=disk \
+              -drive format=raw,file=$(USB),index=1,media=disk
 
-.PHONY: all run run-text debug clean
+.PHONY: all run run-text debug test usb clean
 
-all: $(IMG)
+all: $(IMG) $(USB)
 
 # --- kernel ------------------------------------------------------------------
 $(BUILD)/%.o: %.c
@@ -77,15 +87,32 @@ $(IMG): $(BUILD)/mbr.bin $(BUILD)/kernel.bin
 	dd if=$(BUILD)/kernel.bin of=$@ bs=512 seek=1 conv=notrunc 2>/dev/null
 	@echo "Built $@ (kernel: $$(wc -c < $(BUILD)/kernel.bin | tr -d ' ') bytes)"
 
+# --- FAT32 test disk ---------------------------------------------------------
+$(USB): tools/mkusb.sh
+	tools/mkusb.sh $@
+
+usb:
+	tools/mkusb.sh $(USB)
+
 # --- running -----------------------------------------------------------------
-run: $(IMG)
+run: $(IMG) $(USB)
 	$(QEMU) $(QEMU_FLAGS) -serial stdio
 
-run-text: $(IMG)
+run-text: $(IMG) $(USB)
 	$(QEMU) $(QEMU_FLAGS) -display curses -serial file:$(BUILD)/serial.log
 
-debug: $(IMG)
+debug: $(IMG) $(USB)
 	$(QEMU) $(QEMU_FLAGS) -serial stdio -s -S
+
+# Boot with no display, give the kernel 5 seconds, then tell QEMU to quit
+# through its monitor. The kernel's serial output is the test result.
+test: $(IMG) $(USB)
+	@rm -f $(BUILD)/serial.log
+	@(sleep 5; echo quit) | $(QEMU) $(QEMU_FLAGS) -display none \
+	  -serial file:$(BUILD)/serial.log -monitor stdio >/dev/null
+	@cat $(BUILD)/serial.log
+	@grep -q "Self-tests: [0-9]* passed, 0 failed" $(BUILD)/serial.log \
+	  && echo "TEST OK" || (echo "TEST FAILED"; exit 1)
 
 clean:
 	rm -rf $(BUILD)

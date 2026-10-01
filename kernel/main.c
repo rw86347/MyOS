@@ -5,19 +5,21 @@
  *   BIOS -> MBR (real mode) -> loaded kernel, enabled A20, entered protected
  *   mode -> entry.asm cleared .bss -> kernel_main()
  */
+#include <disk_demo.h>
+#include <kprintf.h>
 #include <serial.h>
 #include <vga.h>
 
 void kernel_main(void)
 {
     serial_init();
-    serial_write("Hello world from MyOS! (serial)\n");
-
     vga_clear();
+
     vga_set_color(VGA_LIGHT_GREEN, VGA_BLACK);
-    vga_write("Hello world from MyOS!\n");
+    kprintf("Hello world from MyOS! (32-bit protected mode, booted by our own MBR)\n");
     vga_set_color(VGA_LIGHT_GREY, VGA_BLACK);
-    vga_write("Booted via our own MBR, now running in 32-bit protected mode.\n");
+
+    disk_demo();
 
     /* Nothing else to do yet. Halt the CPU; with interrupts off it stays put. */
     for (;;)

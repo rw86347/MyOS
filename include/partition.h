@@ -1,0 +1,16 @@
+#ifndef PARTITION_H
+#define PARTITION_H
+
+#include <blockdev.h>
+
+/* Read `disk`'s MBR partition table and register each partition as a new
+   block device (e.g. hdb1). Returns the number found, or -1 on read error. */
+int partition_scan(struct blockdev *disk);
+
+/* The MBR type byte of a partition device (stored in priv). */
+static inline uint8_t partition_type(const struct blockdev *part)
+{
+    return (uint8_t)(uintptr_t)part->priv;
+}
+
+#endif
