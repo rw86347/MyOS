@@ -41,6 +41,7 @@ static const char shift_map[128] = {
 #define SC_RSHIFT 0x36
 #define SC_CTRL   0x1D
 #define SC_CAPS   0x3A
+#define SC_F10    0x44
 #define SC_F11    0x57
 #define SC_F12    0x58
 
@@ -89,6 +90,7 @@ static void keyboard_irq(struct regs *r)
         return;                 /* we only care about presses */
 
     if (sc == SC_CAPS)  { caps = !caps; return; }
+    if (sc == SC_F10)   { put(KEY_F10); return; }
     if (sc == SC_F11)   { put(KEY_F11); return; }
     if (sc == SC_F12)   { put(KEY_F12); return; }
 

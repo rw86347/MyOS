@@ -2,17 +2,26 @@
  * main.c — the kernel's C entry point
  *
  * By the time we get here:
- *   BIOS -> MBR (real mode) -> loaded kernel, enabled A20, entered protected
- *   mode -> entry.asm cleared .bss -> kernel_main()
+ *   BIOS -> MBR (real mode: loaded kernel, read memory map, enabled A20,
+ *   entered protected mode) -> entry.asm (cleared .bss, turned on paging,
+ *   jumped to the higher half at 0xC0000000) -> kernel_main()
  */
 #include <disk_demo.h>
 #include <gdt.h>
 #include <interrupts.h>
+#include <kheap.h>
 #include <keyboard.h>
 #include <kprintf.h>
+#include <memlayout.h>
+#include <mem_test.h>
+#include <paging.h>
+#include <pmm.h>
+#include <selftest.h>
 #include <serial.h>
 #include <timer.h>
 #include <vga.h>
+
+extern char _start[];       /* first byte of the kernel (entry.asm) */
 
 /* Show "up 0:01:23" in the top-right corner of the screen. */
 static void show_uptime(uint32_t secs)
@@ -28,7 +37,11 @@ static void show_uptime(uint32_t secs)
 /* Deliberately crash, to show the exception handlers work. */
 static void trigger_fault(int key)
 {
-    if (key == KEY_F12) {
+    if (key == KEY_F10) {
+        kprintf("\n[F10] Reading through a NULL pointer...\n");
+        volatile uint32_t *null = 0;
+        kprintf("%lu\n", *null);           /* page 0 is not mapped */
+    } else if (key == KEY_F12) {
         kprintf("\n[F12] Dividing by zero...\n");
         /* Written in assembly on purpose: in C, dividing by zero is
            "undefined behaviour", so GCC may assume it never happens and
@@ -70,6 +83,10 @@ void kernel_main(void)
     /* Step 2: CPU tables and interrupts. */
     gdt_init();             /* our own segment table */
     idt_init();             /* interrupt table + exception handlers + PIC remap */
+
+    /* Step 3: memory. */
+    pmm_init();             /* which physical RAM is free (BIOS memory map) */
+    vmm_init();             /* page tables for all RAM; unmap NULL */
     timer_init();           /* IRQ 0: 1 ms tick */
     keyboard_init();        /* IRQ 1 */
     interrupts_enable();    /* sti: from now on, IRQs can arrive */
@@ -79,9 +96,14 @@ void kernel_main(void)
     kprintf("Interrupts on: timer %u Hz (sleep 100 ms = %lu ticks), keyboard ready\n",
             TIMER_HZ, timer_ms() - t0);
 
-    disk_demo();
+    kprintf("Memory: %lu MiB usable, paging on, kernel at %p, heap at %p\n",
+            pmm_usable_count() / 256, (void *)_start, (void *)KHEAP_START);
 
-    kprintf("Type here (F11/F12 = test a CPU fault)> ");
+    disk_demo();
+    mem_selftest();
+    selftest_summary();
+
+    kprintf("Type here (F10/F11/F12 = test a CPU fault)> ");
 
     /* Main loop: sleep until an interrupt wakes us (timer tick or key),
        then handle whatever is new. */
@@ -97,7 +119,7 @@ void kernel_main(void)
 
         int c;
         while ((c = keyboard_getc()) != -1) {
-            if (c == KEY_F11 || c == KEY_F12)
+            if (c == KEY_F10 || c == KEY_F11 || c == KEY_F12)
                 trigger_fault(c);
             else
                 echo(c);

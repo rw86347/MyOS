@@ -2,7 +2,7 @@
  * disk_demo.c — exercise the disk + file system drivers at boot.
  *
  * Finds every disk, reads its partition table, mounts FAT32 partitions,
- * prints the whole directory tree and a few files, then runs self-tests
+ * prints the whole directory tree, then runs self-tests
  * (reads across cluster boundaries, long names, ATA write + read-back).
  *
  * Temporary: once we have a VFS, syscalls and a shell, `ls` and `cat`
@@ -14,20 +14,8 @@
 #include <fat32.h>
 #include <kprintf.h>
 #include <partition.h>
+#include <selftest.h>
 #include <string.h>
-
-static int passed, failed;
-
-/* Only failures are printed, so everything fits on the 25-line VGA screen. */
-static void check(int ok, const char *what)
-{
-    if (ok) {
-        passed++;
-    } else {
-        failed++;
-        kprintf("  FAIL: %s\n", what);
-    }
-}
 
 /* ---- directory tree ----------------------------------------------------- */
 
@@ -53,34 +41,16 @@ static int tree_cb(const struct fat32_dirent *e, void *ctx)
     return 0;                           /* keep going */
 }
 
-/* ---- printing a file ---------------------------------------------------- */
-
-static void cat(struct fat32_fs *fs, const char *path)
-{
-    struct fat32_dirent f;
-    char buf[128];
-
-    kprintf("%s: ", path);
-    if (fat32_lookup(fs, path, &f) < 0) {
-        kprintf("(not found)\n");
-        return;
-    }
-    /* Read in small pieces to show reading at an offset works. */
-    uint32_t off = 0;
-    int n;
-    while ((n = fat32_read(fs, &f, off, buf, sizeof buf - 1)) > 0) {
-        buf[n] = '\0';
-        kprintf("%s", buf);
-        off += n;
-    }
-}
-
 /* ---- self-tests --------------------------------------------------------- */
 
 static void run_tests(struct fat32_fs *fs)
 {
     static uint8_t buf[4096];
     struct fat32_dirent f;
+
+    static const char hello[] = "Hello from a FAT32 USB stick!\n";
+    int n0 = fat32_lookup(fs, "/HELLO.TXT", &f) == 0 ? fat32_read(fs, &f, 0, buf, sizeof buf) : -1;
+    check(n0 == (int)sizeof hello - 1 && memcmp(buf, hello, n0) == 0, "read /HELLO.TXT");
 
     /* numbers.txt: 100 lines of exactly 24 bytes: "line 001 of numbers.txt\n" */
     int ok = fat32_lookup(fs, "/data/numbers.txt", &f) == 0 && f.size == 2400;
@@ -162,9 +132,7 @@ void disk_demo(void)
         struct tree_ctx t = { &fs, 1 };
         fat32_readdir(&fs, &root, tree_cb, &t);
 
-        cat(&fs, "/HELLO.TXT");
         run_tests(&fs);
-        kprintf("Self-tests: %d passed, %d failed\n", passed, failed);
         return;                 /* one file system is enough for the demo */
     }
     kprintf("No FAT32 partition found.\n");

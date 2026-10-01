@@ -9,4 +9,8 @@
  */
 void kprintf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 
+/* Same, but to the serial port only: for detail that would clutter the
+   25-line screen (memory maps, debug output). */
+void klog(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+
 #endif

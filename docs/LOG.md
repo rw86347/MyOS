@@ -23,3 +23,11 @@ Short dated notes after each work session: what was done, what broke, what was l
   disk tests, echo and the exception handler. Lesson: GCC turned `1/zero` into a compare (div by
   zero is UB) — used inline asm `div` to force the fault. Added -MMD header dependency tracking.
   Next: Step 3 (memory: memory map, page allocator, paging, kmalloc).
+- 2026-10-01: Step 3 done. MBR now saves the BIOS E820 memory map at 0x1000 (MBR is 292/446
+  bytes). Kernel relinked to run at 0xC0010000 (loaded at 0x10000; linker AT()); entry.asm builds
+  a 4 MiB boot page table mapped at 0 and 0xC0000000, enables paging, jumps high. pmm.c: bitmap
+  frame allocator (RAM up to 768 MiB), reserves low 1 MiB + kernel. paging.c: direct-maps all RAM
+  at 0xC0000000, removes identity map (NULL now faults), vmm_map/unmap/translate. kheap.c:
+  first-fit kmalloc/kfree at 0xF0000000 with merging. 31 self-tests pass; F10 = NULL deref ->
+  page fault with CR2 decoding. klog() = serial-only output (E820 map).
+  Next: Step 4 (kernel threads, context switch, time-slot scheduler).

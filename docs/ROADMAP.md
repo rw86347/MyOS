@@ -11,7 +11,8 @@ Mark a step `[x]` only when its "Done when" check works.
   Done when: QEMU shows **"Hello world from MyOS!"**.
 - [x] **2. CPU tables & interrupts** — GDT, IDT, exception handlers, PIC remap, PIT timer, PS/2 keyboard.
   Done when: a fault prints a message instead of rebooting; typed keys echo to the screen.
-- [ ] **3. Memory** — read Multiboot memory map, physical page allocator, paging, kernel heap (`kmalloc`/`kfree`).
+- [x] **3. Memory** — BIOS E820 memory map (read by our MBR), physical page allocator, paging with
+  the kernel in the higher half (0xC0000000, Linux's 3G/1G split), kernel heap (`kmalloc`/`kfree`).
   Done when: allocate/free tests pass and paging is on.
 - [ ] **4. Threads & scheduler** — kernel threads, context switch, then the **time-slot scheduler**:
   20 × 1 ms slots, slots 1 and 10 for the system, named tasks assigned to slots from a config file.

@@ -1,41 +1,46 @@
 /*
  * linker.ld — memory layout of the kernel image
  *
- * The MBR copies kernel.bin from disk to physical address 0x10000 and jumps
- * there, so we tell the linker the kernel *runs* at 0x10000 (". = 0x10000").
- * Every absolute address in the kernel (string literals, globals, calls) is
- * computed relative to that.
+ * Two addresses for everything:
+ *   VMA (virtual)  where the code RUNS once paging is on:  0xC0010000...
+ *   LMA (load)     where the MBR PUTS it in physical RAM:  0x10000...
+ * "AT(...)" sets the load address. objcopy -O binary lays the file out by
+ * load address, so kernel.bin still starts with _start, loaded at 0x10000.
  *
- * .text.entry comes first so _start is the very first byte of kernel.bin.
- * Keep in sync with KERNEL_LOAD in arch/i386/boot/mbr.asm.
+ * Keep in sync with KERNEL_LOAD in mbr.asm and KERNEL_VBASE in memlayout.h
+ * and entry.asm.
  */
 ENTRY(_start)
 
+KERNEL_VBASE = 0xC0000000;
+
 SECTIONS
 {
-    . = 0x10000;
+    . = KERNEL_VBASE + 0x10000;
 
-    .text : {
+    .text : AT(ADDR(.text) - KERNEL_VBASE) {
         *(.text.entry)          /* _start — must be first */
         *(.text .text.*)
     }
 
-    .rodata : {
+    .rodata : AT(ADDR(.rodata) - KERNEL_VBASE) {
         *(.rodata .rodata.*)    /* constant data, e.g. string literals */
     }
 
-    .data : {
+    .data : AT(ADDR(.data) - KERNEL_VBASE) {
         *(.data .data.*)        /* initialized globals */
     }
 
     /* .bss holds zero-initialized globals. It takes no space in kernel.bin;
        entry.asm clears it at boot using these two symbols. */
-    .bss : {
+    .bss : AT(ADDR(.bss) - KERNEL_VBASE) {
         __bss_start = .;
         *(COMMON)
         *(.bss .bss.*)
         __bss_end = .;
     }
+
+    __kernel_end = .;           /* first address after the kernel (virtual) */
 
     /DISCARD/ : {
         *(.comment)

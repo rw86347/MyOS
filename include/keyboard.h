@@ -2,8 +2,9 @@
 #define KEYBOARD_H
 
 /* Special keys, returned outside the ASCII range. */
-#define KEY_F11 0x100
-#define KEY_F12 0x101
+#define KEY_F10 0x100
+#define KEY_F11 0x101
+#define KEY_F12 0x102
 
 void keyboard_init(void);
 

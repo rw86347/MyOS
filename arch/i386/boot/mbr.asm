@@ -29,6 +29,8 @@
 
 KERNEL_LOAD     equ 0x10000     ; physical address where the kernel is loaded (64 KiB)
 KERNEL_STACK    equ 0x90000     ; initial kernel stack top (grows down; free RAM below 640K)
+BOOTINFO        equ 0x1000      ; where we leave the memory map for the kernel
+E820_MAX        equ 32          ; max memory map entries (32 x 24 bytes)
 
 %ifndef KERNEL_SECTORS
   %error "KERNEL_SECTORS must be defined (the Makefile does this)"
@@ -68,6 +70,37 @@ start:
     mov dl, [boot_drive]
     int 0x13
     jc disk_error               ; carry flag set = the read failed
+
+    ; --- b2. Ask the BIOS for the memory map (int 0x15, EAX=0xE820) ----------
+    ; The only reliable way to learn where RAM is (and which ranges belong to
+    ; the BIOS, ACPI, PCI devices...) — and it only works in real mode, so the
+    ; bootloader collects it for the kernel. Each call returns one 24-byte
+    ; entry { u64 base, u64 length, u32 type, u32 acpi } at ES:DI; EBX is a
+    ; "continuation" value: 0 means that was the last entry.
+    ; Result at BOOTINFO (see arch/i386/include/bootinfo.h):
+    ;   [BOOTINFO]     u32 number of entries
+    ;   [BOOTINFO+4]   the entries
+    xor ebx, ebx
+    xor bp, bp                  ; bp = entry count
+    mov di, BOOTINFO + 4
+.e820_next:
+    mov eax, 0xE820
+    mov edx, 0x534D4150         ; 'SMAP' — magic the BIOS checks
+    mov ecx, 24
+    mov dword [di + 20], 1      ; preset "ACPI: entry valid" for old BIOSes
+    int 0x15
+    jc .e820_done               ; carry: error or no more entries
+    cmp eax, 0x534D4150         ; BIOS answers with 'SMAP' too
+    jne .e820_done
+    inc bp
+    add di, 24
+    cmp bp, E820_MAX
+    jae .e820_done
+    test ebx, ebx
+    jnz .e820_next
+.e820_done:
+    mov [BOOTINFO], bp
+    mov word [BOOTINFO + 2], 0
 
     ; --- c. Enable the A20 line ----------------------------------------------
     ; Historical quirk: the 8086 could only address 1 MiB, and addresses
@@ -181,7 +214,9 @@ msg_disk_error: db "MyOS: disk read error!", 13, 10, 0
 ; -----------------------------------------------------------------------------
 ; Pad to 510 bytes and add the boot signature
 ; -----------------------------------------------------------------------------
-; (Bytes 446-509 are where a partition table lives on a real disk. We don't
-; need one for QEMU; we'll add one before booting from USB on real hardware.)
-times 510 - ($ - $$) db 0
+; Bytes 446-509 are where a partition table lives on a real disk. We don't
+; need one for QEMU yet, but keep the space free: if the code above grows
+; past 446 bytes, "times" gets a negative count and nasm stops with an error.
+times 446 - ($ - $$) db 0
+times 64 db 0                   ; partition table (4 empty entries)
 dw 0xAA55                       ; stored little-endian as 0x55, 0xAA

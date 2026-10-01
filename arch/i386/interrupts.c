@@ -87,6 +87,15 @@ static void exception(struct regs *r)
 
     kprintf("\n*** CPU EXCEPTION %lu: %s (error code %lx) ***\n",
             r->vector, exception_names[r->vector], r->err_code);
+    if (r->vector == 14) {
+        /* Page fault: CR2 holds the address that was accessed, and the
+           error code says how: bit 0 = page was present (so it's a
+           permission problem), bit 1 = write, bit 2 = from user mode. */
+        kprintf("%s %s of address %08lx (%s)\n",
+                r->err_code & 4 ? "User" : "Kernel",
+                r->err_code & 2 ? "write" : "read", cr2,
+                r->err_code & 1 ? "permission denied" : "page not mapped");
+    }
     kprintf("EIP=%08lx  CS=%04lx  EFLAGS=%08lx  CR2=%08lx\n", r->eip, r->cs, r->eflags, cr2);
     kprintf("EAX=%08lx EBX=%08lx ECX=%08lx EDX=%08lx\n", r->eax, r->ebx, r->ecx, r->edx);
     kprintf("ESI=%08lx EDI=%08lx EBP=%08lx\n", r->esi, r->edi, r->ebp);

@@ -12,14 +12,18 @@
 #include <string.h>
 #include <vga.h>
 
-static void out(char c)
+/* Where output goes: kprintf -> screen + serial, klog -> serial only.
+   The destination is passed down as a function pointer ("sink"). */
+typedef void (*sink_t)(char c);
+
+static void to_both(char c)
 {
     vga_putc(c);
     serial_putc(c);
 }
 
 /* Print `s` padded to `width` (pad on the left unless left_align). */
-static void out_padded(const char *s, int width, char pad, int left_align)
+static void out_padded(sink_t out, const char *s, int width, char pad, int left_align)
 {
     int len = (int)strlen(s);
     if (!left_align)
@@ -45,11 +49,8 @@ static void utoa(uint32_t v, unsigned base, char *buf)
     *buf = '\0';
 }
 
-void kprintf(const char *fmt, ...)
+static void vformat(sink_t out, const char *fmt, va_list ap)
 {
-    va_list ap;
-    va_start(ap, fmt);
-
     for (; *fmt; fmt++) {
         if (*fmt != '%') {
             out(*fmt);
@@ -77,7 +78,7 @@ void kprintf(const char *fmt, ...)
         switch (*fmt) {
         case 's': {
             const char *s = va_arg(ap, const char *);
-            out_padded(s ? s : "(null)", width, ' ', left_align);
+            out_padded(out, s ? s : "(null)", width, ' ', left_align);
             break;
         }
         case 'c':
@@ -91,21 +92,21 @@ void kprintf(const char *fmt, ...)
             } else {
                 utoa((uint32_t)v, 10, buf);
             }
-            out_padded(buf, width, pad, left_align);
+            out_padded(out, buf, width, pad, left_align);
             break;
         }
         case 'u':
             utoa(va_arg(ap, uint32_t), 10, buf);
-            out_padded(buf, width, pad, left_align);
+            out_padded(out, buf, width, pad, left_align);
             break;
         case 'x':
             utoa(va_arg(ap, uint32_t), 16, buf);
-            out_padded(buf, width, pad, left_align);
+            out_padded(out, buf, width, pad, left_align);
             break;
         case 'p':
             out('0'); out('x');
             utoa((uint32_t)(uintptr_t)va_arg(ap, void *), 16, buf);
-            out_padded(buf, 8, '0', 0);
+            out_padded(out, buf, 8, '0', 0);
             break;
         case '%':
             out('%');
@@ -116,5 +117,20 @@ void kprintf(const char *fmt, ...)
             break;
         }
     }
+}
+
+void kprintf(const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    vformat(to_both, fmt, ap);
+    va_end(ap);
+}
+
+void klog(const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    vformat(serial_putc, fmt, ap);
     va_end(ap);
 }

@@ -8,17 +8,18 @@
  *   byte 0: the ASCII character
  *   byte 1: the color attribute — low 4 bits foreground, high 4 bits background
  *
- * Without paging enabled, a pointer value is a physical address, so we can
- * just point at 0xB8000.
+ * 0xB8000 is a PHYSICAL address. With paging on, the kernel reaches physical
+ * memory through the direct map at +0xC0000000 (see memlayout.h).
  */
 #include <io.h>
+#include <memlayout.h>
 #include <stddef.h>
 #include <vga.h>
 
 #define VGA_WIDTH  80
 #define VGA_HEIGHT 25
 
-static volatile uint16_t *const vga_buffer = (uint16_t *)0xB8000;
+static volatile uint16_t *const vga_buffer = P2V(0xB8000);
 static size_t  row, col;
 static uint8_t color = VGA_LIGHT_GREY | (VGA_BLACK << 4);
 
