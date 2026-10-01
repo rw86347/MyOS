@@ -4,16 +4,18 @@ Target first: 32-bit x86 (i686) in QEMU. Real hardware and ARM come later.
 Mark a step `[x]` only when its "Done when" check works.
 
 ## Phase 1 — Boot and basic kernel
-- [ ] **0. Toolchain** — cross-compiler (`i686-elf-gcc`), QEMU, GDB, Makefile.
+- [x] **0. Toolchain** — cross-compiler (`i686-elf-gcc`), QEMU, GDB, Makefile.
   Done when: `make` produces a kernel binary.
-- [ ] **1. Boot & print** — Multiboot header, boot via GRUB (or Limine), write to VGA text buffer and serial port.
-  Done when: QEMU shows **"Hello from MyOS"**.
+- [x] **1. Boot & print** — our own BIOS MBR bootloader: load kernel from disk, enable A20, GDT,
+  enter protected mode; kernel writes to VGA text buffer and serial port. (See `docs/DESIGN.md`.)
+  Done when: QEMU shows **"Hello world from MyOS!"**.
 - [ ] **2. CPU tables & interrupts** — GDT, IDT, exception handlers, PIC remap, PIT timer, PS/2 keyboard.
   Done when: a fault prints a message instead of rebooting; typed keys echo to the screen.
 - [ ] **3. Memory** — read Multiboot memory map, physical page allocator, paging, kernel heap (`kmalloc`/`kfree`).
   Done when: allocate/free tests pass and paging is on.
-- [ ] **4. Threads & scheduler** — kernel threads, context switch, round-robin scheduling on the timer.
-  Done when: two threads take turns printing.
+- [ ] **4. Threads & scheduler** — kernel threads, context switch, then the **time-slot scheduler**:
+  20 × 1 ms slots, slots 1 and 10 for the system, named tasks assigned to slots from a config file.
+  Done when: two named threads print in their assigned slots (e.g. "brakes" in 4,9,14,19).
 
 ## Phase 2 — Running Linux programs
 - [ ] **5. User mode & syscalls** — ring 3, TSS, `int 0x80` handler using **Linux i386 syscall numbers**.
@@ -39,5 +41,6 @@ Mark a step `[x]` only when its "Done when" check works.
 - [ ] **14. ARM port** — one board (original Raspberry Pi), device tree, ARM boot path.
 
 ## Notes
+- Drivers: most will move to user space, built against a Linux-kernel-API shim (see `docs/DESIGN.md`).
 - WiFi alone can be more code than everything else combined — plan for it last.
 - If speed matters more than learning: Linux kernel + BusyBox ("Linux From Scratch") reaches the same goals far faster.

@@ -1,0 +1,104 @@
+# MyOS Design Decisions
+
+Decisions that shape later roadmap steps. Add open questions at the bottom of each section.
+
+## Boot: our own BIOS/MBR bootloader (no GRUB)
+- BIOS loads `arch/i386/boot/mbr.asm` (512 bytes) at 0x7C00 in real mode.
+- MBR reads the kernel from LBA 1.. into 0x10000 via `int 0x13` AH=0x42, enables A20,
+  loads a flat GDT, enters 32-bit protected mode, jumps to `_start` at 0x10000.
+- Limits for now: kernel ≤ 127 sectors (~63 KiB), loaded below 1 MiB, no partition table.
+  When the kernel grows: add a stage-2 loader that reads in a loop and copies above 1 MiB,
+  and gets the BIOS memory map (`int 0x15, E820`) before leaving real mode.
+
+## Scheduling: fixed time-slot table (time partitioning)
+Like ARINC 653 in avionics: time is divided into a repeating **major frame**.
+- Major frame = **20 slots × 1 ms** = 20 ms (both numbers configurable).
+- Slots are numbered **1–20**. Slots **1 and 10 are system slots** (kernel / system user-space apps).
+  The other **18 slots** can be assigned to **named** tasks.
+- A real-time task gets a fixed set of slots, so its timing is guaranteed. Example:
+  `"anti-lock brakes"` → slots 4, 9, 14, 19 (runs every 5 ms, 1 ms each).
+- Configured in a text config file (e.g. `config/slots.conf`). Until the kernel has a
+  filesystem, the build turns the file into a C table compiled into the kernel; later the
+  kernel can read it from the initramfs.
+- Timer: PIT (later local APIC timer) programmed for a 1 ms tick; each tick = next slot.
+
+Open questions:
+- What runs in an unassigned slot, or when a task finishes its slot early? (Idle? Best-effort
+  "background" tasks round-robin?)
+- Can a name own multiple processes/threads?
+- What happens if a task overruns? (Preempt hard at slot end — the usual answer.)
+
+## Drivers: in user space, Linux-compatible
+- Goal: most drivers run as user-space processes (microkernel-style). The kernel provides
+  what they need: mapping device memory (MMIO) and I/O ports, delivering IRQs, DMA buffers.
+- "Linux-compatible" means **source-level**: Linux drivers are written against Linux's
+  *internal* kernel API (no stable ABI), so binary `.ko` modules can't be loaded. Instead,
+  a shim library re-implements the Linux kernel API the drivers use, and unmodified (or
+  lightly patched) Linux driver source is compiled against it.
+  Prior art: FreeBSD **LinuxKPI** (in-kernel), TU Dresden **DDE** (user space), NetBSD **rump**.
+- Early drivers (serial, VGA, PIT, keyboard) stay in the kernel until user mode exists.
+
+## Compatibility policy: "Linux without the legacy"
+What has to match Linux is the **boundary** that programs and disks see. The inside of the
+kernel can be our own design.
+- **Must match exactly:** syscall numbers, argument order, struct layouts (`struct stat64`,
+  `struct statx`, `linux_dirent64`, ...), errno values, file semantics (permissions, `O_*` flags),
+  and on-disk formats (ext2/ext4, FAT32, MBR/GPT partition tables).
+- **Can be dropped (return `-ENOSYS`):** Linux i386 still carries old syscall versions for
+  1990s binaries. Examples: old `stat`/`oldstat` (use `statx`/`fstatat64`), 16-bit-uid
+  `setuid`/`getuid` (use the `*32` versions), 32-bit-`time_t` calls (use the `*_time64`
+  versions), `socketcall` (use direct `socket`/`bind`/...), `oldolduname`, `vm86`, `uselib`,
+  `sysfs`, a.out binaries.
+- **Rule for what to implement:** implement what **recent musl** actually calls (check musl's
+  source for each syscall), then glibc as needed. Every syscall we don't implement logs its
+  number and name to serial once. Real programs show us what's missing.
+- Honest note on speed: dropping legacy syscalls makes the kernel *smaller and simpler*, not
+  much faster. Linux's per-syscall cost is already low. Our speed wins come from a smaller code
+  path, the fixed slot scheduler (predictable latency), and zero-copy I/O paths (below).
+  Linux's throughput will be hard to beat; guaranteed timing is where we can win.
+
+## Storage: disks and file systems
+Layers, bottom to top:
+```
+  program     open/read/write/stat/getdents64/mmap     (Linux syscall ABI)
+  ----------------------------------------------------------------------
+  kernel      VFS  (superblock, inode, dentry, file — same concepts as Linux)
+              page cache  (file data cached in 4 KiB pages; also used by mmap)
+              file systems: initramfs (cpio), ext2 -> ext4, FAT32
+              partition parsing: MBR, later GPT
+              block layer: request queues, one shared-memory ring per disk
+  ----------------------------------------------------------------------
+  user space  block drivers: ATA PIO -> ATA DMA (PIIX/ICH), AHCI (SATA), virtio-blk (QEMU),
+              later USB mass storage
+```
+
+Order of work (fills in roadmap steps 7 and 9):
+1. **VFS + initramfs**: a RAM-only filesystem loaded with the kernel. No disk driver is needed,
+   so the file syscalls and ELF loading can be tested early.
+2. **Block layer + ATA PIO driver**: the simplest disk interface (CPU copies every byte). Slow
+   but about 200 lines, and works in QEMU and on every IDE-era PC.
+3. **MBR partition table** parsing (we already write MBRs; GPT later).
+4. **ext2 read**, then **ext2 write**: the classic Unix filesystem and the best documented.
+5. **ext4 read** (extents, 64-bit block numbers, `dir_index`): modern Linux disks use ext4.
+   Writing ext4 safely needs journaling, which is a big job, so it comes much later.
+6. **FAT32**: USB sticks and moving files between machines.
+7. Faster drivers: **ATA DMA / AHCI** for real hardware, **virtio-blk** for QEMU.
+
+Driver compatibility for disks: the Linux disk drivers (libata, AHCI) are large and tied
+to Linux's SCSI layer, so a Linux-API shim for them is more work than writing small native
+drivers. Plan: native drivers for storage (ATA/AHCI/virtio are well documented and small);
+use the Linux shim where writing our own would be impractical (network cards, WiFi, USB
+host controllers).
+
+Open questions:
+- Where do **file systems** run? In the kernel (recommended: every `read()` stays one
+  syscall), or as user-space servers like the drivers (cleaner isolation, but every file
+  operation costs extra context switches, which works against "faster than Linux").
+- Block drivers in user space need a fast path: kernel and driver share a request ring and the
+  data buffers (no copying), and an IRQ wakes the driver. Can a disk driver own one of the
+  system slots (1 or 10), or does it need its own slots?
+- Root filesystem at boot: initramfs only at first. Later, do we mount ext4 from disk with an
+  initramfs that holds the drivers (Linux style)?
+
+## Unchanged goals
+- Linux i386 syscall ABI (`int 0x80`), ELF, static musl binaries first.
