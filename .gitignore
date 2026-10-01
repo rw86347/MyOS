@@ -1,0 +1,9 @@
+build/
+*.o
+*.elf
+*.bin
+*.iso
+.DS_Store
+
+# The live disk is its own repo (myos-live), checked out here.
+/live/
