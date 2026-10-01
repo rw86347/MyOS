@@ -13,4 +13,8 @@ void kprintf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
    25-line screen (memory maps, debug output). */
 void klog(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 
+/* Write n bytes to the screen and the serial port, as one piece. */
+#include <stddef.h>
+void console_write(const char *s, size_t n);
+
 #endif

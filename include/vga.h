@@ -15,6 +15,7 @@ void vga_clear(void);
 void vga_set_color(enum vga_color fg, enum vga_color bg);
 void vga_putc(char c);
 void vga_write(const char *s);
+void vga_write_n(const char *s, size_t n);
 
 /* Write a string at a fixed screen position (column x, row y) without moving
    the cursor — for status displays like the uptime clock. */

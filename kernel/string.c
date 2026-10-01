@@ -1,39 +1,10 @@
 /*
- * string.c — simple, readable versions of the C memory/string functions.
+ * string.c — the C memory/string functions that aren't speed-critical.
  */
 #include <string.h>
 
-void *memcpy(void *dst, const void *src, size_t n)
-{
-    unsigned char *d = dst;
-    const unsigned char *s = src;
-    while (n--)
-        *d++ = *s++;
-    return dst;
-}
-
-/* Like memcpy, but correct even when the two areas overlap. */
-void *memmove(void *dst, const void *src, size_t n)
-{
-    unsigned char *d = dst;
-    const unsigned char *s = src;
-    if (d < s) {
-        while (n--)
-            *d++ = *s++;
-    } else {
-        while (n--)
-            d[n] = s[n];        /* copy backwards */
-    }
-    return dst;
-}
-
-void *memset(void *dst, int c, size_t n)
-{
-    unsigned char *d = dst;
-    while (n--)
-        *d++ = (unsigned char)c;
-    return dst;
-}
+/* memcpy, memset and memmove are hot and CPU-specific: see
+   arch/<cpu>/memcpy.c. */
 
 int memcmp(const void *a, const void *b, size_t n)
 {

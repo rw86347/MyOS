@@ -10,6 +10,9 @@
 
 #define THREAD_MAX      16
 #define THREAD_STACK    8192          /* bytes of kernel stack per thread */
+#define THREAD_FILES    32            /* open files per thread (fds 0-31) */
+
+struct file;
 
 enum thread_state { THREAD_UNUSED, THREAD_READY, THREAD_DEAD };
 
@@ -20,6 +23,8 @@ struct thread {
     void *stack;                      /* kmalloc'd stack (NULL for "main") */
     int exit_code;                    /* set by exit() or a fatal fault */
     int uses_fpu;                     /* user thread: save/restore FPU+SSE */
+    struct file *files[THREAD_FILES]; /* open files, indexed by fd (vfs.h);
+                                         per process from step 8 */
     uint8_t fpu_state[FPU_STATE_SIZE] __attribute__((aligned(16)));
 };
 
@@ -41,9 +46,16 @@ void thread_exit(void);
 
 struct thread *thread_current(void);
 
+/* A small number for the thread (its table slot + 1). */
+int thread_id(const struct thread *t);
+
 /* The current thread is about to run a user program: give it a clean FPU,
    and from now on save/restore the FPU registers when it's switched. */
 void thread_start_fpu(void);
+
+/* Changes whenever a thread is created or exits, so the scheduler knows
+   when its cached slot table is stale. */
+uint32_t thread_generation(void);
 
 /* The thread with this name, or NULL. (Dead threads are skipped.) */
 struct thread *thread_find(const char *name);

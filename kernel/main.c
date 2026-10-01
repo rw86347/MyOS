@@ -2,11 +2,17 @@
  * main.c — the kernel's C entry point
  *
  * By the time we get here:
- *   BIOS -> MBR (real mode: loaded kernel, read memory map, enabled A20,
- *   entered protected mode) -> entry.asm (cleared .bss, turned on paging,
- *   jumped to the higher half at 0xC0000000) -> kernel_main()
+ *   BIOS -> MBR -> stage 2 (real mode: memory map, kernel + initramfs loaded
+ *   above 1 MiB, protected mode) -> entry.asm (cleared .bss, turned on
+ *   paging, jumped to the higher half at 0xC0000000) -> kernel_main()
+ *
+ * Three kinds of build (see the Makefile):
+ *   make         a normal boot: no test or benchmark code at all
+ *   make test    SELFTEST: runs the self-tests, then the normal loop
+ *   make bench   BENCH: runs the benchmarks, then switches QEMU off
  */
-#include <disk_demo.h>
+#include <cpu.h>
+#include <cycles.h>
 #include <fpu.h>
 #include <gdt.h>
 #include <initrd.h>
@@ -15,16 +21,20 @@
 #include <keyboard.h>
 #include <kprintf.h>
 #include <memlayout.h>
-#include <mem_test.h>
 #include <paging.h>
 #include <pmm.h>
-#include <sched_test.h>
-#include <selftest.h>
+#include <sched.h>
 #include <serial.h>
-#include <thread_test.h>
+#include <sysenter.h>
+#include <thread.h>
 #include <timer.h>
-#include <user_test.h>
 #include <vga.h>
+#ifdef SELFTEST
+#include <selftest.h>
+#endif
+#ifdef BENCH
+#include <bench.h>
+#endif
 
 extern char _start[];       /* first byte of the kernel (entry.asm) */
 
@@ -37,29 +47,6 @@ static void show_uptime(uint32_t secs)
     s[5] = '0' + m / 10;   s[6] = '0' + m % 10;
     s[8] = '0' + sec / 10; s[9] = '0' + sec % 10;
     vga_write_at(80 - sizeof s + 1, 0, s, VGA_BLACK, VGA_LIGHT_GREY);
-}
-
-/* Deliberately crash, to show the exception handlers work. */
-static void trigger_fault(int key)
-{
-    if (key == KEY_F10) {
-        kprintf("\n[F10] Reading through a NULL pointer...\n");
-        volatile uint32_t *null = 0;
-        kprintf("%lu\n", *null);           /* page 0 is not mapped */
-    } else if (key == KEY_F12) {
-        kprintf("\n[F12] Dividing by zero...\n");
-        /* Written in assembly on purpose: in C, dividing by zero is
-           "undefined behaviour", so GCC may assume it never happens and
-           replace `1 / x` with a comparison — no divide, no fault. */
-        __asm__ volatile ("mov $1, %%eax\n\t"
-                          "xor %%edx, %%edx\n\t"
-                          "xor %%ecx, %%ecx\n\t"
-                          "div %%ecx"           /* EDX:EAX / 0 -> exception 0 */
-                          : : : "eax", "ecx", "edx");
-    } else {
-        kprintf("\n[F11] Loading an invalid segment selector...\n");
-        __asm__ volatile ("mov $0x99, %%ax\n\tmov %%ax, %%ds" : : : "eax");
-    }
 }
 
 /* Echo typed keys. Control characters are shown as ^C, ^D, ... */
@@ -79,44 +66,49 @@ static void echo(int c)
 
 void kernel_main(void)
 {
+#ifdef BENCH
+    uint64_t boot_start = cycles_now();     /* for the boot-time benchmark */
+#endif
     serial_init();
     vga_clear();
     vga_set_color(VGA_LIGHT_GREEN, VGA_BLACK);
-    kprintf("Hello world from MyOS!  (protected mode, own MBR)\n");
+    kprintf("Hello world from MyOS!  (protected mode, own boot loader)\n");
     vga_set_color(VGA_LIGHT_GREY, VGA_BLACK);
 
-    /* Step 2: CPU tables and interrupts. */
-    gdt_init();             /* our own segment table */
+    cpu_init();             /* what can this CPU do? (stops if too old) */
+
+    /* CPU tables and interrupts. */
+    gdt_init();             /* our own segment table + TSS */
     idt_init();             /* interrupt table + exception handlers + PIC remap */
+    serial_irq_init();      /* serial output now queued, sent by IRQ 4 */
     fpu_init();             /* x87 + SSE on; saved per user thread */
 
-    /* Step 3: memory. */
+    /* Memory. */
     pmm_init();             /* which physical RAM is free (BIOS memory map) */
-    vmm_init();             /* page tables for all RAM; unmap NULL */
+    vmm_init();             /* map all RAM with 4 MiB pages; unmap NULL */
+    sysenter_init();        /* fast syscalls, if the CPU has sysenter */
     timer_init();           /* IRQ 0: 1 ms tick */
     keyboard_init();        /* IRQ 1 */
     interrupts_enable();    /* sti: from now on, IRQs can arrive */
 
-    uint32_t t0 = timer_ms();
-    sleep_ms(100);
-    kprintf("Interrupts on: timer %u Hz (sleep 100 ms = %lu ticks), keyboard ready\n",
-            TIMER_HZ, timer_ms() - t0);
-
     kprintf("Memory: %lu MiB usable, paging on, kernel at %p, heap at %p\n",
             pmm_usable_count() / 256, (void *)_start, (void *)KHEAP_START);
 
-    disk_demo();
-    initrd_init();          /* Step 7: the initramfs stage 2 loaded */
-    mem_selftest();
-    thread_selftest();      /* Step 4: kernel threads + context switch */
-    user_selftest();        /* Step 5: ring 3 programs, int 0x80 write/exit */
-    sched_selftest();       /* Step 4: start the 20 x 1 ms slot scheduler */
-    selftest_summary();
+    initrd_init();          /* the initramfs stage 2 loaded */
+    thread_init();          /* kernel_main becomes thread 0, "main" */
 
+#if defined(SELFTEST)
+    run_selftests();        /* ends with the slot scheduler running */
     kprintf("Type here (F10/F11/F12 = test a CPU fault)> ");
+#elif defined(BENCH)
+    run_benchmarks(boot_start);     /* switches QEMU off when done */
+#else
+    sched_start();          /* the 20 x 1 ms slot scheduler */
+    kprintf("Type here> ");
+#endif
 
     /* Main loop: sleep until an interrupt wakes us (timer tick or key),
-       then handle whatever is new. */
+       then handle whatever is new. main owns the system slots 1 and 10. */
     uint32_t last_secs = 0xFFFFFFFF;
     for (;;) {
         cpu_wait();
@@ -129,10 +121,11 @@ void kernel_main(void)
 
         int c;
         while ((c = keyboard_getc()) != -1) {
-            if (c == KEY_F10 || c == KEY_F11 || c == KEY_F12)
-                trigger_fault(c);
-            else
-                echo(c);
+#ifdef SELFTEST
+            if (selftest_key(c))    /* F10/F11/F12: crash on purpose */
+                continue;
+#endif
+            echo(c);
         }
     }
 }

@@ -85,7 +85,6 @@ static void test_cooperative(void)
 
 void thread_selftest(void)
 {
-    thread_init();
     test_cooperative();     /* preemption off: the order must be exact */
     test_preemption();
 }

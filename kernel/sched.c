@@ -27,6 +27,22 @@ static volatile int slot;           /* slot running now, 1-20 (0 = not started) 
 static volatile int need_resched;   /* set by the timer, handled at IRQ exit */
 static struct thread *idle;
 
+/* slot_thread[s] = the thread that owns slot s right now (or NULL). Looking
+   owners up by name is too slow for every tick, so we keep this table and
+   rebuild it only when threads come or go (thread_generation changes).
+   Every tick is then one array lookup. */
+static struct thread *slot_thread[SCHED_SLOTS + 1];
+static uint32_t slot_table_gen = ~0u;
+
+static void rebuild_slot_table(void)
+{
+    for (int s = 1; s <= SCHED_SLOTS; s++) {
+        const char *name = sched_slot_owner(s);
+        slot_thread[s] = name ? thread_find(name) : NULL;
+    }
+    slot_table_gen = thread_generation();
+}
+
 /* The idle thread: runs when nobody else may. hlt sleeps until the next
    interrupt, so an idle CPU uses little power. */
 static void idle_loop(void *arg)
@@ -69,11 +85,9 @@ struct thread *sched_pick(int yielding)
     if (!slots_on)
         return thread_next_ready();
 
-    /* Look up the owner by name every time: simple, and it means a task
-       can be created (or restarted) at any moment and still get its slots.
-       16 short string compares per millisecond is nothing. */
-    const char *name = sched_slot_owner(slot);
-    struct thread *want = name ? thread_find(name) : NULL;
+    if (slot_table_gen != thread_generation())
+        rebuild_slot_table();               /* rare: a thread came or went */
+    struct thread *want = slot_thread[slot];
 
     if (!want || want->state != THREAD_READY)
         want = idle;                /* free slot, or the owner has finished */

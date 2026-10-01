@@ -12,6 +12,7 @@
  *
  * This tick will drive the time-slot scheduler: 20 slots x 1 ms (DESIGN.md).
  */
+#include <cycles.h>
 #include <interrupts.h>
 #include <io.h>
 #include <sched.h>
@@ -29,6 +30,7 @@ static void timer_irq(struct regs *r)
 {
     (void)r;
     ticks++;
+    cycles_tick(ticks);                 /* background calibration (cpu.c) */
     sched_tick();                       /* next time slot; may switch threads */
 }
 

@@ -25,6 +25,9 @@ void thread_trampoline(void);
 
 static struct thread threads[THREAD_MAX];
 static struct thread *current;
+static uint32_t generation;             /* bumped when threads come or go */
+
+uint32_t thread_generation(void) { return generation; }
 
 static void set_name(struct thread *t, const char *name)
 {
@@ -92,7 +95,9 @@ struct thread *thread_create(const char *name, void (*fn)(void *), void *arg)
     set_name(t, name);
     t->exit_code = 0;
     t->uses_fpu = 0;
+    memset(t->files, 0, sizeof t->files);
     t->state = THREAD_READY;
+    generation++;
     return t;
 }
 
@@ -142,6 +147,7 @@ void thread_exit(void)
     /* We can't free our own stack — we're standing on it. thread_create()
        frees it later, when it reuses this slot. */
     current->state = THREAD_DEAD;
+    generation++;
     thread_yield();
     kprintf("thread_exit: no other thread to run!\n");
     for (;;)
@@ -171,4 +177,9 @@ void thread_start_fpu(void)
     fpu_restore(current->fpu_state);
     current->uses_fpu = 1;
     irq_restore(flags);
+}
+
+int thread_id(const struct thread *t)
+{
+    return (int)(t - threads) + 1;
 }

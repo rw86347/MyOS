@@ -54,7 +54,8 @@ struct tss {
 } __attribute__((packed));
 
 static struct gdt_entry gdt[6];
-static struct tss tss;
+/* Not static: sysentry.asm reads esp0 from it directly. */
+struct tss kernel_tss;
 
 static void set_entry(int i, uint32_t base, uint32_t limit, uint8_t access, uint8_t flags)
 {
@@ -81,9 +82,9 @@ void gdt_init(void)
     /* TSS descriptor: access 0x89 = present | ring 0 | "32-bit TSS, not busy".
        iomap_base past the end = no I/O permission bitmap, so user programs
        can't use in/out on any port. */
-    tss.ss0 = GDT_KERNEL_DATA;
-    tss.iomap_base = sizeof tss;
-    set_entry(5, (uint32_t)(uintptr_t)&tss, sizeof tss - 1, 0x89, 0x0);
+    kernel_tss.ss0 = GDT_KERNEL_DATA;
+    kernel_tss.iomap_base = sizeof kernel_tss;
+    set_entry(5, (uint32_t)(uintptr_t)&kernel_tss, sizeof kernel_tss - 1, 0x89, 0x0);
 
     struct gdt_ptr ptr = { sizeof gdt - 1, (uint32_t)(uintptr_t)gdt };
 
@@ -107,5 +108,5 @@ void gdt_init(void)
 
 void tss_set_kernel_stack(uint32_t esp0)
 {
-    tss.esp0 = esp0;
+    kernel_tss.esp0 = esp0;
 }

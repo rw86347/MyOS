@@ -4,35 +4,57 @@
  * Variadic functions: <stdarg.h> is one of the headers the compiler itself
  * provides, so it works even in a freestanding kernel. va_arg() walks
  * through the extra arguments one by one.
+ *
+ * Speed: the text is collected in a small buffer on the stack and handed to
+ * the console in one piece (console_write), not one character at a time.
+ * Each hand-over costs one interrupt-off section and one VGA cursor move —
+ * port I/O is slow on old PCs, so per-character work adds up.
  */
 #include <stdarg.h>
 #include <stdint.h>
+#include <interrupts.h>
 #include <kprintf.h>
 #include <serial.h>
 #include <string.h>
 #include <vga.h>
 
-/* Where output goes: kprintf -> screen + serial, klog -> serial only.
-   The destination is passed down as a function pointer ("sink"). */
-typedef void (*sink_t)(char c);
-
-static void to_both(char c)
+void console_write(const char *s, size_t n)
 {
-    vga_putc(c);
-    serial_putc(c);
+    /* Interrupts off for the whole piece: output from two threads (or an
+       interrupt) can't get mixed up inside one line. */
+    uint32_t flags = irq_save();
+    vga_write_n(s, n);
+    serial_write_n(s, n);
+    irq_restore(flags);
+}
+
+/* Where output goes: kprintf -> screen + serial, klog -> serial only. */
+struct out {
+    void (*flush)(const char *s, size_t n);
+    size_t n;
+    char buf[120];
+};
+
+static void out(struct out *o, char c)
+{
+    o->buf[o->n++] = c;
+    if (o->n == sizeof o->buf) {
+        o->flush(o->buf, o->n);
+        o->n = 0;
+    }
 }
 
 /* Print `s` padded to `width` (pad on the left unless left_align). */
-static void out_padded(sink_t out, const char *s, int width, char pad, int left_align)
+static void out_padded(struct out *o, const char *s, int width, char pad, int left_align)
 {
     int len = (int)strlen(s);
     if (!left_align)
         for (; width > len; width--)
-            out(pad);
+            out(o, pad);
     while (*s)
-        out(*s++);
+        out(o, *s++);
     for (; width > len; width--)
-        out(' ');
+        out(o, ' ');
 }
 
 /* Convert an unsigned number to text in the given base (10 or 16). */
@@ -49,11 +71,11 @@ static void utoa(uint32_t v, unsigned base, char *buf)
     *buf = '\0';
 }
 
-static void vformat(sink_t out, const char *fmt, va_list ap)
+static void vformat(struct out *o, const char *fmt, va_list ap)
 {
     for (; *fmt; fmt++) {
         if (*fmt != '%') {
-            out(*fmt);
+            out(o, *fmt);
             continue;
         }
         fmt++;
@@ -78,11 +100,11 @@ static void vformat(sink_t out, const char *fmt, va_list ap)
         switch (*fmt) {
         case 's': {
             const char *s = va_arg(ap, const char *);
-            out_padded(out, s ? s : "(null)", width, ' ', left_align);
+            out_padded(o, s ? s : "(null)", width, ' ', left_align);
             break;
         }
         case 'c':
-            out((char)va_arg(ap, int));
+            out(o, (char)va_arg(ap, int));
             break;
         case 'd': {
             int v = va_arg(ap, int);
@@ -92,38 +114,41 @@ static void vformat(sink_t out, const char *fmt, va_list ap)
             } else {
                 utoa((uint32_t)v, 10, buf);
             }
-            out_padded(out, buf, width, pad, left_align);
+            out_padded(o, buf, width, pad, left_align);
             break;
         }
         case 'u':
             utoa(va_arg(ap, uint32_t), 10, buf);
-            out_padded(out, buf, width, pad, left_align);
+            out_padded(o, buf, width, pad, left_align);
             break;
         case 'x':
             utoa(va_arg(ap, uint32_t), 16, buf);
-            out_padded(out, buf, width, pad, left_align);
+            out_padded(o, buf, width, pad, left_align);
             break;
         case 'p':
-            out('0'); out('x');
+            out(o, '0'); out(o, 'x');
             utoa((uint32_t)(uintptr_t)va_arg(ap, void *), 16, buf);
-            out_padded(out, buf, 8, '0', 0);
+            out_padded(o, buf, 8, '0', 0);
             break;
         case '%':
-            out('%');
+            out(o, '%');
             break;
         default:            /* unknown: print it literally */
-            out('%');
-            out(*fmt);
+            out(o, '%');
+            out(o, *fmt);
             break;
         }
     }
+    if (o->n)
+        o->flush(o->buf, o->n);
 }
 
 void kprintf(const char *fmt, ...)
 {
     va_list ap;
     va_start(ap, fmt);
-    vformat(to_both, fmt, ap);
+    struct out o = { console_write, 0, {0} };
+    vformat(&o, fmt, ap);
     va_end(ap);
 }
 
@@ -131,6 +156,7 @@ void klog(const char *fmt, ...)
 {
     va_list ap;
     va_start(ap, fmt);
-    vformat(serial_putc, fmt, ap);
+    struct out o = { serial_write_n, 0, {0} };
+    vformat(&o, fmt, ap);
     va_end(ap);
 }

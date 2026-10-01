@@ -19,6 +19,7 @@
 #include <pic.h>
 #include <stddef.h>
 #include <sched.h>
+#include <serial.h>
 #include <syscall.h>
 #include <thread.h>
 
@@ -102,6 +103,22 @@ static void user_exception(struct regs *r, uint32_t cr2)
     thread_exit();                  /* never returns */
 }
 
+/* The exception table (uaccess.asm): instructions that touch user memory,
+   and where to continue if they fault. */
+struct ex_entry { uint32_t insn, fixup; };
+extern const struct ex_entry __start_ex_table[], __stop_ex_table[];
+
+static int fixup_user_access(struct regs *r)
+{
+    for (const struct ex_entry *e = __start_ex_table; e < __stop_ex_table; e++) {
+        if (e->insn == r->eip) {
+            r->eip = e->fixup;      /* `iret` resumes at the fixup: -EFAULT */
+            return 1;
+        }
+    }
+    return 0;
+}
+
 /* A CPU exception in the kernel is a bug: show everything we know, then stop
    (instead of the CPU giving up and rebooting — a "triple fault"). */
 static void exception(struct regs *r)
@@ -111,6 +128,8 @@ static void exception(struct regs *r)
 
     if (r->cs & 3)                  /* the CPU was in ring 3: a user program */
         user_exception(r, cr2);
+    if (r->vector == 14 && fixup_user_access(r))
+        return;                     /* a bad user pointer, not a kernel bug */
 
     kprintf("\n*** CPU EXCEPTION %lu: %s (error code %lx) ***\n",
             r->vector, exception_names[r->vector], r->err_code);
@@ -128,6 +147,7 @@ static void exception(struct regs *r)
     kprintf("ESI=%08lx EDI=%08lx EBP=%08lx\n", r->esi, r->edi, r->ebp);
     kprintf("System halted. (Look up EIP with: i686-elf-addr2line -e build/kernel.elf %lx)\n",
             r->eip);
+    serial_flush();                 /* interrupts are off: send it all now */
     for (;;)
         __asm__ volatile ("cli; hlt");
 }

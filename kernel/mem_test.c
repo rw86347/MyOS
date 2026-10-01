@@ -53,6 +53,8 @@ static void test_paging(void)
     pmm_free(frame);
 }
 
+#define SMALL_SIZE_MAX 1024
+
 static void test_kheap(void)
 {
     uint32_t used0, free0, mapped0;
@@ -79,13 +81,16 @@ static void test_kheap(void)
                 ok = 0;
     check(ok, "kmalloc: blocks don't overlap");
 
+    /* A freed small object is the very next one handed out for its size
+       class (p[1] is 38 bytes: class 64). */
+    kfree(p[1]);
+    void *again = kmalloc(37);
+    check(again == p[1], "kmalloc: reuses a freed block of the same size class");
+    p[1] = again;
+
     /* Free every other block, then all: freed space must merge back. */
     for (int i = 0; i < N; i += 2)
         kfree(p[i]);
-    void *again = kmalloc(37);
-    check(again != NULL && (uint8_t *)again >= (uint8_t *)KHEAP_START,
-          "kmalloc: reuses freed space");
-    kfree(again);
     for (int i = 1; i < N; i += 2)
         kfree(p[i]);
 
@@ -105,9 +110,18 @@ static void test_kheap(void)
     check(ok, "kmalloc: 100 KiB block works");
     kfree(big);
 
-    /* After freeing everything, the heap is one free block again. */
+    /* After freeing everything, the heap is back where it started (small
+       objects that existed before — the file tree's inodes — stay), and
+       the big-block range is one free block again. */
     kheap_stats(&used, &free_bytes, &mapped);
-    check(used == 0 && free_bytes + 16 == mapped, "kheap: fully merged after free");
+    check(used == used0 && free_bytes + 16 == mapped, "kheap: fully merged after free");
+
+    /* Small objects come from the direct map, big ones from the heap range. */
+    void *s = kmalloc(SMALL_SIZE_MAX), *b = kmalloc(SMALL_SIZE_MAX + 1);
+    check((uintptr_t)s < KHEAP_START && (uintptr_t)b >= KHEAP_START,
+          "kmalloc: size classes up to 1 KiB, big blocks above");
+    kfree(s);
+    kfree(b);
 }
 
 void mem_selftest(void)

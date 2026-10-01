@@ -28,6 +28,10 @@ SECTIONS
 
     .rodata : AT(ADDR(.rodata) - KERNEL_VBASE) {
         *(.rodata .rodata.*)    /* constant data, e.g. string literals */
+        . = ALIGN(4);
+        __start_ex_table = .;   /* uaccess.asm's (faulting insn, fixup) pairs */
+        *(__ex_table)
+        __stop_ex_table = .;
     }
 
     .data : AT(ADDR(.data) - KERNEL_VBASE) {

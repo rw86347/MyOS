@@ -1,5 +1,6 @@
 /*
- * user_test.c — run the embedded user programs and check what happened.
+ * user_test.c — run the test programs (from /bin in the initramfs) and
+ * check what happened.
  *
  *   hello: prints with write(), gets -EFAULT for a kernel pointer, exit(42)
  *   peek:  reads kernel memory -> page fault -> killed (exit code 139),
@@ -25,26 +26,22 @@
 #include <thread.h>
 #include <user_test.h>
 #include <usermode.h>
+#include <vfs.h>
 
 /* user/programs.asm: each program's ELF file, embedded byte for byte */
-extern const char user_hello[], user_hello_end[];
-extern const char user_peek[], user_peek_end[];
-extern const char user_args[], user_args_end[];
-extern const char user_fpu[], user_fpu_end[];
-
-/* Run one program to completion; returns its exit code (-1 = didn't start). */
-static int run(const char *name, const char *start, const char *end,
-               const char *const argv[])
+/* Run one program from the initramfs to completion; returns its exit code
+   (-1 = didn't start). */
+static int run(const char *path, const char *const argv[])
 {
-    struct thread *t = user_exec(name, start, end - start, argv);
+    struct thread *t = user_exec(path, argv);
     if (!t) {
-        kprintf("User mode: %s failed to load\n", name);
+        kprintf("User mode: %s failed to load\n", path);
         return -1;
     }
     while (t->state != THREAD_DEAD)
         thread_yield();
-    user_cleanup();
-    kprintf("User mode: %s exited with code %d\n", name, t->exit_code);
+    user_cleanup(t);
+    kprintf("User mode: %s exited with code %d\n", t->name, t->exit_code);
     return t->exit_code;
 }
 
@@ -69,7 +66,7 @@ static int run_fpu_test(void)
     stop_wiping = 0;
     struct thread *w = thread_create("wiper", fpu_wiper, NULL);
     sched_set_preempt(1);
-    int code = run("fpu", user_fpu, user_fpu_end, argv);
+    int code = run("/bin/fpu", argv);
     stop_wiping = 1;
     while (w && w->state != THREAD_DEAD)
         thread_yield();
@@ -80,10 +77,15 @@ static int run_fpu_test(void)
 /* Broken ELF files: each must be refused with -ENOEXEC. */
 static void test_bad_elf(void)
 {
-    uint32_t size = user_hello_end - user_hello;
+    struct inode *hello;
+    if (vfs_lookup("/bin/hello", &hello) < 0) {
+        check(0, "elf: /bin/hello in the initramfs");
+        return;
+    }
+    uint32_t size = hello->size;
     struct elf32_ehdr *copy = kmalloc(size);
     struct elf_info info;
-    memcpy(copy, user_hello, size);
+    memcpy(copy, hello->data, size);
 
     check(elf_load("not an ELF file at all", 23, &info) == -ENOEXEC,
           "elf: garbage refused");
@@ -95,14 +97,14 @@ static void test_bad_elf(void)
 
     copy->e_phoff = 0xFFFFFFF0;                     /* headers past the end */
     check(elf_load(copy, size, &info) == -ENOEXEC, "elf: bad header offset refused");
-    copy->e_phoff = ((const struct elf32_ehdr *)user_hello)->e_phoff;
+    copy->e_phoff = ((const struct elf32_ehdr *)hello->data)->e_phoff;
 
     /* A segment that wants to load into the kernel's half of memory. */
     struct elf32_phdr *ph = (void *)((char *)copy + copy->e_phoff);
     ph[0].p_vaddr = 0xC0010000;
     check(elf_load(copy, size, &info) == -ENOEXEC, "elf: segment in kernel space refused");
 
-    user_cleanup();
+    vmm_unmap_user_all();
     kfree(copy);
 }
 
@@ -112,12 +114,16 @@ void user_selftest(void)
     static const char *const args[] = { "args", "one", "two", NULL };
     uint32_t free_before = pmm_free_count();
 
-    check(run("hello", user_hello, user_hello_end, no_args) == 42,
-          "user: hello wrote, got -EFAULT for a kernel pointer, exit(42)");
-    check(run("peek", user_peek, user_peek_end, no_args) == 139,
+    static const char *const files_args[] = { "files", NULL };
+
+    check(run("/bin/hello", no_args) == 42,
+          "user: hello wrote, got -EFAULT for bad pointers, exit(42)");
+    check(run("/bin/peek", no_args) == 139,
           "user: reading kernel memory kills the program, not the kernel");
-    check(run("args", user_args, user_args_end, args) == 3,
+    check(run("/bin/args", args) == 3,
           "user: argc/argv on the start-up stack");
+    check(run("/bin/files", files_args) == 0,
+          "user: open/read/close/stat/lseek on initramfs files (step 7)");
     check(run_fpu_test() == 0, "user: FPU/SSE registers survive thread switches");
     test_bad_elf();
 

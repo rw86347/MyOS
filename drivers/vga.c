@@ -65,7 +65,8 @@ static void update_cursor(void)
     outb(0x3D5, pos >> 8);
 }
 
-void vga_putc(char c)
+/* Put one character, without moving the hardware cursor. */
+static void put_char(char c)
 {
     if (c == '\n') {
         col = 0;
@@ -87,6 +88,20 @@ void vga_putc(char c)
     }
     if (row == VGA_HEIGHT)
         scroll();
+}
+
+void vga_putc(char c)
+{
+    put_char(c);
+    update_cursor();
+}
+
+/* Many characters, one cursor move: the cursor is set through 4 slow port
+   writes, so we do that once per piece of text, not per character. */
+void vga_write_n(const char *s, size_t n)
+{
+    for (size_t i = 0; i < n; i++)
+        put_char(s[i]);
     update_cursor();
 }
 
@@ -99,6 +114,8 @@ void vga_write_at(size_t x, size_t y, const char *s, enum vga_color fg, enum vga
 
 void vga_write(const char *s)
 {
-    while (*s)
-        vga_putc(*s++);
+    size_t n = 0;
+    while (s[n])
+        n++;
+    vga_write_n(s, n);
 }

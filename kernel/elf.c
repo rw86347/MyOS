@@ -12,35 +12,55 @@
 #include <pmm.h>
 #include <string.h>
 
-/* Map the pages covering [va, va+len) for a user segment. A page may
-   already be mapped by the previous segment (two segments can share the
-   page where one ends and the next begins); then we keep it, and make it
-   writable if this segment needs that. */
-static int map_segment(uint32_t va, uint32_t len, int writable)
+/* Map the pages covering [va, va+len), writable for now (we're about to
+   copy into them; the kernel respects read-only pages, CR0.WP). A page may
+   already be mapped by the previous segment: two segments can share the
+   page where one ends and the next begins; then we keep it. */
+static int map_segment(uint32_t va, uint32_t len)
 {
-    uint32_t flags = PTE_USER | (writable ? PTE_WRITABLE : 0);
     uint32_t first = va & ~0xFFFu;
     uint32_t last = (va + len - 1) & ~0xFFFu;
 
     for (uint32_t page = first; ; page += PAGE_SIZE) {
-        uint32_t pa = vmm_translate(page);
-        if (pa) {
-            if (writable) {             /* re-map with the write bit */
-                pa = vmm_unmap(page);
-                vmm_map(page, pa, flags);
-            }
-        } else {
-            pa = pmm_alloc();
+        if (!vmm_translate(page)) {
+            uint32_t pa = pmm_alloc();
             if (!pa)
                 return -1;
             memset(P2V(pa), 0, PAGE_SIZE);
-            if (vmm_map(page, pa, flags) < 0) {
+            if (vmm_map(page, pa, PTE_USER | PTE_WRITABLE) < 0) {
                 pmm_free(pa);
                 return -1;
             }
         }
         if (page == last)
             return 0;
+    }
+}
+
+/* Does any writable PT_LOAD segment touch this page? */
+static int page_needs_write(const struct elf32_phdr *ph, int n, uint32_t page)
+{
+    for (int i = 0; i < n; i++)
+        if (ph[i].p_type == PT_LOAD && (ph[i].p_flags & PF_W) && ph[i].p_memsz &&
+            ph[i].p_vaddr < page + PAGE_SIZE && ph[i].p_vaddr + ph[i].p_memsz > page)
+            return 1;
+    return 0;
+}
+
+/* After loading: make the pages of read-only segments (code, constants)
+   read-only, unless a writable segment shares the page. */
+static void protect_segments(const struct elf32_phdr *ph, int n)
+{
+    for (int i = 0; i < n; i++) {
+        if (ph[i].p_type != PT_LOAD || (ph[i].p_flags & PF_W) || !ph[i].p_memsz)
+            continue;
+        uint32_t last = (ph[i].p_vaddr + ph[i].p_memsz - 1) & ~0xFFFu;
+        for (uint32_t page = ph[i].p_vaddr & ~0xFFFu; ; page += PAGE_SIZE) {
+            if (!page_needs_write(ph, n, page))
+                vmm_protect(page, PTE_USER);
+            if (page == last)
+                break;
+        }
     }
 }
 
@@ -83,11 +103,11 @@ int elf_load(const void *image, uint32_t size, struct elf_info *info)
             end < p->p_vaddr || end > KERNEL_VBASE)
             return -ENOEXEC;
 
-        if (map_segment(p->p_vaddr, p->p_memsz, p->p_flags & PF_W) < 0)
+        if (map_segment(p->p_vaddr, p->p_memsz) < 0)
             return -ENOMEM;
 
-        /* The kernel can write even read-only user pages (CR0.WP is off),
-           so we copy straight to the program's addresses. */
+        /* The pages are mapped in the current address space, so we copy
+           straight to the program's addresses. */
         memcpy((void *)p->p_vaddr, file + p->p_offset, p->p_filesz);
         memset((void *)(p->p_vaddr + p->p_filesz), 0, p->p_memsz - p->p_filesz);
 
@@ -101,5 +121,7 @@ int elf_load(const void *image, uint32_t size, struct elf_info *info)
     if (info->entry < PAGE_SIZE || info->entry >= KERNEL_VBASE ||
         !vmm_translate(info->entry))
         return -ENOEXEC;
+
+    protect_segments(ph, eh->e_phnum);
     return 0;
 }

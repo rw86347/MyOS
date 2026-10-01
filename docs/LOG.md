@@ -89,3 +89,31 @@ Short dated notes after each work session: what was done, what broke, what was l
   -R 0:0) + generated data/numbers.txt (110 KB, 4 load chunks). kernel/initrd.c checks
   magic, trailer, reservation. Booted first try; 55 self-tests pass.
   Next: 7b, cpio reader + VFS (open/read/close/stat).
+- 2026-10-02: Performance pass (docs/performance.md has the numbers). CLAUDE.md: speed and
+  predictability first, binding performance rules, two targets (old i686 PCs tuned for, GPD
+  Pocket 4 x86-64/UEFI later). Measurement: cpu.c (cpuid, required features, SEP quirk),
+  rdtsc cycle counter calibrated in the background by the PIT IRQ, `make bench` (QEMU
+  -icount shift=0,sleep=off: repeatable instruction counts; -cpu pentium3 everywhere).
+  Build modes: normal / test (-DSELFTEST) / bench (-DBENCH) in build/, build/test/,
+  build/bench/; test code only in its mode. Wins: async serial (8 KiB ring, IRQ 4, OUT2
+  bit!) + kprintf buffered (one VGA cursor move per piece), short writes instead of
+  spinning; rep movsd/stosd memcpy/memset (11.7x); slot->thread table; PGE global kernel
+  pages; CR0.WP; exception-table uaccess (copy_from_user/get_user32/strncpy_from_user, -EFAULT
+  via fixup, no page-table walks); sysenter + vsyscall page at 0xBFFFF000 (AT_SYSINFO);
+  kmalloc size classes 16..1024 (O(1), 240x faster with 1000 live objects); boot 11.6 ms ->
+  0.6 ms. User C test programs via user/lib (crt0 + mini libc). Gotchas: sysenter.asm and
+  sysenter.c both made sysenter.o (renamed sysentry.asm); make 3.81 picks the FIRST matching
+  pattern rule (user rules must come before the kernel's); QEMU real-time jitter (~5 ms) was
+  host noise. 56 self-tests pass.
+- 2026-10-02: Step 7 done. fs/initramfs.c unpacks the cpio (newc) archive once into an inode
+  tree (fs/vfs.c): names and data point into the archive (zero-copy), a 512-bucket hash on
+  (directory, name) makes lookup one probe per path component. struct file + per-thread fd
+  table (32); console is fds 0-2 (shared static file). Syscalls: read, write (generic),
+  open, openat (AT_FDCWD), close, lseek, _llseek, statx (Linux layout, static_assert 256 B;
+  AT_EMPTY_PATH = fstat). read() caps at 256 KiB per call. Programs moved out of the kernel
+  into /bin in the initramfs (test/bench builds), user_exec(path, argv) loads them in place;
+  user/programs.asm removed. user/files.c: 28 checks (open/read/stat/lseek/close, errors,
+  "..", the 110 KB file in order, -EFAULT for unmapped/kernel/read-only-code buffers) pass.
+  57 self-tests pass. Benchmarks: open+close 1131, read 4 KiB 1453, statx 1044.
+  Next: step 6b (musl, needs Docker) and step 8 (processes: fork/COW, execve, wait4, pipes,
+  signals, TTY — BusyBox shell).

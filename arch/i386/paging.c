@@ -21,6 +21,7 @@
  * a frame from pmm_alloc(), and all of RAM is in the direct map, so the
  * table for physical address `pa` is simply at P2V(pa).
  */
+#include <cpu.h>
 #include <kprintf.h>
 #include <memlayout.h>
 #include <paging.h>
@@ -35,6 +36,7 @@
 
 extern uint32_t boot_page_directory[1024];      /* from entry.asm */
 static uint32_t *kernel_pd = boot_page_directory;
+static uint32_t global_bit;     /* PTE_GLOBAL if the CPU has it, else 0 */
 
 /* Tell the CPU to forget a cached translation (the TLB is a cache of
    recently used page table entries; it does not notice our edits). */
@@ -83,6 +85,36 @@ void vmm_init(void)
        are free for user programs, and NULL is not mapped. */
     kernel_pd[0] = 0;
     flush_tlb();
+
+    /* 3. Write protection also for the kernel (CR0.WP). Without it, ring 0
+       ignores the read-only bit, and a syscall could be tricked into
+       writing to a program's read-only pages (its code). */
+    uint32_t cr0;
+    __asm__ volatile ("mov %%cr0, %0" : "=r"(cr0));
+    __asm__ volatile ("mov %0, %%cr0" : : "r"(cr0 | (1u << 16)) : "memory");
+
+    /* 4. Global pages (Pentium Pro and later). The TLB caches recent
+       translations, and loading CR3 — which we'll do on every switch to
+       another process (step 8) — throws them all away. Kernel mappings are
+       the same in every process, so we mark them "global": the CPU keeps
+       those across CR3 loads. Fewer TLB misses after every switch. */
+    if (cpu_has(CPU_PGE)) {
+        global_bit = PTE_GLOBAL;
+        for (uint32_t i = PDE_INDEX(KERNEL_VBASE); i < 1024; i++) {
+            if (IS_BIG(kernel_pd[i]))
+                kernel_pd[i] |= PTE_GLOBAL;
+            else if (kernel_pd[i] & PTE_PRESENT) {      /* a page table */
+                uint32_t *pt = P2V(FRAME(kernel_pd[i]));
+                for (int j = 0; j < 1024; j++)
+                    if (pt[j] & PTE_PRESENT)
+                        pt[j] |= PTE_GLOBAL;
+            }
+        }
+        uint32_t cr4;
+        __asm__ volatile ("mov %%cr4, %0" : "=r"(cr4));
+        cr4 |= 1 << 7;                      /* CR4.PGE (also flushes the TLB) */
+        __asm__ volatile ("mov %0, %%cr4" : : "r"(cr4) : "memory");
+    }
 }
 
 /* Find the page table entry for `va`. If its page table doesn't exist yet,
@@ -115,6 +147,8 @@ int vmm_map(uint32_t va, uint32_t pa, uint32_t flags)
         return -1;
     if (*pte & PTE_PRESENT)
         return -1;                              /* already mapped */
+    if (va >= KERNEL_VBASE)
+        flags |= global_bit;                    /* kernel mappings are global */
     *pte = FRAME(pa) | (flags & 0xFFF) | PTE_PRESENT;
     invlpg(va);
     return 0;
@@ -143,25 +177,14 @@ uint32_t vmm_translate(uint32_t va)
     return FRAME(*pte) | (va & 0xFFF);
 }
 
-int vmm_user_ok(uint32_t va, uint32_t len, int write)
+int vmm_protect(uint32_t va, uint32_t flags)
 {
-    if (len == 0)
-        return 1;
-    uint32_t last = va + len - 1;
-    if (last < va || last >= KERNEL_VBASE)
-        return 0;               /* wraps around, or reaches into the kernel */
-
-    uint32_t need = PTE_PRESENT | PTE_USER | (write ? PTE_WRITABLE : 0);
-    for (uint32_t page = va & ~0xFFFu; ; page += PAGE_SIZE) {
-        /* Both levels must allow it: the CPU checks the directory entry
-           and the page table entry. */
-        uint32_t pde = kernel_pd[PDE_INDEX(page)];
-        uint32_t *pte = get_pte(page, 0, 0);
-        if ((pde & need) != need || !pte || (*pte & need) != need)
-            return 0;
-        if (page >= (last & ~0xFFFu))
-            return 1;
-    }
+    uint32_t *pte = get_pte(va, 0, 0);
+    if (!pte || !(*pte & PTE_PRESENT))
+        return -1;
+    *pte = FRAME(*pte) | (flags & 0xFFF) | PTE_PRESENT;
+    invlpg(va);
+    return 0;
 }
 
 void vmm_unmap_user_all(void)
@@ -172,7 +195,7 @@ void vmm_unmap_user_all(void)
             continue;
         uint32_t *pt = P2V(FRAME(pde));
         for (int j = 0; j < 1024; j++)
-            if (pt[j] & PTE_PRESENT)
+            if ((pt[j] & PTE_PRESENT) && !(pt[j] & PTE_SHARED))
                 pmm_free(FRAME(pt[j]));
         kernel_pd[i] = 0;
         pmm_free(FRAME(pde));                   /* the page table itself */

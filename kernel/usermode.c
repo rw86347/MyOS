@@ -5,7 +5,10 @@
  *
  *   0x08048000   code + data   (the ELF file's PT_LOAD segments, elf.c)
  *   ...
- *   0xBFFF0000   stack, 64 KiB, just below the kernel at 0xC0000000
+ *   0xBFFEF000   stack, 64 KiB, growing down from 0xBFFFF000
+ *   0xBFFFF000   the vsyscall page: the fast way into the kernel (sysenter),
+ *                read-only, shared by every program
+ *   0xC0000000   the kernel
  *
  * The stack doesn't start empty. Linux hands every program its arguments
  * and some facts about itself on the stack; the C library's _start reads
@@ -21,7 +24,7 @@
  * The "auxiliary vector" (auxv) tells the program things only the kernel
  * knows: the page size, where its program headers ended up in memory
  * (musl needs them for thread-local storage), random bytes for security
- * features, user/group IDs.
+ * features, user/group IDs, and where the fast syscall entry is.
  *
  * Shortcut for now: there is one page directory for everything, so every
  * program would use the same addresses. We only run one program at a time
@@ -33,13 +36,16 @@
 #include <paging.h>
 #include <pmm.h>
 #include <string.h>
+#include <sysenter.h>
 #include <timer.h>
 #include <usermode.h>
+#include <vfs.h>
 
 void user_enter(uint32_t eip, uint32_t esp);    /* usermode.asm */
 
 /* Auxiliary vector types (Linux <elf.h>) */
 #define AT_NULL    0
+#define AT_IGNORE  1
 #define AT_PHDR    3
 #define AT_PHENT   4
 #define AT_PHNUM   5
@@ -51,6 +57,7 @@ void user_enter(uint32_t eip, uint32_t esp);    /* usermode.asm */
 #define AT_EGID   14
 #define AT_SECURE 23
 #define AT_RANDOM 25
+#define AT_SYSINFO 32           /* the vsyscall entry (sysenter) */
 
 #define MAX_ARGS 16
 
@@ -81,7 +88,8 @@ static uint32_t push_bytes(uint32_t *sp, const void *data, uint32_t len)
 }
 
 /* Build the start-up stack described at the top; returns the initial ESP. */
-static uint32_t build_stack(const char *const argv[], const struct elf_info *info)
+static uint32_t build_stack(const char *const argv[], const struct elf_info *info,
+                            uint32_t sysinfo)
 {
     uint32_t sp = USER_STACK_TOP;
 
@@ -108,6 +116,7 @@ static uint32_t build_stack(const char *const argv[], const struct elf_info *inf
         AT_UID, 0, AT_EUID, 0, AT_GID, 0, AT_EGID, 0,   /* we're all root */
         AT_SECURE, 0,
         AT_RANDOM, random_addr,
+        sysinfo ? AT_SYSINFO : AT_IGNORE, sysinfo,
         AT_NULL,   0,
     };
     uint32_t words[1 + MAX_ARGS + 1 + 1 + sizeof auxv / 4];
@@ -135,24 +144,40 @@ static void run_program(void *arg)
     user_enter(start_eip, start_esp);
 }
 
-struct thread *user_exec(const char *name, const void *elf, uint32_t size,
-                         const char *const argv[])
+struct thread *user_exec(const char *path, const char *const argv[])
 {
+    /* The program's ELF file is in the initramfs, already in memory: the
+       loader reads it right where it is (no copy). */
+    struct inode *ino;
+    if (vfs_lookup(path, &ino) < 0 || !S_ISREG(ino->mode) || !ino->data)
+        return NULL;
+
     struct elf_info info;
-    if (elf_load(elf, size, &info) < 0 || map_stack() < 0) {
-        user_cleanup();
+    if (elf_load(ino->data, ino->size, &info) < 0 || map_stack() < 0) {
+        vmm_unmap_user_all();
         return NULL;
     }
+    uint32_t sysinfo = vsyscall_map();      /* 0: CPU has no sysenter */
     start_eip = info.entry;
-    start_esp = build_stack(argv, &info);
+    start_esp = build_stack(argv, &info, sysinfo);
+
+    /* The thread is named after the file: "/bin/hello" -> "hello". */
+    const char *name = path;
+    for (const char *p = path; *p; p++)
+        if (*p == '/')
+            name = p + 1;
 
     struct thread *t = thread_create(name, run_program, NULL);
-    if (!t)
-        user_cleanup();
+    if (!t) {
+        vmm_unmap_user_all();
+        return NULL;
+    }
+    fd_open_console(t);             /* stdin, stdout, stderr */
     return t;
 }
 
-void user_cleanup(void)
+void user_cleanup(struct thread *t)
 {
+    fd_close_all(t);
     vmm_unmap_user_all();
 }

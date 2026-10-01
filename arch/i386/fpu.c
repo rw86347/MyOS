@@ -23,6 +23,7 @@
  * dropped by Linux in 2018: it leaked register contents between processes
  * (the "LazyFP" attack).
  */
+#include <cpu.h>
 #include <fpu.h>
 #include <kprintf.h>
 #include <string.h>
@@ -34,9 +35,6 @@
 #define CR4_OSFXSR     (1 << 9)     /* OS saves SSE state with FXSAVE: SSE allowed */
 #define CR4_OSXMMEXCPT (1 << 10)    /* OS handles SSE exceptions (exception 19) */
 
-#define CPUID_FXSR (1u << 24)
-#define CPUID_SSE  (1u << 25)
-
 static int has_fxsr;
 
 /* The state of a freshly reset FPU: every new user thread starts from it. */
@@ -44,9 +42,7 @@ static uint8_t clean_state[FPU_STATE_SIZE] __attribute__((aligned(16)));
 
 void fpu_init(void)
 {
-    uint32_t eax = 1, ebx, ecx, edx;
-    __asm__ volatile ("cpuid" : "+a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx));
-    has_fxsr = (edx & CPUID_FXSR) != 0;
+    has_fxsr = cpu_has(CPU_FXSR);
 
     uint32_t cr0;
     __asm__ volatile ("mov %%cr0, %0" : "=r"(cr0));
@@ -58,7 +54,7 @@ void fpu_init(void)
         uint32_t cr4;
         __asm__ volatile ("mov %%cr4, %0" : "=r"(cr4));
         cr4 |= CR4_OSFXSR;
-        if (edx & CPUID_SSE)
+        if (cpu_has(CPU_SSE))
             cr4 |= CR4_OSXMMEXCPT;
         __asm__ volatile ("mov %0, %%cr4" : : "r"(cr4));
     }
@@ -67,7 +63,7 @@ void fpu_init(void)
     fpu_save(clean_state);
     fpu_restore(clean_state);           /* (FNSAVE also resets; undo that) */
 
-    kprintf("FPU: x87%s, saved with %s\n", edx & CPUID_SSE ? " + SSE" : "",
+    kprintf("FPU: x87%s, saved with %s\n", cpu_has(CPU_SSE) ? " + SSE" : "",
             has_fxsr ? "FXSAVE" : "FNSAVE");
 }
 
