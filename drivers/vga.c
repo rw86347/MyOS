@@ -11,6 +11,7 @@
  * Without paging enabled, a pointer value is a physical address, so we can
  * just point at 0xB8000.
  */
+#include <io.h>
 #include <stddef.h>
 #include <vga.h>
 
@@ -20,6 +21,8 @@
 static volatile uint16_t *const vga_buffer = (uint16_t *)0xB8000;
 static size_t  row, col;
 static uint8_t color = VGA_LIGHT_GREY | (VGA_BLACK << 4);
+
+static void update_cursor(void);
 
 static uint16_t cell(char c, uint8_t attr)
 {
@@ -36,6 +39,7 @@ void vga_clear(void)
     for (size_t i = 0; i < VGA_WIDTH * VGA_HEIGHT; i++)
         vga_buffer[i] = cell(' ', color);
     row = col = 0;
+    update_cursor();
 }
 
 /* Move every line up by one and blank the bottom line. */
@@ -48,11 +52,31 @@ static void scroll(void)
     row = VGA_HEIGHT - 1;
 }
 
+/* Move the blinking hardware cursor to (row, col). The VGA card's CRT
+   controller is programmed through an index port (0x3D4) and a data port
+   (0x3D5): registers 0x0E/0x0F hold the cursor position, high/low byte. */
+static void update_cursor(void)
+{
+    uint16_t pos = row * VGA_WIDTH + col;
+    outb(0x3D4, 0x0F);
+    outb(0x3D5, pos & 0xFF);
+    outb(0x3D4, 0x0E);
+    outb(0x3D5, pos >> 8);
+}
+
 void vga_putc(char c)
 {
     if (c == '\n') {
         col = 0;
         row++;
+    } else if (c == '\b') {     /* backspace: step back and erase */
+        if (col > 0) {
+            col--;
+        } else if (row > 0) {
+            row--;
+            col = VGA_WIDTH - 1;
+        }
+        vga_buffer[row * VGA_WIDTH + col] = cell(' ', color);
     } else {
         vga_buffer[row * VGA_WIDTH + col] = cell(c, color);
         if (++col == VGA_WIDTH) {
@@ -62,6 +86,14 @@ void vga_putc(char c)
     }
     if (row == VGA_HEIGHT)
         scroll();
+    update_cursor();
+}
+
+void vga_write_at(size_t x, size_t y, const char *s, enum vga_color fg, enum vga_color bg)
+{
+    uint8_t attr = (uint8_t)(fg | (bg << 4));
+    for (; *s && x < VGA_WIDTH; s++, x++)
+        vga_buffer[y * VGA_WIDTH + x] = cell(*s, attr);
 }
 
 void vga_write(const char *s)

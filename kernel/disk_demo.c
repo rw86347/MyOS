@@ -163,7 +163,6 @@ void disk_demo(void)
         fat32_readdir(&fs, &root, tree_cb, &t);
 
         cat(&fs, "/HELLO.TXT");
-        cat(&fs, "/src/main.c");
         run_tests(&fs);
         kprintf("Self-tests: %d passed, %d failed\n", passed, failed);
         return;                 /* one file system is enough for the demo */

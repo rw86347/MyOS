@@ -39,10 +39,13 @@ CFLAGS  := -std=c11 -ffreestanding -O2 -Wall -Wextra -g \
 LDFLAGS := -T arch/i386/linker.ld -nostdlib -ffreestanding -O2 -Wl,--no-warn-rwx-segments
 LIBS    := -lgcc    # gcc's helper routines (e.g. 64-bit division on i386)
 
-C_SRCS  := $(wildcard kernel/*.c drivers/*.c fs/*.c)
+C_SRCS  := $(wildcard arch/i386/*.c kernel/*.c drivers/*.c fs/*.c)
 C_OBJS  := $(patsubst %.c,$(BUILD)/%.o,$(C_SRCS))
+# Kernel assembly files (the MBR in arch/i386/boot/ is built separately).
+ASM_SRCS := $(filter-out arch/i386/entry.asm,$(wildcard arch/i386/*.asm))
+ASM_OBJS := $(patsubst %.asm,$(BUILD)/%.o,$(ASM_SRCS))
 # entry.o must be linked first (it holds _start; linker.ld also enforces this)
-OBJS    := $(BUILD)/arch/i386/entry.o $(C_OBJS)
+OBJS    := $(BUILD)/arch/i386/entry.o $(ASM_OBJS) $(C_OBJS)
 
 IMG     := $(BUILD)/myos.img
 USB     := $(BUILD)/usb.img
@@ -55,13 +58,17 @@ QEMU_FLAGS := -m 64M \
 all: $(IMG) $(USB)
 
 # --- kernel ------------------------------------------------------------------
+# -MMD -MP: also write a .d file listing the headers each .c includes, so
+# changing a header rebuilds every file that uses it.
 $(BUILD)/%.o: %.c
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
 
-$(BUILD)/arch/i386/entry.o: arch/i386/entry.asm
+$(BUILD)/%.o: %.asm
 	@mkdir -p $(dir $@)
 	$(NASM) -f elf32 $< -o $@
+
+-include $(C_OBJS:.o=.d)
 
 $(BUILD)/kernel.elf: $(OBJS) arch/i386/linker.ld
 	$(CC) $(LDFLAGS) $(OBJS) -o $@ $(LIBS)
@@ -104,15 +111,22 @@ run-text: $(IMG) $(USB)
 debug: $(IMG) $(USB)
 	$(QEMU) $(QEMU_FLAGS) -serial stdio -s -S
 
-# Boot with no display, give the kernel 5 seconds, then tell QEMU to quit
-# through its monitor. The kernel's serial output is the test result.
+# Boot with no display and drive it through QEMU's monitor: wait for boot,
+# "type" h, i, Enter, press F12 (divide-by-zero test), then quit.
+# The kernel's serial output is the test result; each grep checks one thing.
 test: $(IMG) $(USB)
 	@rm -f $(BUILD)/serial.log
-	@(sleep 5; echo quit) | $(QEMU) $(QEMU_FLAGS) -display none \
-	  -serial file:$(BUILD)/serial.log -monitor stdio >/dev/null
-	@cat $(BUILD)/serial.log
-	@grep -q "Self-tests: [0-9]* passed, 0 failed" $(BUILD)/serial.log \
-	  && echo "TEST OK" || (echo "TEST FAILED"; exit 1)
+	@(sleep 4; for k in h i ret; do echo "sendkey $$k"; sleep 0.2; done; \
+	  echo "sendkey f12"; sleep 1; echo quit) \
+	  | $(QEMU) $(QEMU_FLAGS) -display none \
+	    -serial file:$(BUILD)/serial.log -monitor stdio >/dev/null
+	@cat $(BUILD)/serial.log; echo
+	@L=$(BUILD)/serial.log; ok=1; \
+	  grep -q "sleep 100 ms = 10[0-9] ticks" $$L || { echo "FAIL: timer"; ok=0; }; \
+	  grep -q "Self-tests: [0-9]* passed, 0 failed" $$L || { echo "FAIL: disk self-tests"; ok=0; }; \
+	  grep -q "fault)> hi" $$L || { echo "FAIL: keyboard echo"; ok=0; }; \
+	  grep -q "CPU EXCEPTION 0: Divide error" $$L || { echo "FAIL: exception handler"; ok=0; }; \
+	  if [ $$ok = 1 ]; then echo "TEST OK"; else echo "TEST FAILED"; exit 1; fi
 
 clean:
 	rm -rf $(BUILD)

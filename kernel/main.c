@@ -6,22 +6,101 @@
  *   mode -> entry.asm cleared .bss -> kernel_main()
  */
 #include <disk_demo.h>
+#include <gdt.h>
+#include <interrupts.h>
+#include <keyboard.h>
 #include <kprintf.h>
 #include <serial.h>
+#include <timer.h>
 #include <vga.h>
+
+/* Show "up 0:01:23" in the top-right corner of the screen. */
+static void show_uptime(uint32_t secs)
+{
+    char s[] = "up 0:00:00";
+    uint32_t h = secs / 3600, m = secs / 60 % 60, sec = secs % 60;
+    s[3] = '0' + h % 10;
+    s[5] = '0' + m / 10;   s[6] = '0' + m % 10;
+    s[8] = '0' + sec / 10; s[9] = '0' + sec % 10;
+    vga_write_at(80 - sizeof s + 1, 0, s, VGA_BLACK, VGA_LIGHT_GREY);
+}
+
+/* Deliberately crash, to show the exception handlers work. */
+static void trigger_fault(int key)
+{
+    if (key == KEY_F12) {
+        kprintf("\n[F12] Dividing by zero...\n");
+        /* Written in assembly on purpose: in C, dividing by zero is
+           "undefined behaviour", so GCC may assume it never happens and
+           replace `1 / x` with a comparison — no divide, no fault. */
+        __asm__ volatile ("mov $1, %%eax\n\t"
+                          "xor %%edx, %%edx\n\t"
+                          "xor %%ecx, %%ecx\n\t"
+                          "div %%ecx"           /* EDX:EAX / 0 -> exception 0 */
+                          : : : "eax", "ecx", "edx");
+    } else {
+        kprintf("\n[F11] Loading an invalid segment selector...\n");
+        __asm__ volatile ("mov $0x99, %%ax\n\tmov %%ax, %%ds" : : : "eax");
+    }
+}
+
+/* Echo typed keys. Control characters are shown as ^C, ^D, ... */
+static void echo(int c)
+{
+    if (c == '\n')
+        kprintf("\n> ");
+    else if (c == '\b')
+        kprintf("\b");
+    else if (c == '\t')
+        kprintf(" ");
+    else if (c < 32)
+        kprintf("^%c", c + '@');
+    else
+        kprintf("%c", c);
+}
 
 void kernel_main(void)
 {
     serial_init();
     vga_clear();
-
     vga_set_color(VGA_LIGHT_GREEN, VGA_BLACK);
-    kprintf("Hello world from MyOS! (32-bit protected mode, booted by our own MBR)\n");
+    kprintf("Hello world from MyOS!  (protected mode, own MBR)\n");
     vga_set_color(VGA_LIGHT_GREY, VGA_BLACK);
+
+    /* Step 2: CPU tables and interrupts. */
+    gdt_init();             /* our own segment table */
+    idt_init();             /* interrupt table + exception handlers + PIC remap */
+    timer_init();           /* IRQ 0: 1 ms tick */
+    keyboard_init();        /* IRQ 1 */
+    interrupts_enable();    /* sti: from now on, IRQs can arrive */
+
+    uint32_t t0 = timer_ms();
+    sleep_ms(100);
+    kprintf("Interrupts on: timer %u Hz (sleep 100 ms = %lu ticks), keyboard ready\n",
+            TIMER_HZ, timer_ms() - t0);
 
     disk_demo();
 
-    /* Nothing else to do yet. Halt the CPU; with interrupts off it stays put. */
-    for (;;)
-        __asm__ volatile ("cli; hlt");
+    kprintf("Type here (F11/F12 = test a CPU fault)> ");
+
+    /* Main loop: sleep until an interrupt wakes us (timer tick or key),
+       then handle whatever is new. */
+    uint32_t last_secs = 0xFFFFFFFF;
+    for (;;) {
+        cpu_wait();
+
+        uint32_t secs = timer_ms() / 1000;
+        if (secs != last_secs) {
+            show_uptime(secs);
+            last_secs = secs;
+        }
+
+        int c;
+        while ((c = keyboard_getc()) != -1) {
+            if (c == KEY_F11 || c == KEY_F12)
+                trigger_fault(c);
+            else
+                echo(c);
+        }
+    }
 }

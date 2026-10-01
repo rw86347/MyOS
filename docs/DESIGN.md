@@ -90,10 +90,10 @@ drivers. Plan: native drivers for storage (ATA/AHCI/virtio are well documented a
 use the Linux shim where writing our own would be impractical (network cards, WiFi, USB
 host controllers).
 
+Decided (2026-10-01): **file systems and the VFS run in the kernel**, so every `read()` stays
+one syscall with no extra context switches. (Block *device drivers* still move to user space.)
+
 Open questions:
-- Where do **file systems** run? In the kernel (recommended: every `read()` stays one
-  syscall), or as user-space servers like the drivers (cleaner isolation, but every file
-  operation costs extra context switches, which works against "faster than Linux").
 - Block drivers in user space need a fast path: kernel and driver share a request ring and the
   data buffers (no copying), and an IRQ wakes the driver. Can a disk driver own one of the
   system slots (1 or 10), or does it need its own slots?

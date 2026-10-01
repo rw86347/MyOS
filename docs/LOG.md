@@ -15,3 +15,11 @@ Short dated notes after each work session: what was done, what broke, what was l
   QEMU attaches usb.img as IDE hdb (no USB stack yet). Boot prints the tree; `make test` runs
   10 self-tests headless — all pass. Gotchas: uint32_t is `unsigned long` on i686-elf (use %lu);
   macOS has no `timeout`; mtools' `mcat` dumps the raw disk (use `mtype`).
+- 2026-10-01: Step 2 done. Kernel GDT (incl. ring-3 segments for later), IDT with 48 asm stubs
+  (isr.asm) -> interrupt_dispatch(); exceptions print a register dump and halt; PIC remapped to
+  vectors 32-47 (spurious IRQ 7/15 handled); PIT at 1000 Hz (1 ms tick for the slot scheduler);
+  PS/2 keyboard (scancode set 1, US, Shift/Caps/Ctrl) into a ring buffer; uptime clock top-right.
+  F12 = divide error, F11 = #GP. `make test` now types keys via QEMU `sendkey` and checks timer,
+  disk tests, echo and the exception handler. Lesson: GCC turned `1/zero` into a compare (div by
+  zero is UB) — used inline asm `div` to force the fault. Added -MMD header dependency tracking.
+  Next: Step 3 (memory: memory map, page allocator, paging, kmalloc).

@@ -241,7 +241,7 @@ void ata_init(void)
             char model[41];
             get_model(id, model);
             if (blockdev_register(&bd))
-                kprintf("ata: %s: %u sectors (%u MiB) \"%s\"\n",
+                kprintf("ata: %s: %lu sectors (%lu MiB) \"%s\"\n",
                         bd.name, sectors, sectors / 2048, model);
         }
     }

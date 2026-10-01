@@ -9,7 +9,7 @@ Mark a step `[x]` only when its "Done when" check works.
 - [x] **1. Boot & print** — our own BIOS MBR bootloader: load kernel from disk, enable A20, GDT,
   enter protected mode; kernel writes to VGA text buffer and serial port. (See `docs/DESIGN.md`.)
   Done when: QEMU shows **"Hello world from MyOS!"**.
-- [ ] **2. CPU tables & interrupts** — GDT, IDT, exception handlers, PIC remap, PIT timer, PS/2 keyboard.
+- [x] **2. CPU tables & interrupts** — GDT, IDT, exception handlers, PIC remap, PIT timer, PS/2 keyboard.
   Done when: a fault prints a message instead of rebooting; typed keys echo to the screen.
 - [ ] **3. Memory** — read Multiboot memory map, physical page allocator, paging, kernel heap (`kmalloc`/`kfree`).
   Done when: allocate/free tests pass and paging is on.
