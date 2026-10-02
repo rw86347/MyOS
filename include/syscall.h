@@ -117,15 +117,20 @@
 #define NR_setgid32    214
 #define NR_setfsuid32  215
 #define NR_setfsgid32  216
+#define NR_truncate64  193
+#define NR_ftruncate64 194
 #define NR_madvise     219
 #define NR_sched_getaffinity 242
 #define NR_set_thread_area 243
 #define NR_get_thread_area 244
 #define NR_set_tid_address 258
+#define NR_statfs64    268
+#define NR_fstatfs64   269
 #define NR_clock_gettime   265
 #define NR_clock_getres    266
 #define NR_clock_nanosleep 267
 #define NR_mkdirat     296
+#define NR_mknodat     297
 #define NR_fchownat    298
 #define NR_unlinkat    301
 #define NR_renameat    302
@@ -137,12 +142,14 @@
 #define NR_set_robust_list 311
 #define NR_utimensat   320
 #define NR_prlimit64   340
+#define NR_renameat2   353
 #define NR_getrandom   355
 #define NR_getsockname 367
 #define NR_getpeername 368
 #define NR_clock_gettime64 403
 #define NR_clock_getres_time64 406
 #define NR_clock_nanosleep_time64 407
+#define NR_utimensat_time64 412
 #define NR_pselect6_time64 413
 #define NR_ppoll_time64 414
 

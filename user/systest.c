@@ -3,7 +3,7 @@
  *
  *   uname, clocks (realtime from the CMOS clock, monotonic), nanosleep,
  *   poll/select with timeouts, thread-local storage (set_thread_area + GS),
- *   getrandom, mprotect, openat with a directory fd, limits, read-only fs.
+ *   getrandom, mprotect, openat with a directory fd, limits, mkdir.
  *
  * Exits 0 if all is well, else the number of the first failed check.
  */
@@ -23,6 +23,7 @@ static int checks;
     } while (0)
 
 #define SYS_mkdir 39
+#define SYS_rmdir 40
 #define SYS_uname 122
 #define SYS_mprotect 125
 #define SYS__newselect 142
@@ -117,7 +118,7 @@ int main(int argc, char **argv)
     CHECK(m[0] == 'c');
 
     /* 8. openat relative to an open directory. */
-    int dfd = open("/data", 0200000);           /* O_DIRECTORY */
+    int dfd = open("/test", 0200000);           /* O_DIRECTORY */
     CHECK(dfd >= 0);
     int fd = (int)syscall5(SYS_openat, dfd, (long)"numbers.txt", 0, 0, 0);
     char b[2];
@@ -125,10 +126,12 @@ int main(int argc, char **argv)
     close(fd);
     close(dfd);
 
-    /* 9. Limits, ids, and the read-only file system. */
+    /* 9. Limits, and a directory made and removed (fstest does more). */
     unsigned long long lim[2];
     CHECK(syscall5(SYS_prlimit64, 0, 7, 0, (long)lim, 0) == 0 && lim[0] == 32);
-    CHECK(syscall3(SYS_mkdir, (long)"/newdir", 0755, 0) == -EROFS);
+    CHECK(syscall3(SYS_mkdir, (long)"/newdir", 0755, 0) == 0);
+    CHECK(syscall3(SYS_mkdir, (long)"/newdir", 0755, 0) == -EEXIST);
+    CHECK(syscall3(SYS_rmdir, (long)"/newdir", 0, 0) == 0);
 
     put("systest: all ");
     put_u64(checks);

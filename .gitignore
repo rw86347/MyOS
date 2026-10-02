@@ -5,6 +5,7 @@ build/
 *.iso
 .DS_Store
 dist/
+disks/
 
 # The live disk is its own repo (myos-live), checked out here.
 /live/

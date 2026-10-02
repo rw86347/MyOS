@@ -41,9 +41,10 @@ void run_selftests(void)
     kprintf("Timer: %u Hz (sleep 100 ms = %lu ticks), keyboard ready\n",
             TIMER_HZ, timer_ms() - t0);
 
-    disk_demo();
     initrd_selftest();      /* the initramfs arrived intact */
-    mem_selftest();
+    mem_selftest();         /* first: it checks the heap is back to empty */
+    disk_demo();
+    bcache_selftest();      /* the block cache, on the test disk */
     thread_selftest();      /* kernel threads + context switch */
     user_selftest();        /* ring 3 programs, syscalls, ELF, FPU */
     sched_selftest();       /* starts the 20 x 1 ms slot scheduler */

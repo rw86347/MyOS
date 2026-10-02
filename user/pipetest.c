@@ -140,8 +140,8 @@ int main(int argc, char **argv)
           has_entry(buf, n, "README.txt") && has_entry(buf, n, ".."));
     CHECK(getdents64(fd, buf, sizeof buf) == 0);     /* that was all */
     close(fd);
-    CHECK(chdir("/data") == 0);
-    CHECK(getcwd(buf, sizeof buf) == 6 && strcmp(buf, "/data") == 0);
+    CHECK(chdir("/test") == 0);
+    CHECK(getcwd(buf, sizeof buf) == 6 && strcmp(buf, "/test") == 0);
     fd = open("numbers.txt", O_RDONLY);
     CHECK(fd >= 0 && read(fd, buf, 2) == 2 && memcmp(buf, "1\n", 2) == 0);
     close(fd);

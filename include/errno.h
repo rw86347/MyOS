@@ -8,6 +8,8 @@
 #define EPERM     1     /* not allowed */
 #define ESRCH     3     /* no such process */
 #define EINTR     4     /* interrupted by a signal */
+#define EIO       5     /* the disk said no (read/write error) */
+#define ENXIO     6     /* no such device (a node with no driver) */
 #define ENOEXEC   8     /* not an executable we can run */
 #define EBADF     9     /* bad file descriptor */
 #define ECHILD   10     /* no child processes */
@@ -15,6 +17,7 @@
 #define ENOMEM   12     /* out of memory */
 #define EACCES   13     /* permission denied */
 #define EFAULT   14     /* bad address */
+#define EBUSY    16     /* in use ("/" can't be removed) */
 #define ENOTDIR  20     /* a path component is not a directory */
 #define EISDIR   21     /* is a directory */
 #define ENODEV   19     /* no such device */

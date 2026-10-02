@@ -14,6 +14,7 @@
  * Runs before the slot scheduler starts (round-robin mode): main yields
  * until the program's thread is dead.
  */
+#include <bcache.h>
 #include <elf.h>
 #include <errno.h>
 #include <kheap.h>
@@ -144,6 +145,7 @@ void user_selftest(void)
     static const char *const no_args[] = { NULL };
     static const char *const args[] = { "args", "one", "two", NULL };
     uint32_t free_before = pmm_free_count(), heap_before = kheap_pages();
+    uint32_t cache_before = bcache_pages();
     sched_set_preempt(1);               /* programs share the CPU, as for real */
 
     static const char *const files_args[] = { "files", NULL };
@@ -168,6 +170,15 @@ void user_selftest(void)
     static const char *const sys_args[] = { "systest", NULL };
     check(run("/bin/systest", sys_args) == 0,
           "user: uname, clocks, sleep, poll, TLS, mprotect, openat (step 8)");
+    static const char *const fs_args[] = { "fstest", NULL };
+    check(run("/bin/fstest", fs_args) == 0,
+          "user: writable files: create, write, rename, rm -r, exec (step 8i)");
+    static const char *const ext2_args[] = { "ext2test", NULL };
+    check(run("/bin/ext2test", ext2_args) == 0,
+          "user: ext2: files made by Linux's mke2fs, mount rules, persist.txt (step 9b)");
+    static const char *const fs_disk_args[] = { "fstest", "/data/fst", NULL };
+    check(run("/bin/fstest", fs_disk_args) == 0,
+          "user: all of fstest again, on the ext2 disk (step 9b)");
     check(run_tty_test() == 0,
           "user: terminal: line editing, EOF, raw mode, Ctrl-C (step 8)");
     check(run_fpu_test() == 0, "user: FPU/SSE registers survive thread switches");
@@ -176,7 +187,9 @@ void user_selftest(void)
 
     check(vmm_translate(0x08048000) == 0, "user: program memory unmapped");
     /* Every page comes back — exactly. The only pages allowed to stay
-       missing are the ones the kernel heap took to grow (it keeps them). */
-    check(pmm_free_count() + (kheap_pages() - heap_before) == free_before,
+       missing are the ones the kernel heap took to grow, and the block
+       cache's (both keep them). */
+    check(pmm_free_count() + (kheap_pages() - heap_before) +
+          (bcache_pages() - cache_before) == free_before,
           "user: every program page freed (none leaked)");
 }

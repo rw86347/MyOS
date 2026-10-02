@@ -133,26 +133,52 @@ static uint32_t build_stack(const char *const argv[], const char *const envp[],
 }
 
 /* "#!/bin/sh -x" at the top of a file: run the interpreter instead, with
-   the script's path as an argument. Fills interp/arg; 1 if it's a script. */
-static int script_interp(const struct inode *ino, char *interp, char *arg)
+   the script's path as an argument. Only the first line counts, and only
+   its first SCRIPT_HEAD bytes (Linux reads 256 too). Fills interp/arg;
+   1 if it's a script. */
+#define SCRIPT_HEAD 256
+
+static int script_interp(struct inode *ino, char *head, char *interp, char *arg)
 {
-    if (ino->size < 3 || ino->data[0] != '#' || ino->data[1] != '!')
+    uint32_t size = ino->size < SCRIPT_HEAD ? ino->size : SCRIPT_HEAD;
+    if (size < 3)
         return 0;
+    file_copy_out(ino, 0, head, 2);     /* most programs aren't scripts: */
+    if (head[0] != '#' || head[1] != '!')
+        return 0;                       /* look at 2 bytes, not 256 */
+    file_copy_out(ino, 0, head, size);
     uint32_t i = 2, n = 0;
-    while (i < ino->size && (ino->data[i] == ' ' || ino->data[i] == '\t'))
+    while (i < size && (head[i] == ' ' || head[i] == '\t'))
         i++;
-    while (i < ino->size && n < PATH_MAX - 1 && ino->data[i] > ' ')
-        interp[n++] = ino->data[i++];
+    while (i < size && head[i] > ' ')
+        interp[n++] = head[i++];
     interp[n] = '\0';
-    while (i < ino->size && (ino->data[i] == ' ' || ino->data[i] == '\t'))
+    while (i < size && (head[i] == ' ' || head[i] == '\t'))
         i++;
     n = 0;
-    while (i < ino->size && n < PATH_MAX - 1 && ino->data[i] != '\n')
-        arg[n++] = ino->data[i++];
+    while (i < size && head[i] != '\n')
+        arg[n++] = head[i++];
     while (n > 0 && arg[n - 1] <= ' ')
         n--;                            /* trailing spaces / \r */
     arg[n] = '\0';
     return interp[0] != '\0';
+}
+
+/* A program file's bytes in one piece, for the ELF loader. A file from
+   the initramfs already is (no copy); one written since then is spread
+   over pages, and one on a disk is in disk blocks, so those are copied
+   into a temporary buffer (*tmp: kfree it). */
+static const uint8_t *file_bytes(struct inode *ino, uint8_t **tmp)
+{
+    *tmp = NULL;
+    if (!ino->pages && !ino->fs && ino->data)
+        return ino->data;
+    *tmp = kmalloc(ino->size ? ino->size : 1);
+    if (*tmp && file_copy_out(ino, 0, *tmp, ino->size) < 0) {
+        kfree(*tmp);
+        *tmp = NULL;
+    }
+    return *tmp;
 }
 
 static int load_elf(struct inode *ino, const char *const argv[],
@@ -161,25 +187,25 @@ static int load_elf(struct inode *ino, const char *const argv[],
 int program_load(const char *path, const char *const argv[],
                  const char *const envp[], uint32_t *entry, uint32_t *sp)
 {
-    /* The program's file is in the initramfs, already in memory: the
-       loader reads it right where it is (no copy). */
+    /* A program from the initramfs is already in memory: the loader
+       reads it right where it is (no copy). */
     struct inode *ino;
     int err = vfs_lookup(path, &ino);
     if (err)
         return err;
     if (S_ISDIR(ino->mode))
         return -EISDIR;
-    if (!S_ISREG(ino->mode) || !ino->data)
+    if (!S_ISREG(ino->mode) || (ino->ops && !ino->fs) || !(ino->mode & 0111))
         return -EACCES;
 
     /* A script? Then run "interpreter [arg] script args..." instead. */
     struct script {
-        char interp[PATH_MAX], arg[PATH_MAX];
+        char head[SCRIPT_HEAD], interp[SCRIPT_HEAD], arg[SCRIPT_HEAD];
         const char *argv[];
     } *s = kmalloc(sizeof(struct script) + (count(argv) + 4) * sizeof(char *));
     if (!s)
         return -ENOMEM;
-    if (script_interp(ino, s->interp, s->arg)) {
+    if (script_interp(ino, s->head, s->interp, s->arg)) {
         int n = 0;
         s->argv[n++] = s->interp;
         if (s->arg[0])
@@ -190,7 +216,7 @@ int program_load(const char *path, const char *const argv[],
         s->argv[n] = NULL;
         struct inode *interp;
         err = vfs_lookup(s->interp, &interp);
-        if (!err && (!S_ISREG(interp->mode) || !interp->data))
+        if (!err && (!S_ISREG(interp->mode) || (interp->ops && !interp->fs)))
             err = -EACCES;
         if (!err)                       /* (one level: no #! interpreters) */
             err = load_elf(interp, s->argv, envp, entry, sp);
@@ -207,7 +233,12 @@ static int load_elf(struct inode *ino, const char *const argv[],
     int err;
 
     struct elf_info info;
-    err = elf_load(ino->data, ino->size, ELF_DYN_BASE, &info);
+    uint8_t *tmp;
+    const uint8_t *bytes = file_bytes(ino, &tmp);
+    if (!bytes)
+        return -ENOMEM;
+    err = elf_load(bytes, ino->size, ELF_DYN_BASE, &info);
+    kfree(tmp);
     if (err)
         return err;
 
@@ -224,10 +255,14 @@ static int load_elf(struct inode *ino, const char *const argv[],
         err = vfs_lookup(info.interp, &ld);
         if (err)
             return err == -ENOENT ? -ENOENT : err;
-        if (!S_ISREG(ld->mode) || !ld->data)
+        if (!S_ISREG(ld->mode) || (ld->ops && !ld->fs))
             return -EACCES;
         struct elf_info linfo;
-        err = elf_load(ld->data, ld->size, ELF_BASE_ANY, &linfo);
+        bytes = file_bytes(ld, &tmp);
+        if (!bytes)
+            return -ENOMEM;
+        err = elf_load(bytes, ld->size, ELF_BASE_ANY, &linfo);
+        kfree(tmp);
         if (err)
             return err;
         if (linfo.interp)

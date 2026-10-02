@@ -16,4 +16,7 @@ int selftest_key(int key);
 /* initrd_test.c */
 void initrd_selftest(void);
 
+/* bcache_test.c */
+void bcache_selftest(void);
+
 #endif

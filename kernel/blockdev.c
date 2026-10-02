@@ -52,3 +52,10 @@ int blockdev_write(struct blockdev *dev, uint32_t lba, uint32_t count, const voi
         return -1;      /* read-only device */
     return dev->write(dev, lba, count, buf);
 }
+
+int blockdev_flush(struct blockdev *dev)
+{
+    while (dev->parent)
+        dev = dev->parent;          /* the drive the partition is on */
+    return dev->flush ? dev->flush(dev) : 0;
+}

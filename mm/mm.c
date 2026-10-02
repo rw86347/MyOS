@@ -64,11 +64,17 @@ struct mm *mm_fork(struct mm *mm)
         kfree(child);
         return NULL;
     }
+    for (int i = 0; i < child->nareas; i++)
+        if (child->area[i].file)
+            vfs_get(child->area[i].file);   /* the child maps the files too */
     return child;
 }
 
 void mm_destroy(struct mm *mm)
 {
+    for (int i = 0; i < mm->nareas; i++)
+        if (mm->area[i].file)
+            vfs_put(mm->area[i].file);
     vmm_pd_destroy(mm->pd);
     kfree(mm);
 }
@@ -130,6 +136,8 @@ int mm_add_file(struct mm *mm, uint32_t start, uint32_t end, uint32_t flags,
     }
     mm->area[i] = (struct vma){ start, end, flags, file, file_off };
     mm->nareas++;
+    if (file)
+        vfs_get(file);      /* a mapped file stays readable, even if deleted */
     return 0;
 }
 
@@ -146,11 +154,15 @@ int mm_remove(struct mm *mm, uint32_t start, uint32_t end)
                     (mm->nareas - i - 1) * sizeof *v);
             mm->area[i + 1] = (struct vma){ end, v->end, v->flags, v->file,
                                             v->file_off + (end - v->start) };
+            if (v->file)
+                vfs_get(v->file);
             v->end = start;
             mm->nareas++;
             break;
         }
         if (start <= v->start && end >= v->end) {       /* all of it */
+            if (v->file)
+                vfs_put(v->file);
             memmove(v, v + 1, (mm->nareas - i - 1) * sizeof *v);
             mm->nareas--;
             i--;
@@ -185,7 +197,8 @@ int mm_fault(uint32_t va, uint32_t err)
 
     /* Demand paging: the first touch of a page in an area creates it —
        zero-filled, or for a mapped file, a copy of that part of the file
-       (straight from the initramfs). Pages never touched cost nothing. */
+       (straight from the initramfs, or from its RAM pages). Pages never
+       touched cost nothing. */
     uint32_t frame = pmm_alloc();
     if (!frame)
         return -1;                      /* out of memory: the program dies */
@@ -194,7 +207,7 @@ int mm_fault(uint32_t va, uint32_t err)
         uint32_t off = v->file_off + (page - v->start);
         if (off < v->file->size)
             n = v->file->size - off < PAGE_SIZE ? v->file->size - off : PAGE_SIZE;
-        memcpy(P2V(frame), v->file->data + off, n);
+        file_copy_out(v->file, off, P2V(frame), n);
     }
     memset((uint8_t *)P2V(frame) + n, 0, PAGE_SIZE - n);
     uint32_t flags = PTE_USER | (v->flags & VM_WRITE ? PTE_WRITABLE : 0);
@@ -251,9 +264,9 @@ int32_t mm_mmap(uint32_t addr, uint32_t len, uint32_t prot, uint32_t flags,
                 struct inode *file, uint32_t off)
 {
     if (!(flags & MAP_ANONYMOUS)) {
-        /* A file: only ones whose bytes are in memory (the initramfs).
-           Mapped privately: writes change our copy, never the file. */
-        if (!file || !S_ISREG(file->mode) || !file->data)
+        /* A file, mapped privately: writes change our copy, never the
+           file (MAP_SHARED is treated the same: see docs/gaps.md). */
+        if (!file || !S_ISREG(file->mode) || (file->ops && !file->fs))
             return -ENODEV;
         if (off & (PAGE_SIZE - 1))
             return -EINVAL;
@@ -301,6 +314,8 @@ static int split_at(struct mm *mm, uint32_t addr)
     mm->area[i + 1].file_off += addr - mm->area[i + 1].start;
     mm->area[i + 1].start = addr;
     mm->nareas++;
+    if (mm->area[i].file)
+        vfs_get(mm->area[i].file);      /* two areas map it now */
     return 0;
 }
 

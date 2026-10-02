@@ -65,10 +65,10 @@ int main(int argc, char **argv)
     struct statx st;
     t = rdtsc();
     for (int i = 0; i < N; i++)
-        close(open("/data/numbers.txt", O_RDONLY));
+        close(open("/test/numbers.txt", O_RDONLY));
     report("open + close (2-part path)", rdtsc() - t);
 
-    int fd = open("/data/numbers.txt", O_RDONLY);
+    int fd = open("/test/numbers.txt", O_RDONLY);
     t = rdtsc();
     for (int i = 0; i < N; i++) {
         lseek(fd, 0, SEEK_SET);
@@ -79,7 +79,7 @@ int main(int argc, char **argv)
 
     t = rdtsc();
     for (int i = 0; i < N; i++)
-        statx(AT_FDCWD, "/data/numbers.txt", 0, STATX_BASIC_STATS, &st);
+        statx(AT_FDCWD, "/test/numbers.txt", 0, STATX_BASIC_STATS, &st);
     report("stat (statx)", rdtsc() - t);
 
     /* Processes (step 8): fork is copy-on-write, so it copies page tables,

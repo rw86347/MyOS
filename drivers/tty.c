@@ -27,6 +27,9 @@
 #include <signal.h>
 #include <string.h>
 #include <tty.h>
+#ifdef BENCH
+#include <bench.h>
+#endif
 #include <uaccess.h>
 #include <vfs.h>
 #include <vga.h>
@@ -261,6 +264,9 @@ int32_t tty_read(struct file *f, void *user_buf, uint32_t n)
             return -EAGAIN;
         if (signal_pending())
             return -EINTR;
+#ifdef BENCH
+        bench_input_wait();
+#endif
         wq_sleep(&readers);
     }
     uint32_t avail = in_head - in_tail;

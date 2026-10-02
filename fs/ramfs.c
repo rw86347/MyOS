@@ -11,7 +11,7 @@
  *   ...
  *
  * Whole pages, straight from the page allocator: a file can grow as big as
- * free RAM (not limited by the kernel heap), appending is cheap, and
+ * the limit below (not limited by the kernel heap), appending is cheap, and
  * deleting a file gives every page back.
  *
  * Speed: one read() or write() copies at most RW_MAX bytes, so a syscall
@@ -25,28 +25,60 @@
 #include <uaccess.h>
 #include <vfs.h>
 
+/* 256 KiB is about 0.1 ms of copying on a Pentium 4. */
 #define RW_MAX (256 * 1024)
 
-/* The archive pointer, or the page holding byte `pos` (NULL: zeros). */
+/* Frames holding file contents. At most half of RAM, like Linux's tmpfs:
+   a runaway `yes > file` gets "No space left on device" instead of
+   starving every program of memory. */
+static uint32_t used_pages;
+
+static uint32_t max_pages(void) { return pmm_usable_count() / 2; }
+
+void ramfs_usage(uint32_t *used, uint32_t *max)
+{
+    *used = used_pages;
+    *max = max_pages();
+}
+
+static uint32_t page_new(void)          /* not zeroed */
+{
+    if (used_pages >= max_pages())
+        return 0;
+    uint32_t f = pmm_alloc();
+    if (f)
+        used_pages++;
+    return f;
+}
+
+static void page_drop(uint32_t f)
+{
+    pmm_free(f);
+    used_pages--;
+}
+
+static uint32_t min(uint32_t a, uint32_t b) { return a < b ? a : b; }
+
+/* The page holding byte `pos`, or NULL for a hole. */
 static const uint8_t *page_at(struct inode *i, uint32_t pos)
 {
     uint32_t idx = pos / PAGE_SIZE;
-    if (!i->pages)
-        return i->data ? i->data + idx * PAGE_SIZE : NULL;
     if (idx >= i->page_cap || !i->pages[idx])
         return NULL;
     return P2V(i->pages[idx]);
 }
 
-void file_copy_out(struct inode *i, uint32_t pos, void *kbuf, uint32_t n)
+int file_copy_out(struct inode *i, uint32_t pos, void *kbuf, uint32_t n)
 {
+    if (i->fs)
+        return i->fs->read_kernel(i, pos, kbuf, n);     /* on a disk */
+    if (!i->pages) {                    /* the archive is contiguous */
+        memcpy(kbuf, i->data + pos, n);
+        return 0;
+    }
     uint8_t *dst = kbuf;
     while (n) {
-        uint32_t in = pos % PAGE_SIZE, k = PAGE_SIZE - in < n ? PAGE_SIZE - in : n;
-        if (!i->pages && i->data) {     /* the archive is contiguous */
-            memcpy(dst, i->data + pos, n);
-            return;
-        }
+        uint32_t in = pos % PAGE_SIZE, k = min(PAGE_SIZE - in, n);
         const uint8_t *src = page_at(i, pos);
         if (src)
             memcpy(dst, src + in, k);
@@ -56,33 +88,44 @@ void file_copy_out(struct inode *i, uint32_t pos, void *kbuf, uint32_t n)
         pos += k;
         n -= k;
     }
+    return 0;
 }
 
-int32_t file_read_at(struct inode *i, uint32_t pos, void *user_buf, uint32_t n)
+/* read() on a regular file: from the file's position, which moves on. */
+static int32_t ram_read(struct file *f, void *user_buf, uint32_t n)
 {
+    struct inode *i = f->inode;
+    uint32_t pos = f->pos;
+    if ((f->flags & O_ACCMODE) == O_WRONLY)
+        return -EBADF;
     if (pos >= i->size)
         return 0;                       /* end of file */
-    if (n > i->size - pos)
-        n = i->size - pos;
-    if (n > RW_MAX)
-        n = RW_MAX;
-    if (!i->pages && i->data)           /* initramfs: one copy, no cache */
-        return copy_to_user(user_buf, i->data + pos, n) < 0 ? -EFAULT : (int32_t)n;
+    n = min(min(n, i->size - pos), RW_MAX);
+    if (!i->pages) {                    /* initramfs: one copy, no cache */
+        if (copy_to_user(user_buf, i->data + pos, n) < 0)
+            return -EFAULT;
+        f->pos += n;
+        return n;
+    }
 
     static const uint8_t zeros[PAGE_SIZE];
     uint32_t done = 0;
     while (done < n) {
-        uint32_t p = pos + done, in = p % PAGE_SIZE;
-        uint32_t k = PAGE_SIZE - in < n - done ? PAGE_SIZE - in : n - done;
+        uint32_t p = pos + done, in = p % PAGE_SIZE, k = min(PAGE_SIZE - in, n - done);
         const uint8_t *src = page_at(i, p);
-        if (copy_to_user((uint8_t *)user_buf + done, src ? src + in : zeros, k) < 0)
-            return done ? (int32_t)done : -EFAULT;
+        if (copy_to_user((uint8_t *)user_buf + done, src ? src + in : zeros, k) < 0) {
+            if (!done)
+                return -EFAULT;
+            break;
+        }
         done += k;
     }
+    f->pos += done;
     return done;
 }
 
-/* Make room in pages[] for `count` entries. */
+/* Make room in pages[] for `count` entries (doubling, so appending a byte
+   at a time doesn't reallocate every page). */
 static int grow_table(struct inode *i, uint32_t count)
 {
     if (count <= i->page_cap)
@@ -103,22 +146,27 @@ static int grow_table(struct inode *i, uint32_t count)
     return 0;
 }
 
-/* The first change: copy the archive bytes into pages of our own. */
-static int make_writable(struct inode *i)
+/* The first change: from now on the contents live in pages of our own.
+   Only the first `keep` bytes are copied from the archive (a truncate to
+   0 copies nothing). If memory runs out, the file stays as it was. */
+static int make_writable(struct inode *i, uint32_t keep)
 {
-    if (i->pages || (!i->data && i->size == 0)) {
-        if (!i->pages && grow_table(i, 1) < 0)
-            return -ENOMEM;
+    if (i->pages)
         return 0;
-    }
-    uint32_t n = (i->size + PAGE_SIZE - 1) / PAGE_SIZE;
+    uint32_t n = keep / PAGE_SIZE + (keep % PAGE_SIZE != 0);
     if (grow_table(i, n ? n : 1) < 0)
         return -ENOMEM;
     for (uint32_t p = 0; p < n; p++) {
-        uint32_t f = pmm_alloc();
-        if (!f)
+        uint32_t f = page_new();
+        if (!f) {
+            while (p--)
+                page_drop(i->pages[p]);
+            kfree(i->pages);
+            i->pages = NULL;
+            i->page_cap = 0;
             return -ENOSPC;
-        uint32_t k = i->size - p * PAGE_SIZE < PAGE_SIZE ? i->size - p * PAGE_SIZE : PAGE_SIZE;
+        }
+        uint32_t k = min(keep - p * PAGE_SIZE, PAGE_SIZE);
         memcpy(P2V(f), i->data + p * PAGE_SIZE, k);
         memset((uint8_t *)P2V(f) + k, 0, PAGE_SIZE - k);
         i->pages[p] = f;
@@ -127,54 +175,72 @@ static int make_writable(struct inode *i)
     return 0;
 }
 
-int32_t file_write_at(struct inode *i, uint32_t pos, const void *user_buf, uint32_t n)
+/* write() on a regular file: at its position (O_APPEND: at the end). */
+static int32_t ram_write(struct file *f, const void *user_buf, uint32_t n)
 {
-    if (n > RW_MAX)
-        n = RW_MAX;
+    struct inode *i = f->inode;
+    if ((f->flags & O_ACCMODE) == O_RDONLY)
+        return -EBADF;
+    if (f->flags & O_APPEND)
+        f->pos = i->size;               /* every write goes to the end */
+    uint32_t pos = f->pos;
+    if (n == 0)
+        return 0;
+    n = min(n, RW_MAX);
     if (pos + n < pos)
-        return -EFBIG;
-    int err = make_writable(i);
+        return -EFBIG;                  /* past 4 GiB */
+    int err = make_writable(i, i->size);
     if (err)
         return err;
-    if (grow_table(i, (pos + n + PAGE_SIZE - 1) / PAGE_SIZE) < 0)
+    if (grow_table(i, (pos + n - 1) / PAGE_SIZE + 1) < 0)
         return -ENOMEM;
 
     uint32_t done = 0;
     while (done < n) {
         uint32_t p = pos + done, idx = p / PAGE_SIZE, in = p % PAGE_SIZE;
-        uint32_t k = PAGE_SIZE - in < n - done ? PAGE_SIZE - in : n - done;
+        uint32_t k = min(PAGE_SIZE - in, n - done);
         if (!i->pages[idx]) {           /* a new page (or a hole being filled) */
-            uint32_t f = pmm_alloc();
-            if (!f)
-                return done ? (int32_t)done : -ENOSPC;
-            memset(P2V(f), 0, PAGE_SIZE);
-            i->pages[idx] = f;
+            uint32_t frame = page_new();
+            if (!frame)
+                break;
+            memset(P2V(frame), 0, PAGE_SIZE);
+            i->pages[idx] = frame;
         }
         if (copy_from_user((uint8_t *)P2V(i->pages[idx]) + in,
-                           (const uint8_t *)user_buf + done, k) < 0)
-            return done ? (int32_t)done : -EFAULT;
+                           (const uint8_t *)user_buf + done, k) < 0) {
+            if (!done)
+                return -EFAULT;
+            break;
+        }
         done += k;
     }
+    if (!done)
+        return -ENOSPC;
     if (pos + done > i->size)
         i->size = pos + done;
     i->mtime = i->ctime = time_now();
+    f->pos += done;
     return done;
 }
 
+const struct file_ops ram_ops = { .read = ram_read, .write = ram_write };
+
 int file_truncate(struct inode *i, uint32_t size)
 {
-    int err = make_writable(i);
+    int err = make_writable(i, min(size, i->size));
     if (err)
         return err;
-    uint32_t keep = (size + PAGE_SIZE - 1) / PAGE_SIZE;
+    uint32_t keep = size / PAGE_SIZE + (size % PAGE_SIZE != 0);
     for (uint32_t p = keep; p < i->page_cap; p++) {
         if (i->pages[p]) {
-            pmm_free(i->pages[p]);      /* shrinking gives pages back */
+            page_drop(i->pages[p]);     /* shrinking gives pages back */
             i->pages[p] = 0;
         }
     }
-    if (size % PAGE_SIZE && keep && keep <= i->page_cap && i->pages[keep - 1]) {
-        uint32_t in = size % PAGE_SIZE;  /* zero the cut-off tail of the last page */
+    /* Zero the cut-off tail of the last page, so growing the file again
+       later shows zeros there, not the old bytes. */
+    if (size % PAGE_SIZE && keep <= i->page_cap && i->pages[keep - 1]) {
+        uint32_t in = size % PAGE_SIZE;
         memset((uint8_t *)P2V(i->pages[keep - 1]) + in, 0, PAGE_SIZE - in);
     }
     i->size = size;                     /* growing just leaves a hole */
@@ -187,7 +253,7 @@ void file_free(struct inode *i)
     if (i->pages) {
         for (uint32_t p = 0; p < i->page_cap; p++)
             if (i->pages[p])
-                pmm_free(i->pages[p]);
+                page_drop(i->pages[p]);
         kfree(i->pages);
         i->pages = NULL;
         i->page_cap = 0;

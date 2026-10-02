@@ -76,8 +76,9 @@ static struct thread *next_best_effort(int skip_current)
 static void idle_loop(void *arg)
 {
     (void)arg;
+    irq_save();
     for (;;)
-        cpu_wait();
+        cpu_idle();                 /* counted as idle time (thread.c) */
 }
 
 void sched_start(void)

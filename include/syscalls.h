@@ -38,6 +38,42 @@ SYSCALL_DEF(sys_set_thread_area);
 SYSCALL_DEF(sys_get_thread_area);
 SYSCALL_DEF(sys_set_tid_address);
 
+/* kernel/syscall.c: helpers for the files below */
+struct inode;
+int get_path(char *dst, uint32_t user_path);    /* copy a path in: 0 or -errno */
+int dir_of(uint32_t dirfd, struct inode **dir); /* *at() dirfd -> NULL (cwd) or dir */
+int32_t do_open(struct inode *dir, uint32_t user_path, uint32_t flags, uint32_t mode);
+
+/* kernel/sys_fs.c */
+SYSCALL_DEF(sys_mkdir);
+SYSCALL_DEF(sys_mkdirat);
+SYSCALL_DEF(sys_mknod);
+SYSCALL_DEF(sys_mknodat);
+SYSCALL_DEF(sys_symlink);
+SYSCALL_DEF(sys_symlinkat);
+SYSCALL_DEF(sys_link);
+SYSCALL_DEF(sys_unlink);
+SYSCALL_DEF(sys_rmdir);
+SYSCALL_DEF(sys_unlinkat);
+SYSCALL_DEF(sys_rename);
+SYSCALL_DEF(sys_renameat);
+SYSCALL_DEF(sys_renameat2);
+SYSCALL_DEF(sys_chmod);
+SYSCALL_DEF(sys_fchmodat);
+SYSCALL_DEF(sys_fchmod);
+SYSCALL_DEF(sys_chown32);
+SYSCALL_DEF(sys_lchown32);
+SYSCALL_DEF(sys_fchownat);
+SYSCALL_DEF(sys_fchown32);
+SYSCALL_DEF(sys_utimensat);
+SYSCALL_DEF(sys_utimensat64);
+SYSCALL_DEF(sys_truncate);
+SYSCALL_DEF(sys_ftruncate);
+SYSCALL_DEF(sys_truncate64);
+SYSCALL_DEF(sys_ftruncate64);
+SYSCALL_DEF(sys_statfs64);
+SYSCALL_DEF(sys_fstatfs64);
+
 /* fs/poll.c */
 SYSCALL_DEF(sys_poll);
 SYSCALL_DEF(sys_ppoll64);

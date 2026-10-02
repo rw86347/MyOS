@@ -104,6 +104,15 @@ drivers. Plan: native drivers for storage (ATA/AHCI/virtio are well documented a
 use the Linux shim where writing our own would be impractical (network cards, WiFi, USB
 host controllers).
 
+Decided (2026-10-02): **network drivers come from Linux, not from scratch.** NIC (and later
+WiFi and USB host) drivers are unmodified Linux v7.2 source compiled against the shim:
+`e1000` first (QEMU's card; no firmware, no `phylib`), then `e100`, `8139too`, `r8169`. The
+shim provides `net_device`, `sk_buff`, NAPI, PCI/DMA/IRQ, timers, workqueues and locks —
+a few thousand lines before the first driver runs, after which each new driver is cheap.
+Only the drivers come from Linux: the TCP/IP stack above `net_device` is lwIP or ours.
+Licence note: those drivers are GPLv2, so a MyOS image that includes them is effectively
+GPLv2 too; MyOS has no licence file yet — pick one before step 10.
+
 Decided (2026-10-01): **file systems and the VFS run in the kernel**, so every `read()` stays
 one syscall with no extra context switches. (Block *device drivers* still move to user space.)
 

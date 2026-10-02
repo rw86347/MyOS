@@ -44,7 +44,7 @@ int main(int argc, char **argv)
     CHECK((st.stx_mode & S_IFMT) == S_IFREG && st.stx_size == (uint64_t)n);
     CHECK(statx(fd, "", AT_EMPTY_PATH, STATX_BASIC_STATS, &st) == 0);
     CHECK(st.stx_size == (uint64_t)n);
-    CHECK(statx(AT_FDCWD, "/data", 0, STATX_BASIC_STATS, &st) == 0);
+    CHECK(statx(AT_FDCWD, "/test", 0, STATX_BASIC_STATS, &st) == 0);
     CHECK((st.stx_mode & S_IFMT) == S_IFDIR);
 
     /* 3. lseek, then read from the middle. */
@@ -59,11 +59,11 @@ int main(int argc, char **argv)
     /* 5. Errors. */
     CHECK(open("/nope", O_RDONLY) == -ENOENT);
     CHECK(open("/README.txt/x", O_RDONLY) == -ENOTDIR);
-    CHECK(open("/README.txt", O_WRONLY) == -EROFS);
+    CHECK(open("/test", O_WRONLY) == -EISDIR);
     CHECK(lseek(1, 0, SEEK_SET) == -ESPIPE);    /* the console can't seek */
 
     /* 6. A path with "..", "." and no leading "/". */
-    fd = open("data/../data/./numbers.txt", O_RDONLY);
+    fd = open("test/../test/./numbers.txt", O_RDONLY);
     CHECK(fd >= 3);
 
     /* 7. Read the 110 KB file in 1000-byte pieces: it must be exactly the

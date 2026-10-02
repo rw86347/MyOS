@@ -12,6 +12,7 @@
  * registers. When we switch back to it later, it finishes the interrupt with
  * `iret` and carries on as if nothing happened.
  */
+#include <cycles.h>
 #include <gdt.h>
 #include <interrupts.h>
 #include <kheap.h>
@@ -270,6 +271,28 @@ void thread_yield(void)
     irq_restore(flags);
 }
 
+/* --- idle time ---------------------------------------------------------- */
+
+/* Cycles the CPU spent halted, waiting for an interrupt: `top` and
+   /proc/stat show it, and benchmarks subtract it to count only work.
+   (It includes the interrupt handler that ends each wait.) */
+static uint64_t idle_cycles;
+
+uint64_t cpu_idle_cycles(void)
+{
+    uint32_t flags = irq_save();
+    uint64_t c = idle_cycles;
+    irq_restore(flags);
+    return c;
+}
+
+void cpu_idle(void)                     /* interrupts off, and off again after */
+{
+    uint64_t t = cycles_now();
+    __asm__ volatile ("sti; hlt; cli");     /* `sti; hlt` can't miss an IRQ */
+    idle_cycles += cycles_now() - t;
+}
+
 void thread_exit(void)
 {
     /* We can't free our own stack — we're standing on it. new_thread()
@@ -279,7 +302,7 @@ void thread_exit(void)
     generation++;
     for (;;) {
         thread_switch(sched_pick(1));
-        __asm__ volatile ("sti; hlt; cli");     /* nobody to run: wait */
+        cpu_idle();                             /* nobody to run: wait */
     }
 }
 
@@ -319,7 +342,7 @@ void wq_sleep(struct wait_queue *q)
         /* Back here without having slept means nobody else could run:
            wait for an interrupt (`sti; hlt` can't miss one in between). */
         if (current->state == THREAD_BLOCKED)
-            __asm__ volatile ("sti; hlt; cli");
+            cpu_idle();
     }
 }
 

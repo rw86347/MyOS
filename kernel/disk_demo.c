@@ -8,12 +8,10 @@
  * Temporary: once we have a VFS, syscalls and a shell, `ls` and `cat`
  * will do this job instead.
  */
-#include <ata.h>
 #include <blockdev.h>
 #include <disk_demo.h>
 #include <fat32.h>
 #include <kprintf.h>
-#include <partition.h>
 #include <selftest.h>
 #include <string.h>
 
@@ -108,15 +106,8 @@ static void run_tests(struct fat32_fs *fs)
 
 void disk_demo(void)
 {
-    ata_init();
-
-    /* Scan each whole disk for partitions. Remember the count first, since
-       scanning adds the partitions to the same device list. */
-    int ndisks = blockdev_count();
-    for (int i = 0; i < ndisks; i++)
-        partition_scan(blockdev_get(i));
-
-    /* Try to mount every partition as FAT32. */
+    /* (The disks and their partitions were found at boot: storage_init.)
+       Try to mount every partition as FAT32. */
     static struct fat32_fs fs;
     for (int i = 0; i < blockdev_count(); i++) {
         struct blockdev *dev = blockdev_get(i);

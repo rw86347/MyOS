@@ -59,6 +59,7 @@ static struct process *proc_alloc(void)
             p->pid = next_pid++;
             p->state = PROC_ALIVE;
             p->cwd = vfs_root();
+            vfs_get(p->cwd);
             p->umask = 022;
             p->pgid = p->sid = p->pid;  /* its own group and session */
             return p;
@@ -69,7 +70,21 @@ static struct process *proc_alloc(void)
 
 static void reap(struct process *p)
 {
+    if (p->cwd) {                       /* a process that never ran */
+        vfs_put(p->cwd);
+        p->cwd = NULL;
+    }
     p->state = PROC_FREE;
+}
+
+/* A process's current directory is in use: if it's deleted, it stays
+   around (empty) until the process moves on. */
+void proc_set_cwd(struct process *p, struct inode *dir)
+{
+    vfs_get(dir);
+    if (p->cwd)
+        vfs_put(p->cwd);
+    p->cwd = dir;
 }
 
 /* The name a program's thread gets: "/bin/hello" -> "hello". */
@@ -188,7 +203,7 @@ int proc_fork_frame(const struct regs *frame, struct process **child_out)
         return -ENOMEM;
     }
     child->parent = parent;
-    child->cwd = parent->cwd;
+    proc_set_cwd(child, parent->cwd);
     child->umask = parent->umask;
     child->pgid = parent->pgid;         /* same job, same session */
     child->sid = parent->sid;
@@ -326,6 +341,8 @@ void proc_exit(int status)
     irq_save();
 
     fd_close_all(p);
+    vfs_put(p->cwd);
+    p->cwd = NULL;
     struct mm *mm = p->mm;
     mm_switch(mm_kernel());             /* can't free the space we stand in */
     p->mm = mm_kernel();

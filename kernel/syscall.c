@@ -12,6 +12,7 @@
  * copy_from_user() & co. (uaccess.h): a range check, then a copy that turns
  * a fault into -EFAULT.
  */
+#include <bcache.h>
 #include <kprintf.h>
 #include <mm.h>
 #include <proc.h>
@@ -59,7 +60,7 @@ SYSCALL(sys_write)
 
 /* The directory a *at() call's dirfd means: NULL for AT_FDCWD (the
    current directory), else the open directory. 0, or -errno. */
-static int dir_of(uint32_t dirfd, struct inode **dir)
+int dir_of(uint32_t dirfd, struct inode **dir)
 {
     if ((int32_t)dirfd == AT_FDCWD) {
         *dir = NULL;
@@ -75,7 +76,7 @@ static int dir_of(uint32_t dirfd, struct inode **dir)
 }
 
 /* Copy a path from user memory. 0, or -errno. */
-static int get_path(char *dst, uint32_t user_path)
+int get_path(char *dst, uint32_t user_path)
 {
     long n = strncpy_from_user(dst, (const char *)user_path, PATH_MAX);
     if (n < 0)
@@ -83,14 +84,16 @@ static int get_path(char *dst, uint32_t user_path)
     return n == 0 ? -ENOENT : 0;    /* "" is not a file name */
 }
 
-static int32_t do_open(struct inode *dir, uint32_t user_path, uint32_t flags)
+int32_t do_open(struct inode *dir, uint32_t user_path, uint32_t flags, uint32_t mode)
 {
     char path[PATH_MAX];
     int err = get_path(path, user_path);
     if (err)
         return err;
     struct file *f;
-    err = vfs_open_at(dir, path, flags, &f);
+    if (flags & O_CREAT)
+        mode &= ~proc_current()->umask;
+    err = vfs_open_at(dir, path, flags, mode, &f);
     if (err)
         return err;
     int fd = fd_install(f);
@@ -104,7 +107,13 @@ static int32_t do_open(struct inode *dir, uint32_t user_path, uint32_t flags)
 /* int open(const char *path, int flags, mode_t mode) */
 SYSCALL(sys_open)
 {
-    return do_open(NULL, a1, a2);
+    return do_open(NULL, a1, a2, a3);
+}
+
+/* int creat(const char *path, mode_t mode): an old spelling of open */
+SYSCALL(sys_creat)
+{
+    return do_open(NULL, a1, O_CREAT | O_WRONLY | O_TRUNC, a2);
 }
 
 /* int openat(int dirfd, const char *path, int flags, mode_t mode) */
@@ -112,7 +121,7 @@ SYSCALL(sys_openat)
 {
     struct inode *dir;
     int err = dir_of(a1, &dir);
-    return err ? err : do_open(dir, a2, a3);
+    return err ? err : do_open(dir, a2, a3, a4);
 }
 
 /* int close(int fd) */
@@ -127,8 +136,14 @@ static int64_t do_seek(uint32_t fd, int64_t off, uint32_t whence)
     struct file *f = fd_get(fd);
     if (!f)
         return -EBADF;
-    if (S_ISCHR(f->inode->mode))
-        return -ESPIPE;             /* the console has no position */
+    if (S_ISCHR(f->inode->mode) || S_ISFIFO(f->inode->mode))
+        return -ESPIPE;             /* the console and pipes have no position */
+    if (S_ISDIR(f->inode->mode)) {
+        if (off != 0 || whence != SEEK_SET)
+            return -EINVAL;         /* directories: only rewinddir() */
+        vfs_dir_rewind(f);
+        return 0;
+    }
     int64_t base = whence == SEEK_SET ? 0 : whence == SEEK_CUR ? (int64_t)f->pos
                  : whence == SEEK_END ? (int64_t)f->inode->size : -1;
     if (base < 0)
@@ -207,11 +222,13 @@ SYSCALL(sys_statx)
     st.stx_uid = i->uid;
     st.stx_gid = i->gid;
     st.stx_mode = (uint16_t)i->mode;
-    st.stx_ino = i->ino;
+    st.stx_ino = i->fs ? i->fs_ino : i->ino;   /* a disk's own number: stable */
     st.stx_size = i->size;
     st.stx_blocks = (i->size + 511) / 512;
-    st.stx_atime.tv_sec = st.stx_ctime.tv_sec = st.stx_mtime.tv_sec = i->mtime;
-    st.stx_dev_minor = 1;           /* the initramfs is "device 0:1" */
+    st.stx_atime.tv_sec = i->atime ? i->atime : i->mtime;
+    st.stx_mtime.tv_sec = i->mtime;
+    st.stx_ctime.tv_sec = i->ctime ? i->ctime : i->mtime;
+    st.stx_dev_minor = i->mnt ? i->mnt->dev_minor : 1;  /* RAM: "device 0:1" */
     st.stx_rdev_major = i->rdev >> 8;
     st.stx_rdev_minor = i->rdev & 0xFF;
     return copy_to_user((void *)a5, &st, sizeof st);
@@ -327,8 +344,8 @@ SYSCALL(sys_fcntl)
 /* ssize_t getdents64(int fd, struct linux_dirent64 *buf, size_t count)
    — reading a directory (what `ls` uses). Each entry: inode number,
    offset of the next, its own length (8-aligned), type, name + NUL.
-   The file remembers the next entry, so a big directory read in many
-   calls costs O(entries), not O(entries squared). */
+   The open directory keeps its place (a cursor, vfs.c), so a big
+   directory read in many calls costs O(entries), not O(entries squared). */
 #define DT_FIFO 1
 #define DT_CHR  2
 #define DT_DIR  4
@@ -358,6 +375,8 @@ SYSCALL(sys_getdents64)
 
     uint8_t rec[19 + NAME_MAX + 1 + 8] __attribute__((aligned(8)));
     uint32_t written = 0;
+    struct inode *next = vfs_dir_first(f), *last = NULL;
+    int ended = 0;
     for (;;) {
         const char *name;
         uint32_t len;
@@ -365,11 +384,14 @@ SYSCALL(sys_getdents64)
         if (f->pos == 0) {              /* "." and ".." come first */
             name = ".", len = 1, i = dir;
         } else if (f->pos == 1) {
-            name = "..", len = 2, i = dir->parent;
+            name = "..", len = 2;
+            i = (dir->flags & I_UNLINKED) ? dir : dir->parent;
         } else {
-            i = f->priv;
-            if (!i)
-                break;                  /* that was all */
+            i = next;
+            if (!i) {
+                ended = 1;              /* that was all */
+                break;
+            }
             name = i->name, len = i->name_len;
         }
         uint32_t reclen = (19 + len + 1 + 7) & ~7u;
@@ -378,7 +400,7 @@ SYSCALL(sys_getdents64)
                 return -EINVAL;         /* buffer too small for one entry */
             break;
         }
-        uint64_t ino = i->ino, off = f->pos + 1;
+        uint64_t ino = i->fs ? i->fs_ino : i->ino, off = f->pos + 1;
         memcpy(rec, &ino, 8);
         memcpy(rec + 8, &off, 8);
         memcpy(rec + 16, &reclen, 2);
@@ -388,9 +410,18 @@ SYSCALL(sys_getdents64)
         if (copy_to_user((uint8_t *)a2 + written, rec, reclen) < 0)
             return -EFAULT;
         written += reclen;
-        if (f->pos >= 2)
-            f->priv = i->next_sibling;
+        if (f->pos >= 2) {
+            last = i;
+            next = vfs_dir_after(i);
+        }
         f->pos++;
+    }
+    /* Remember where we stopped. (Nothing can change the directory during
+       this call: syscalls run with interrupts off.) */
+    if (ended || last) {
+        int err = vfs_dir_stop(f, ended ? NULL : last);
+        if (err)
+            return err;
     }
     return written;
 }
@@ -407,7 +438,7 @@ SYSCALL(sys_chdir)
         return err;
     if (!S_ISDIR(i->mode))
         return -ENOTDIR;
-    proc_current()->cwd = i;
+    proc_set_cwd(proc_current(), i);
     return 0;
 }
 
@@ -418,7 +449,7 @@ SYSCALL(sys_fchdir)
         return -EBADF;
     if (!S_ISDIR(f->inode->mode))
         return -ENOTDIR;
-    proc_current()->cwd = f->inode;
+    proc_set_cwd(proc_current(), f->inode);
     return 0;
 }
 
@@ -430,6 +461,8 @@ SYSCALL(sys_getcwd)
     uint32_t at = PATH_MAX;
     path[--at] = '\0';
     struct inode *i = proc_current()->cwd;
+    if (i->flags & I_UNLINKED)
+        return -ENOENT;                 /* our directory was deleted */
     if (i == vfs_root())
         path[--at] = '/';
     for (; i != vfs_root(); i = i->parent) {
@@ -510,9 +543,8 @@ SYSCALL(sys_readlinkat)
 
 /* int access(const char *path, int mode) / faccessat(dirfd, path, mode, flags).
    We're all root: everything exists-and-allowed, except executing a file
-   with no x bit, and writing the read-only initramfs. */
+   with no x bit. */
 #define X_OK 1
-#define W_OK 2
 
 static int32_t do_access(struct inode *dir, uint32_t user_path, uint32_t mode)
 {
@@ -525,8 +557,6 @@ static int32_t do_access(struct inode *dir, uint32_t user_path, uint32_t mode)
         return err;
     if ((mode & X_OK) && !S_ISDIR(i->mode) && !(i->mode & 0111))
         return -EACCES;
-    if ((mode & W_OK) && !i->ops && !S_ISDIR(i->mode))
-        return -EROFS;
     return 0;
 }
 
@@ -538,12 +568,13 @@ SYSCALL(sys_faccessat)
     return err ? err : do_access(dir, a2, a3);
 }
 
-/* Anything that would change the file system: the initramfs is read-only
-   (a writable tmpfs comes later). A clear error beats "not implemented". */
-SYSCALL(sys_rofs) { return -EROFS; }
-
-/* fsync, sync, madvise, set_robust_list...: nothing to do, success. */
+/* madvise, set_robust_list...: nothing to do, success. */
 SYSCALL(sys_nop) { return 0; }
+
+/* sync(): write every changed disk block now. fsync(fd) / fdatasync(fd):
+   the same (the cache doesn't know which blocks belong to which file). */
+SYSCALL(sys_sync)  { bsync(); return 0; }
+SYSCALL(sys_fsync) { return fd_get(a1) ? bsync() : -EBADF; }
 
 /* No networking yet (step 10), so no fd is a socket. Programs ask anyway:
    bash checks whether its input is a network connection (getpeername). */
@@ -718,38 +749,40 @@ SYSCALL(sys_clone)
 static const syscall_fn syscall_table[] = {
     [NR_exit]       = sys_exit,
     [NR_fork]       = sys_fork,
-    [NR_creat]      = sys_rofs,
-    [NR_link]       = sys_rofs,
-    [NR_unlink]     = sys_rofs,
+    [NR_creat]      = sys_creat,
+    [NR_link]       = sys_link,
+    [NR_unlink]     = sys_unlink,
     [NR_time]       = sys_time,
-    [NR_mknod]      = sys_rofs,
-    [NR_chmod]      = sys_rofs,
+    [NR_mknod]      = sys_mknod,
+    [NR_chmod]      = sys_chmod,
     [NR_getuid]     = sys_getid,
     [NR_getgid]     = sys_getid,
     [NR_geteuid]    = sys_getid,
     [NR_getegid]    = sys_getid,
-    [NR_sync]       = sys_nop,
-    [NR_rename]     = sys_rofs,
-    [NR_mkdir]      = sys_rofs,
-    [NR_rmdir]      = sys_rofs,
+    [NR_sync]       = sys_sync,
+    [NR_rename]     = sys_rename,
+    [NR_mkdir]      = sys_mkdir,
+    [NR_rmdir]      = sys_rmdir,
     [NR_setrlimit]  = sys_setrlimit,
     [NR_getrlimit]  = sys_getrlimit,
     [NR_gettimeofday] = sys_gettimeofday,
-    [NR_symlink]    = sys_rofs,
-    [NR_truncate]   = sys_rofs,
-    [NR_ftruncate]  = sys_rofs,
-    [NR_fchmod]     = sys_rofs,
+    [NR_symlink]    = sys_symlink,
+    [NR_truncate]   = sys_truncate,
+    [NR_ftruncate]  = sys_ftruncate,
+    [NR_fchmod]     = sys_fchmod,
     [NR_sysinfo]    = sys_sysinfo,
-    [NR_fsync]      = sys_nop,
+    [NR_fsync]      = sys_fsync,
     [NR_clone]      = sys_clone,
     [NR_uname]      = sys_uname,
     [NR_mprotect]   = sys_mprotect,
     [NR__newselect] = sys_select,
-    [NR_fdatasync]  = sys_nop,
+    [NR_fdatasync]  = sys_fsync,
     [NR_nanosleep]  = sys_nanosleep,
     [NR_poll]       = sys_poll,
     [NR_ugetrlimit] = sys_getrlimit,
-    [NR_lchown32]   = sys_rofs,
+    [NR_truncate64] = sys_truncate64,
+    [NR_ftruncate64] = sys_ftruncate64,
+    [NR_lchown32]   = sys_lchown32,
     [NR_getuid32]   = sys_getid,
     [NR_getgid32]   = sys_getid,
     [NR_geteuid32]  = sys_getid,
@@ -758,12 +791,12 @@ static const syscall_fn syscall_table[] = {
     [NR_setregid32] = sys_setid,
     [NR_getgroups32] = sys_getgroups,
     [NR_setgroups32] = sys_nop,
-    [NR_fchown32]   = sys_rofs,
+    [NR_fchown32]   = sys_fchown32,
     [NR_setresuid32] = sys_setid,
     [NR_getresuid32] = sys_getresid,
     [NR_setresgid32] = sys_setid,
     [NR_getresgid32] = sys_getresid,
-    [NR_chown32]    = sys_rofs,
+    [NR_chown32]    = sys_chown32,
     [NR_setuid32]   = sys_setid,
     [NR_setgid32]   = sys_setid,
     [NR_setfsuid32] = sys_getid,        /* returns the old fs uid: 0 */
@@ -773,21 +806,25 @@ static const syscall_fn syscall_table[] = {
     [NR_set_thread_area] = sys_set_thread_area,
     [NR_get_thread_area] = sys_get_thread_area,
     [NR_set_tid_address] = sys_set_tid_address,
+    [NR_statfs64]   = sys_statfs64,
+    [NR_fstatfs64]  = sys_fstatfs64,
     [NR_clock_gettime]   = sys_clock_gettime,
     [NR_clock_getres]    = sys_clock_getres,
     [NR_clock_nanosleep] = sys_clock_nanosleep,
-    [NR_mkdirat]    = sys_rofs,
-    [NR_fchownat]   = sys_rofs,
-    [NR_unlinkat]   = sys_rofs,
-    [NR_renameat]   = sys_rofs,
-    [NR_linkat]     = sys_rofs,
-    [NR_symlinkat]  = sys_rofs,
-    [NR_fchmodat]   = sys_rofs,
+    [NR_mkdirat]    = sys_mkdirat,
+    [NR_mknodat]    = sys_mknodat,
+    [NR_fchownat]   = sys_fchownat,
+    [NR_unlinkat]   = sys_unlinkat,
+    [NR_renameat]   = sys_renameat,
+    [NR_linkat]     = sys_link,
+    [NR_symlinkat]  = sys_symlinkat,
+    [NR_fchmodat]   = sys_fchmodat,
     [NR_set_robust_list] = sys_nop,
     [NR_pselect6]   = sys_pselect32,
     [NR_ppoll]      = sys_ppoll32,
-    [NR_utimensat]  = sys_rofs,
+    [NR_utimensat]  = sys_utimensat,
     [NR_prlimit64]  = sys_prlimit64,
+    [NR_renameat2]  = sys_renameat2,
     [NR_getrandom]  = sys_getrandom,
     [NR_socketcall] = sys_socketcall,
     [NR_getsockname] = sys_notsock,
@@ -795,6 +832,7 @@ static const syscall_fn syscall_table[] = {
     [NR_clock_gettime64]  = sys_clock_gettime64,
     [NR_clock_getres_time64] = sys_clock_getres64,
     [NR_clock_nanosleep_time64] = sys_clock_nanosleep64,
+    [NR_utimensat_time64] = sys_utimensat64,
     [NR_pselect6_time64] = sys_pselect64,
     [NR_ppoll_time64]    = sys_ppoll64,
     [NR_read]       = sys_read,

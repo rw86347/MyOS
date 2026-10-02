@@ -11,7 +11,11 @@
  *   make test    SELFTEST: runs the self-tests, then the normal loop
  *   make bench   BENCH: runs the benchmarks, then switches QEMU off
  */
+#include <ata.h>
+#include <bcache.h>
+#include <blockdev.h>
 #include <cpu.h>
+#include <ext2.h>
 #include <cycles.h>
 #include <fpu.h>
 #include <gdt.h>
@@ -25,6 +29,7 @@
 #include <proc.h>
 #include <vfs.h>
 #include <paging.h>
+#include <partition.h>
 #include <pmm.h>
 #include <sched.h>
 #include <serial.h>
@@ -98,6 +103,35 @@ static void echo(int c)
         kprintf("%c", c);
 }
 
+/* Does any partition live on this disk? */
+static int has_partitions(struct blockdev *disk)
+{
+    for (int i = 0; i < blockdev_count(); i++)
+        if (blockdev_get(i)->parent == disk)
+            return 1;
+    return 0;
+}
+
+/* Disks: find them and their partitions. The first ext2 file system on
+   them — a Linux partition (type 0x83), or a whole disk with no partition
+   table — becomes /data: files there survive a restart. */
+static void storage_init(void)
+{
+    ata_init();
+    int ndisks = blockdev_count();      /* scanning adds the partitions */
+    for (int i = 0; i < ndisks; i++)
+        partition_scan(blockdev_get(i));
+    bcache_init();                      /* and their blocks, cached */
+
+    for (int i = 0; i < blockdev_count(); i++) {
+        struct blockdev *d = blockdev_get(i);
+        if (d->parent ? partition_type(d) != 0x83 : has_partitions(d))
+            continue;
+        if (ext2_mount(d, "/data") == 0)
+            break;
+    }
+}
+
 void kernel_main(void)
 {
 #ifdef BENCH
@@ -133,6 +167,7 @@ void kernel_main(void)
     time_init();            /* the date and time, from the CMOS clock */
     initrd_init();          /* the initramfs stage 2 loaded */
     thread_init();          /* kernel_main becomes thread 0, "main" */
+    storage_init();         /* IDE disks and their partitions */
 
 #if defined(SELFTEST)
     run_selftests();        /* ends with the slot scheduler running */

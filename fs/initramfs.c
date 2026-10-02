@@ -77,7 +77,7 @@ void initramfs_load(const uint8_t *a, uint32_t size)
             return;
         }
         uint32_t mode = hex8(h + 14), uid = hex8(h + 22), gid = hex8(h + 30);
-        uint32_t nlink = hex8(h + 38), mtime = hex8(h + 46);
+        uint32_t mtime = hex8(h + 46);
         uint32_t filesize = hex8(h + 54), namesize = hex8(h + 94);
         uint32_t rdev = (hex8(h + 78) << 8) | hex8(h + 86);    /* devices */
 
@@ -106,8 +106,7 @@ void initramfs_load(const uint8_t *a, uint32_t size)
             i->gid = gid;
             i->mtime = mtime;
             if (!S_ISDIR(mode)) {
-                i->nlink = nlink;
-                i->size = filesize;
+                i->size = filesize;     /* (nlink stays 1: no hard links) */
                 i->data = a + data_off;     /* zero-copy: points into the archive
                                                (a symlink's data is its target) */
             }

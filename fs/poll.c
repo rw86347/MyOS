@@ -14,6 +14,9 @@
 #include <timer.h>
 #include <uaccess.h>
 #include <vfs.h>
+#ifdef BENCH
+#include <bench.h>
+#endif
 
 #define POLLIN   0x001
 #define POLLOUT  0x004
@@ -60,6 +63,9 @@ static int32_t do_poll(struct pollfd *p, uint32_t n, int32_t timeout_ms)
             return ready;
         if (signal_pending())
             return -EINTR;
+#ifdef BENCH
+        bench_input_wait();
+#endif
         if (wq_sleep_until(&poll_wait, deadline))
             return scan(p, n);          /* time's up: one last look */
     }

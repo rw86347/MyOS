@@ -63,7 +63,9 @@ VirtualBox: convert it first, then attach myos.vdi as the disk of a new
 
 WHAT DOESN'T WORK YET
 ---------------------
-- Files can't be created or changed yet (everything is read-only).
+- Files can be created, edited, moved and deleted, but only in memory:
+  everything you change is gone when you switch off (nothing is written
+  back to the USB stick yet).
 - No network, no sound, no mouse, no graphics — text screen only.
 - ps, top, free, df, mount: coming next. Ctrl-Z / fg / bg: not yet.
 

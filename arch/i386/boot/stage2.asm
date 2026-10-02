@@ -5,9 +5,10 @@
 ; Our jobs:
 ;   1. ask the BIOS for the memory map (E820) — only possible in real mode
 ;   2. enable the A20 line, so memory above 1 MiB is reachable
-;   3. load the kernel to 1 MiB and the initramfs right after it
+;   3. show the boot picture (VGA mode 13h, 320x200) and load the kernel
+;      to 1 MiB and the initramfs right after it, with a progress bar
 ;   4. leave a note for the kernel at BOOTINFO (bootinfo.h)
-;   5. switch to 32-bit protected mode and jump to the kernel
+;   5. back to text mode, then 32-bit protected mode and jump to the kernel
 ;
 ; The tricky part is 3. In real mode the BIOS disk call can only write into
 ; the first 1 MiB of memory. So we load in chunks: read 32 KiB into a
@@ -17,6 +18,7 @@
 ; when booting from a USB stick or CD on real hardware too.
 ;
 ; Passed in by the Makefile with -D:
+;   SPLASH_LBA, SPLASH_SECTORS       the 320x200 picture (tools/mksplash.py)
 ;   KERNEL_LBA, KERNEL_SECTORS       where kernel.bin is on the disk
 ;   INITRD_LBA, INITRD_SECTORS       where the initramfs is on the disk
 ;   INITRD_BYTES                     its exact size
@@ -34,9 +36,6 @@ stage2:
     mov es, ax
     mov [boot_drive], dl
 
-    mov si, msg_stage2
-    call print16
-
     ; --- 1. Memory map --------------------------------------------------------
     call read_e820
 
@@ -50,7 +49,15 @@ stage2:
     and al, 0xFE                ; never write bit 0 (it resets the machine!)
     out 0x92, al
 
-    ; --- 3. Load the kernel and the initramfs -------------------------------------
+    ; --- 3. Picture, then the kernel and the initramfs --------------------------
+    ; Mode 13h while still in real mode: the BIOS call goes away once we
+    ; enter protected mode. The picture is one byte per pixel at 0xA0000.
+    call graphics_on
+    call load_logo
+    mov dword [prog_done], 0
+    mov dword [prog_total], KERNEL_SECTORS + INITRD_SECTORS
+    call draw_bar
+
     mov eax, KERNEL_LBA
     mov ecx, KERNEL_SECTORS
     mov edi, KERNEL_LOAD
@@ -61,12 +68,12 @@ stage2:
     mov edi, INITRD_LOAD
     call load
 
+    call hold                       ; so the picture can be seen; QEMU loads fast
+    call graphics_off               ; kernel console is the VGA text screen
+
     ; --- 4. Tell the kernel where the initramfs is ------------------------------
     mov dword [BOOTINFO + 0], INITRD_LOAD
     mov dword [BOOTINFO + 4], INITRD_BYTES
-
-    mov si, msg_done
-    call print16
 
     ; --- 5. Switch to protected mode ------------------------------------------
     cli                         ; BIOS interrupt handlers are 16-bit: keep them off
@@ -80,7 +87,7 @@ stage2:
 
 ; -----------------------------------------------------------------------------
 ; load: copy ECX sectors, starting at disk sector EAX, to physical address EDI
-; (anywhere in memory, also above 1 MiB). Prints a dot per 32 KiB chunk.
+; (anywhere in memory, also above 1 MiB). Advances the progress bar per chunk.
 ; -----------------------------------------------------------------------------
 load:
 .next:
@@ -91,9 +98,46 @@ load:
     jbe .read
     mov ebx, CHUNK_SECTORS
 .read:
-    ; a. disk -> bounce buffer, BIOS int 0x13 AH=0x42 (as in the MBR)
+    call read_bounce            ; disk -> bounce buffer
+
+    ; bounce buffer -> EDI, BIOS int 0x15 AH=0x87. The BIOS wants a little
+    ; GDT (move_gdt) whose entries 2 and 3 describe the source and the
+    ; destination; we patch the destination's base address = EDI.
+    mov edx, edi
+    mov [move_dst + 2], dx      ; base bits 0-15
+    shr edx, 16
+    mov [move_dst + 4], dl      ; base bits 16-23
+    mov [move_dst + 7], dh      ; base bits 24-31
+    push ax                     ; (EAX is the disk sector we're at: keep it)
+    xor ax, ax                  ; ES must be 0: the GDT lives in the first 64 KiB
+    mov es, ax
+    pop ax
+    pushad
+    mov cx, bx
+    shl cx, 8                   ; CX = 16-bit words to copy (sectors * 256)
+    mov si, move_gdt            ; ES:SI = the table
+    mov ah, 0x87
+    int 0x15
+    popad
+    jc move_error
+    add [prog_done], ebx
+    call draw_bar
+
+    ; next chunk
+    add eax, ebx                ; next disk sector
+    sub ecx, ebx                ; sectors left
+    shl ebx, 9                  ; sectors -> bytes
+    add edi, ebx                ; next destination
+    jmp .next
+.done:
+    ret
+
+; read_bounce: BIOS read of EBX sectors at LBA EAX into the bounce buffer.
+read_bounce:
     mov [dap_count], bx
     mov [dap_lba], eax
+    mov word [dap_off], 0
+    mov word [dap_seg], BOUNCE >> 4
     pushad                      ; BIOS calls may change registers
     mov si, dap                 ; (pushad/popad don't touch the flags, so
     mov ah, 0x42                ;  the carry flag survives popad)
@@ -101,33 +145,145 @@ load:
     int 0x13
     popad
     jc disk_error
+    ret
 
-    ; b. bounce buffer -> EDI, BIOS int 0x15 AH=0x87. The BIOS wants a little
-    ;    GDT (move_gdt) whose entries 2 and 3 describe the source and the
-    ;    destination; we patch the destination's base address = EDI.
-    mov edx, edi
-    mov [move_dst + 2], dx      ; base bits 0-15
-    shr edx, 16
-    mov [move_dst + 4], dl      ; base bits 16-23
-    mov [move_dst + 7], dh      ; base bits 24-31
-    pushad
-    mov cx, bx
-    shl cx, 8                   ; CX = 16-bit words to copy (sectors * 256)
-    mov si, move_gdt            ; ES:SI = the table (ES = 0)
-    mov ah, 0x87
-    int 0x15
-    mov ax, 0x0E2E              ; print '.' — progress you can watch
+; graphics_on: 320x200, 256 colours. Palette entries 0..15 are a grey ramp
+; matching the bytes tools/mksplash.py writes (0 black, 15 white).
+graphics_on:
+    mov ax, 0x0013
     int 0x10
-    popad
-    jc move_error
+    mov dx, 0x3C8
+    xor al, al
+    out dx, al
+    inc dx                      ; 0x3C9, palette data
+    xor bx, bx
+.pel:
+    mov al, bl
+    mov ah, 63
+    mul ah                      ; ax = level * 63
+    mov cl, 15
+    div cl                      ; al = level * 63 / 15  (VGA DAC is 6-bit)
+    out dx, al
+    out dx, al
+    out dx, al
+    inc bx
+    cmp bx, 16
+    jb .pel
+    ret
 
-    ; c. next chunk
-    add eax, ebx                ; next disk sector
-    sub ecx, ebx                ; sectors left
-    shl ebx, 9                  ; sectors -> bytes
-    add edi, ebx                ; next destination
+graphics_off:
+    mov ax, 0x0003              ; 80x25 text, what the kernel console expects
+    int 0x10
+    ret
+
+; hold: ~2 seconds, so the picture is visible. QEMU finishes the disk copy
+; in a flash. The BIOS tick counter (int 0x1A) runs at 18.2 Hz. Disk and
+; video calls can come back with interrupts off, which freezes that counter,
+; so interrupts are turned on first. A spin cap keeps a broken clock from
+; hanging the boot.
+hold:
+    sti
+    call segs                   ; BIOS calls may return with DS changed
+    mov ah, 0
+    int 0x1A
+    call segs
+    mov [hold_tick], dx
+    mov dword [hold_spins], 0
+.wait:
+    mov ah, 0
+    int 0x1A
+    call segs
+    sub dx, [hold_tick]
+    cmp dx, 36                  ; 36/18.2 ≈ 2 seconds
+    jae .done
+    inc dword [hold_spins]
+    cmp dword [hold_spins], 2000000
+    jb .wait
+.done:
+    ret
+
+; segs: DS = ES = 0, which is where our data and the BIOS packet live.
+segs:
+    push ax
+    xor ax, ax
+    mov ds, ax
+    mov es, ax
+    pop ax
+    ret
+
+; load_logo: the picture is below 1 MiB, so the BIOS can read it into the
+; bounce buffer and we copy it onto the screen. 0xA0000 is mode 13h's buffer.
+load_logo:
+    mov eax, SPLASH_LBA
+    mov ecx, SPLASH_SECTORS
+    xor di, di
+.next:
+    test ecx, ecx
+    jz .done
+    mov ebx, ecx
+    cmp ebx, CHUNK_SECTORS
+    jbe .read
+    mov ebx, CHUNK_SECTORS
+.read:
+    call read_bounce
+    push eax
+    push ecx
+    push ds
+    mov ax, BOUNCE >> 4
+    mov ds, ax
+    mov ax, 0xA000
+    mov es, ax
+    xor si, si
+    mov cx, bx
+    shl cx, 8                   ; words = sectors * 256
+    cld
+    rep movsw                   ; di advances across the screen
+    pop ds
+    xor ax, ax
+    mov es, ax
+    pop ecx
+    pop eax
+    add eax, ebx
+    sub ecx, ebx
     jmp .next
 .done:
+    ret
+
+; draw_bar: a 300-pixel line near the bottom. Grey track, white fill for
+; prog_done/prog_total. Preserves every register load() is using.
+draw_bar:
+    pushad
+    push es
+    mov ax, 0xA000
+    mov es, ax
+    mov eax, [prog_done]
+    mov ebx, 300
+    mul ebx
+    cmp dword [prog_total], 0
+    je .empty
+    xor edx, edx
+    div dword [prog_total]
+    cmp eax, 300
+    jbe .width
+    mov eax, 300
+.width:
+    mov ecx, eax
+    jmp .paint
+.empty:
+    xor ecx, ecx
+.paint:
+    mov di, 198 * 320 + 10
+    push cx
+    mov cx, 300
+    mov al, 8
+    cld
+    rep stosb
+    pop cx
+    mov di, 198 * 320 + 10
+    mov al, 15
+    rep stosb
+    pop es
+    popad
     ret
 
 ; -----------------------------------------------------------------------------
@@ -168,6 +324,7 @@ disk_error:
 move_error:
     mov si, msg_move_error
 fail:
+    call graphics_off           ; errors are printed on the text screen
     call print16
 .hang:
     hlt
@@ -260,15 +417,19 @@ dap:                            ; Disk Address Packet for int 0x13 / ah=0x42
     db 0x10                     ; size of this packet (16 bytes)
     db 0
 dap_count:
-    dw 0                        ; number of sectors (set by load)
-    dw 0                        ; destination offset  } BOUNCE
-    dw BOUNCE >> 4              ; destination segment }
+    dw 0                        ; number of sectors (set by read_bounce)
+dap_off:
+    dw 0                        ; destination offset
+dap_seg:
+    dw 0                        ; destination segment
 dap_lba:
-    dq 0                        ; starting sector (set by load)
+    dq 0                        ; starting sector (set by read_bounce)
 
 boot_drive:     db 0
-msg_stage2:     db "MyOS: stage 2 loading kernel + initramfs", 0
-msg_done:       db " ok", 13, 10, 0
+prog_done:      dd 0            ; sectors copied, for the progress bar
+prog_total:     dd 0
+hold_tick:      dw 0
+hold_spins:     dd 0            ; a cap, in case the BIOS clock never ticks
 msg_disk_error: db 13, 10, "MyOS: disk read error!", 13, 10, 0
 msg_move_error: db 13, 10, "MyOS: copy above 1 MiB failed!", 13, 10, 0
 

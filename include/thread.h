@@ -108,6 +108,13 @@ int wq_sleep_until(struct wait_queue *q, uint32_t deadline);
 /* Called by the timer every 1 ms: wake the timed sleepers that are due. */
 void thread_timer_tick(uint32_t now_ms);
 
+/* --- idle time --- */
+
+/* Halt until an interrupt, counting the time as idle (interrupts must be
+   off; they're off again afterwards). */
+void cpu_idle(void);
+uint64_t cpu_idle_cycles(void);         /* total so far */
+
 /* --- for the scheduler --- */
 
 /* Round robin: the next READY thread after the current one, or NULL. */

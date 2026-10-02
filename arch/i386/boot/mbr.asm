@@ -17,6 +17,7 @@
 ; Disk layout of build/myos.img:
 ;   sector 0 (LBA 0)                this MBR
 ;   LBA 1 .. STAGE2_SECTORS         stage 2 (stage2.asm)
+;   next                            the boot picture (stage 2 loads it; not us)
 ;   next                            kernel.bin
 ;   next                            initrd.cpio (the initramfs)
 ; =============================================================================

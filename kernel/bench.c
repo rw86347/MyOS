@@ -9,7 +9,9 @@
  * emulates the CPU in software, so a "cycle" there isn't a real Pentium 4
  * cycle. Real numbers come from running `make bench` on the old hardware.
  */
+#include <bcache.h>
 #include <bench.h>
+#include <blockdev.h>
 #include <cycles.h>
 #include <interrupts.h>
 #include <io.h>
@@ -20,6 +22,7 @@
 #include <string.h>
 #include <thread.h>
 #include <proc.h>
+#include <tty.h>
 
 static void report(const char *what, uint64_t total, uint32_t n)
 {
@@ -151,21 +154,98 @@ static void bench_slots(void)
             (uint32_t)(worst / cycles_per_us()));
 }
 
+/* --- disk ------------------------------------------------------------------ */
+
+/* Raw reads from the boot disk (hda), 64 KiB at a time, nothing cached.
+   Counted: the CPU's work only (port I/O, interrupts, thread switches),
+   not the time it sleeps waiting for the disk — in QEMU that wait jumps
+   the virtual clock ahead by however long the Mac took, so it changes
+   from run to run. A real disk's speed needs real hardware. */
+static void bench_disk(void)
+{
+    enum { N = 20, SECTORS = 128 };
+    static uint8_t buf[SECTORS * SECTOR_SIZE];
+    struct blockdev *hda = blockdev_count() ? blockdev_get(0) : NULL;
+    if (!hda)
+        return;
+    uint64_t idle = cpu_idle_cycles(), t = cycles_now();
+    for (int i = 0; i < N; i++)
+        if (blockdev_read(hda, i * SECTORS, SECTORS, buf) < 0) {
+            kprintf("  disk read failed\n");
+            return;
+        }
+    t = (cycles_now() - t - (cpu_idle_cycles() - idle)) / N;
+    kprintf("  %-28s %8lu cycles\n", "disk read 64 KiB, CPU work", (uint32_t)t);
+
+    /* The same block again and again: what a block-cache hit costs. */
+    enum { HITS = 1000 };
+    struct buf *b = bread(hda, 0, 4096);
+    if (!b)
+        return;
+    brelse(b);
+    t = cycles_now();
+    for (int i = 0; i < HITS; i++)
+        brelse(bread(hda, 0, 4096));
+    t = (cycles_now() - t) / HITS;
+    kprintf("  %-28s %8lu cycles\n", "bread + brelse (cached)", (uint32_t)t);
+}
+
+/* --- boot to a command line ----------------------------------------------- */
+
+static uint64_t shell_start, shell_ready;
+
+void bench_input_wait(void)
+{
+    if (shell_start && !shell_ready)
+        shell_ready = cycles_now();
+}
+
+/* Start /init the way a normal boot does (it starts bash) and time it
+   until the first program waits for a key: bash showing its prompt. That
+   is everything a person waits for after the kernel is ready — /init,
+   the dynamic linker, bash's libraries, /etc/profile. Returns microseconds. */
+static uint32_t bench_shell(void)
+{
+    static const char *const argv[] = { "/init", NULL };
+    static const char *const envp[] = {
+        "HOME=/", "PATH=/bin:/sbin:/usr/bin:/usr/sbin", "TERM=linux", NULL,
+    };
+    shell_start = cycles_now();
+    struct process *p = proc_spawn("/init", argv, envp);
+    if (!p)
+        return 0;
+    proc_set_init(p);
+    tty_set_foreground(p->pgid);
+    while (!shell_ready)
+        cpu_wait();
+    return (uint32_t)((shell_ready - shell_start) / cycles_per_us());
+}
+
 void run_benchmarks(uint64_t boot_start)
 {
     /* From the first line of kernel_main to here: everything the kernel
        does to get ready (the BIOS and boot loader come before). */
-    uint64_t ready = cycles_now();
+    /* Counted: the CPU's work. Time spent waiting for the disks (the boot
+       reads the partition tables and mounts /data) is shown apart: in QEMU
+       it's the virtual clock jumping by however long the Mac took, which
+       changes from run to run; on real hardware it's seek time. */
+    uint64_t ready = cycles_now(), waited = cpu_idle_cycles();
+    uint32_t ready_us = (uint32_t)((ready - boot_start - waited) / cycles_per_us());
     kprintf("Cycle counter: %lu MHz\n", cycles_per_us());
-    kprintf("Boot: kernel ready after %lu us\n",
-            (uint32_t)((ready - boot_start) / cycles_per_us()));
+    kprintf("Boot: kernel ready after %lu us of CPU work (+ %lu us waiting for disks)\n",
+            ready_us, (uint32_t)(waited / cycles_per_us()));
     kprintf("Benchmarks (average cycles per operation):\n");
     bench_memory();
     bench_kmalloc();
     bench_switch();
     bench_exec();
+    bench_disk();
     run_program("/bin/bench");                          /* prints its own lines */
-    bench_slots();                                      /* last: starts slots */
+    bench_slots();                      /* starts the slot scheduler */
+    uint32_t shell_us = bench_shell();  /* last: bash stays behind */
+    kprintf("  %-28s %8lu us\n", "/init + bash to a prompt", shell_us);
+    kprintf("Boot: command line ready after %lu us of CPU work (kernel ready + that)\n",
+            ready_us + shell_us);
     kprintf("Benchmarks done\n");
     serial_flush();                 /* everything out before QEMU stops */
 

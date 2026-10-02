@@ -110,11 +110,13 @@ static void test_kheap(void)
     check(ok, "kmalloc: 100 KiB block works");
     kfree(big);
 
-    /* After freeing everything, the heap is back where it started (small
-       objects that existed before — the file tree's inodes — stay), and
-       the big-block range is one free block again. */
+    /* After freeing everything, the heap is back where it started (blocks
+       that existed before — the file tree's inodes, a thread's stack —
+       stay): all the space we used is free again, including what the heap
+       grew by for the 100 KiB block. */
     kheap_stats(&used, &free_bytes, &mapped);
-    check(used == used0 && free_bytes + 16 == mapped, "kheap: fully merged after free");
+    check(used == used0 && free_bytes - free0 == mapped - mapped0,
+          "kheap: everything freed is free again (merged)");
 
     /* Small objects come from the direct map, big ones from the heap range. */
     void *s = kmalloc(SMALL_SIZE_MAX), *b = kmalloc(SMALL_SIZE_MAX + 1);

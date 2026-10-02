@@ -81,9 +81,6 @@ when it's fixed. File references point at the comment that mentions the gap.
   waiters); `select` handles fds 0-31 only.
 - **Time**: millisecond resolution; the CMOS clock is assumed to be UTC; no
   `settimeofday`, no `alarm`/`setitimer`/timers.
-- **No writable file system**: everything that would change files returns `-EROFS`
-  (bash can't save history, `/tmp` is read-only, `>` redirections to files fail). A tmpfs
-  is the next storage step.
 - **No networking**: socket calls fail (`getpeername` says "not a socket").
 - **`uname` says "Linux"** (programs check it to know which syscalls exist); the release
   is "6.1.0-MyOS". `getrandom` is not cryptographic (no entropy source).
@@ -91,10 +88,10 @@ when it's fixed. File references point at the comment that mentions the gap.
   without PAE (`PROT_NONE` would need unmapping).
 - **No address-space randomisation**: static PIEs always load at 0x00400000.
 - **Every program runs as root** (uid 0).
-- **Programs and mmap'd files only come from the initramfs** (`inode->data`); disk file
-  systems will need a page cache. File mappings are private copies (made per page on first
-  touch); `MAP_SHARED` file mappings behave like `MAP_PRIVATE` (nothing can be written
-  back anyway).
+- **File mappings are private copies** (made per page on first touch), so `MAP_SHARED`
+  file mappings behave like `MAP_PRIVATE`: a program writing through one doesn't change
+  the file. A program written at run time is copied into one buffer for the ELF loader
+  (initramfs programs are read in place). Disk file systems will need a page cache.
 - **Dynamic linking**: one interpreter level; the interpreter is put at the first free
   place in the mmap area (no randomisation).
 - **Arguments + environment: 64 KiB, 1024 entries; paths 255 bytes** (Linux: 128 KiB+, 4096).
@@ -105,26 +102,49 @@ when it's fixed. File references point at the comment that mentions the gap.
   but the faulting instruction runs again when it returns (like Linux).
 
 ## Disk / file systems
-- **ATA driver polls** instead of using IRQs 14/15, even though interrupts work now (the
-  comment in `drivers/ata.c` still says "we don't have interrupt handling yet").
-- **ATA is PIO only**; no DMA. Slow, but always works. (`drivers/ata.c`)
+- **ATA is PIO only**; no DMA: the CPU copies every byte (one interrupt per 8 KiB). Needs
+  a PCI scan to find the bus-master registers. (`drivers/ata.c`)
+- **Only legacy IDE ports** (0x1F0/0x170, IRQ 14/15): a controller in "native PCI" mode
+  (some SATA chipsets) isn't found. A channel whose IRQ never arrives is polled.
+- **The block cache is fixed at 256 blocks (1 MiB)** and writes back about once a second:
+  switching off loses up to ~1 s of changes (`sync` writes at once). Blocks are written in
+  cache order, not sorted by position; a failed write is reported and dropped (no retry).
+  `fsync` writes the whole cache. (`fs/bcache.c`)
 - **LBA28 only**: disks up to 128 GiB. LBA48 is a small addition. (`drivers/ata.c`)
 - **MBR partitions only**: no extended/logical partitions, no GPT. (`fs/partition.c`)
 - **FAT32 is read-only.** (`fs/fat32.c`)
 - **FAT32 long names are ASCII only**; other characters become `?`. (`fs/fat32.c`)
 - **Block devices live in a fixed-size array.** The comment says "no kmalloc yet" — we have
   kmalloc now. (`kernel/blockdev.c`)
-- **The VFS knows only the initramfs (read-only) and the console.** No ext2 yet (step 9),
-  FAT32 isn't plugged in, nothing can be written or created (`-EROFS`). (`fs/vfs.c`)
-- **Missing for a shell (step 8):** `getdents64` (listing a directory), `chdir` / a current
-  directory (relative paths start at `/`), `openat`/`statx` relative to a directory fd
-  (`-ENOSYS`), following symbolic links, `dup2`, `fcntl`.
-- **Reading the console returns end-of-file**: there's no way to wait for a key yet (needs
-  sleeping/blocking, step 8). (`fs/vfs.c`)
-- **One `read()` copies at most 256 KiB** (so a syscall never runs long with interrupts
-  off); programs and C libraries loop on short reads. (`fs/vfs.c`, `READ_MAX`)
-- **Open files belong to the thread** (`thread->files`, 32 fds); they become per process
-  with fork in step 8. Hard links in the cpio archive aren't merged.
+- **Only /data is on a disk** (step 9b): the rest of the tree is in RAM (the initramfs,
+  changeable), and changes outside /data are lost at power-off. Files in RAM may use at
+  most half of RAM, then writes get `-ENOSPC`. (`fs/ramfs.c`)
+- **ext2** (`fs/ext2.c`): the first ext2 file system found (a type-0x83 partition or a
+  whole disk without a partition table) is mounted at /data; no `mount`/`umount` calls
+  yet, no FAT32 in the VFS. No journal: switching off mid-change can leave the disk
+  inconsistent (e2fsck repairs it); the superblock stays "not cleanly unmounted" since
+  nothing unmounts. Refused: ext4 extents, 64-bit, flex_bg; mounted read-only: disks with
+  checksums or other features we can't keep up to date. A directory we change loses its
+  hash index (as with Linux's own ext2 driver). Hard links can't be made, and a file
+  with two names (made by Linux) becomes two separate nodes here, whose sizes can drift
+  apart until a reboot. Every directory looked at stays in memory (no eviction). File
+  data goes through the block cache: reading a block costs ~4 cache lookups (inode,
+  indirect blocks, data) — a page cache with the block list cached is step 11. One lock
+  per file system. Block allocation scans the group's bitmap (bounded by its size).
+  Times are 32-bit seconds. Only on IDE disks (the USB-stick image has no /data).
+- **No hard links**: a file and its name are one struct, so `link()` returns `-EPERM`
+  (what Linux says on FAT). Hard links in the cpio archive become separate files.
+- **No named pipes** (`mkfifo`: `mknod` of a FIFO returns `-EPERM`) and no block device
+  nodes. (`kernel/sys_fs.c`)
+- **Permissions are stored, not checked**: everyone is root, so `chmod`/`chown` only change
+  what `ls -l` shows. The one check: `execve` needs an x bit.
+- **Directories: `lseek` only rewinds** (to 0); `seekdir` to a saved place isn't supported.
+  Entries are listed newest first (`ls` sorts anyway).
+- **`atime` isn't updated by reads** (like mounting with `noatime`).
+- **Files are limited to 4 GiB** (32-bit sizes). A sparse file with a huge offset needs a
+  big page table (4 bytes per 4 KiB of file size). (`fs/ramfs.c`)
+- **One `read()`/`write()` copies at most 256 KiB** (so a syscall never runs long with
+  interrupts off); programs and C libraries loop on short counts. (`fs/ramfs.c`, `RW_MAX`)
 - **Paths are limited to 255 bytes** (Linux: 4096). (`include/vfs.h`, `PATH_MAX`)
 - **The initramfs is built at compile time**: editing a file in it means `make` again
   (the kernel itself isn't rebuilt, only the archive and the disk image).

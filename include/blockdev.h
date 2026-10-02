@@ -28,6 +28,8 @@ struct blockdev {
        negative on error. Partitions leave these NULL and use parent+offset. */
     int (*read)(struct blockdev *dev, uint32_t lba, uint32_t count, void *buf);
     int (*write)(struct blockdev *dev, uint32_t lba, uint32_t count, const void *buf);
+    /* Make written data permanent (a drive's own write cache). May be NULL. */
+    int (*flush)(struct blockdev *dev);
 
     struct blockdev *parent;    /* for partitions: the whole disk */
     uint32_t offset;            /* for partitions: first sector on the parent */
@@ -43,5 +45,6 @@ struct blockdev *blockdev_get(int index);
 /* Read/write sectors on any device (handles partitions, checks bounds). */
 int blockdev_read(struct blockdev *dev, uint32_t lba, uint32_t count, void *buf);
 int blockdev_write(struct blockdev *dev, uint32_t lba, uint32_t count, const void *buf);
+int blockdev_flush(struct blockdev *dev);
 
 #endif

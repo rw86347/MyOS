@@ -80,5 +80,6 @@ void proc_exit(int status) __attribute__((noreturn));
 int  proc_wait4(int pid, uint32_t user_status, int options);
 int  proc_setpgid(int pid, int pgid);
 int  proc_setsid(void);
+void proc_set_cwd(struct process *p, struct inode *dir);    /* chdir */
 
 #endif

@@ -19,6 +19,7 @@
 #   make usb        (re)build build/usb.img, the FAT32 test disk (needs mtools)
 #   make dist       dist/myos-usb.zip: the boot image + instructions, to write to a
 #                   USB stick or run in an emulator on another computer
+#   make utm        "dist/MyOS read-write.utm": a ready-made UTM virtual machine
 #   make clean      delete build/
 #
 # Build modes: a normal build contains no test or benchmark code at all.
@@ -32,7 +33,8 @@
 #   initramfs/  --cpio-->  build/initrd.cpio      (loaded right after the kernel)
 #   arch/i386/boot/mbr.asm     --nasm-->  build/mbr.bin     (exactly 512 bytes)
 #   arch/i386/boot/stage2.asm  --nasm-->  build/stage2.bin  (STAGE2_SECTORS)
-#   myos.img = [ mbr.bin | stage2.bin | kernel.bin | initrd.cpio | padding ]
+#   tools/mksplash.py          --png-->   build/splash.bin  (320x200, mode 13h)
+#   myos.img = [ mbr.bin | stage2.bin | splash.bin | kernel.bin | initrd.cpio | padding ]
 # =============================================================================
 
 CC      := i686-elf-gcc
@@ -97,16 +99,37 @@ OBJS    := $(BUILD)/arch/i386/entry.o $(ASM_OBJS) $(C_OBJS) $(GEN_OBJS)
 
 IMG     := $(BUILD)/myos.img
 INITRD  := $(BUILD)/initrd.cpio
-# 4 KiB reserved for stage 2 on the disk (layout.inc gets it with -D)
+# 4 KiB reserved for stage 2 on the disk (layout.inc gets it with -D).
+# The boot picture is 320x200 bytes, one per pixel: 125 sectors exactly.
 STAGE2_SECTORS := 8
+SPLASH_SECTORS := 125
 USB     := build/usb.img
+
+# The data disk: an ext2 file system the kernel mounts at /data (fs/ext2.c),
+# where files survive a restart. `make run` & co. use disks/data.img, made
+# once and then kept — your files live there; `make clean` leaves it alone
+# (delete it yourself for a fresh, empty one). Tests and benchmarks get a
+# fresh disk of their own every run. Tools: Homebrew's e2fsprogs.
+E2FS    := /opt/homebrew/opt/e2fsprogs/sbin
+MKE2FS  := $(E2FS)/mke2fs
+E2FSCK  := $(E2FS)/e2fsck
+DEBUGFS := $(E2FS)/debugfs
+# Plain ext2 (no journal, no hash index), owned by root.
+MKE2FS_OPTS := -q -t ext2 -O none,filetype,sparse_super -E root_owner=0:0 -L myos-data
+DATA    := disks/data.img
+ifneq ($(MODE),normal)
+  DATA  := $(BUILD)/data.img
+endif
+
 # -cpu pentium3: the features both target CPUs (Pentium 4, Pentium M) have —
 # so we never rely on anything the old machines lack.
-QEMU_FLAGS := -m 64M -cpu pentium3 \
-              -drive format=raw,file=$(IMG),index=0,media=disk \
-              -drive format=raw,file=$(USB),index=1,media=disk
+# (Recursive "=": a target may use a disk of its own, see test-shell.)
+QEMU_FLAGS = -m 64M -cpu pentium3 \
+             -drive format=raw,file=$(IMG),index=0,media=disk \
+             -drive format=raw,file=$(USB),index=1,media=disk \
+             -drive format=raw,file=$(DATA),index=2,media=disk
 
-.PHONY: all dist run run-full run-text debug test check-selftests test-shell bench run-bench usb clean
+.PHONY: all dist utm run run-full run-text debug test check-selftests test-shell bench run-bench usb clean
 
 all: $(IMG) $(USB)
 
@@ -199,10 +222,10 @@ $(INITRD): $(INITRD_FILES) $(ALPINE_STAMP) tools/busybox-applets.txt \
 	          $(BUILD)/initramfs/tmp $(BUILD)/initramfs/lib $(BUILD)/initramfs/etc/terminfo
 	cp -R initramfs/. $(BUILD)/initramfs/
 ifneq ($(MODE_FLAGS),)
-	@mkdir -p $(BUILD)/initramfs/data
+	@mkdir -p $(BUILD)/initramfs/test
 	for f in $(USER_BINS); do cp $$f $(BUILD)/initramfs/bin/$$(basename $$f .elf); done
 	cp -R user/rootfs/. $(BUILD)/initramfs/
-	seq 1 20000 > $(BUILD)/initramfs/data/numbers.txt
+	seq 1 20000 > $(BUILD)/initramfs/test/numbers.txt
 endif
 	cp $(ALPINE)/bin/busybox.static $(BUILD)/initramfs/bin/busybox
 	cp $(ALPINE)/bin/bash $(BUILD)/initramfs/bin/bash
@@ -217,6 +240,7 @@ endif
 	ln -s bin $(BUILD)/initramfs/sbin
 	ln -s ../bin $(BUILD)/initramfs/usr/bin
 	ln -s ../bin $(BUILD)/initramfs/usr/sbin
+	chmod 1777 $(BUILD)/initramfs/tmp
 	cd $(BUILD)/initramfs && find . -mindepth 1 ! -name .DS_Store | sort \
 	  | cpio -o -H newc -R 0:0 --quiet > ../initrd.cpio
 
@@ -238,8 +262,9 @@ $(BUILD)/stage2.bin: arch/i386/boot/stage2.asm arch/i386/boot/layout.inc \
 	I=$(call sectors,$(INITRD)); \
 	END=0x$$($(NM) $(BUILD)/kernel.elf | awk '$$3 == "__kernel_end" { print $$1 }'); \
 	$(NASM) -f bin -i arch/i386/boot/ -DSTAGE2_SECTORS=$(STAGE2_SECTORS) \
-	  -DKERNEL_LBA=$$((1 + $(STAGE2_SECTORS))) -DKERNEL_SECTORS=$$K \
-	  -DINITRD_LBA=$$((1 + $(STAGE2_SECTORS) + K)) -DINITRD_SECTORS=$$I \
+	  -DSPLASH_LBA=$$((1 + $(STAGE2_SECTORS))) -DSPLASH_SECTORS=$(SPLASH_SECTORS) \
+	  -DKERNEL_LBA=$$((1 + $(STAGE2_SECTORS) + $(SPLASH_SECTORS))) -DKERNEL_SECTORS=$$K \
+	  -DINITRD_LBA=$$((1 + $(STAGE2_SECTORS) + $(SPLASH_SECTORS) + K)) -DINITRD_SECTORS=$$I \
 	  -DINITRD_BYTES=$$(( $$(wc -c < $(INITRD)) )) \
 	  -DINITRD_LOAD=$$(( (END - 0xC0000000 + 4095) / 4096 * 4096 )) \
 	  $< -o $@
@@ -248,14 +273,21 @@ $(BUILD)/stage2.bin: arch/i386/boot/stage2.asm arch/i386/boot/layout.inc \
 # 1.44 MB of zeros (it grows if the pieces need more), then the pieces one
 # after another. "conv=notrunc" overwrites without shrinking the file;
 # "sync" pads the last partial sector with zeros.
-$(IMG): $(BUILD)/mbr.bin $(BUILD)/stage2.bin $(BUILD)/kernel.bin $(INITRD) tools/mbr-partition.sh
+$(BUILD)/splash.bin: assets/myos-logo.png tools/mksplash.py
+	@mkdir -p $(dir $@)
+	python3 tools/mksplash.py $< $@
+	@test $$(wc -c < $@) -eq 64000
+
+$(IMG): $(BUILD)/mbr.bin $(BUILD)/stage2.bin $(BUILD)/splash.bin $(BUILD)/kernel.bin $(INITRD) tools/mbr-partition.sh
 	dd if=/dev/zero of=$@ bs=512 count=2880 2>/dev/null
 	dd if=$(BUILD)/mbr.bin    of=$@ bs=512 seek=0 conv=notrunc 2>/dev/null
 	dd if=$(BUILD)/stage2.bin of=$@ bs=512 seek=1 conv=notrunc 2>/dev/null
-	dd if=$(BUILD)/kernel.bin of=$@ bs=512 seek=$$((1 + $(STAGE2_SECTORS))) \
+	dd if=$(BUILD)/splash.bin of=$@ bs=512 seek=$$((1 + $(STAGE2_SECTORS))) \
+	  conv=notrunc 2>/dev/null
+	dd if=$(BUILD)/kernel.bin of=$@ bs=512 seek=$$((1 + $(STAGE2_SECTORS) + $(SPLASH_SECTORS))) \
 	  conv=notrunc,sync 2>/dev/null
 	K=$(call sectors,$(BUILD)/kernel.bin); \
-	dd if=$(INITRD) of=$@ bs=512 seek=$$((1 + $(STAGE2_SECTORS) + K)) \
+	dd if=$(INITRD) of=$@ bs=512 seek=$$((1 + $(STAGE2_SECTORS) + $(SPLASH_SECTORS) + K)) \
 	  conv=notrunc,sync 2>/dev/null
 	tools/mbr-partition.sh $@
 	@echo "Built $@ (kernel: $$(wc -c < $(BUILD)/kernel.bin | tr -d ' ') bytes," \
@@ -271,6 +303,13 @@ dist: $(IMG)
 	cd dist && rm -f myos-usb.zip && zip -q myos-usb.zip myos-usb.img README.txt
 	@echo "dist/myos-usb.zip: $$(wc -c < dist/myos-usb.zip | tr -d ' ') bytes"
 
+# The same disk inside a ready-made UTM virtual machine (macOS): double-click
+# it in Finder. tools/mkutm.sh explains the machine settings.
+UTM_VM := dist/MyOS read-write.utm
+utm: $(IMG)
+	@mkdir -p dist
+	tools/mkutm.sh $(IMG) "$(UTM_VM)"
+
 # --- FAT32 test disk ---------------------------------------------------------
 $(USB): tools/mkusb.sh
 	tools/mkusb.sh $@
@@ -278,21 +317,54 @@ $(USB): tools/mkusb.sh
 usb:
 	tools/mkusb.sh $(USB)
 
+# --- the ext2 data disk -------------------------------------------------------
+# 64 MiB with 4 KiB blocks. Made only if it isn't there.
+disks/data.img:
+	@mkdir -p disks
+	$(MKE2FS) $(MKE2FS_OPTS) -b 4096 -F $@ 64M
+
+# A fresh, empty one for a benchmark build.
+$(BUILD)/data.img:
+	@mkdir -p $(dir $@)
+	$(MKE2FS) $(MKE2FS_OPTS) -b 4096 -F $@ 16M
+
+# The test disk: 1 KiB blocks (so files soon need indirect blocks), made by
+# Linux's mke2fs from a directory of known files; user/ext2test.c reads them.
+TEST_E2ROOT := $(BUILD)/e2root
+define make-test-disk
+	@rm -rf $(TEST_E2ROOT) $(1); mkdir -p $(TEST_E2ROOT)/dir/sub
+	@echo "hello from ext2" > $(TEST_E2ROOT)/hello.txt
+	@echo nested > $(TEST_E2ROOT)/dir/sub/nested.txt
+	@ln -s hello.txt $(TEST_E2ROOT)/link
+	@seq 1 50000 > $(TEST_E2ROOT)/numbers.txt
+	@$(MKE2FS) $(MKE2FS_OPTS) -b $(2) -d $(TEST_E2ROOT) -F $(1) 16M
+endef
+
+# After a test boot: is the disk still a valid ext2 file system (Linux's
+# e2fsck), and does Linux's debugfs read what MyOS wrote ($(2) = $(3))?
+define check-test-disk
+	@$(E2FSCK) -fn $(1) > $(1).fsck 2>&1 \
+	  || { echo "FAIL: e2fsck found damage on the disk MyOS wrote:"; cat $(1).fsck; exit 1; }
+	@[ "$$($(DEBUGFS) -R 'cat $(2)' $(1) 2>/dev/null)" = "$(3)" ] \
+	  || { echo "FAIL: debugfs can't read $(2) back from the disk"; exit 1; }
+	@echo "DISK OK: e2fsck clean, debugfs reads $(2)"
+endef
+
 # --- running -----------------------------------------------------------------
 # The PC text screen is 720x400 pixels; zoom-to-fit scales it up to the
 # window (or the whole screen), so the letters grow with it.
 DISPLAY_OPTS := -display cocoa,zoom-to-fit=on
 
-run: $(IMG) $(USB)
+run: $(IMG) $(USB) $(DATA)
 	$(QEMU) $(QEMU_FLAGS) $(DISPLAY_OPTS) -serial stdio
 
-run-full: $(IMG) $(USB)
+run-full: $(IMG) $(USB) $(DATA)
 	$(QEMU) $(QEMU_FLAGS) $(DISPLAY_OPTS),full-screen=on -serial stdio
 
-run-text: $(IMG) $(USB)
+run-text: $(IMG) $(USB) $(DATA)
 	$(QEMU) $(QEMU_FLAGS) -display curses -serial file:$(BUILD)/serial.log
 
-debug: $(IMG) $(USB)
+debug: $(IMG) $(USB) $(DATA)
 	$(QEMU) $(QEMU_FLAGS) $(DISPLAY_OPTS) -serial stdio -s -S
 
 # Boot with no display and drive it through QEMU's monitor: wait for boot,
@@ -302,6 +374,7 @@ test:
 	@$(MAKE) --no-print-directory MODE=test check-selftests
 
 check-selftests: $(IMG) $(USB)
+	$(call make-test-disk,$(DATA),1024)
 	@rm -f $(BUILD)/serial.log
 	@(sleep 4; for k in h i ret; do echo "sendkey $$k"; sleep 0.2; done; \
 	  echo "sendkey f10"; sleep 1; echo quit) \
@@ -322,6 +395,9 @@ check-selftests: $(IMG) $(USB)
 	  grep -q "args one two" $$L || { echo "FAIL: argv"; ok=0; }; \
 	  grep -q "User mode: fpu exited with code 0" $$L || { echo "FAIL: FPU state"; ok=0; }; \
 	  grep -q "systest: all [0-9]* checks passed" $$L || { echo "FAIL: step 8 startup calls"; ok=0; }; \
+	  grep -q "fstest /fst: all [0-9]* checks passed" $$L || { echo "FAIL: step 8i writable files"; ok=0; }; \
+	  grep -q "ext2test: all [0-9]* checks passed" $$L || { echo "FAIL: step 9b ext2 (Linux-made files)"; ok=0; }; \
+	  grep -q "fstest /data/fst: all [0-9]* checks passed" $$L || { echo "FAIL: step 9b ext2 (fstest)"; ok=0; }; \
 	  grep -q "sigtest: all [0-9]* checks passed" $$L || { echo "FAIL: step 8 signals"; ok=0; }; \
 	  grep -q "ttytest: all [0-9]* checks passed" $$L || { echo "FAIL: step 8 terminal"; ok=0; }; \
 	  grep -q "pipetest: all [0-9]* checks passed" $$L || { echo "FAIL: step 8 pipes"; ok=0; }; \
@@ -330,16 +406,24 @@ check-selftests: $(IMG) $(USB)
 	  grep -q "User mode: hello exited with code 42" $$L || { echo "FAIL: user exit()"; ok=0; }; \
 	  grep -q "peek: killed by CPU exception 14" $$L || { echo "FAIL: user page fault"; ok=0; }; \
 	  grep -q "Kernel read of address 00000000 (page not mapped)" $$L || { echo "FAIL: NULL page fault"; ok=0; }; \
-	  if [ $$ok = 1 ]; then echo "TEST OK"; else echo "TEST FAILED"; exit 1; fi
+	  [ $$ok = 1 ] || { echo "TEST FAILED"; exit 1; }
+	$(call check-test-disk,$(DATA),/persist.txt,written by MyOS)
+	@echo "TEST OK"
 
 # Boot the normal image (/init starts bash) and type commands at it through
 # QEMU's monitor (tools/qemu-type.sh); check what the shell printed (with
 # the terminal escape sequences taken out).
 SHELL_TEST_CMDS := 'echo hello from $$0 $$BASH_VERSION' 'ls /' 'echo one two three | wc -w' \
                    'cat /etc/hostname' 'cd /etc; pwd' 'uname -sm' \
+                   'cd /tmp; mkdir -p a/b; echo saved > a/b/f; cp a/b/f a/g; mv a/g a/h; echo more >> a/h; echo lines=$$(wc -l < a/h)' \
+                   'sed -i s/saved/edited/ a/h; head -n 1 a/h' 'rm -r a && echo removed $$(ls -A | wc -l)' \
+                   'cd /data; mkdir -p a/b; echo kept > a/b/f; cp /bin/busybox bb; mv bb a/; rm numbers.txt; sync' \
+                   'cat /data/a/b/f; cmp /bin/busybox /data/a/bb && echo same busybox' \
                    'for i in 1 2 3; do echo -n "n$$i "; done; echo' 'sh -c "echo busybox sh too"'
 
+test-shell: DATA := $(BUILD)/shell-data.img
 test-shell: $(IMG) $(USB)
+	$(call make-test-disk,$(DATA),4096)
 	@rm -f $(BUILD)/serial.log
 	@(sleep 5; for c in $(SHELL_TEST_CMDS); do \
 	    tools/qemu-type.sh "$$c" | while read k; do echo "$$k"; sleep 0.05; done; sleep 1; \
@@ -359,18 +443,25 @@ test-shell: $(IMG) $(USB)
 	  grep -q "^myos[[:space:]]*$$" $$L || { echo "FAIL: cat"; ok=0; }; \
 	  grep -q "^/etc[[:space:]]*$$" $$L || { echo "FAIL: cd/pwd"; ok=0; }; \
 	  grep -q "^Linux i686" $$L || { echo "FAIL: uname"; ok=0; }; \
+	  grep -q "^lines=2" $$L || { echo "FAIL: mkdir, >, >>, cp, mv"; ok=0; }; \
+	  grep -q "^edited" $$L || { echo "FAIL: sed -i (temp file + rename)"; ok=0; }; \
+	  grep -q "^removed 0" $$L || { echo "FAIL: rm -r"; ok=0; }; \
 	  grep -q "^n1 n2 n3" $$L || { echo "FAIL: bash for loop"; ok=0; }; \
 	  grep -q "^busybox sh too" $$L || { echo "FAIL: sh from bash"; ok=0; }; \
 	  [ $$(grep -c "^busybox sh too" $$L) = 2 ] || { echo "FAIL: history (up arrow)"; ok=0; }; \
 	  grep -q "^after ctrl-c" $$L || { echo "FAIL: Ctrl-C"; ok=0; }; \
-	  if [ $$ok = 1 ]; then echo "SHELL TEST OK"; else echo "SHELL TEST FAILED"; exit 1; fi
+	  grep -q "^kept" $$L || { echo "FAIL: files on the ext2 disk"; ok=0; }; \
+	  grep -q "^same busybox" $$L || { echo "FAIL: a 1 MB copy on the ext2 disk"; ok=0; }; \
+	  [ $$ok = 1 ] || { echo "SHELL TEST FAILED"; exit 1; }
+	$(call check-test-disk,$(DATA),/a/b/f,kept)
+	@echo "SHELL TEST OK"
 
 # Boot the benchmark build; it prints its results and switches QEMU off
 # through the isa-debug-exit device (QEMU then exits with status 1 — fine).
 bench:
 	@$(MAKE) --no-print-directory MODE=bench run-bench
 
-run-bench: $(IMG) $(USB)
+run-bench: $(IMG) $(USB) $(DATA)
 	@$(QEMU) $(QEMU_FLAGS) -display none -serial file:$(BUILD)/serial.log \
 	  -icount shift=0,sleep=off -device isa-debug-exit,iobase=0xf4,iosize=0x04 || true
 	@sed -n '/^CPU:/p;/^Cycle counter/p;/^Boot:/p;/^Benchmarks/,/^Benchmarks done/p' $(BUILD)/serial.log

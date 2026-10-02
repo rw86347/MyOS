@@ -157,3 +157,69 @@ Short dated notes after each work session: what was done, what broke, what was l
   out at once; added pselect6/ppoll time32, setfsuid/gid, getpeername/socketcall
   (ENOTSOCK). `make test-shell`: bash runs commands, pipes, loops, BusyBox sh, history
   (up arrow) and Ctrl-C interrupting `sleep 30`. Boot 713 us (330 initramfs files).
+- 2026-10-02: Step 8i: writable files (everything still in RAM). fs/ramfs.c: a file starts
+  as a pointer into the initramfs and moves into pages of its own on its first change
+  (only the bytes it keeps are copied); holes read as zeros; at most half of RAM
+  (ENOSPC). vfs.c: create / unlink / rename (Linux's replace rules, no moving a directory
+  into itself), O(1) removal with "pprev" links, reference counts (open files, mmap'd
+  areas, current directories) so a deleted file in use lives on until let go; directory
+  cursors so `rm -r` can delete entries while reading them. open: O_CREAT/O_EXCL/O_TRUNC/
+  O_APPEND, read/write access checked. New kernel/sys_fs.c: mkdir(at), mknod(at), symlink(at),
+  unlink(at), rmdir, rename(at/at2), chmod/fchmod(at), chown family, utimensat (both time
+  sizes), truncate/ftruncate (+64), statfs64/fstatfs64; creat; link -> EPERM. execve needs
+  an x bit and can run programs and scripts written at run time. user/fstest.c: 158 checks;
+  `make test-shell` now does mkdir -p, >, >>, cp, mv, sed -i, rm -r. The page-leak check
+  still balances exactly. Cost: open+close 1395 -> 1441, read 1479 -> 1509, exec+exit
+  33194 -> 33631 cycles (reference counts, access checks). Decided: network drivers come
+  from Linux through the shim (DESIGN.md); roadmap now lists steps 9a-9e, 10, 12b.
+- 2026-10-02: `make bench` now also times boot to a bash prompt: it starts /init and stops
+  the clock the first time a program waits for a key. 690 us kernel ready + 6142 us for
+  /init and bash = 6.8 ms (QEMU virtual time). Wall clock in QEMU on the Mac: ~0.5 s from
+  starting QEMU (0.36 s of that is QEMU, SeaBIOS and the loader copying 3.1 MB).
+- 2026-10-02: `make utm` (tools/mkutm.sh): the boot disk inside a ready-made UTM VM
+  ("dist/MyOS read-write.utm"): i440FX, Pentium III, 256 MiB, IDE, VGA, e1000, USB off and
+  PS/2 on (UTM's defaults give a USB keyboard and remove the PS/2 controller, and the image
+  must be an IDE disk, not the "boot ISO"). Settings checked against UTM 4.6.4's source.
+- 2026-10-02: Step 9a: the IDE driver sleeps instead of spinning: the drive's IRQ (14/15)
+  wakes the waiting thread; READ/WRITE MULTIPLE gives one IRQ per 16 sectors (one per
+  sector made QEMU's instruction-count clock jump 128 times per 64 KiB); a channel whose
+  IRQ never arrives falls back to polling; one command per channel at a time (sleeping
+  lock); drive-cache flush is a separate blockdev op. Disks and partitions are found in
+  every boot. fs/bcache.c: 256 one-page buffers, O(1) hash lookup, LRU reuse, write-back
+  by a "flush" thread (started on the first change) about once a second + one drive flush
+  per batch; sync/fsync/fdatasync call it. The kernel now counts idle time (for `top`, and
+  so `make bench` can report CPU work only: QEMU's disk timing varied 10x between runs).
+  64 KiB read: 223 722 -> 34 365 cycles of CPU work; cache hit 101 cycles. 7 new self-tests.
+- 2026-10-02: Step 9b: files survive a restart. fs/ext2.c reads and writes Linux's ext2:
+  superblock/group/bitmap handling, direct + 1/2/3-level indirect blocks, directories
+  (entries split/merged in place, a directory's hash-index flag cleared when we change
+  it), fast and slow symlinks, device nodes, truncate, rename (in-place replace, ".."
+  updated), unlink with the inode freed at the last close. One sleeping lock per file
+  system; user buffers are touched before taking it (a page fault on an mmap'd disk file
+  needs the lock too). VFS: an fs_ops table (load_dir, create, unlink, rename, evict,
+  setattr, truncate, read_kernel, statfs) and mounts; disk directories join the tree on
+  first look; EXDEV across file systems (mv copies), EBUSY for a mount's root; stat shows
+  the disk's inode numbers and a device number per file system. The first ext2 disk is
+  mounted at /data at boot; the initramfs test files moved to /test. Makefile: disks/
+  data.img for `make run` (kept), fresh test disks made by mke2fs from known files (1 KiB
+  blocks for `make test`, 4 KiB for test-shell); after each run Linux's e2fsck must find
+  the disk clean and debugfs must read what MyOS wrote. fstest runs on /data too (158
+  checks), user/ext2test.c reads mke2fs's files (double-indirect) and the mount rules.
+  The UTM VM got a 256 MiB data disk (kept when the VM is rebuilt). Boot: +36 us of CPU
+  work; `make bench` now shows disk waits apart (they vary with QEMU's clock).
+  Installed: Homebrew e2fsprogs (mke2fs, e2fsck, debugfs). Also: roadmap step 11b Graphics.
+- 2026-10-02: Boot picture, as a trial. Stage 2 switches to VGA mode 13h (320x200)
+  while it is still in real mode, copies assets/myos-logo.png (converted by
+  tools/mksplash.py to a 64,000-byte grey ramp) onto 0xA0000, and draws a
+  progress bar as the kernel and initramfs load. It holds two seconds, then
+  returns to text mode 0x03 before protected mode, so the kernel console is
+  unchanged. The picture is its own span of sectors between stage 2 and the
+  kernel. A trial UTM goes on the Desktop with its own UUID; `make utm` still
+  writes dist/MyOS read-write.utm.
+- 2026-10-02: Boot picture fixes (review of the trial above): stage2.asm didn't assemble
+  (`hold_spins` was never declared), and `xor ax, ax` before setting ES wiped the low half
+  of EAX — the disk sector the loader is at — so every kernel chunk after the first came
+  from the picture's sectors and the kernel never started (no serial output at all). Now
+  AX is saved around it. The picture and progress bar show (checked with a QEMU
+  screendump); make test and test-shell pass. Cost: the 2-second `hold` makes boot to a
+  bash prompt 2.5 s instead of 0.5 s in QEMU (the kernel's own 6.9 ms is unchanged).
