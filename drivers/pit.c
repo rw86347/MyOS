@@ -16,6 +16,7 @@
 #include <interrupts.h>
 #include <io.h>
 #include <sched.h>
+#include <thread.h>
 #include <timer.h>
 
 #define PIT_FREQ     1193182
@@ -31,6 +32,7 @@ static void timer_irq(struct regs *r)
     (void)r;
     ticks++;
     cycles_tick(ticks);                 /* background calibration (cpu.c) */
+    thread_timer_tick(ticks);           /* wake timed sleepers that are due */
     sched_tick();                       /* next time slot; may switch threads */
 }
 

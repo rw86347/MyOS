@@ -2,7 +2,11 @@
 # MyOS Makefile
 #
 #   make            build build/myos.img (bootable raw disk image)
-#   make run        boot in QEMU: VGA in a window, serial output in this terminal
+#   make run        boot in QEMU: VGA in a window (the text is scaled to fill the
+#                   window — make the window bigger for bigger text), serial
+#                   output in this terminal
+#   make run-full   the same, full screen with the text scaled up to fill it
+#                   (leave full screen: Cmd-F, or the View menu)
 #   make run-text   boot in QEMU fully in the terminal (VGA text screen via curses;
 #                   serial goes to build/serial.log). Quit: Esc then 2, type "quit".
 #   make debug      like run, but paused at the first instruction; then in another
@@ -10,7 +14,11 @@
 #   make test       build with self-tests (build/test/), boot headless, print the
 #                   serial log, fail unless every check passes
 #   make bench      build with benchmarks (build/bench/), boot headless, print cycles
+#   make test-shell boot the normal image, type commands into the BusyBox shell,
+#                   check the output
 #   make usb        (re)build build/usb.img, the FAT32 test disk (needs mtools)
+#   make dist       dist/myos-usb.zip: the boot image + instructions, to write to a
+#                   USB stick or run in an emulator on another computer
 #   make clean      delete build/
 #
 # Build modes: a normal build contains no test or benchmark code at all.
@@ -98,7 +106,7 @@ QEMU_FLAGS := -m 64M -cpu pentium3 \
               -drive format=raw,file=$(IMG),index=0,media=disk \
               -drive format=raw,file=$(USB),index=1,media=disk
 
-.PHONY: all run run-text debug test check-selftests bench run-bench usb clean
+.PHONY: all dist run run-full run-text debug test check-selftests test-shell bench run-bench usb clean
 
 all: $(IMG) $(USB)
 
@@ -157,22 +165,58 @@ $(BUILD)/kernel.elf: $(OBJS) arch/i386/linker.ld
 $(BUILD)/kernel.bin: $(BUILD)/kernel.elf
 	$(OBJCOPY) -O binary $< $@
 
-# --- initramfs ---------------------------------------------------------------
-# Everything in initramfs/ is packed into a cpio archive ("newc" format, the
-# one Linux uses), owned by root. Test and bench builds add the test
-# programs as /bin/NAME, and data/numbers.txt: ~110 KB, so stage 2 has to
-# load the archive in several 32 KiB chunks.
-INITRD_FILES := $(shell find initramfs -type f 2>/dev/null)
+# --- Alpine Linux programs ---------------------------------------------------
+# Unmodified 32-bit x86 Linux programs from Alpine (tools/fetch-alpine.sh:
+# pinned versions + checksums, downloaded once):
+#   BusyBox  static: a shell and ~300 Unix commands in one program
+#   bash     dynamically linked: needs musl's dynamic linker and C library
+#            (/lib/ld-musl-i386.so.1), readline and ncurses (/usr/lib), and
+#            terminal descriptions (/etc/terminfo)
+ALPINE := build/ext/alpine
+ALPINE_STAMP := $(ALPINE)/.fetched
 
-$(INITRD): $(INITRD_FILES) $(if $(MODE_FLAGS),$(USER_BINS)) Makefile
+$(ALPINE_STAMP): tools/fetch-alpine.sh
+	tools/fetch-alpine.sh $(ALPINE)
+
+# --- initramfs ---------------------------------------------------------------
+# The root file system, packed into a cpio archive ("newc" format, the one
+# Linux uses), owned by root:
+#   initramfs/         /init, /etc/...
+#   BusyBox            /bin/busybox, plus a link /bin/NAME -> busybox for each
+#                      of its commands (tools/busybox-applets.txt);
+#                      /sbin, /usr/bin, /usr/sbin are links to /bin
+#   bash               /bin/bash, /lib (musl), /usr/lib (readline, ncurses),
+#                      /etc/terminfo (linux, vt100, dumb), /etc/inputrc
+# Test and bench builds add the test programs as /bin/NAME, the files in
+# user/rootfs/, and data/numbers.txt (~110 KB of test data).
+INITRD_FILES := $(shell find initramfs -type f 2>/dev/null)
+TEST_FILES   := $(shell find user/rootfs -type f 2>/dev/null)
+
+$(INITRD): $(INITRD_FILES) $(ALPINE_STAMP) tools/busybox-applets.txt \
+           $(if $(MODE_FLAGS),$(USER_BINS) $(TEST_FILES)) Makefile
 	@rm -rf $(BUILD)/initramfs
-	@mkdir -p $(BUILD)/initramfs
+	@mkdir -p $(BUILD)/initramfs/bin $(BUILD)/initramfs/usr/lib $(BUILD)/initramfs/root \
+	          $(BUILD)/initramfs/tmp $(BUILD)/initramfs/lib $(BUILD)/initramfs/etc/terminfo
 	cp -R initramfs/. $(BUILD)/initramfs/
 ifneq ($(MODE_FLAGS),)
-	@mkdir -p $(BUILD)/initramfs/bin $(BUILD)/initramfs/data
+	@mkdir -p $(BUILD)/initramfs/data
 	for f in $(USER_BINS); do cp $$f $(BUILD)/initramfs/bin/$$(basename $$f .elf); done
+	cp -R user/rootfs/. $(BUILD)/initramfs/
 	seq 1 20000 > $(BUILD)/initramfs/data/numbers.txt
 endif
+	cp $(ALPINE)/bin/busybox.static $(BUILD)/initramfs/bin/busybox
+	cp $(ALPINE)/bin/bash $(BUILD)/initramfs/bin/bash
+	cp -P $(ALPINE)/lib/ld-musl-i386.so.1 $(ALPINE)/lib/libc.musl-x86.so.1 $(BUILD)/initramfs/lib/
+	cp -P $(ALPINE)/usr/lib/libreadline.so.* $(ALPINE)/usr/lib/libncursesw.so.* \
+	      $(BUILD)/initramfs/usr/lib/
+	for t in l/linux v/vt100 d/dumb; do mkdir -p $(BUILD)/initramfs/etc/terminfo/$$(dirname $$t); \
+	  cp $(ALPINE)/etc/terminfo/$$t $(BUILD)/initramfs/etc/terminfo/$$t; done
+	cp $(ALPINE)/etc/inputrc $(BUILD)/initramfs/etc/inputrc
+	cd $(BUILD)/initramfs/bin && for a in $$(cat $(CURDIR)/tools/busybox-applets.txt); do \
+	  [ -e "$$a" ] || [ -L "$$a" ] || ln -s busybox "$$a"; done
+	ln -s bin $(BUILD)/initramfs/sbin
+	ln -s ../bin $(BUILD)/initramfs/usr/bin
+	ln -s ../bin $(BUILD)/initramfs/usr/sbin
 	cd $(BUILD)/initramfs && find . -mindepth 1 ! -name .DS_Store | sort \
 	  | cpio -o -H newc -R 0:0 --quiet > ../initrd.cpio
 
@@ -204,7 +248,7 @@ $(BUILD)/stage2.bin: arch/i386/boot/stage2.asm arch/i386/boot/layout.inc \
 # 1.44 MB of zeros (it grows if the pieces need more), then the pieces one
 # after another. "conv=notrunc" overwrites without shrinking the file;
 # "sync" pads the last partial sector with zeros.
-$(IMG): $(BUILD)/mbr.bin $(BUILD)/stage2.bin $(BUILD)/kernel.bin $(INITRD)
+$(IMG): $(BUILD)/mbr.bin $(BUILD)/stage2.bin $(BUILD)/kernel.bin $(INITRD) tools/mbr-partition.sh
 	dd if=/dev/zero of=$@ bs=512 count=2880 2>/dev/null
 	dd if=$(BUILD)/mbr.bin    of=$@ bs=512 seek=0 conv=notrunc 2>/dev/null
 	dd if=$(BUILD)/stage2.bin of=$@ bs=512 seek=1 conv=notrunc 2>/dev/null
@@ -213,8 +257,19 @@ $(IMG): $(BUILD)/mbr.bin $(BUILD)/stage2.bin $(BUILD)/kernel.bin $(INITRD)
 	K=$(call sectors,$(BUILD)/kernel.bin); \
 	dd if=$(INITRD) of=$@ bs=512 seek=$$((1 + $(STAGE2_SECTORS) + K)) \
 	  conv=notrunc,sync 2>/dev/null
+	tools/mbr-partition.sh $@
 	@echo "Built $@ (kernel: $$(wc -c < $(BUILD)/kernel.bin | tr -d ' ') bytes," \
 	  "initramfs: $$(wc -c < $(INITRD) | tr -d ' ') bytes)"
+
+# --- a package to share ------------------------------------------------------
+# The normal boot image is a complete disk: written byte for byte to a USB
+# stick (dd, Rufus...), a PC's BIOS boots it. The README explains how.
+dist: $(IMG)
+	@mkdir -p dist
+	cp $(IMG) dist/myos-usb.img
+	cp tools/dist-README.txt dist/README.txt
+	cd dist && rm -f myos-usb.zip && zip -q myos-usb.zip myos-usb.img README.txt
+	@echo "dist/myos-usb.zip: $$(wc -c < dist/myos-usb.zip | tr -d ' ') bytes"
 
 # --- FAT32 test disk ---------------------------------------------------------
 $(USB): tools/mkusb.sh
@@ -224,14 +279,21 @@ usb:
 	tools/mkusb.sh $(USB)
 
 # --- running -----------------------------------------------------------------
+# The PC text screen is 720x400 pixels; zoom-to-fit scales it up to the
+# window (or the whole screen), so the letters grow with it.
+DISPLAY_OPTS := -display cocoa,zoom-to-fit=on
+
 run: $(IMG) $(USB)
-	$(QEMU) $(QEMU_FLAGS) -serial stdio
+	$(QEMU) $(QEMU_FLAGS) $(DISPLAY_OPTS) -serial stdio
+
+run-full: $(IMG) $(USB)
+	$(QEMU) $(QEMU_FLAGS) $(DISPLAY_OPTS),full-screen=on -serial stdio
 
 run-text: $(IMG) $(USB)
 	$(QEMU) $(QEMU_FLAGS) -display curses -serial file:$(BUILD)/serial.log
 
 debug: $(IMG) $(USB)
-	$(QEMU) $(QEMU_FLAGS) -serial stdio -s -S
+	$(QEMU) $(QEMU_FLAGS) $(DISPLAY_OPTS) -serial stdio -s -S
 
 # Boot with no display and drive it through QEMU's monitor: wait for boot,
 # "type" h, i, Enter, press F10 (NULL pointer -> page fault), then quit.
@@ -259,11 +321,49 @@ check-selftests: $(IMG) $(USB)
 	  grep -q "Hello from user mode (ring 3), via int 0x80!" $$L || { echo "FAIL: user write()"; ok=0; }; \
 	  grep -q "args one two" $$L || { echo "FAIL: argv"; ok=0; }; \
 	  grep -q "User mode: fpu exited with code 0" $$L || { echo "FAIL: FPU state"; ok=0; }; \
+	  grep -q "systest: all [0-9]* checks passed" $$L || { echo "FAIL: step 8 startup calls"; ok=0; }; \
+	  grep -q "sigtest: all [0-9]* checks passed" $$L || { echo "FAIL: step 8 signals"; ok=0; }; \
+	  grep -q "ttytest: all [0-9]* checks passed" $$L || { echo "FAIL: step 8 terminal"; ok=0; }; \
+	  grep -q "pipetest: all [0-9]* checks passed" $$L || { echo "FAIL: step 8 pipes"; ok=0; }; \
+	  grep -q "forktest: all [0-9]* checks passed" $$L || { echo "FAIL: step 8 processes"; ok=0; }; \
 	  grep -q "files: all [0-9]* checks passed" $$L || { echo "FAIL: step 7 files"; ok=0; }; \
 	  grep -q "User mode: hello exited with code 42" $$L || { echo "FAIL: user exit()"; ok=0; }; \
 	  grep -q "peek: killed by CPU exception 14" $$L || { echo "FAIL: user page fault"; ok=0; }; \
 	  grep -q "Kernel read of address 00000000 (page not mapped)" $$L || { echo "FAIL: NULL page fault"; ok=0; }; \
 	  if [ $$ok = 1 ]; then echo "TEST OK"; else echo "TEST FAILED"; exit 1; fi
+
+# Boot the normal image (/init starts bash) and type commands at it through
+# QEMU's monitor (tools/qemu-type.sh); check what the shell printed (with
+# the terminal escape sequences taken out).
+SHELL_TEST_CMDS := 'echo hello from $$0 $$BASH_VERSION' 'ls /' 'echo one two three | wc -w' \
+                   'cat /etc/hostname' 'cd /etc; pwd' 'uname -sm' \
+                   'for i in 1 2 3; do echo -n "n$$i "; done; echo' 'sh -c "echo busybox sh too"'
+
+test-shell: $(IMG) $(USB)
+	@rm -f $(BUILD)/serial.log
+	@(sleep 5; for c in $(SHELL_TEST_CMDS); do \
+	    tools/qemu-type.sh "$$c" | while read k; do echo "$$k"; sleep 0.05; done; sleep 1; \
+	  done; \
+	  echo "sendkey up"; sleep 0.2; echo "sendkey ret"; sleep 1; \
+	  tools/qemu-type.sh "sleep 30" | while read k; do echo "$$k"; sleep 0.05; done; sleep 1; \
+	  echo "sendkey ctrl-c"; sleep 1; \
+	  tools/qemu-type.sh "echo after ctrl-c" | while read k; do echo "$$k"; sleep 0.05; done; \
+	  sleep 1; echo quit) \
+	  | $(QEMU) $(QEMU_FLAGS) -display none -serial file:$(BUILD)/serial.log -monitor stdio >/dev/null
+	@perl -pe 's/\e\[[0-9;?]*[A-Za-z]//g; s/\r//g' $(BUILD)/serial.log > $(BUILD)/serial.txt
+	@sed -n '/Welcome/,$$p' $(BUILD)/serial.txt; echo
+	@L=$(BUILD)/serial.txt; ok=1; \
+	  grep -q "^hello from /bin/bash 5\.2" $$L || { echo "FAIL: bash"; ok=0; }; \
+	  grep -q "README.txt" $$L || { echo "FAIL: ls"; ok=0; }; \
+	  grep -q "^3[[:space:]]*$$" $$L || { echo "FAIL: echo | wc -w"; ok=0; }; \
+	  grep -q "^myos[[:space:]]*$$" $$L || { echo "FAIL: cat"; ok=0; }; \
+	  grep -q "^/etc[[:space:]]*$$" $$L || { echo "FAIL: cd/pwd"; ok=0; }; \
+	  grep -q "^Linux i686" $$L || { echo "FAIL: uname"; ok=0; }; \
+	  grep -q "^n1 n2 n3" $$L || { echo "FAIL: bash for loop"; ok=0; }; \
+	  grep -q "^busybox sh too" $$L || { echo "FAIL: sh from bash"; ok=0; }; \
+	  [ $$(grep -c "^busybox sh too" $$L) = 2 ] || { echo "FAIL: history (up arrow)"; ok=0; }; \
+	  grep -q "^after ctrl-c" $$L || { echo "FAIL: Ctrl-C"; ok=0; }; \
+	  if [ $$ok = 1 ]; then echo "SHELL TEST OK"; else echo "SHELL TEST FAILED"; exit 1; fi
 
 # Boot the benchmark build; it prints its results and switches QEMU off
 # through the isa-debug-exit device (QEMU then exits with status 1 — fine).

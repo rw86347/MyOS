@@ -48,6 +48,45 @@ static const char shift_map[128] = {
 static int shift, ctrl, caps;
 static int extended;            /* the previous byte was the 0xE0 prefix */
 
+/* Once a terminal (tty.c) listens, keys go to it as the bytes a real
+   terminal sends: Enter = CR, Backspace = DEL (0x7F), and the keys
+   without a character as "escape sequences" (ESC [ ...), the way the
+   Linux console sends them (TERM=linux). */
+static void (*listener)(const char *bytes, int n);
+
+void keyboard_set_listener(void (*fn)(const char *bytes, int n))
+{
+    listener = fn;
+}
+
+/* Extended keys (0xE0 prefix): scancode -> what the Linux console sends. */
+static const char *extended_seq(uint8_t sc)
+{
+    switch (sc) {
+    case 0x48: return "\033[A";        /* up */
+    case 0x50: return "\033[B";        /* down */
+    case 0x4D: return "\033[C";        /* right */
+    case 0x4B: return "\033[D";        /* left */
+    case 0x47: return "\033[1~";       /* Home */
+    case 0x4F: return "\033[4~";       /* End */
+    case 0x52: return "\033[2~";       /* Insert */
+    case 0x53: return "\033[3~";       /* Delete */
+    case 0x49: return "\033[5~";       /* Page Up */
+    case 0x51: return "\033[6~";       /* Page Down */
+    case 0x1C: return "\r";            /* keypad Enter */
+    case 0x35: return "/";             /* keypad / */
+    default:   return 0;
+    }
+}
+
+static void send(const char *s)
+{
+    int n = 0;
+    while (s[n])
+        n++;
+    listener(s, n);
+}
+
 /* Ring buffer: the IRQ handler writes at head, keyboard_getc reads at tail.
    One writer and one reader on one CPU, so no lock is needed. */
 #define BUF_SIZE 64
@@ -75,10 +114,12 @@ static void keyboard_irq(struct regs *r)
     int released = sc & 0x80;
     sc &= 0x7F;
 
-    if (extended) {             /* arrows etc. — ignored for now, but right */
-        extended = 0;           /* Ctrl (E0 1D) still counts as Ctrl */
-        if (sc == SC_CTRL)
+    if (extended) {             /* arrows, Home, Delete, right Ctrl... */
+        extended = 0;
+        if (sc == SC_CTRL)      /* right Ctrl counts as Ctrl */
             ctrl = !released;
+        else if (!released && listener && extended_seq(sc))
+            send(extended_seq(sc));
         return;
     }
 
@@ -90,6 +131,11 @@ static void keyboard_irq(struct regs *r)
         return;                 /* we only care about presses */
 
     if (sc == SC_CAPS)  { caps = !caps; return; }
+    if (listener) {
+        if (sc == SC_F10) { send("\033[21~"); return; }
+        if (sc == SC_F11) { send("\033[23~"); return; }
+        if (sc == SC_F12) { send("\033[24~"); return; }
+    }
     if (sc == SC_F10)   { put(KEY_F10); return; }
     if (sc == SC_F11)   { put(KEY_F11); return; }
     if (sc == SC_F12)   { put(KEY_F12); return; }
@@ -103,8 +149,17 @@ static void keyboard_irq(struct regs *r)
         c = c - 'a' + 1;        /* Ctrl-A = 1 ... Ctrl-Z = 26, like a terminal */
     else if (ctrl && c >= 'A' && c <= 'Z')
         c = c - 'A' + 1;
-    if (c)
+    if (!c)
+        return;
+    if (listener) {             /* a terminal: send what a real one would */
+        if (c == '\n')
+            c = '\r';           /* Enter */
+        else if (c == '\b')
+            c = 0x7F;           /* Backspace */
+        listener(&c, 1);
+    } else {
         put(c);
+    }
 }
 
 void keyboard_init(void)

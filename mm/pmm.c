@@ -2,8 +2,9 @@
  * pmm.c — physical memory manager: hands out 4 KiB pages ("frames") of RAM
  *
  * We keep a BITMAP with one bit per physical frame: 1 = used, 0 = free.
- * 768 MiB / 4 KiB = 196608 frames -> 24 KiB of bitmap. Simple and small;
- * finding a free frame is a linear scan, which is fine for now.
+ * 768 MiB / 4 KiB = 196608 frames -> 24 KiB of bitmap. Simple and small.
+ * Finding a free frame scans from a "lowest free" hint; setting up ranges
+ * works a whole bitmap word (32 frames) at a time.
  *
  * Setup, from the BIOS E820 memory map stage 2 saved for us:
  *   1. mark everything USED,
@@ -17,6 +18,14 @@
  *
  * Frames are always handed out lowest-address first. paging.c relies on
  * that while it builds the direct map (see vmm_init).
+ *
+ * Sharing (step 8): after fork, parent and child share their pages until one
+ * of them writes ("copy-on-write"). So a frame can have several owners, and
+ * may only really be freed when the last one lets go. extra_refs[f] counts
+ * the owners BEYOND the first: 0 for a normal frame. pmm_ref() adds an
+ * owner; pmm_free() removes one, and frees the frame only when none are
+ * left. Counting "extra" owners means every frame starts correct at 0 —
+ * even frames allocated before the array existed.
  */
 #include <bootinfo.h>
 #include <kprintf.h>
@@ -31,6 +40,8 @@ static uint32_t nframes;            /* frames up to the end of usable RAM */
 static uint32_t free_frames;
 static uint32_t total_usable;       /* frames the BIOS called usable */
 static uint32_t search_from;        /* every frame below this is used */
+static uint16_t *extra_refs;        /* one per frame (see above); NULL early on */
+static uint32_t refs_phys, refs_pages;
 
 extern char __kernel_end[];         /* from linker.ld (virtual address) */
 
@@ -38,8 +49,37 @@ static int  is_used(uint32_t f) { return bitmap[f / 32] & (1u << (f % 32)); }
 static void set_used(uint32_t f) { bitmap[f / 32] |= 1u << (f % 32); }
 static void set_free(uint32_t f) { bitmap[f / 32] &= ~(1u << (f % 32)); }
 
+/* Mark one frame free or used, keeping free_frames right. */
+static void mark_one(uint32_t f, int make_free)
+{
+    if (make_free && is_used(f)) {
+        set_free(f);
+        free_frames++;
+    } else if (!make_free && !is_used(f)) {
+        set_used(f);
+        free_frames--;
+    }
+}
+
+/* Count the 1 bits (used frames) in a bitmap word. All-used and all-free
+   words are by far the most common, so they're answered at once. */
+static uint32_t bits_set(uint32_t w)
+{
+    if (w == ~0u)
+        return 32;
+    uint32_t n = 0;
+    for (; w; w &= w - 1)           /* clears the lowest 1 bit each round */
+        n++;
+    return n;
+}
+
 /* Mark the frames covering [base, base+len) free or used. Freeing rounds
-   the range inward (only whole frames inside it); reserving rounds outward. */
+   the range inward (only whole frames inside it); reserving rounds outward.
+
+   Speed: boot marks all of RAM this way, so with 512 MiB that's 131072
+   frames. One bitmap word holds 32 frames, so in the middle of a range we
+   set a whole word at a time — 32x fewer steps. Only the ragged ends go
+   frame by frame. */
 static void mark_range(uint64_t base, uint64_t len, int make_free)
 {
     uint64_t end = base + len;
@@ -52,17 +92,24 @@ static void mark_range(uint64_t base, uint64_t len, int make_free)
     }
     if (end > DIRECTMAP_LIMIT)
         end = DIRECTMAP_LIMIT;      /* ignore RAM above 768 MiB for now */
+    if (base >= end)
+        return;
 
-    for (uint64_t a = base; a < end; a += PAGE_SIZE) {
-        uint32_t f = (uint32_t)(a / PAGE_SIZE);
-        if (make_free && is_used(f)) {
-            set_free(f);
-            free_frames++;
-        } else if (!make_free && !is_used(f)) {
-            set_used(f);
-            free_frames--;
+    uint32_t f = (uint32_t)(base / PAGE_SIZE), last = (uint32_t)(end / PAGE_SIZE);
+    while (f < last && f % 32)              /* up to a word boundary */
+        mark_one(f++, make_free);
+    for (; f + 32 <= last; f += 32) {       /* whole words: 32 frames at once */
+        uint32_t used = bits_set(bitmap[f / 32]);
+        if (make_free) {
+            free_frames += used;
+            bitmap[f / 32] = 0;
+        } else {
+            free_frames -= 32 - used;
+            bitmap[f / 32] = ~0u;
         }
     }
+    while (f < last)                        /* the rest */
+        mark_one(f++, make_free);
 }
 
 static const char *e820_type_name(uint32_t type)
@@ -117,6 +164,40 @@ void pmm_init(void)
     if (bi->initrd_size)
         mark_range(bi->initrd_phys, bi->initrd_size, 0);
     search_from = 0;
+
+    /* 6. Room for the share counts: 2 bytes per frame, in one contiguous
+       run (at boot the free RAM above the kernel is one big run). It is
+       only zeroed in pmm_refs_init(), once paging maps all of RAM. */
+    refs_pages = (nframes * sizeof(uint16_t) + PAGE_SIZE - 1) / PAGE_SIZE;
+    for (uint32_t f = 0, run = 0; f < nframes; f++) {
+        run = is_used(f) ? 0 : run + 1;
+        if (run == refs_pages) {
+            uint32_t first = f + 1 - refs_pages;
+            mark_range((uint64_t)first * PAGE_SIZE, refs_pages * PAGE_SIZE, 0);
+            refs_phys = first * PAGE_SIZE;
+            break;
+        }
+    }
+}
+
+void pmm_refs_init(void)
+{
+    if (!refs_phys) {
+        kprintf("pmm: no room for share counts\n");
+        return;
+    }
+    extra_refs = P2V(refs_phys);
+    memset(extra_refs, 0, refs_pages * PAGE_SIZE);
+}
+
+void pmm_ref(uint32_t phys)
+{
+    extra_refs[phys / PAGE_SIZE]++;
+}
+
+int pmm_shared(uint32_t phys)
+{
+    return extra_refs && extra_refs[phys / PAGE_SIZE] != 0;
 }
 
 uint32_t pmm_alloc(void)
@@ -137,6 +218,10 @@ void pmm_free(uint32_t phys)
     uint32_t f = phys / PAGE_SIZE;
     if (phys % PAGE_SIZE || f >= nframes || !is_used(f)) {
         kprintf("pmm_free: bad or double free of %08lx\n", phys);
+        return;
+    }
+    if (extra_refs && extra_refs[f]) {
+        extra_refs[f]--;            /* someone else still uses it */
         return;
     }
     set_free(f);

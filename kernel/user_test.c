@@ -25,24 +25,28 @@
 #include <string.h>
 #include <thread.h>
 #include <user_test.h>
-#include <usermode.h>
+#include <proc.h>
+#include <timer.h>
+#include <tty.h>
 #include <vfs.h>
 
 /* user/programs.asm: each program's ELF file, embedded byte for byte */
-/* Run one program from the initramfs to completion; returns its exit code
-   (-1 = didn't start). */
+/* Run one program from the initramfs to completion; returns its exit code,
+   or 128 + the signal that killed it (like a shell shows it), or -1 if it
+   didn't start. */
 static int run(const char *path, const char *const argv[])
 {
-    struct thread *t = user_exec(path, argv);
-    if (!t) {
+    static const char *const envp[] = { "HOME=/", "TEST=1", NULL };
+    struct process *p = proc_spawn(path, argv, envp);
+    if (!p) {
         kprintf("User mode: %s failed to load\n", path);
         return -1;
     }
-    while (t->state != THREAD_DEAD)
-        thread_yield();
-    user_cleanup(t);
-    kprintf("User mode: %s exited with code %d\n", t->name, t->exit_code);
-    return t->exit_code;
+    const char *name = p->thread->name;
+    int status = proc_wait_kernel(p);
+    int code = W_IFEXITED(status) ? W_EXITSTATUS(status) : 128 + W_TERMSIG(status);
+    kprintf("User mode: %s exited with code %d\n", name, code);
+    return code;
 }
 
 /* Plays "another program using the FPU": keeps wiping st0 and xmm0. If the
@@ -74,6 +78,34 @@ static int run_fpu_test(void)
     return code;
 }
 
+/* Run /bin/ttytest and "type" at it: each time it waits in read(), the
+   next keys go in (as if from the keyboard). */
+static int run_tty_test(void)
+{
+    static const char *const argv[] = { "ttytest", NULL };
+    static const char *const envp[] = { NULL };
+    static const char *const keys[] = {
+        "hello wq\x7forld\r",          /* Backspace is DEL (0x7F) */
+        "\x04",                         /* Ctrl-D */
+        "\033[A",                       /* up arrow, in raw mode */
+        "\x03",                         /* Ctrl-C */
+    };
+    struct process *p = proc_spawn("/bin/ttytest", argv, envp);
+    if (!p)
+        return -1;
+    for (unsigned i = 0; i < sizeof keys / sizeof keys[0]; i++) {
+        uint32_t t0 = timer_ms();
+        while (!tty_reader_waiting() && p->state == PROC_ALIVE && timer_ms() - t0 < 2000)
+            thread_yield();
+        tty_input(keys[i], strlen(keys[i]));
+    }
+    int status = proc_wait_kernel(p);
+    int code = W_IFEXITED(status) ? W_EXITSTATUS(status) : 128 + W_TERMSIG(status);
+    kprintf("User mode: ttytest exited with code %d\n", code);
+    tty_set_foreground(0);
+    return code;
+}
+
 /* Broken ELF files: each must be refused with -ENOEXEC. */
 static void test_bad_elf(void)
 {
@@ -87,24 +119,23 @@ static void test_bad_elf(void)
     struct elf_info info;
     memcpy(copy, hello->data, size);
 
-    check(elf_load("not an ELF file at all", 23, &info) == -ENOEXEC,
+    check(elf_load("not an ELF file at all", 23, ELF_DYN_BASE, &info) == -ENOEXEC,
           "elf: garbage refused");
-    check(elf_load(copy, 40, &info) == -ENOEXEC, "elf: truncated header refused");
+    check(elf_load(copy, 40, ELF_DYN_BASE, &info) == -ENOEXEC, "elf: truncated header refused");
 
     copy->e_machine = 62;                           /* x86-64 */
-    check(elf_load(copy, size, &info) == -ENOEXEC, "elf: wrong CPU refused");
+    check(elf_load(copy, size, ELF_DYN_BASE, &info) == -ENOEXEC, "elf: wrong CPU refused");
     copy->e_machine = EM_386;
 
     copy->e_phoff = 0xFFFFFFF0;                     /* headers past the end */
-    check(elf_load(copy, size, &info) == -ENOEXEC, "elf: bad header offset refused");
+    check(elf_load(copy, size, ELF_DYN_BASE, &info) == -ENOEXEC, "elf: bad header offset refused");
     copy->e_phoff = ((const struct elf32_ehdr *)hello->data)->e_phoff;
 
     /* A segment that wants to load into the kernel's half of memory. */
     struct elf32_phdr *ph = (void *)((char *)copy + copy->e_phoff);
     ph[0].p_vaddr = 0xC0010000;
-    check(elf_load(copy, size, &info) == -ENOEXEC, "elf: segment in kernel space refused");
+    check(elf_load(copy, size, ELF_DYN_BASE, &info) == -ENOEXEC, "elf: segment in kernel space refused");
 
-    vmm_unmap_user_all();
     kfree(copy);
 }
 
@@ -112,7 +143,8 @@ void user_selftest(void)
 {
     static const char *const no_args[] = { NULL };
     static const char *const args[] = { "args", "one", "two", NULL };
-    uint32_t free_before = pmm_free_count();
+    uint32_t free_before = pmm_free_count(), heap_before = kheap_pages();
+    sched_set_preempt(1);               /* programs share the CPU, as for real */
 
     static const char *const files_args[] = { "files", NULL };
 
@@ -124,11 +156,27 @@ void user_selftest(void)
           "user: argc/argv on the start-up stack");
     check(run("/bin/files", files_args) == 0,
           "user: open/read/close/stat/lseek on initramfs files (step 7)");
+    static const char *const fork_args[] = { "forktest", NULL };
+    check(run("/bin/forktest", fork_args) == 0,
+          "user: fork, wait4, brk, mmap, stack growth, execve (step 8)");
+    static const char *const pipe_args[] = { "pipetest", NULL };
+    check(run("/bin/pipetest", pipe_args) == 0,
+          "user: pipes, dup2, fcntl, getdents64, chdir, symlinks (step 8)");
+    static const char *const sig_args[] = { "sigtest", NULL };
+    check(run("/bin/sigtest", sig_args) == 0,
+          "user: signals: handlers, masks, EINTR, SIGCHLD, groups (step 8)");
+    static const char *const sys_args[] = { "systest", NULL };
+    check(run("/bin/systest", sys_args) == 0,
+          "user: uname, clocks, sleep, poll, TLS, mprotect, openat (step 8)");
+    check(run_tty_test() == 0,
+          "user: terminal: line editing, EOF, raw mode, Ctrl-C (step 8)");
     check(run_fpu_test() == 0, "user: FPU/SSE registers survive thread switches");
+    sched_set_preempt(0);
     test_bad_elf();
 
     check(vmm_translate(0x08048000) == 0, "user: program memory unmapped");
-    /* Every frame comes back, except the thread stacks (kmalloc'd, which
-       may have grown the heap) — so compare against a little slack. */
-    check(pmm_free_count() + 16 >= free_before, "user: program frames freed");
+    /* Every page comes back — exactly. The only pages allowed to stay
+       missing are the ones the kernel heap took to grow (it keeps them). */
+    check(pmm_free_count() + (kheap_pages() - heap_before) == free_before,
+          "user: every program page freed (none leaked)");
 }

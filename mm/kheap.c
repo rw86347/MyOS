@@ -60,6 +60,7 @@ struct free_obj { struct free_obj *next; };
 
 static struct free_obj *free_list[NCLASSES];
 static uint32_t small_in_use;           /* bytes handed out (for kheap_stats) */
+static uint32_t pages_taken;            /* pages the heap got from the PMM */
 
 static int class_of(uint32_t size)
 {
@@ -75,6 +76,7 @@ static int refill(int c)
     uint32_t frame = pmm_alloc();
     if (!frame)
         return -1;
+    pages_taken++;
     struct slab_page *page = P2V(frame);
     page->magic = SLAB_MAGIC;
     page->cls = c;
@@ -150,6 +152,7 @@ static int grow(uint32_t bytes)
             break;                      /* keep whatever we did get */
         }
         heap_end += PAGE_SIZE;
+        pages_taken++;
     }
     if (heap_end == start)
         return -1;
@@ -261,4 +264,9 @@ void kheap_stats(uint32_t *used, uint32_t *free_bytes, uint32_t *mapped)
             *used += b->size;
     }
     *mapped = heap_end - KHEAP_START;
+}
+
+uint32_t kheap_pages(void)
+{
+    return pages_taken;
 }

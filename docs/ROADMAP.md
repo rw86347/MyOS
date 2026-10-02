@@ -28,19 +28,35 @@ Mark a step `[x]` only when its "Done when" check works.
   - [x] 7b: cpio unpacked into an inode tree (zero-copy), O(1)-per-component lookup, fds,
     `open`/`openat`/`read`/`close`/`statx`/`lseek`/`_llseek`; programs run from `/bin`.
   Done when: `open`/`read`/`close`/`stat` work on initramfs files.
-- [ ] **8. Processes & TTY** — `fork`, `execve`, `wait4`, `pipe`, `dup2`, signals, TTY line discipline.
+- [x] **8. Processes & TTY** — `fork`, `execve`, `wait4`, `pipe`, `dup2`, signals, TTY line discipline.
   Done when: **a BusyBox shell runs** and `ls`, `cat`, `echo | wc` work. (Big milestone!)
+  - [x] 8a/8b: processes, per-process address spaces, copy-on-write fork, demand paging,
+    brk/mmap/munmap, exit/wait4, run queue, sleeping (wait queues).
+  - [x] 8c: execve (envp, `#!` scripts). 8d: pipes, dup2/dup3, fcntl, getdents64,
+    chdir/getcwd, symlinks, writev/readv, /dev/null, /dev/zero, /dev/console.
+  - [x] 8e: terminal (canonical/raw, termios ioctls, Ctrl-C, VT100 on VGA), poll/select.
+  - [x] 8f: signals (sigaction, masks, delivery frames, sigreturn, kill, groups, SIGCHLD,
+    SIGPIPE, sigsuspend), process groups and sessions.
+  - [x] 8g (kernel): TLS (set_thread_area), uname, ids, clocks (CMOS), nanosleep, limits,
+    static-PIE loading, clone, *at() with dirfd, mprotect.
+  - [x] 8h: BusyBox (Alpine's static i386 build, unmodified) in the initramfs; /init is a
+    BusyBox shell script that starts a login shell. `make test-shell` types commands.
 - [ ] **9. Disk & ext2** — ATA/IDE PIO driver, ext2 read then write.
   Done when: files survive a reboot.
   - [x] Done early (polling, in-kernel): block device layer, ATA PIO read/write, MBR partitions,
     FAT32 read-only (long names, path lookup, file reads). Test disk: `make usb`; `make test`.
   - [ ] FAT32 write, ext2, plug into the VFS (step 7), IRQ-driven I/O (after step 2).
+  - Later (see `docs/DESIGN.md`): ext4 read, then ext4 write (needs a journal), then exFAT.
+    NTFS is out of scope.
 
 ## Phase 3 — Networking & beyond
 - [ ] **10. PCI & network** — PCI enumeration, e1000 or RTL8139 driver, TCP/IP (lwIP port), BSD sockets syscalls.
   Done when: `ping` and `wget` work in QEMU.
 - [ ] **11. Fuller Linux ABI** — `mmap`, `brk`, dynamic linking (`ld.so`), more syscalls as programs need them.
   Done when: ordinary dynamically linked GNU programs run.
+  - [x] Pulled forward (2026-10-02): dynamic linking — the kernel loads a program's
+    interpreter (PT_INTERP: musl's ld.so), file-backed mmap (demand-paged from the
+    initramfs). Alpine's unmodified, dynamically linked bash runs as the login shell.
 - [ ] **12. Real hardware** — boot from USB/CD on an old Pentium 4 / Pentium M machine.
 - [ ] **13. WiFi** — pick ONE chip with open docs (e.g. Atheros AR5xxx / ath5k), port driver + firmware loading,
   802.11 + WPA2 (run `wpa_supplicant` in user space).

@@ -11,9 +11,14 @@
  *       slot:   1    2    3    4    5    6   ...  10  ...  14  ...  19   20
  *       runs:  main idle idle brk  idle radio... main ... brk  ... brk  idle
  *
- * The owner keeps the CPU for its whole slot. If it yields or exits early,
- * the idle thread gets the rest of the slot — no other task may use it, so
- * every task's timing stays exactly what the table says.
+ * The owner keeps the CPU for its whole slot; its timing is exactly what
+ * the table says, whatever else is running.
+ *
+ * Everything else — ordinary programs, the shell, kernel helper threads —
+ * is "best effort": those threads share the leftover time round robin,
+ * 1 ms at a time. Leftover time is a free slot, or a slot whose owner is
+ * asleep, has finished, or gave the rest of its slot away (yield). Only if
+ * no best-effort thread is ready does the idle thread run (hlt).
  */
 #include <interrupts.h>
 #include <sched.h>
@@ -33,14 +38,37 @@ static struct thread *idle;
    Every tick is then one array lookup. */
 static struct thread *slot_thread[SCHED_SLOTS + 1];
 static uint32_t slot_table_gen = ~0u;
+static struct thread *be_last;      /* best effort: the last pick */
 
 static void rebuild_slot_table(void)
 {
+    for (int i = 0; i < THREAD_MAX; i++)
+        thread_at(i)->owns_slot = 0;
     for (int s = 1; s <= SCHED_SLOTS; s++) {
         const char *name = sched_slot_owner(s);
         slot_thread[s] = name ? thread_find(name) : NULL;
+        if (slot_thread[s])
+            slot_thread[s]->owns_slot = 1;
     }
     slot_table_gen = thread_generation();
+}
+
+/* The next ready best-effort thread after the last one picked (round
+   robin), or NULL. Walks the run queue (READY threads only), so it's
+   short: slot owners and idle are the only ones skipped. */
+static struct thread *next_best_effort(int skip_current)
+{
+    int n = thread_ready_count();
+    struct thread *t = (be_last && be_last->state == THREAD_READY)
+                     ? be_last->rq_next : thread_ready_first();
+    for (int i = 0; i < n; i++, t = t->rq_next) {
+        if (!t->owns_slot && !t->is_idle &&
+            !(skip_current && t == thread_current())) {
+            be_last = t;
+            return t;
+        }
+    }
+    return NULL;
 }
 
 /* The idle thread: runs when nobody else may. hlt sleeps until the next
@@ -55,6 +83,7 @@ static void idle_loop(void *arg)
 void sched_start(void)
 {
     idle = thread_create("idle", idle_loop, NULL);
+    idle->is_idle = 1;
 
     uint32_t flags = irq_save();
     slot = 1;                       /* the frame starts now, in slot 1, which
@@ -87,13 +116,14 @@ struct thread *sched_pick(int yielding)
 
     if (slot_table_gen != thread_generation())
         rebuild_slot_table();               /* rare: a thread came or went */
-    struct thread *want = slot_thread[slot];
+    struct thread *owner = slot_thread[slot];
+    if (owner && owner->state == THREAD_READY &&
+        !(yielding && owner == thread_current()))
+        return owner;                       /* the slot's owner, on time */
 
-    if (!want || want->state != THREAD_READY)
-        want = idle;                /* free slot, or the owner has finished */
-    if (yielding && want == thread_current())
-        want = idle;                /* owner gave up the rest of its slot */
-    return want;
+    /* Leftover time: best-effort threads take turns. */
+    struct thread *t = next_best_effort(yielding);
+    return t ? t : idle;
 }
 
 void sched_tick(void)

@@ -19,7 +19,7 @@
 #include <serial.h>
 #include <string.h>
 #include <thread.h>
-#include <usermode.h>
+#include <proc.h>
 
 static void report(const char *what, uint64_t total, uint32_t n)
 {
@@ -97,14 +97,13 @@ static void bench_switch(void)
 static void run_program(const char *path)
 {
     static const char *const argv[] = { "bench", NULL };
-    struct thread *t = user_exec(path, argv);
-    if (!t) {
+    static const char *const envp[] = { NULL };
+    struct process *p = proc_spawn(path, argv, envp);
+    if (!p) {
         kprintf("  %s: failed to load\n", path);
         return;
     }
-    while (t->state != THREAD_DEAD)
-        thread_yield();
-    user_cleanup(t);
+    proc_wait_kernel(p);
 }
 
 static void bench_exec(void)

@@ -11,11 +11,11 @@
 #define N 20000
 
 /* Same layout as the kernel's lines: name padded to 28, number to 8. */
-static void report(const char *what, uint64_t cycles)
+static void report_n(const char *what, uint64_t cycles, uint32_t n)
 {
     char num[21];
     int i = sizeof num;
-    uint64_t v = cycles / N;
+    uint64_t v = cycles / n;
     num[--i] = '\0';
     do {
         num[--i] = '0' + (char)(v % 10);
@@ -30,6 +30,11 @@ static void report(const char *what, uint64_t cycles)
         put(" ");
     put(&num[i]);
     put(" cycles\n");
+}
+
+static void report(const char *what, uint64_t cycles)
+{
+    report_n(what, cycles, N);
 }
 
 int main(int argc, char **argv)
@@ -76,5 +81,29 @@ int main(int argc, char **argv)
     for (int i = 0; i < N; i++)
         statx(AT_FDCWD, "/data/numbers.txt", 0, STATX_BASIC_STATS, &st);
     report("stat (statx)", rdtsc() - t);
+
+    /* Processes (step 8): fork is copy-on-write, so it copies page tables,
+       not memory. */
+    enum { P = 500 };
+    t = rdtsc();
+    for (int i = 0; i < P; i++) {
+        int pid = fork();
+        if (pid == 0)
+            _exit(0);
+        wait4(pid, 0, 0, 0);
+    }
+    report_n("fork + exit + wait", rdtsc() - t, P);
+
+    char *targv[] = { "true", 0 }, *tenv[] = { 0 };
+    t = rdtsc();
+    for (int i = 0; i < P; i++) {
+        int pid = fork();
+        if (pid == 0) {
+            execve("/bin/true", targv, tenv);
+            _exit(1);
+        }
+        wait4(pid, 0, 0, 0);
+    }
+    report_n("fork + exec + exit + wait", rdtsc() - t, P);
     return 0;
 }

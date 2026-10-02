@@ -38,6 +38,7 @@ VSYSCALL_ADDR   equ 0xBFFFF000      ; keep in sync with sysenter.h
 
 extern kernel_tss
 extern sysenter_dispatch
+extern isr_return
 
 ; ---------------------------------------------------------------------------
 ; The vsyscall page's code. Copied into a page at boot (sysenter.c) and
@@ -93,6 +94,13 @@ sysenter_entry:
     push esp                        ; argument: the frame (struct regs *)
     call sysenter_dispatch
     add esp, 4
+
+    ; sysexit can't restore ECX and EDX (it uses them), which is fine for
+    ; an ordinary syscall: the vsyscall code saved them. But if the return
+    ; address changed — a signal handler to run, sigreturn, execve — every
+    ; register must come back exactly: take the full `iret` way instead.
+    cmp dword [esp + 56], VSYSCALL_RET  ; the frame's EIP
+    jne isr_return
 
     pop gs
     pop fs

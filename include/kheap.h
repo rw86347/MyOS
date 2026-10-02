@@ -9,6 +9,9 @@
 void *kmalloc(size_t size);
 void  kfree(void *ptr);
 
+/* Pages the heap has taken from the PMM so far (it never gives any back). */
+uint32_t kheap_pages(void);
+
 /* Bytes in use, bytes free inside the heap, bytes of address space mapped. */
 void  kheap_stats(uint32_t *used, uint32_t *free_bytes, uint32_t *mapped);
 

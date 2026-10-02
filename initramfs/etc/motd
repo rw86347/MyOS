@@ -1,0 +1,4 @@
+
+  Welcome to MyOS!   bash + BusyBox, on a kernel of its own.
+  Try: ls /bin   uname -a   echo hi | wc -c   help
+

@@ -21,13 +21,18 @@
 #include <keyboard.h>
 #include <kprintf.h>
 #include <memlayout.h>
+#include <mm.h>
+#include <proc.h>
+#include <vfs.h>
 #include <paging.h>
 #include <pmm.h>
 #include <sched.h>
 #include <serial.h>
 #include <sysenter.h>
 #include <thread.h>
+#include <syscalls.h>
 #include <timer.h>
+#include <tty.h>
 #include <vga.h>
 #ifdef SELFTEST
 #include <selftest.h>
@@ -37,6 +42,35 @@
 #endif
 
 extern char _start[];       /* first byte of the kernel (entry.asm) */
+
+#if !defined(SELFTEST) && !defined(BENCH)
+/* Start /init from the initramfs as process 1, like Linux does, and wait
+   for it (main sleeps, so its system slots go to the programs). Returns
+   only if there is no /init. */
+static void run_init(void)
+{
+    static const char *const argv[] = { "/init", NULL };
+    static const char *const envp[] = {
+        "HOME=/", "PATH=/bin:/sbin:/usr/bin:/usr/sbin", "TERM=linux", NULL,
+    };
+    struct inode *ino;
+    if (vfs_lookup("/init", &ino) < 0)
+        return;                         /* nothing to run: stay in the kernel */
+    struct process *p = proc_spawn("/init", argv, envp);
+    if (!p) {
+        kprintf("Could not start /init\n");
+        return;
+    }
+    proc_set_init(p);
+    tty_set_foreground(p->pgid);        /* Ctrl-C reaches init's group */
+    tty_attach_keyboard();              /* keys go to the terminal now */
+    int status = proc_wait_kernel(p);
+    kprintf("\n/init exited (status %d). System halted.\n", status);
+    serial_flush();
+    for (;;)
+        __asm__ volatile ("cli; hlt");
+}
+#endif
 
 /* Show "up 0:01:23" in the top-right corner of the screen. */
 static void show_uptime(uint32_t secs)
@@ -55,7 +89,7 @@ static void echo(int c)
     if (c == '\n')
         kprintf("\n> ");
     else if (c == '\b')
-        kprintf("\b");
+        kprintf("\b \b");                 /* back, blank, back */
     else if (c == '\t')
         kprintf(" ");
     else if (c < 32)
@@ -86,6 +120,8 @@ void kernel_main(void)
     /* Memory. */
     pmm_init();             /* which physical RAM is free (BIOS memory map) */
     vmm_init();             /* map all RAM with 4 MiB pages; unmap NULL */
+    pmm_refs_init();        /* pages may now be shared (copy-on-write) */
+    mm_init();              /* address spaces */
     sysenter_init();        /* fast syscalls, if the CPU has sysenter */
     timer_init();           /* IRQ 0: 1 ms tick */
     keyboard_init();        /* IRQ 1 */
@@ -94,6 +130,7 @@ void kernel_main(void)
     kprintf("Memory: %lu MiB usable, paging on, kernel at %p, heap at %p\n",
             pmm_usable_count() / 256, (void *)_start, (void *)KHEAP_START);
 
+    time_init();            /* the date and time, from the CMOS clock */
     initrd_init();          /* the initramfs stage 2 loaded */
     thread_init();          /* kernel_main becomes thread 0, "main" */
 
@@ -104,6 +141,7 @@ void kernel_main(void)
     run_benchmarks(boot_start);     /* switches QEMU off when done */
 #else
     sched_start();          /* the 20 x 1 ms slot scheduler */
+    run_init();             /* the first program, if the initramfs has one */
     kprintf("Type here> ");
 #endif
 

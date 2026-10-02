@@ -74,6 +74,11 @@ common_stub:
     push esp                    ; argument: pointer to the saved registers
     call interrupt_dispatch
     add esp, 4
+
+; The way back out. A forked child also starts here (thread_fork): its
+; stack holds a copy of the parent's saved registers.
+global isr_return
+isr_return:
                                 ; (a syscall's return value was written into
                                 ;  the saved EAX, so popad delivers it)
 

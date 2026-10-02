@@ -70,7 +70,8 @@ Layers, bottom to top:
   ----------------------------------------------------------------------
   kernel      VFS  (superblock, inode, dentry, file — same concepts as Linux)
               page cache  (file data cached in 4 KiB pages; also used by mmap)
-              file systems: initramfs (cpio), ext2 -> ext4, FAT32
+              file systems: initramfs (cpio), ext2, ext4 (read then write), FAT32, exFAT
+              not planned: NTFS
               partition parsing: MBR, later GPT
               block layer: request queues, one shared-memory ring per disk
   ----------------------------------------------------------------------
@@ -86,9 +87,16 @@ Order of work (fills in roadmap steps 7 and 9):
 3. **MBR partition table** parsing (we already write MBRs; GPT later).
 4. **ext2 read**, then **ext2 write**: the classic Unix filesystem and the best documented.
 5. **ext4 read** (extents, 64-bit block numbers, `dir_index`): modern Linux disks use ext4.
-   Writing ext4 safely needs journaling, which is a big job, so it comes much later.
-6. **FAT32**: USB sticks and moving files between machines.
-7. Faster drivers: **ATA DMA / AHCI** for real hardware, **virtio-blk** for QEMU.
+6. **ext4 write.** In scope. A crash must not corrupt the disk, so this waits on a journal
+   (replay the log on mount, commit data and metadata through it). It comes after ext4 read.
+7. **FAT32**: USB sticks and moving files between machines. Read-only already works.
+   A file cannot be bigger than 4 GB, and the volume itself tops out around 32 GB in practice.
+8. **exFAT**: the same job once a stick is bigger than 32 GB or a file is bigger than 4 GB.
+   This is what Windows and cameras write now.
+9. Faster drivers: **ATA DMA / AHCI** for real hardware, **virtio-blk** for QEMU.
+
+Decided (2026-10-02): **exFAT and ext4 write are in scope. NTFS is not.** We will not mount
+Windows system disks.
 
 Driver compatibility for disks: the Linux disk drivers (libata, AHCI) are large and tied
 to Linux's SCSI layer, so a Linux-API shim for them is more work than writing small native

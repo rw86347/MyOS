@@ -52,8 +52,14 @@ struct elf32_phdr {
 #define ET_EXEC      2
 #define EM_386       3
 
+#define ET_DYN       3          /* position independent (here: static PIE) */
+
 #define PT_LOAD      1
+#define PT_INTERP    3          /* "load this dynamic linker first" */
 #define PT_PHDR      6
+
+#define ELF_MAX_PHDRS 16
+#define ELF_DYN_BASE  0x00400000u   /* where a position-independent program goes */
 
 #define PF_X         1
 #define PF_W         2
@@ -64,10 +70,16 @@ struct elf_info {
     uint32_t entry;             /* where to start */
     uint32_t phdr;              /* address of the program headers in memory */
     uint32_t phnum;
+    uint32_t brk_start;         /* first page after the segments: the heap */
+    uint32_t base;              /* how far it was shifted (position independent) */
+    const char *interp;         /* PT_INTERP: the dynamic linker it wants, or NULL */
 };
 
 /* Check the ELF image (size bytes) and load its segments into user memory.
+   A position-independent file (ET_DYN) goes to dyn_base — or, with
+   ELF_BASE_ANY, to the first free place in the mmap area.
    Returns 0, or a negative errno (-ENOEXEC: not a usable i386 executable). */
-int elf_load(const void *image, uint32_t size, struct elf_info *info);
+#define ELF_BASE_ANY 0
+int elf_load(const void *image, uint32_t size, uint32_t dyn_base, struct elf_info *info);
 
 #endif

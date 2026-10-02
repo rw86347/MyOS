@@ -35,4 +35,5 @@ void initrd_init(void)
     size = bi->initrd_size;
     kprintf("initramfs: %lu KiB at physical %08lx\n", size / 1024, bi->initrd_phys);
     initramfs_load(data, size);     /* its files become the file tree */
+    dev_init();                     /* plus /dev/null, /dev/console, ... */
 }

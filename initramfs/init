@@ -1,0 +1,15 @@
+#!/bin/sh
+# /init — the first program MyOS runs (process 1), like on Linux.
+# It's a BusyBox shell script: show a welcome, then start a login shell —
+# bash if it's there, else BusyBox's — and a new one whenever it exits.
+export HOME=/root
+export PATH=/bin:/sbin:/usr/bin:/usr/sbin
+export TERM=linux
+cat /etc/motd
+SHELL=/bin/sh
+[ -x /bin/bash ] && SHELL=/bin/bash
+export SHELL
+while :; do
+    $SHELL -l
+    echo "(shell exited - starting a new one)"
+done

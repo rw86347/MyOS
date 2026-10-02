@@ -8,7 +8,7 @@
 ; =============================================================================
 
 [bits 32]
-global _start
+global _start, __restore, __restore_rt
 extern __libc_start
 
 section .text
@@ -20,3 +20,13 @@ _start:
     push eax
     call __libc_start           ; never returns
     hlt                         ; (a privileged instruction: faults if reached)
+
+; Signal "restorers": a handler returns here, and these ask the kernel to
+; put the interrupted program back (sigreturn). Same code as musl's.
+__restore:                      ; for handler(sig)
+    pop eax                     ; drop the signal number
+    mov eax, 119                ; sigreturn
+    int 0x80
+__restore_rt:                   ; for handler(sig, info, ucontext)
+    mov eax, 173                ; rt_sigreturn
+    int 0x80

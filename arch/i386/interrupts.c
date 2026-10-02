@@ -18,6 +18,8 @@
 #include <kprintf.h>
 #include <pic.h>
 #include <stddef.h>
+#include <mm.h>
+#include <proc.h>
 #include <sched.h>
 #include <serial.h>
 #include <syscall.h>
@@ -88,19 +90,38 @@ static const char *const exception_names[32] = {
     "Hypervisor injection", "VMM communication", "Security", "Reserved",
 };
 
+/* Which Linux signal a CPU exception becomes in a user program. */
+static int exception_signal(uint32_t vector)
+{
+    switch (vector) {
+    case 0: case 16: case 19: return 8;     /* SIGFPE: divide, FPU, SSE error */
+    case 3:                   return 5;     /* SIGTRAP: breakpoint */
+    case 6:                   return 4;     /* SIGILL: invalid opcode */
+    default:                  return 11;    /* SIGSEGV */
+    }
+}
+
 /* A fault in a user program: kill just that program, like Linux's SIGSEGV.
-   The kernel is fine — the program did something it isn't allowed to. */
-static void user_exception(struct regs *r, uint32_t cr2)
+   The kernel is fine — the program did something it isn't allowed to.
+   (Programs catching these signals comes with signals, step 8f.) */
+static int user_exception(struct regs *r, uint32_t cr2)
 {
     struct thread *t = thread_current();
     kprintf("%s: killed by CPU exception %lu (%s) at EIP %08lx",
             t->name, r->vector, exception_names[r->vector], r->eip);
     if (r->vector == 14)
         kprintf(", %s of %08lx (%s)", r->err_code & 2 ? "write" : "read", cr2,
-                r->err_code & 1 ? "kernel-only page" : "not mapped");
+                r->err_code & 1 ? "not allowed" : "not mapped");
     kprintf("\n");
-    t->exit_code = 128 + 11;        /* what a shell shows for SIGSEGV */
-    thread_exit();                  /* never returns */
+    int sig = exception_signal(r->vector);
+    struct process *p = proc_current();
+    uint32_t h = p->sig_action[sig - 1].handler;
+    if (h != SIG_DFL && h != SIG_IGN && !(p->sig_blocked & SIGBIT(sig))) {
+        p->sig_pending |= SIGBIT(sig);  /* its handler runs on the way out */
+        return 1;
+    }
+    proc_exit(W_SIGNALED(sig));     /* never returns */
+    return 0;
 }
 
 /* The exception table (uaccess.asm): instructions that touch user memory,
@@ -126,8 +147,17 @@ static void exception(struct regs *r)
     uint32_t cr2;
     __asm__ volatile ("mov %%cr2, %0" : "=r"(cr2));   /* page faults: bad address */
 
-    if (r->cs & 3)                  /* the CPU was in ring 3: a user program */
-        user_exception(r, cr2);
+    /* A page fault may just be memory that doesn't exist YET: a stack or
+       heap page touched for the first time, or a copy-on-write page after
+       fork. mm_fault() creates it, and the instruction runs again. This
+       works for the kernel touching user memory too (copy_to_user). */
+    if (r->vector == 14 && mm_fault(cr2, r->err_code) == 0)
+        return;
+
+    if (r->cs & 3) {                /* the CPU was in ring 3: a user program */
+        user_exception(r, cr2);     /* kills it, or queues its handler */
+        return;
+    }
     if (r->vector == 14 && fixup_user_access(r))
         return;                     /* a bad user pointer, not a kernel bug */
 
@@ -157,15 +187,18 @@ void interrupt_dispatch(struct regs *r)
 {
     if (r->vector < 32) {
         exception(r);
+        SIGNAL_CHECK(r);            /* e.g. a handled SIGSEGV */
         return;
     }
 
     if (r->vector == 0x80) {
         /* Linux i386 convention: number in EAX, arguments in EBX, ECX, EDX,
            ESI, EDI, EBP; the result goes back in EAX. */
+        thread_current()->uregs = r;    /* fork/execve need the registers */
         r->eax = syscall_dispatch(r->eax, r->ebx, r->ecx, r->edx,
                                   r->esi, r->edi, r->ebp);
         sched_preempt_check();      /* the slot may have ended meanwhile */
+        SIGNAL_CHECK(r);            /* back to user mode: deliver signals */
         return;
     }
 
@@ -179,4 +212,6 @@ void interrupt_dispatch(struct regs *r)
     /* If the timer said "time's up", switch threads now. This must come
        after the EOI: the PIC won't send another tick until it gets one. */
     sched_preempt_check();
+    if (r->cs & 3)
+        SIGNAL_CHECK(r);            /* e.g. Ctrl-C for a busy program */
 }

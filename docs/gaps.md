@@ -48,11 +48,12 @@ when it's fixed. File references point at the comment that mentions the gap.
   can't collide; kernel threads could. Fix: `irq_save` sections (one CPU) or a mutex.
 - **Round-robin mode still exists** for boot and the thread self-tests (before
   `sched_start()`). (`kernel/sched.c`)
-- **No way to sleep or block.** A thread waiting for a key or for time still gets its
-  slots (it just `hlt`s through them).
 - **Dead threads are reaped lazily**: their slot and stack are only freed when
   `thread_create` needs the slot. (`kernel/thread.c`)
-- **Fixed table of 16 threads.** (`include/thread.h`, `THREAD_MAX`)
+- **Fixed tables: 64 threads, 64 processes, 32 fds and 32 memory areas per process.**
+  (`THREAD_MAX`, `PROC_MAX`, `PROC_FILES`, `MM_AREAS`)
+- **One thread per process**: `clone(CLONE_THREAD)` returns `-ENOSYS`, no `futex`.
+  `vfork` is plain fork (copy-on-write makes it cheap), and `clone(CLONE_VM)` gets a copy.
 - **No stack overflow detection.** A thread that uses more than 8 KiB silently overwrites
   the heap. Fix: guard pages (an unmapped page below each stack).
 - **The slot table is compiled into the kernel.** Today `config/slots.conf` is turned into a
@@ -69,39 +70,39 @@ when it's fixed. File references point at the comment that mentions the gap.
   simply preempted at the slot end. Real-time systems usually log or count overruns.
 - **The first slot after `sched_start()` is shorter than 1 ms** (the frame starts mid-tick).
 
-## User mode / syscalls (step 5)
-- **One shared address space.** All user programs use the kernel's single page directory,
-  so only one program can be loaded at a time (`user_exec` / `user_cleanup`). Needs a page
-  directory per process — comes with fork/exec (step 8). (`kernel/usermode.c`)
-- **User programs don't get time slots.** They run in round-robin mode before the slot
-  scheduler starts. A program should be a named slot owner in `slots.conf`.
-- **A user program that never exits hangs the boot**: the test waits for it with
-  preemption off, and there's no `kill` or timeout.
-- **Programs can only be started from the initramfs**: `user_exec` hands the loader the
-  file's bytes right where they sit in the archive (`inode->data`). Disk file systems will
-  need to read or map the file instead. (`kernel/usermode.c`)
-- **Static, fixed-address ELF only** (`ET_EXEC`). No static-PIE (`ET_DYN`), no dynamic
-  linking / `PT_INTERP` (step 11). (`kernel/elf.c`)
-- **The environment (`envp`) is always empty**, and `argv` is capped at 16 entries.
-- **`AT_RANDOM` isn't random**: it's derived from the uptime. There's no entropy source.
-- **The user stack is a fixed 64 KiB** and doesn't grow. Linux grows it on demand (page
-  faults just below the stack).
-- **Execute permission isn't enforced.** 32-bit x86 paging has no "no-execute" bit (that
-  needs PAE), so data and stack pages are executable.
-- **FPU/SSE errors kill the program like a segfault** (exit code 139). Linux would send
-  `SIGFPE`; there are no signals yet (step 8). Only happens if a program unmasks FPU
-  exceptions. (`arch/i386/interrupts.c`)
-- **Syscalls so far:** `exit`, `exit_group`, `read`, `write`, `open`, `openat`, `close`,
-  `lseek`, `_llseek`, `statx`, `getpid` (returns the thread number). Unknown calls return
-  `-ENOSYS` and are logged to serial. (`kernel/syscall.c`)
-- **`write()` to the console may be short** when the serial queue is nearly full (by design:
-  no syscall waits for the serial port). Hand-written test programs don't retry; C
-  libraries do.
-- **The vsyscall page is at a fixed address** (0xBFFFF000) and there's no vDSO ELF image
-  (`AT_SYSINFO_EHDR`), so `clock_gettime` & co. will need a real syscall. A real vDSO comes
-  with step 11.
-- **Syscalls run with interrupts off** (interrupt gate). A long syscall delays the timer
-  and the slot schedule. A trap gate would keep interrupts on, but needs locks first.
+## Processes, signals, terminal (step 8)
+- **No job control stops**: SIGSTOP/SIGTSTP/SIGTTIN/SIGTTOU are ignored, so Ctrl-Z does
+  nothing and `fg`/`bg` can't work. No SIGTTOU/SIGTTIN for background terminal access.
+- **No syscall restart**: a signal makes a sleeping syscall return `-EINTR` even with
+  `SA_RESTART`. No `sigaltstack`, no core dumps, `pselect`/`ppoll` ignore their mask.
+- **One terminal**: the console (VGA + keyboard). Serial input isn't read; `/dev/ttyN` are
+  all the console. VT100 subset only (no scroll regions, no line drawing).
+- **`poll`/`select`**: every waiter is woken on any terminal/pipe change (fine for a few
+  waiters); `select` handles fds 0-31 only.
+- **Time**: millisecond resolution; the CMOS clock is assumed to be UTC; no
+  `settimeofday`, no `alarm`/`setitimer`/timers.
+- **No writable file system**: everything that would change files returns `-EROFS`
+  (bash can't save history, `/tmp` is read-only, `>` redirections to files fail). A tmpfs
+  is the next storage step.
+- **No networking**: socket calls fail (`getpeername` says "not a socket").
+- **`uname` says "Linux"** (programs check it to know which syscalls exist); the release
+  is "6.1.0-MyOS". `getrandom` is not cryptographic (no entropy source).
+- **`mprotect(PROT_NONE)` doesn't hide pages**: present user pages stay readable on x86
+  without PAE (`PROT_NONE` would need unmapping).
+- **No address-space randomisation**: static PIEs always load at 0x00400000.
+- **Every program runs as root** (uid 0).
+- **Programs and mmap'd files only come from the initramfs** (`inode->data`); disk file
+  systems will need a page cache. File mappings are private copies (made per page on first
+  touch); `MAP_SHARED` file mappings behave like `MAP_PRIVATE` (nothing can be written
+  back anyway).
+- **Dynamic linking**: one interpreter level; the interpreter is put at the first free
+  place in the mmap area (no randomisation).
+- **Arguments + environment: 64 KiB, 1024 entries; paths 255 bytes** (Linux: 128 KiB+, 4096).
+- **Syscalls run with interrupts off** (interrupt gate); long ones are capped (reads at
+  256 KiB, console writes return short). Needs locks to change.
+- **Execute permission isn't enforced** (no NX bit without PAE).
+- **CPU exceptions become signals** (SIGSEGV/SIGFPE/SIGILL); a handler for them is called
+  but the faulting instruction runs again when it returns (like Linux).
 
 ## Disk / file systems
 - **ATA driver polls** instead of using IRQs 14/15, even though interrupts work now (the

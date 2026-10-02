@@ -1,0 +1,4 @@
+# /etc/profile — read by login shells (/init starts "sh -l").
+export PATH=/bin:/sbin:/usr/bin:/usr/sbin
+export PS1='myos:\w# '
+alias ll='ls -l'

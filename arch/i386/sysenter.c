@@ -8,8 +8,11 @@
 #include <paging.h>
 #include <pmm.h>
 #include <sched.h>
+#include <proc.h>
+#include <signal.h>
 #include <string.h>
 #include <syscall.h>
+#include <thread.h>
 #include <sysenter.h>
 #include <uaccess.h>
 
@@ -47,7 +50,7 @@ uint32_t vsyscall_map(void)
     if (!vsyscall_frame)
         return 0;
     /* Read-only and shared: one physical page for every program, which
-       vmm_unmap_user_all() must not free (PTE_SHARED). */
+       freeing an address space must leave alone (PTE_SHARED). */
     if (vmm_map(VSYSCALL_ADDR, vsyscall_frame, PTE_USER | PTE_SHARED) < 0)
         return 0;
     return VSYSCALL_ADDR;
@@ -60,6 +63,8 @@ void sysenter_dispatch(struct regs *r)
        the vsyscall code pushed the real EBP on the user stack. */
     uint32_t a6 = 0;
     get_user32(&a6, r->user_esp);
+    thread_current()->uregs = r;        /* fork/execve need the registers */
     r->eax = syscall_dispatch(r->eax, r->ebx, r->ecx, r->edx, r->esi, r->edi, a6);
     sched_preempt_check();
+    SIGNAL_CHECK(r);                    /* back to user mode: deliver signals */
 }

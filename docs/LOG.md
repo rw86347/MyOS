@@ -117,3 +117,43 @@ Short dated notes after each work session: what was done, what broke, what was l
   57 self-tests pass. Benchmarks: open+close 1131, read 4 KiB 1453, statx 1044.
   Next: step 6b (musl, needs Docker) and step 8 (processes: fork/COW, execve, wait4, pipes,
   signals, TTY — BusyBox shell).
+- 2026-10-02: Page allocator: mark_range sets whole bitmap words (32 frames) in the middle
+  of a range, with an instant count for all-used words. Kernel ready (QEMU icount):
+  512 MiB 4181 -> 181 us, 64 MiB 621 -> 119 us. Boot estimate for a real P4: BIOS POST
+  dominates (~5-8 s); MyOS after the BIOS ~0.1-0.25 s from IDE, nearly all disk reads.
+- 2026-10-02: Step 8 (kernel side) done, BusyBox pending. Page share counts (pmm extra_refs);
+  per-process page directories (kernel half copied, heap page tables preallocated so copies
+  never go stale, 64 MiB kernel heap); mm.c: areas (VMAs), demand paging, brk, mmap/munmap,
+  mprotect; COW fork (vmm_pd_fork, vmm_cow_fault). proc.c: spawn, fork (child starts at
+  isr_return with a copy of the syscall frame), execve (new mm first, so it can fail
+  safely; #! scripts), exit (reparent, zombies), wait4. Threads: wait queues, run queue,
+  timed sleeps (sorted list). Scheduler: free/leftover slots go round-robin to best-effort
+  threads. VFS: symlinks, dev nodes, pipes (one-page ring), getdents64, chdir/getcwd,
+  dup2, fcntl, writev; poll/select. TTY: line discipline, termios, Ctrl-C -> SIGINT to the
+  foreground group; keyboard sends terminal bytes; VGA understands VT100. Signals with
+  Linux frames; sysenter returns via iret when EIP changed. 8g: set_thread_area (GDT 6-8
+  per thread), uname, clocks from CMOS, nanosleep, prlimit, static PIE, clone, *at().
+  Tests: forktest 26, pipetest 27, sigtest 26, systest 27, ttytest 12 checks; exact page
+  accounting (no leaks). 62 self-tests pass. Thread switch 94 cycles; fork+exit+wait 51k;
+  null syscall 128 (signal check inlined). Bugs found by tests: tests assumed timing that
+  only holds with preemption off (fixed with sched_yield); setpgid on a session leader
+  is EPERM (correct). Next: BusyBox + bash (Docker).
+- 2026-10-02: Step 8 done: BusyBox runs. Alpine's busybox-static 1.36.1 (x86, unmodified,
+  downloaded by tools/fetch-busybox.sh with a pinned SHA-256) + 305 applet links in /bin
+  (list from `busybox --list` run on MyOS itself), /sbin and /usr/* link to /bin. /init =
+  BusyBox shell script -> `sh -l` in a loop; /etc/profile, passwd, group, motd, hostname.
+  Fixes found by BusyBox: #! handling moved into program_load (the kernel's own spawn of
+  /init is a script); execve must reset FS/GS (the old TLS descriptor is gone -> #GP on
+  `pop gs`). `make test-shell` types commands via QEMU sendkey (tools/qemu-type.sh): echo,
+  ls, `echo | wc -w`, cat, cd/pwd, uname all work. Unknown syscalls now logged once
+  (BusyBox cat tries sendfile64 first). Next: bash.
+- 2026-10-02: bash runs (Alpine 5.2.26, dynamically linked, unmodified) as the login shell.
+  tools/fetch-alpine.sh: pinned + checksummed Alpine x86 packages (busybox-static, bash,
+  musl, readline, libncursesw, ncurses-terminfo-base). Kernel: PT_INTERP (load the
+  program at 0x00400000, ld-musl at the first mmap gap; AT_BASE/AT_ENTRY/AT_PHDR) and
+  file-backed mmap, demand-paged from the initramfs (VMAs carry inode + offset; splits
+  keep offsets). /init starts `bash -l` (or BusyBox sh). Found by bash: musl calls the
+  32-bit-time pselect6 (308) when the timeout fits — readline got ENOSYS and bash logged
+  out at once; added pselect6/ppoll time32, setfsuid/gid, getpeername/socketcall
+  (ENOTSOCK). `make test-shell`: bash runs commands, pipes, loops, BusyBox sh, history
+  (up arrow) and Ctrl-C interrupting `sleep 30`. Boot 713 us (330 initramfs files).

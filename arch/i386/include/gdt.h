@@ -17,6 +17,12 @@ void gdt_init(void);
 /* The stack the CPU switches to when a user program enters the kernel
    (syscall, interrupt, fault). Set on every thread switch. */
 void tss_set_kernel_stack(uint32_t esp0);
+
+/* Thread-local storage segments: GDT entries 6-8. */
+#define GDT_TLS_FIRST   6
+#define GDT_TLS_ENTRIES 3
+void     gdt_load_tls(const uint64_t tls[GDT_TLS_ENTRIES]);
+uint64_t gdt_tls_descriptor(uint32_t base, uint32_t limit, uint32_t flags);
 #endif
 
 #endif

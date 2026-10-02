@@ -17,6 +17,8 @@
  *   3      0x1B      user code,   ring 3   (0x18 | RPL 3) — used from step 5
  *   4      0x23      user data,   ring 3   (0x20 | RPL 3)
  *   5      0x28      TSS (Task State Segment)
+ *   6-8    0x33...   thread-local storage (TLS): set per thread by the
+ *                    set_thread_area syscall; musl points GS at entry 6
  *
  * The TSS: when an interrupt or `int 0x80` arrives while a USER program
  * runs, the CPU switches to ring 0 — and must not keep using the program's
@@ -27,6 +29,7 @@
  */
 #include <stdint.h>
 #include <gdt.h>
+#include <string.h>
 
 struct gdt_entry {
     uint16_t limit_low;
@@ -53,7 +56,7 @@ struct tss {
     uint16_t trap, iomap_base;
 } __attribute__((packed));
 
-static struct gdt_entry gdt[6];
+static struct gdt_entry gdt[9];
 /* Not static: sysentry.asm reads esp0 from it directly. */
 struct tss kernel_tss;
 
@@ -109,4 +112,43 @@ void gdt_init(void)
 void tss_set_kernel_stack(uint32_t esp0)
 {
     kernel_tss.esp0 = esp0;
+}
+
+/* --- thread-local storage -------------------------------------------------- */
+
+/* Every thread can have up to 3 segments of its own (entries 6-8), which
+   the C library uses to find its per-thread data (errno, ...) through GS.
+   On a thread switch we copy the new thread's three descriptors in; the
+   next `pop gs` on the way back to user mode loads the new base. */
+void gdt_load_tls(const uint64_t tls[GDT_TLS_ENTRIES])
+{
+    memcpy(&gdt[GDT_TLS_FIRST], tls, GDT_TLS_ENTRIES * sizeof(uint64_t));
+}
+
+/* struct user_desc (the set_thread_area argument) -> a descriptor. */
+uint64_t gdt_tls_descriptor(uint32_t base, uint32_t limit, uint32_t flags)
+{
+    /* flags: bit 0 seg_32bit, bits 1-2 contents, 3 read_exec_only,
+              4 limit_in_pages, 5 seg_not_present, 6 useable */
+    int seg32 = flags & 1, contents = (flags >> 1) & 3, ro = (flags >> 3) & 1;
+    int pages = (flags >> 4) & 1, absent = (flags >> 5) & 1, avl = (flags >> 6) & 1;
+    if (base == 0 && limit == 0 && ro && absent)
+        return 0;                       /* "clear this entry" */
+
+    uint8_t access = (absent ? 0 : 0x80) | 0x60 | 0x10 | 0x01;  /* ring 3, data/code */
+    if (contents == 2)
+        access |= 0x08 | (ro ? 0 : 0x02);       /* code; readable */
+    else
+        access |= (contents == 1 ? 0x04 : 0) | (ro ? 0 : 0x02);   /* data; writable */
+    uint8_t f = (pages << 3) | (seg32 << 2) | avl;
+
+    struct gdt_entry e = {
+        .limit_low = limit & 0xFFFF, .base_low = base & 0xFFFF,
+        .base_mid = (base >> 16) & 0xFF, .access = access,
+        .flags_limit = (uint8_t)((f << 4) | ((limit >> 16) & 0x0F)),
+        .base_high = (base >> 24) & 0xFF,
+    };
+    uint64_t d;
+    memcpy(&d, &e, sizeof d);
+    return d;
 }

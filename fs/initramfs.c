@@ -79,6 +79,7 @@ void initramfs_load(const uint8_t *a, uint32_t size)
         uint32_t mode = hex8(h + 14), uid = hex8(h + 22), gid = hex8(h + 30);
         uint32_t nlink = hex8(h + 38), mtime = hex8(h + 46);
         uint32_t filesize = hex8(h + 54), namesize = hex8(h + 94);
+        uint32_t rdev = (hex8(h + 78) << 8) | hex8(h + 86);    /* devices */
 
         /* Name and data must lie inside the archive (watch for overflow). */
         uint32_t name_off = off + HDR_SIZE;
@@ -107,7 +108,12 @@ void initramfs_load(const uint8_t *a, uint32_t size)
             if (!S_ISDIR(mode)) {
                 i->nlink = nlink;
                 i->size = filesize;
-                i->data = a + data_off;     /* zero-copy: points into the archive */
+                i->data = a + data_off;     /* zero-copy: points into the archive
+                                               (a symlink's data is its target) */
+            }
+            if (S_ISCHR(mode)) {
+                i->rdev = rdev;
+                dev_attach(i);              /* /dev/null & co. */
             }
             files++;
         }
