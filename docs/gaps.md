@@ -354,16 +354,23 @@ when it's fixed. File references point at the comment that mentions the gap.
   correct echo requests and SLIRP dropping them, because forwarding one would
   need a raw socket and therefore root), so ICMP to the internet can only be
   tested in UTM. See `docs/utm.md`.
-- **`wget` failed to resolve a name once on vmnet, and it is not understood.**
-  In the probe boot above, `ping google.com` resolved and answered while
-  `wget http://example.com/` in the same boot said `bad address 'example.com'`.
-  Ruled out since, all from the command line: the dual A+AAAA query musl's
-  `getaddrinfo` sends (14 attempts, all fine, both replies captured); the
-  per-socket receive queue (8 datagrams deep, not 1); the vmnet resolver itself
-  (queried through SLIRP's NAT, 4 of 4 fine); and the sequence of pings that
-  ran before it (replayed, fine). So it is either specific to vmnet or
-  intermittent at a rate below 1 in 14. Reproducing it means another probe
-  boot in UTM with the lookups baked into `/init`.
+- **`wget` failed to resolve a name once on vmnet. Not reproducible in 32
+  attempts, so recorded rather than chased further.** In the first probe boot,
+  `ping google.com` resolved and answered while `wget http://example.com/` in
+  the same boot said `bad address 'example.com'`.
+  Everything plausible was then tested and came back clean: the dual A+AAAA
+  query musl's `getaddrinfo` sends (14 command-line attempts, both replies
+  captured every time); the per-socket receive queue (8 datagrams deep, not
+  1); the vmnet resolver itself, reached from command-line QEMU through
+  SLIRP's NAT (4 of 4); the burst of pings that preceded it, replayed; and
+  finally a second vmnet probe crossing program against hostname — ping, wget
+  and nslookup, `example.com` and `google.com`, three rounds — which came back
+  18 of 18 with every query answered in the packet capture.
+  So it is a transient at a rate below 1 in 32. The likeliest explanation is a
+  single lost datagram that musl's retry budget did not cover, which would be
+  invisible from here. If it recurs, the method that works is a probe image
+  that writes its results to its own disk and is read back with `debugfs` —
+  there is no usable serial console under UTM. See `docs/utm.md`.
 - **`sendfile64` (syscall 239) is not implemented.** BusyBox's `cp` and `cat`
   try it whenever the destination can take it, fall back to read/write
   correctly, and leave one `syscall 239 not implemented` line in every boot

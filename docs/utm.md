@@ -146,10 +146,42 @@ So: DHCP works against a real server (not QEMU's), the kernel's nameserver
 reaches user space, and ICMP crosses a real NAT. It also closes the question
 `docs/gaps.md` had been carrying — vmnet does forward ICMP.
 
-One thing failed in that boot and is still unexplained: `wget` could not
-resolve `example.com` while `ping google.com` resolved fine. Four hypotheses
-were tested from the command line and all came back clean — musl's dual
-A+AAAA query, the per-socket receive queue depth, the vmnet resolver itself
-(reachable from command-line QEMU through SLIRP's NAT, which is a useful trick
-in itself), and the burst of pings that preceded it. Details and what is left
-to try in `docs/gaps.md`.
+One lookup failed in that boot — `wget` could not resolve `example.com` while
+`ping google.com` resolved fine — and it did not reproduce in 32 further
+attempts. What was tested, and the method that got the answer, is below.
+
+## Reading results out of a VM you cannot talk to
+
+Serial over TCP produced nothing and the sandbox blocks the easy channels, so
+the way to get data out of a UTM guest is to have it write to its own disk and
+read the disk from the host afterwards. A probe `/init` that runs the
+experiment, writes `/root/probe.txt`, and calls `sync`:
+
+```sh
+qemu-img convert -U -f qcow2 -O raw "$VM/Data/"*.qcow2 /tmp/probe.img
+S=$(( $(wc -c < build/myos.img) / 512 )); START=$(( (S + 2047) / 2048 * 2048 ))
+dd if=/tmp/probe.img of=/tmp/root.img bs=512 skip=$START
+printf 'cat /root/probe.txt\n' | debugfs /tmp/root.img
+```
+
+`-U` on `qemu-img` is needed because UTM keeps a lock on the image even after
+the VM stops. And `debugfs` prints its prompt on the same line as the first
+line of output, so filtering lines that start with `debugfs` silently eats the
+first result — which cost a confusing few minutes.
+
+A packet capture can go in the bundle too, via the VM's additional arguments:
+
+```
+-object filter-dump,id=d0,netdev=net0,file=<bundle>/Data/net.pcap
+```
+
+Two constraints, both learned the hard way: the file has to be inside the
+bundle, because the sandbox refuses everywhere else, and **the path must not
+contain a space** — UTM splits additional arguments on whitespace, so
+`~/Desktop/MyOS probe.utm/...` arrives at QEMU as `probe.utm/...`. Name a
+probe VM without spaces.
+
+That probe crossed program against hostname — `ping`, `wget` and `nslookup`
+against `example.com` and `google.com`, three rounds — and came back 18 of 18,
+with every query answered in the capture. See `docs/gaps.md` for the full list
+of what was ruled out.
