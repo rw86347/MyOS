@@ -573,6 +573,14 @@ test-shell: $(IMG) $(USB)
 	  | $(QEMU) $(QEMU_FLAGS) -display none -serial file:$(BUILD)/serial.log -monitor stdio >/dev/null
 	@perl -pe 's/\e\[[0-9;?]*[A-Za-z]//g; s/\r//g' $(BUILD)/serial.log > $(BUILD)/serial.txt
 	@sed -n '/Welcome/,$$p' $(BUILD)/serial.txt; echo
+# Three of these checks are deliberately not anchored to the start of a line.
+# The commands are typed on a timer, so a slow one -- ping waits a second
+# between packets, wget does DNS and a fetch -- is still printing when the next
+# one is typed into it, and its output ends up with "cd /t" in front. Anchoring
+# those made the test fail at random. Unanchored is still exact here because
+# each pattern contains something the echoed command line cannot: a received
+# count, a resolved address, a byte count. The commands that return instantly
+# keep their anchors.
 	@L=$(BUILD)/serial.txt; ok=1; \
 	  grep -q "^hello from /bin/bash 5\.2" $$L || { echo "FAIL: bash"; ok=0; }; \
 	  grep -q "README.txt" $$L || { echo "FAIL: ls"; ok=0; }; \
@@ -580,10 +588,10 @@ test-shell: $(IMG) $(USB)
 	  grep -q "^myos[[:space:]]*$$" $$L || { echo "FAIL: cat"; ok=0; }; \
 	  grep -q "^/etc[[:space:]]*$$" $$L || { echo "FAIL: cd/pwd"; ok=0; }; \
 	  grep -q "^Linux i686" $$L || { echo "FAIL: uname"; ok=0; }; \
-	  grep -q "^2 packets transmitted, 2 packets received" $$L || { echo "FAIL: ping 10.0.2.2 (raw ICMP socket, alarm)"; ok=0; }; \
-	  grep -q "^PING example.com ([0-9]" $$L || { echo "FAIL: DNS through musl (UDP socket, resolv.conf)"; ok=0; }; \
+	  grep -q "2 packets transmitted, 2 packets received" $$L || { echo "FAIL: ping 10.0.2.2 (raw ICMP socket, alarm)"; ok=0; }; \
+	  grep -q "PING example.com ([0-9]" $$L || { echo "FAIL: DNS through musl (UDP socket, resolv.conf)"; ok=0; }; \
 	  grep -q "^resolv from kernel$$" $$L || { echo "FAIL: /etc/resolv.conf was not taken from /proc/net/dns (so DNS only works where 10.0.2.3 exists)"; ok=0; }; \
-	  grep -q "^wget ok [1-9]" $$L || { echo "FAIL: wget (TCP socket)"; ok=0; }; \
+	  grep -q "wget ok [1-9]" $$L || { echo "FAIL: wget (TCP socket)"; ok=0; }; \
 	  grep -q "^lines=2" $$L || { echo "FAIL: mkdir, >, >>, cp, mv"; ok=0; }; \
 	  grep -q "^edited" $$L || { echo "FAIL: sed -i (temp file + rename)"; ok=0; }; \
 	  grep -q "^removed 0" $$L || { echo "FAIL: rm -r"; ok=0; }; \

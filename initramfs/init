@@ -15,7 +15,11 @@ export TERM=linux
 # address happens to be right.
 mkdir -p /proc
 mount -t proc proc /proc 2>/dev/null
-[ -r /proc/net/dns ] && cp /proc/net/dns /etc/resolv.conf 2>/dev/null
+# `read` is a shell builtin, and that is the point: BusyBox's cp and cat both
+# reach for sendfile64 whenever the destination can take it, the kernel does
+# not have that syscall yet, and the failed call prints a line on every boot.
+# /proc/net/dns is one line by construction (fs/procfs.c).
+[ -r /proc/net/dns ] && { read -r ns < /proc/net/dns; echo "$ns" > /etc/resolv.conf; } 2>/dev/null
 
 cat /etc/motd
 SHELL=/bin/sh

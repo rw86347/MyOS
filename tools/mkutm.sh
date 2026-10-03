@@ -44,18 +44,27 @@
 set -e
 installed=0
 net=Shared
-debug_dir=
+debug_port=
 while :; do
     case "$1" in
     --installed) installed=1; shift ;;
     # shared | emulated | bridged; see the note above. Capitalised for the
     # plist, which is how UTM writes it.
     --net) net=$(echo "$2" | tr '[:lower:]' '[:upper:]' | cut -c1)$(echo "$2" | cut -c2-); shift 2 ;;
-    # Add a serial port writing to DIR/serial.log and a QEMU monitor socket at
-    # DIR/monitor.sock, so the machine can be booted and driven from a script
-    # (tools/qemu-type.sh speaks to that socket). Left out of a VM meant for a
-    # person: it would scatter files and hold a socket nobody asked for.
-    --debug-dir) debug_dir=$2; shift 2 ;;
+    # Put the QEMU monitor on 127.0.0.1:PORT and the serial console on
+    # PORT+1, so the machine can be booted, read and driven from a script:
+    #   nc 127.0.0.1 4445 > boot.log          the console
+    #   tools/qemu-type.sh 'cmd' | nc 127.0.0.1 4444    keystrokes
+    # Left out of a VM meant for a person, which should not be listening on
+    # anything.
+    #
+    # Both over TCP, which is not the obvious choice -- a file and a unix
+    # socket would be simpler. UTM runs QEMU inside the App Sandbox, and the
+    # sandbox refuses to bind a unix socket ("Operation not permitted") and
+    # refuses to open a file for writing anywhere outside the VM bundle,
+    # including /tmp and $HOME. A listening TCP socket on localhost is the one
+    # channel it allows. Found by trying the other two.
+    --debug-port) debug_port=$2; shift 2 ;;
     *) break ;;
     esac
 done
@@ -128,15 +137,13 @@ if [ $installed = 0 ] && [ ! -f "$out/Data/$DATA_UUID.qcow2" ]; then
 fi
 
 EXTRA_ARGS=
-if [ -n "$debug_dir" ]; then
-    mkdir -p "$debug_dir"
-    : > "$debug_dir/serial.log"
-    rm -f "$debug_dir/monitor.sock"
+if [ -n "$debug_port" ]; then
+    serial_port=$((debug_port + 1))
     EXTRA_ARGS="
-			<string>-serial</string>
-			<string>file:$debug_dir/serial.log</string>
 			<string>-monitor</string>
-			<string>unix:$debug_dir/monitor.sock,server,nowait</string>"
+			<string>tcp:127.0.0.1:$debug_port,server,nowait</string>
+			<string>-serial</string>
+			<string>tcp:127.0.0.1:$serial_port,server,nowait</string>"
 fi
 
 cat > "$out/config.plist" <<EOF

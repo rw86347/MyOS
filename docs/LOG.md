@@ -993,3 +993,48 @@ that the broken path still produces a valid-looking answer. The same week's
 other two: the fuzz harness over-allocating its packet buffer so a four-byte
 overread stayed inside the allocation, and a readdir race test whose deleted
 entries still pointed at live memory.
+
+## 2026-10-04 — `ping google.com`, on a real network
+
+The goal was a UTM machine on the Desktop that can ping google.com, and it
+does. What stood in the way was not MyOS.
+
+QEMU's SLIRP backend, which every `make run` and `make test` uses, does not
+forward ICMP to anywhere except the gateway: doing so needs a raw socket and
+therefore root. A packet capture settled it — MyOS emits three correct echo
+requests and nothing comes back, in a boot where `wget` works. So `ping
+8.8.8.8` is not testable on the command line at all. UTM's `Shared` mode is
+Apple's vmnet, a real NAT in the macOS kernel, which does forward ICMP; QEMU
+can use it directly but not without root (`cannot create vmnet interface:
+possibly not enough privileges`). UTM is signed for it. That is the only
+reason to leave the command line, and `docs/utm.md` now says so, along with
+everything it took to drive UTM from a script — chiefly that its QEMU runs in
+the App Sandbox, which refuses to bind a unix socket or write a file outside
+the VM bundle, so the monitor has to go over localhost TCP.
+
+Verified in a probe VM: a lease from 192.168.64.1, `/etc/resolv.conf` holding
+that nameserver, and `ping google.com` 3 of 3 at 260–311 ms.
+
+Two things had to be fixed to get there, and the second was the interesting
+one. `/etc/resolv.conf` was a file in the image naming QEMU's 10.0.2.3 — right
+in QEMU and wrong everywhere else, which is precisely the machine DHCP was
+added for. The kernel is the DHCP client, so it is the only thing that knows;
+it now reports the nameserver as `/proc/net/dns`, already in resolv.conf's
+format, and both inits copy it.
+
+Testing that copy turned up three things nobody had looked at. runit's stage 1
+mounted /proc, /sys and /run without creating the mount points, with errors
+sent to /dev/null — all three had been failing silently. `initramfs/init` never
+mounted /proc at all, so musl's `ttyname()` had been working by luck. And the
+check had to compare `/proc/net/dns` against `/etc/resolv.conf` byte for byte
+with comments in the shipped file, because under QEMU the kernel's answer is
+the same address the image guessed: comparing addresses would pass whether or
+not the copy happened. The same trap as the DHCP lease line, one day apart.
+
+Also fixed: `make test-shell` had three checks that failed at random. The
+commands are typed on a timer, so a slow one — ping waits a second between
+packets — is still printing when the next is typed into it, and `^wget ok`
+stops matching. Those three are now unanchored, which is still exact because
+each pattern contains something the echoed command line cannot: a received
+count, a resolved address, a byte count. Worth saying plainly: a test that
+fails at random is worse than no test, because it trains you to ignore it.

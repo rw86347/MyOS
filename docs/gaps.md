@@ -347,13 +347,29 @@ when it's fixed. File references point at the comment that mentions the gap.
   `udhcpc` cannot run even though the kernel now does the same job. If a
   user-space client ever matters, that is what it needs — along with a way for
   user space to *set* the address, which also does not exist.
-- **ICMP through Apple's vmnet is unverified.** `tools/mkutm.sh --net shared`
-  builds a VM on Apple's vmnet, which NATs like a real router and should
-  forward ICMP, unlike QEMU's SLIRP (where `ping 8.8.8.8` gets nothing — a
-  packet capture shows MyOS emitting correct echo requests and SLIRP dropping
-  them, because forwarding them would need a raw socket and therefore root).
-  Verifying this from a script needs either UTM automation permission or root
-  for `-netdev vmnet-shared`, so it has been reasoned about and not measured.
+- ~~ICMP through Apple's vmnet is unverified.~~ **Measured 2026-10-04 and it
+  works**: a probe VM in `shared` mode took a lease from 192.168.64.1, and
+  `ping google.com` returned 3 of 3 at 260–311 ms. QEMU's SLIRP still cannot do
+  this (`ping 8.8.8.8` gets nothing; a packet capture shows MyOS emitting
+  correct echo requests and SLIRP dropping them, because forwarding one would
+  need a raw socket and therefore root), so ICMP to the internet can only be
+  tested in UTM. See `docs/utm.md`.
+- **`wget` failed to resolve a name once on vmnet, and it is not understood.**
+  In the probe boot above, `ping google.com` resolved and answered while
+  `wget http://example.com/` in the same boot said `bad address 'example.com'`.
+  Ruled out since, all from the command line: the dual A+AAAA query musl's
+  `getaddrinfo` sends (14 attempts, all fine, both replies captured); the
+  per-socket receive queue (8 datagrams deep, not 1); the vmnet resolver itself
+  (queried through SLIRP's NAT, 4 of 4 fine); and the sequence of pings that
+  ran before it (replayed, fine). So it is either specific to vmnet or
+  intermittent at a rate below 1 in 14. Reproducing it means another probe
+  boot in UTM with the lookups baked into `/init`.
+- **`sendfile64` (syscall 239) is not implemented.** BusyBox's `cp` and `cat`
+  try it whenever the destination can take it, fall back to read/write
+  correctly, and leave one `syscall 239 not implemented` line in every boot
+  log. Harmless but it is a real syscall that real programs use, and doing it
+  properly (straight out of the page cache) would make file copies faster
+  rather than merely quieter.
 
 ## Drivers
 
