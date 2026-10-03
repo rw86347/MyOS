@@ -16,6 +16,7 @@
 #include <interrupts.h>
 #include <io.h>
 #include <sched.h>
+#include <signal.h>
 #include <thread.h>
 #include <timer.h>
 
@@ -33,6 +34,7 @@ static void timer_irq(struct regs *r)
     ticks++;
     cycles_tick(ticks);                 /* background calibration (cpu.c) */
     thread_timer_tick(ticks);           /* wake timed sleepers that are due */
+    signal_alarm_tick(ticks);           /* SIGALRM for alarm/setitimer */
     sched_tick();                       /* next time slot; may switch threads */
 }
 

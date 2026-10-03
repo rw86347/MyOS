@@ -1,0 +1,534 @@
+/*
+ * ipv4.c — ARP, ICMP, and the IP header check (step 10)
+ *
+ * QEMU's user network gives the guest 10.0.2.15, with the gateway at
+ * 10.0.2.2 and DNS at 10.0.2.3. Those are the addresses until DHCP exists.
+ * The parser trusts lengths only after checking them against the bytes we
+ * actually have. IP options and fragments are dropped. UDP and TCP sit on
+ * top of ip_send / the demux at the bottom of on_ip.
+ *
+ * ip_send never blocks. If the next hop's MAC is unknown, the finished
+ * frame waits in a small fixed queue while an ARP request goes out, and
+ * the reply sends it. That matters for more than speed: a send that slept
+ * here would be re-entered from the receive path, and a caller's buffer
+ * (tcp.c builds segments in one static buffer) could be overwritten under
+ * it before the bytes reached the card.
+ *
+ * The neighbour cache only ever learns from a reply to a request of our
+ * own. Unsolicited replies and other stations' requests are how ARP caches
+ * get poisoned, so they are answered where appropriate but never recorded.
+ */
+#include <errno.h>
+#include <interrupts.h>
+#include <ipv4.h>
+#include <kprintf.h>
+#include <netdevice.h>
+#include <socket.h>
+#include <string.h>
+#include <tcp.h>
+#include <timer.h>
+#include <udp.h>
+
+#define OUR_IP    IPV4_ADDR
+#define OUR_MASK  0xFFFFFF00u
+#define OUR_GW    IPV4_GW
+
+struct arp_pkt {
+    uint16_t htype, ptype;
+    uint8_t hlen, plen;
+    uint16_t oper;
+    uint8_t sha[6];
+    uint8_t spa[4];
+    uint8_t tha[6];
+    uint8_t tpa[4];
+} __attribute__((packed));
+
+struct iphdr {
+    uint8_t ver_ihl, tos;
+    uint16_t tot_len, id, frag;
+    uint8_t ttl, protocol;
+    uint16_t check;
+    uint32_t saddr, daddr;
+} __attribute__((packed));
+
+struct icmp_hdr {
+    uint8_t type, code;
+    uint16_t check;
+    uint16_t id, seq;
+} __attribute__((packed));
+
+#define ARP_REQUEST 1
+#define ARP_REPLY   2
+#define ICMP_ECHO_REPLY 0
+#define ICMP_ECHO       8
+
+#define NEIGH_N      8
+#define NEIGH_TTL_MS 60000          /* ask again about a host after a minute */
+
+struct neigh {
+    uint32_t ip;
+    uint8_t mac[6];
+    uint32_t used_at;               /* for least-recently-used eviction */
+    uint32_t expires;               /* 0: slot free */
+};
+
+static struct neigh table[NEIGH_N];
+static struct net_device *eth;
+static volatile int ping_got;
+static uint16_t ping_seq;
+static uint32_t ping_dst;
+
+static int past(uint32_t deadline, uint32_t now)
+{
+    return (int32_t)(now - deadline) >= 0;
+}
+
+uint32_t ip_csum_add(uint32_t sum, const void *data, uint32_t len)
+{
+    const uint8_t *p = data;
+    while (len > 1) {
+        sum += (uint32_t)p[0] << 8 | p[1];
+        p += 2;
+        len -= 2;
+    }
+    if (len)
+        sum += (uint32_t)p[0] << 8;
+    return sum;
+}
+
+uint16_t ip_csum_finish(uint32_t sum)
+{
+    while (sum >> 16)
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    return (uint16_t)~sum;
+}
+
+static uint16_t checksum(const void *data, uint32_t len)
+{
+    return ip_csum_finish(ip_csum_add(0, data, len));
+}
+
+static void wr_be32(uint8_t a[4], uint32_t ip);
+
+uint16_t ip_transport_csum(uint32_t src, uint32_t dst, uint8_t proto,
+                           const void *seg, uint32_t len)
+{
+    uint8_t ph[12];
+    wr_be32(ph, src);
+    wr_be32(ph + 4, dst);
+    ph[8] = 0;
+    ph[9] = proto;
+    ph[10] = (uint8_t)(len >> 8);
+    ph[11] = (uint8_t)len;
+    uint32_t sum = ip_csum_add(0, ph, 12);
+    sum = ip_csum_add(sum, seg, len);
+    return ip_csum_finish(sum);
+}
+
+static uint32_t rd_be32(const uint8_t a[4])
+{
+    return ((uint32_t)a[0] << 24) | ((uint32_t)a[1] << 16) |
+           ((uint32_t)a[2] << 8) | a[3];
+}
+
+static void wr_be32(uint8_t a[4], uint32_t ip)
+{
+    a[0] = (uint8_t)(ip >> 24);
+    a[1] = (uint8_t)(ip >> 16);
+    a[2] = (uint8_t)(ip >> 8);
+    a[3] = (uint8_t)ip;
+}
+
+static int eth_send(const uint8_t dst[6], uint16_t proto, const void *payload, uint32_t len)
+{
+    if (!eth || len > ETH_DATA_LEN)
+        return -EINVAL;
+    struct sk_buff *skb = alloc_skb(2 + ETH_HLEN + len);
+    if (!skb)
+        return -ENOMEM;
+    skb_reserve(skb, 2);
+    unsigned char *p = skb_put(skb, ETH_HLEN + len);
+    if (!p) {
+        kfree_skb(skb);
+        return -ENOMEM;
+    }
+    memcpy(p, dst, 6);
+    memcpy(p + 6, eth->dev_addr, 6);
+    p[12] = (uint8_t)(proto >> 8);
+    p[13] = (uint8_t)proto;
+    memcpy(p + ETH_HLEN, payload, len);
+    skb->dev = eth;
+    int rc = dev_queue_xmit(skb);
+    if (rc == -EAGAIN)
+        kfree_skb(skb);             /* the driver did not take it */
+    return rc;
+}
+
+/* A full table drops the least recently used entry, not the first one: an
+   attacker cannot aim the eviction at the gateway, which is in constant use. */
+static void remember(uint32_t ip, const uint8_t mac[6])
+{
+    uint32_t now = timer_ms();
+    int slot = -1;
+    for (int i = 0; i < NEIGH_N; i++) {
+        if (table[i].expires && table[i].ip == ip) {
+            slot = i;
+            break;
+        }
+        if (!table[i].expires && slot < 0)
+            slot = i;
+    }
+    if (slot < 0) {
+        slot = 0;
+        for (int i = 1; i < NEIGH_N; i++)
+            if ((int32_t)(table[i].used_at - table[slot].used_at) < 0)
+                slot = i;
+    }
+    table[slot].ip = ip;
+    memcpy(table[slot].mac, mac, 6);
+    table[slot].used_at = now;
+    table[slot].expires = (now + NEIGH_TTL_MS) | 1;     /* never 0: 0 is free */
+}
+
+static int lookup(uint32_t ip, uint8_t mac[6])
+{
+    uint32_t now = timer_ms();
+    for (int i = 0; i < NEIGH_N; i++) {
+        if (!table[i].expires || table[i].ip != ip)
+            continue;
+        if (past(table[i].expires, now)) {
+            table[i].expires = 0;       /* stale: ask again */
+            return -1;
+        }
+        memcpy(mac, table[i].mac, 6);
+        table[i].used_at = now;
+        return 0;
+    }
+    return -1;
+}
+
+/* A station we may talk to: not zero, not a broadcast, not a multicast. */
+static int ip_ok(uint32_t ip)
+{
+    return ip && ip != 0xFFFFFFFFu && (ip >> 28) != 0xE;
+}
+
+static int mac_ok(const uint8_t mac[6])
+{
+    if (mac[0] & 1)                     /* multicast or broadcast */
+        return 0;
+    for (int i = 0; i < 6; i++)
+        if (mac[i])
+            return 1;
+    return 0;                           /* all zero */
+}
+
+static void arp_send(uint16_t oper, const uint8_t tha[6], uint32_t tpa)
+{
+    struct arp_pkt a;
+    memset(&a, 0, sizeof a);
+    a.htype = htons(1);
+    a.ptype = htons(ETH_P_IP);
+    a.hlen = 6;
+    a.plen = 4;
+    a.oper = htons(oper);
+    memcpy(a.sha, eth->dev_addr, 6);
+    wr_be32(a.spa, OUR_IP);
+    memcpy(a.tha, tha, 6);
+    wr_be32(a.tpa, tpa);
+    uint8_t dst[6];
+    if (oper == ARP_REQUEST)
+        memset(dst, 0xFF, 6);
+    else
+        memcpy(dst, tha, 6);
+    eth_send(dst, ETH_P_ARP, &a, sizeof a);
+}
+
+/* Frames waiting for an ARP reply. Finished and ready to go: only the
+   destination MAC in the first six bytes is still blank. Four is plenty —
+   each protocol already retries (TCP's retransmit timer, dns_resolve's
+   second try), and every retry re-sends the request. */
+#define ARP_QUEUE   4
+#define ARP_WAIT_MS 1000
+
+static struct {
+    struct sk_buff *skb;
+    uint32_t ip;                        /* next hop we are waiting for */
+    uint32_t expires;
+} pending[ARP_QUEUE];
+
+static int xmit_to(struct sk_buff *skb, const uint8_t mac[6]);
+
+static void arp_expire(uint32_t now)
+{
+    for (int i = 0; i < ARP_QUEUE; i++)
+        if (pending[i].skb && past(pending[i].expires, now)) {
+            kfree_skb(pending[i].skb);
+            pending[i].skb = NULL;
+        }
+}
+
+/* Hold one frame and ask who owns `ip`. Never blocks. */
+static int arp_queue(struct sk_buff *skb, uint32_t ip)
+{
+    uint32_t now = timer_ms();
+    arp_expire(now);
+    int slot = -1;
+    for (int i = 0; i < ARP_QUEUE && slot < 0; i++)
+        if (!pending[i].skb)
+            slot = i;
+    if (slot < 0) {                     /* full: the oldest frame gives way */
+        slot = 0;
+        for (int i = 1; i < ARP_QUEUE; i++)
+            if ((int32_t)(pending[i].expires - pending[slot].expires) < 0)
+                slot = i;
+        kfree_skb(pending[slot].skb);
+    }
+    pending[slot].skb = skb;
+    pending[slot].ip = ip;
+    pending[slot].expires = (now + ARP_WAIT_MS) | 1;
+    uint8_t zero[6] = { 0 };
+    arp_send(ARP_REQUEST, zero, ip);
+    return 0;
+}
+
+/* Did we ask about this address? A reply we did not ask for is ignored. */
+static int arp_awaited(uint32_t ip)
+{
+    for (int i = 0; i < ARP_QUEUE; i++)
+        if (pending[i].skb && pending[i].ip == ip)
+            return 1;
+    return 0;
+}
+
+static void arp_flush(uint32_t ip, const uint8_t mac[6])
+{
+    for (int i = 0; i < ARP_QUEUE; i++) {
+        if (!pending[i].skb || pending[i].ip != ip)
+            continue;
+        struct sk_buff *skb = pending[i].skb;
+        pending[i].skb = NULL;          /* clear first: xmit_to frees it */
+        xmit_to(skb, mac);
+    }
+}
+
+static int on_arp(struct sk_buff *skb)
+{
+    if (skb->len < sizeof(struct arp_pkt)) {
+        kfree_skb(skb);
+        return 0;
+    }
+    struct arp_pkt a;
+    memcpy(&a, skb->data, sizeof a);
+    kfree_skb(skb);
+    if (ntohs(a.htype) != 1 || ntohs(a.ptype) != ETH_P_IP || a.hlen != 6 || a.plen != 4)
+        return 0;
+    uint32_t spa = rd_be32(a.spa);
+    uint32_t tpa = rd_be32(a.tpa);
+    uint16_t oper = ntohs(a.oper);
+    if (!ip_ok(spa) || !mac_ok(a.sha))
+        return 0;
+
+    /* Answer a request for our address straight from the MAC on the frame.
+       The asker is not recorded: a request claiming to be the gateway is
+       the oldest trick there is. */
+    if (oper == ARP_REQUEST && tpa == OUR_IP)
+        arp_send(ARP_REPLY, a.sha, spa);
+
+    /* Learn only from a reply to a question of ours. */
+    if (oper == ARP_REPLY && tpa == OUR_IP && arp_awaited(spa)) {
+        remember(spa, a.sha);
+        arp_flush(spa, a.sha);
+    }
+    return 0;
+}
+
+static uint16_t ip_id = 1;
+
+/* The Ethernet and IP headers are written straight into the skb in front
+   of the payload: one copy of the payload, no 1500-byte buffer on the stack.
+   The destination MAC is left blank for xmit_to, so a frame can be built
+   before we know it. The caller's payload is copied here and nowhere else,
+   which is what lets ip_send return without blocking. */
+static struct sk_buff *ip_frame(uint32_t dst, uint8_t proto,
+                                const void *payload, uint32_t len)
+{
+    if (!eth || len > ETH_DATA_LEN - sizeof(struct iphdr))
+        return NULL;
+    uint32_t total = sizeof(struct iphdr) + len;
+    struct sk_buff *skb = alloc_skb(2 + ETH_HLEN + total);
+    if (!skb)
+        return NULL;
+    skb_reserve(skb, 2);
+    unsigned char *p = skb_put(skb, ETH_HLEN + total);
+    memset(p, 0, 6);
+    memcpy(p + 6, eth->dev_addr, 6);
+    p[12] = (uint8_t)(ETH_P_IP >> 8);
+    p[13] = (uint8_t)ETH_P_IP;
+    struct iphdr *ip = (struct iphdr *)(p + ETH_HLEN);
+    memset(ip, 0, sizeof *ip);
+    ip->ver_ihl = 0x45;
+    ip->tot_len = htons((uint16_t)total);
+    ip->id = htons(ip_id++);
+    ip->ttl = 64;
+    ip->protocol = proto;
+    ip->saddr = htonl(OUR_IP);
+    ip->daddr = htonl(dst);
+    ip->check = htons(checksum(ip, sizeof *ip));
+    memcpy(p + ETH_HLEN + sizeof *ip, payload, len);
+    skb->dev = eth;
+    return skb;
+}
+
+static int xmit_to(struct sk_buff *skb, const uint8_t mac[6])
+{
+    memcpy(skb->data, mac, 6);
+    int rc = dev_queue_xmit(skb);
+    if (rc == -EAGAIN)
+        kfree_skb(skb);             /* the driver did not take it */
+    return rc;
+}
+
+/* For a station whose MAC we already have on the frame it sent us. */
+static int ip_send_mac(uint32_t dst, const uint8_t mac[6], uint8_t proto,
+                       const void *payload, uint32_t len)
+{
+    struct sk_buff *skb = ip_frame(dst, proto, payload, len);
+    if (!skb)
+        return -EMSGSIZE;
+    return xmit_to(skb, mac);
+}
+
+/* Returns 0 once the frame is the network's problem — sent, or waiting for
+   an ARP reply that will send it. Never blocks, so it is safe to call from
+   the receive path and from a caller whose payload buffer is reused. */
+int ip_send(uint32_t dst, uint8_t proto, const void *payload, uint32_t len)
+{
+    uint32_t next = ((dst ^ OUR_IP) & OUR_MASK) ? OUR_GW : dst;
+    if (!ip_ok(next))
+        return -EINVAL;
+    struct sk_buff *skb = ip_frame(dst, proto, payload, len);
+    if (!skb)
+        return -EMSGSIZE;
+    uint8_t mac[6];
+    if (lookup(next, mac) == 0)
+        return xmit_to(skb, mac);
+    return arp_queue(skb, next);
+}
+
+static int on_ip(struct sk_buff *skb)
+{
+    if (skb->len < sizeof(struct iphdr)) {
+        kfree_skb(skb);
+        return 0;
+    }
+    struct iphdr ip;
+    memcpy(&ip, skb->data, sizeof ip);
+    uint32_t ihl = (ip.ver_ihl & 0x0F) * 4;
+    uint32_t total = ntohs(ip.tot_len);
+    if ((ip.ver_ihl >> 4) != 4 || ihl != 20 || total < ihl || total > skb->len) {
+        kfree_skb(skb);
+        return 0;
+    }
+    if (ip.frag & htons(0x3FFF)) {      /* a fragment: drop */
+        kfree_skb(skb);
+        return 0;
+    }
+    uint16_t saved = ip.check;
+    ip.check = 0;
+    if (checksum(&ip, sizeof ip) != ntohs(saved)) {
+        kfree_skb(skb);
+        return 0;
+    }
+    /* Addressed to us, and only to us. Nothing here has a use for broadcast
+       or multicast yet, and the two things we would do with them are both
+       bad: answering a broadcast ping makes this machine a smurf amplifier,
+       and a bound UDP port cannot tell a broadcast datagram from a unicast
+       one. DHCP will need an exception for its own port when it arrives. */
+    uint32_t dst = ntohl(ip.daddr);
+    if (dst != OUR_IP) {
+        kfree_skb(skb);
+        return 0;
+    }
+    if (ip.protocol == IPPROTO_ICMP && total >= ihl + sizeof(struct icmp_hdr)) {
+        struct icmp_hdr ic;
+        memcpy(&ic, skb->data + ihl, sizeof ic);
+        uint32_t body = total - ihl;
+        if (checksum(skb->data + ihl, body) != 0) {
+            kfree_skb(skb);
+            return 0;
+        }
+        raw_icmp_input(skb->data, total);   /* ping(8) reads these */
+        /* Only the host we pinged can answer our ping. */
+        if (ic.type == ICMP_ECHO_REPLY && ntohs(ic.seq) == ping_seq &&
+            ntohl(ip.saddr) == ping_dst)
+            ping_got = 1;
+        /* Static: net_rx_action has one caller at a time. A bigger echo is
+           still passed to raw sockets above, we just do not reflect it. */
+        static uint8_t reply[1400];
+        if (ic.type == ICMP_ECHO && body <= sizeof reply) {
+            memcpy(reply, skb->data + ihl, body);
+            struct icmp_hdr *o = (struct icmp_hdr *)reply;
+            o->type = ICMP_ECHO_REPLY;
+            o->check = 0;
+            o->check = htons(checksum(reply, body));
+            /* Reply to the station that asked. Its MAC is already on the
+               frame, so this does not wait for ARP inside the receive path. */
+            ip_send_mac(ntohl(ip.saddr), skb->eth_src, IPPROTO_ICMP, reply, body);
+        }
+    } else if (ip.protocol == IPPROTO_UDP) {
+        udp_input(ntohl(ip.saddr), dst, skb->data + ihl, total - ihl);
+    } else if (ip.protocol == IPPROTO_TCP) {
+        tcp_input(ntohl(ip.saddr), dst, skb->data + ihl, total - ihl);
+    }
+    kfree_skb(skb);
+    return 0;
+}
+
+static struct packet_type arp_pt = { .type = ETH_P_ARP, .func = on_arp };
+static struct packet_type ip_pt = { .type = ETH_P_IP, .func = on_ip };
+
+void ipv4_init(void)
+{
+    eth = dev_get_by_name("eth0");
+    if (!eth)
+        return;
+    dev_add_pack(&arp_pt);
+    dev_add_pack(&ip_pt);
+    kprintf("ipv4: eth0 is 10.0.2.15/24 gateway 10.0.2.2\n");
+}
+
+int net_ping(uint32_t dst)
+{
+    if (!eth)
+        return -ENODEV;
+    struct icmp_hdr ic;
+    memset(&ic, 0, sizeof ic);
+    ic.type = ICMP_ECHO;
+    ic.id = htons(1);
+    ping_seq++;
+    ic.seq = htons(ping_seq);
+    uint8_t pkt[sizeof ic + 32];
+    memcpy(pkt, &ic, sizeof ic);
+    memset(pkt + sizeof ic, 0x5A, 32);
+    struct icmp_hdr *h = (struct icmp_hdr *)pkt;
+    h->check = htons(checksum(pkt, sizeof pkt));
+    ping_got = 0;
+    ping_dst = dst;
+    /* Three tries, 500 ms apart. The first can be spent learning the MAC,
+       and a NIC may hold received frames for a while after it is enabled
+       (QEMU's e1000: one second). Same sequence number each time, so a
+       late reply to an earlier try still counts. */
+    for (int tries = 0; tries < 3; tries++) {
+        if (ip_send(dst, IPPROTO_ICMP, pkt, sizeof pkt) < 0)
+            return -EIO;
+        uint32_t t0 = timer_ms();
+        while (timer_ms() - t0 < 500) {
+            net_rx_action();
+            if (ping_got)
+                return 0;
+            net_sleep(10);
+        }
+    }
+    return -EIO;
+}

@@ -36,6 +36,7 @@
 #define NBUF_MAX   2048         /* 8 MiB of blocks at most */
 #define HASH_SIZE  2048         /* buckets: 2^11, see hash_of */
 #define FLUSH_MS   1000         /* changes reach the disk within ~1 s */
+#define RUN_MAX    128          /* blocks in one write: 128 KiB of 1 KiB blocks */
 
 static struct buf bufs[NBUF_MAX];
 static int nbuf;                        /* in use: depends on RAM */
@@ -103,24 +104,12 @@ static struct buf *victim(void)
 
 static uint32_t sectors(const struct buf *b) { return b->size / SECTOR_SIZE; }
 
-/* Write one changed block to the disk (sleeps). A change made while the
-   write is running marks it dirty again, so it's written next time. A
-   failed write is reported and dropped: retrying a broken disk forever
-   would hang every program waiting for a buffer. */
-static int write_back(struct buf *b)
-{
-    b->refs++;                          /* not reused while being written */
-    b->dirty = 0;
-    ndirty--;
-    int err = blockdev_write(b->dev, b->block * sectors(b), sectors(b), b->data);
-    nwrites++;
-    if (err)
-        kprintf("bcache: write error on %s, block %lu: change lost\n",
-                b->dev->name, b->block);
-    b->refs--;
-    wq_wake_all(&io_done);              /* it may be free to reuse now */
-    return err;
-}
+/* Write a changed block, and its dirty neighbours, to the disk (sleeps;
+   see write_run below). A change made while the write is running marks
+   it dirty again, so it's written next time. A failed write is reported
+   and dropped: retrying a broken disk forever would hang every program
+   waiting for a buffer. */
+static int write_run(struct buf *b);
 
 /* (Inlined into both callers: bread is the hot one — every block a file
    system touches goes through it — and the flag then costs nothing.) */
@@ -130,6 +119,17 @@ struct buf *get(struct blockdev *dev, uint32_t block, uint32_t size, int read);
 struct buf *bread(struct blockdev *dev, uint32_t block, uint32_t size)
 {
     return get(dev, block, size, 1);
+}
+
+int bpeek(struct blockdev *dev, uint32_t block, uint32_t size, void *dst)
+{
+    uint32_t flags = irq_save();
+    struct buf *b = lookup(dev, block, size);
+    int hit = b && b->valid;
+    if (hit)
+        memcpy(dst, b->data, size);
+    irq_restore(flags);
+    return hit;
 }
 
 struct buf *bclear(struct blockdev *dev, uint32_t block, uint32_t size)
@@ -164,7 +164,7 @@ struct buf *get(struct blockdev *dev, uint32_t block, uint32_t size, int read)
             continue;
         }
         if (b->dirty) {
-            write_back(b);              /* slept: look at everything again */
+            write_run(b);               /* slept: look at everything again */
             continue;
         }
         if (!b->data) {                 /* first use of this buffer */
@@ -230,6 +230,50 @@ void brelse(struct buf *b)
     irq_restore(flags);
 }
 
+static struct buf *dirty_at(struct blockdev *dev, uint32_t block, uint32_t size)
+{
+    struct buf *b = lookup(dev, block, size);
+    return b && b->dirty && b->valid ? b : NULL;
+}
+
+/* Write b and the dirty blocks next to it on the disk as ONE command (up
+   to 128 KiB): a file written in order becomes a few big writes, not one
+   per block. Sleeps. */
+static int write_run(struct buf *b)
+{
+    uint32_t spb = sectors(b), max = BIO_SECTORS / spb > RUN_MAX ? RUN_MAX : BIO_SECTORS / spb;
+    uint32_t first = b->block, n = 0;
+    while (first > 0 && b->block - first + 1 < max && dirty_at(b->dev, first - 1, b->size))
+        first--;
+    struct buf *run[RUN_MAX];
+    struct bio_vec v[BIO_VEC_MAX];
+    int nv = 0;
+    for (struct buf *x; n < max && (x = dirty_at(b->dev, first + n, b->size)); n++) {
+        uint32_t pa = V2P(x->data);
+        if (nv && v[nv - 1].phys + v[nv - 1].len == pa)
+            v[nv - 1].len += x->size;
+        else if (nv == BIO_VEC_MAX)
+            break;
+        else
+            v[nv++] = (struct bio_vec){ pa, x->size };
+        run[n] = x;
+        x->refs++;                      /* not reused while being written */
+        x->dirty = 0;
+        ndirty--;
+    }
+    if (!nv)
+        return 0;                       /* b is being read, not dirty data */
+    int err = blockdev_writev(b->dev, first * spb, v, nv);
+    nwrites++;
+    if (err)
+        kprintf("bcache: write error on %s, blocks %lu-%lu: changes lost\n",
+                b->dev->name, first, first + n - 1);
+    for (uint32_t k = 0; k < n; k++)
+        run[k]->refs--;
+    wq_wake_all(&io_done);
+    return err;
+}
+
 int bsync(void)
 {
     uint32_t flags = irq_save();
@@ -247,7 +291,7 @@ int bsync(void)
             seen |= written[k] == disk;
         if (!seen && nwritten < BLOCKDEV_MAX)
             written[nwritten++] = disk;
-        if (write_back(b) < 0)
+        if (write_run(b) < 0)
             err = -EIO;
     }
     for (int k = 0; k < nwritten; k++)  /* one drive-cache flush per disk */

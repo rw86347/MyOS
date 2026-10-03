@@ -25,6 +25,7 @@
 #define S_IFLNK   0120000           /* symbolic link */
 #define S_IFCHR   0020000           /* character device (the console) */
 #define S_IFIFO   0010000           /* pipe */
+#define S_IFSOCK  0140000           /* socket */
 #define S_ISDIR(m) (((m) & S_IFMT) == S_IFDIR)
 #define S_ISREG(m) (((m) & S_IFMT) == S_IFREG)
 #define S_ISCHR(m) (((m) & S_IFMT) == S_IFCHR)
@@ -87,6 +88,9 @@ struct fs_ops {
     int (*setattr)(struct inode *i);                /* mode/owner/times changed */
     int (*truncate)(struct inode *i, uint32_t size);
     int (*read_kernel)(struct inode *i, uint32_t pos, void *kbuf, uint32_t n);
+    /* Fill n page frames with pages [index, index + n) of the file, zeros
+       past its end — for the page cache. May be NULL (read_kernel is used). */
+    int (*readpages)(struct inode *i, uint32_t index, uint32_t n, const uint32_t *frames);
     int (*statfs)(struct mount *m, uint32_t *bsize, uint32_t *blocks, uint32_t *bfree,
                   uint32_t *files, uint32_t *ffree);
 };
@@ -120,6 +124,9 @@ struct inode {
     const struct fs_ops *fs;        /* the disk file system it's on (NULL: RAM) */
     struct mount *mnt;              /* ...that one */
     uint32_t fs_ino;                /* its inode number there */
+    uint32_t pc_id;                 /* page cache: its pages' tag (0: none yet) */
+    uint32_t ra_next;               /* page cache: a miss here means "read in order" */
+    uint16_t ra_win;                /* page cache: last read-ahead, pages */
 
     /* Who is using it: open files, mmap'd areas, current directories. A
        file that's deleted while in use (`rm` of a running log file, of a

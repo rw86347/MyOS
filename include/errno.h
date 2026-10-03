@@ -40,5 +40,23 @@
 #define ELOOP    40     /* too many symbolic links */
 #define EOVERFLOW 75    /* value too large (a 32-bit lseek past 2 GiB) */
 #define ENOTSOCK 88     /* not a socket */
+#define EDESTADDRREQ 89 /* no destination address */
+#define EMSGSIZE 90     /* message too long */
+#define EPROTOTYPE 91   /* wrong protocol for this socket type */
+#define ENOPROTOOPT 92  /* that socket option does not exist */
+#define EPROTONOSUPPORT 93 /* protocol not supported */
+#define EOPNOTSUPP 95   /* not supported on this socket */
+#define EAFNOSUPPORT 97 /* address family not supported */
+#define EADDRINUSE 98   /* address already in use */
+#define EADDRNOTAVAIL 99 /* that address is not ours */
+#define EALREADY   114  /* a connect is already under way */
+#define EINPROGRESS 115 /* non-blocking connect started */
+#define ENETDOWN 100    /* the network device is not up */
+#define ENETUNREACH 101 /* no route to that network */
+#define EISCONN  106    /* already connected */
+#define ECONNRESET 104  /* the other end reset the connection */
+#define ENOTCONN 107    /* not connected */
+#define ETIMEDOUT 110   /* timed out */
+#define ECONNREFUSED 111 /* nothing was listening */
 
 #endif

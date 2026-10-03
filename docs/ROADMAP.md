@@ -68,7 +68,13 @@ Mark a step `[x]` only when its "Done when" check works.
     not re-measured.
   - [ ] 9c-3: the live disk's installer (partition, mke2fs, copy, boot area), raw block
     devices (/dev/hda...), and the UTM VM on the installed layout.
-  - [ ] 9d: PCI scan + bus-master DMA (PIIX/ICH); AHCI (SATA disks).
+  - [x] 9d (part): PCI scan + bus-master DMA (PIIX/ICH), reads and writes, PIO
+    fallback. 64 KiB read: 1 250 instructions of CPU work (PIO: 41 788).
+  - [x] 9d (rest): AHCI (SATA), NVMe and virtio-blk drivers, all scatter-gather DMA
+    with interrupts; IRQ sharing. `read()` goes through the page cache (4-way,
+    sized from RAM, read-ahead up to 128 KiB in one command); writes cluster into
+    one command per run of blocks. `tools/diskbench.sh` (MyOS vs Linux 6.1 on all
+    four types) and `tools/test-disks.sh` (self-tests on AHCI/NVMe/virtio).
   - [ ] 9e: FAT32 in the VFS: read, then write (USB sticks, swapping files with a Mac/PC).
     Read is in: the first FAT32 partition is mounted at /mnt (read-only). Write,
     which has to allocate clusters and update the FAT, is still open.
@@ -82,6 +88,27 @@ Mark a step `[x]` only when its "Done when" check works.
   Done when: `ping`, `wget` and BusyBox `udhcpc` work in QEMU.
   The stack above the driver follows Linux's shape (`sk_buff`, sockets, the same
   driver callbacks). Decided 2026-10-03, `docs/DESIGN.md`. Not lwIP.
+  - [x] 10a: the driver boundary and a PCI scan. `sk_buff`, `net_device`
+    (`ndo_start_xmit`), NAPI, loopback. QEMU's e1000 (8086:100e, IRQ 11) is
+    found. `make test`: `net: loopback delivered`, `pci: e1000 8086:100e`.
+    No Linux driver source yet (GPLv2; no MyOS licence file).
+  - [x] 10b: our own e1000, ARP, and ICMP. QEMU user-net address 10.0.2.15/24.
+    `make test` greps `net: ping 10.0.2.2 ok` (the gateway answered). No
+    sockets. The shell's `ping` still cannot open a socket.
+  - [x] 10c: UDP, DNS, and a TCP client. `dns_resolve` asks 10.0.2.3 for an
+    A record. One TCP connection can handshake, send, and receive.
+    `make test` greps `net: dns example.com is ` and
+    `net: tcp example.com HTTP ok` (needs a path to the internet).
+    No listen socket, no DHCP, no socket syscalls.
+  - [x] 10d: UDP and raw ICMP sockets (`net/socket.c`: socket, bind, connect,
+    sendto/recvfrom, sendmsg/recvmsg, the name calls, socketcall), `/etc/resolv.conf`,
+    and `alarm`/`setitimer`. BusyBox `ping -c 2 10.0.2.2` works, and musl resolves
+    names. `make test-shell` greps both.
+  - [x] 10e: TCP sockets, client side (`net/tcp.c`: one connection per socket,
+    16 KiB rings, up to 4 segments in flight, MSS option, backed-off retransmits)
+    and a network thread for receive and TCP timers. BusyBox `wget` works;
+    `make test-shell` greps `wget ok`.
+  - [ ] 10f: DHCP (`udhcpc`): AF_PACKET, interface ioctls, a settable address.
 - [ ] **11. Fuller Linux ABI** — `mmap`, `brk`, dynamic linking (`ld.so`), more syscalls as programs need them.
   Done when: ordinary dynamically linked GNU programs run.
   - [x] Pulled forward (2026-10-02): dynamic linking — the kernel loads a program's

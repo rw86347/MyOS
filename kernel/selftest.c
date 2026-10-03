@@ -20,6 +20,7 @@ static int passed, failed;
 
 void pcache_selftest(void);
 void fatvfs_selftest(void);
+void net_selftest(void);
 
 void check(int ok, const char *what)
 {
@@ -50,6 +51,7 @@ void run_selftests(void)
     bcache_selftest();      /* the block cache, on the test disk */
     pcache_selftest();      /* disk file pages: second read from RAM */
     fatvfs_selftest();      /* FAT32 files through the VFS */
+    net_selftest();         /* loopback packet path, PCI e1000 */
     thread_selftest();      /* kernel threads + context switch */
     user_selftest();        /* ring 3 programs, syscalls, ELF, FPU */
     sched_selftest();       /* starts the 20 x 1 ms slot scheduler */

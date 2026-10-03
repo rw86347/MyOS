@@ -4,6 +4,8 @@
  * Devices live in a small fixed-size array: a PC has only a few disks.
  */
 #include <blockdev.h>
+#include <memlayout.h>
+#include <paging.h>
 #include <stddef.h>
 
 static struct blockdev devices[BLOCKDEV_MAX];
@@ -51,6 +53,67 @@ int blockdev_write(struct blockdev *dev, uint32_t lba, uint32_t count, const voi
     if (!dev->write)
         return -1;      /* read-only device */
     return dev->write(dev, lba, count, buf);
+}
+
+int blockdev_map(const void *buf, uint32_t bytes, struct bio_vec *v, int max)
+{
+    uintptr_t va = (uintptr_t)buf;
+    int n = 0;
+    while (bytes) {
+        uint32_t piece = PAGE_SIZE - (va & (PAGE_SIZE - 1)), pa;
+        if (piece > bytes)
+            piece = bytes;
+        if (va >= KERNEL_VBASE && va - KERNEL_VBASE < DIRECTMAP_LIMIT)
+            pa = V2P(va);
+        else if ((pa = vmm_translate(va & ~(PAGE_SIZE - 1))) != 0)
+            pa |= va & (PAGE_SIZE - 1);
+        if (!pa)
+            return -1;
+        if (n && v[n - 1].phys + v[n - 1].len == pa)
+            v[n - 1].len += piece;
+        else if (n == max)
+            return -1;
+        else
+            v[n++] = (struct bio_vec){ pa, piece };
+        va += piece;
+        bytes -= piece;
+    }
+    return n;
+}
+
+static int rwv(struct blockdev *dev, uint32_t lba, const struct bio_vec *v, int n, int write)
+{
+    uint32_t count = 0;
+    for (int k = 0; k < n; k++)
+        count += v[k].len / SECTOR_SIZE;
+    if (n < 1 || n > BIO_VEC_MAX || count > BIO_SECTORS || !in_range(dev, lba, count))
+        return -1;
+    while (dev->parent) {
+        lba += dev->offset;
+        dev = dev->parent;
+    }
+    if (write && !dev->write)
+        return -1;                              /* read-only device */
+    if (dev->rwv)
+        return dev->rwv(dev, lba, v, n, write);
+    for (int k = 0; k < n; k++) {               /* no scatter-gather: piece by piece */
+        uint32_t c = v[k].len / SECTOR_SIZE;
+        if ((write ? dev->write(dev, lba, c, P2V(v[k].phys))
+                   : dev->read(dev, lba, c, P2V(v[k].phys))) < 0)
+            return -1;
+        lba += c;
+    }
+    return 0;
+}
+
+int blockdev_readv(struct blockdev *dev, uint32_t lba, const struct bio_vec *v, int n)
+{
+    return rwv(dev, lba, v, n, 0);
+}
+
+int blockdev_writev(struct blockdev *dev, uint32_t lba, const struct bio_vec *v, int n)
+{
+    return rwv(dev, lba, v, n, 1);
 }
 
 int blockdev_flush(struct blockdev *dev)

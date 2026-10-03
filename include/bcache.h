@@ -38,6 +38,10 @@ struct buf *bread(struct blockdev *dev, uint32_t block, uint32_t size);  /* NULL
 /* Like bread, for a block whose old contents don't matter (it was just
    allocated, or will be overwritten whole): zeros, and no disk read. */
 struct buf *bclear(struct blockdev *dev, uint32_t block, uint32_t size);
+/* If the block is cached, copy it to dst and return 1; else 0. Never reads
+   the disk. The page cache uses it so a block changed (and maybe not yet
+   written) through this cache is never read stale from the disk. */
+int  bpeek(struct blockdev *dev, uint32_t block, uint32_t size, void *dst);
 void bdirty(struct buf *b);
 void brelse(struct buf *b);
 int  bsync(void);               /* 0, or -EIO */

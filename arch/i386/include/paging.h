@@ -7,6 +7,7 @@
 #define PTE_PRESENT  0x001
 #define PTE_WRITABLE 0x002
 #define PTE_USER     0x004
+#define PTE_PCD      0x010      /* cache disabled: device registers */
 #define PTE_PS       0x080      /* in a directory entry: a 4 MiB page (PSE) */
 #define PTE_GLOBAL   0x100      /* kernel pages: keep in the TLB across CR3 loads */
 #define PTE_SHARED   0x200      /* OS bit: frame is shared, don't free it on unmap */

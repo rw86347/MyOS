@@ -76,7 +76,7 @@ LIBS    := -lgcc    # gcc's helper routines (e.g. 64-bit division on i386)
 TEST_SRCS  := kernel/selftest.c kernel/disk_demo.c $(wildcard kernel/*_test.c)
 BENCH_SRCS := kernel/bench.c
 C_SRCS  := $(filter-out $(TEST_SRCS) $(BENCH_SRCS), \
-             $(wildcard arch/i386/*.c kernel/*.c drivers/*.c fs/*.c mm/*.c))
+             $(wildcard arch/i386/*.c kernel/*.c drivers/*.c fs/*.c mm/*.c net/*.c))
 ifeq ($(MODE),test)
   C_SRCS += $(TEST_SRCS)
 endif
@@ -128,9 +128,10 @@ endif
 QEMU_FLAGS = -m 64M -cpu pentium3 \
              -drive format=raw,file=$(IMG),index=0,media=disk \
              -drive format=raw,file=$(USB),index=1,media=disk \
-             -drive format=raw,file=$(DATA),index=2,media=disk
+             -drive format=raw,file=$(DATA),index=2,media=disk \
+             -netdev user,id=net0 -device e1000,netdev=net0
 
-.PHONY: all dist utm utm-hd hd run-hd test-hd run run-full run-text debug test check-selftests test-shell bench run-bench usb clean
+.PHONY: all dist utm utm-hd hd run-hd test-hd run run-full run-text debug test check-selftests test-shell bench run-bench usb clean fuzz fuzz-build fuzz-replay
 
 all: $(IMG) $(USB)
 
@@ -437,7 +438,7 @@ test:
 check-selftests: $(IMG) $(USB)
 	$(call make-test-disk,$(DATA),1024)
 	@rm -f $(BUILD)/serial.log
-	@(sleep 4; for k in h i ret; do echo "sendkey $$k"; sleep 0.2; done; \
+	@(sleep 8; for k in h i ret; do echo "sendkey $$k"; sleep 0.2; done; \
 	  echo "mouse_move 10 5"; sleep 0.3; echo "mouse_button 1"; sleep 0.3; \
 	  echo "mouse_button 0"; sleep 0.3; \
 	  echo "sendkey f10"; sleep 1; echo quit) \
@@ -465,6 +466,11 @@ check-selftests: $(IMG) $(USB)
 	  grep -q "pcache: second read comes from RAM" $$L || { echo "FAIL: step 9c-2 page cache"; ok=0; }; \
 	  grep -q "pcache: read-ahead filled the next page" $$L || { echo "FAIL: step 9c-2 read-ahead"; ok=0; }; \
 	  grep -q "fatvfs: HELLO.TXT read through the VFS" $$L || { echo "FAIL: step 9e FAT32 in the VFS"; ok=0; }; \
+	  grep -q "net: loopback delivered" $$L || { echo "FAIL: step 10 loopback"; ok=0; }; \
+	  grep -q "pci: e1000 8086:100e" $$L || { echo "FAIL: step 10 PCI e1000"; ok=0; }; \
+	  grep -q "net: ping 10.0.2.2 ok" $$L || { echo "FAIL: step 10 e1000 ping"; ok=0; }; \
+	  grep -q "net: dns example.com is " $$L || { echo "FAIL: step 10 DNS"; ok=0; }; \
+	  grep -q "net: tcp example.com HTTP ok" $$L || { echo "FAIL: step 10 TCP"; ok=0; }; \
 	  grep -q "ext2test: all [0-9]* checks passed" $$L || { echo "FAIL: step 9b ext2 (Linux-made files)"; ok=0; }; \
 	  grep -q "fstest /data/fst: all [0-9]* checks passed" $$L || { echo "FAIL: step 9b ext2 (fstest)"; ok=0; }; \
 	  grep -q "sigtest: all [0-9]* checks passed" $$L || { echo "FAIL: step 8 signals"; ok=0; }; \
@@ -484,6 +490,8 @@ check-selftests: $(IMG) $(USB)
 # the terminal escape sequences taken out).
 SHELL_TEST_CMDS := 'echo hello from $$0 $$BASH_VERSION' 'ls /' 'echo one two three | wc -w' \
                    'cat /etc/hostname' 'cd /etc; pwd' 'uname -sm' \
+                   'ping -c 2 10.0.2.2' 'ping -c 1 -W 1 example.com' \
+                   'wget -q -O /tmp/e.html http://example.com/ && echo wget ok $$(wc -c < /tmp/e.html); rm -f /tmp/e.html' \
                    'cd /tmp; mkdir -p a/b; echo saved > a/b/f; cp a/b/f a/g; mv a/g a/h; echo more >> a/h; echo lines=$$(wc -l < a/h)' \
                    'sed -i s/saved/edited/ a/h; head -n 1 a/h' 'rm -r a && echo removed $$(ls -A | wc -l)' \
                    'cd /data; mkdir -p a/b; echo kept > a/b/f; cp /bin/busybox bb; mv bb a/; rm numbers.txt; sync' \
@@ -512,6 +520,9 @@ test-shell: $(IMG) $(USB)
 	  grep -q "^myos[[:space:]]*$$" $$L || { echo "FAIL: cat"; ok=0; }; \
 	  grep -q "^/etc[[:space:]]*$$" $$L || { echo "FAIL: cd/pwd"; ok=0; }; \
 	  grep -q "^Linux i686" $$L || { echo "FAIL: uname"; ok=0; }; \
+	  grep -q "^2 packets transmitted, 2 packets received" $$L || { echo "FAIL: ping 10.0.2.2 (raw ICMP socket, alarm)"; ok=0; }; \
+	  grep -q "^PING example.com ([0-9]" $$L || { echo "FAIL: DNS through musl (UDP socket, resolv.conf)"; ok=0; }; \
+	  grep -q "^wget ok [1-9]" $$L || { echo "FAIL: wget (TCP socket)"; ok=0; }; \
 	  grep -q "^lines=2" $$L || { echo "FAIL: mkdir, >, >>, cp, mv"; ok=0; }; \
 	  grep -q "^edited" $$L || { echo "FAIL: sed -i (temp file + rename)"; ok=0; }; \
 	  grep -q "^removed 0" $$L || { echo "FAIL: rm -r"; ok=0; }; \
@@ -534,6 +545,120 @@ run-bench: $(IMG) $(USB) $(DATA)
 	@$(QEMU) $(QEMU_FLAGS) -display none -serial file:$(BUILD)/serial.log \
 	  -icount shift=0,sleep=off -device isa-debug-exit,iobase=0xf4,iosize=0x04 || true
 	@sed -n '/^CPU:/p;/^Cycle counter/p;/^Boot:/p;/^Benchmarks/,/^Benchmarks done/p' $(BUILD)/serial.log
+
+# =============================================================================
+# Fuzzing the packet parsers (tools/fuzz/)
+# =============================================================================
+# Builds net/*.c with the HOST compiler, not the cross compiler, and links it
+# against tools/fuzz/stubs.c instead of the rest of the kernel. That is the
+# whole point: on the host we get AddressSanitizer, so a one-byte overrun in a
+# parser is an immediate, located failure instead of silent corruption that
+# QEMU would happily run. The kernel sources are compiled unmodified, so a bug
+# the fuzzer finds is a bug in the kernel.
+#
+#   make fuzz              fuzz every target for a while
+#   make fuzz T=dns N=1e6  one target, longer
+#   make fuzz-replay       re-run the saved corpus and crashes (for CI)
+#
+# Apple's clang has no libFuzzer runtime, so tools/fuzz/driver.c is the
+# mutation loop; set FUZZER=libfuzzer where the real one exists.
+FUZZ_CC    ?= clang
+FUZZ_DIR   := build/fuzz
+FUZZ_KSRCS := net/skbuff.c net/ipv4.c net/udp.c net/tcp.c net/dns.c \
+              tools/fuzz/stubs.c tools/fuzz/targets.c
+FUZZ_TARGETS := wire ip arp dns tcp
+FUZZ_SAN   := -fsanitize=address,undefined -fno-sanitize-recover=all \
+              -fsanitize-coverage=trace-pc-guard
+FUZZ_WARN  := -std=c11 -g -O1 -Wall -Wextra -fno-omit-frame-pointer
+# The kernel side compiles against the kernel's own headers, with
+# -Itools/fuzz/shim FIRST so it replaces the two that are full of i386
+# assembly (interrupts.h, uaccess.h) and nothing else.
+FUZZ_KFLAGS := $(FUZZ_WARN) $(FUZZ_SAN) -Itools/fuzz/shim -Iinclude -Itools/fuzz
+# The driver is ordinary host code and must NOT see -Iinclude: the kernel has
+# its own string.h and errno.h, which would shadow the C library's and hide
+# strerror, strncmp and errno.
+FUZZ_DFLAGS := $(FUZZ_WARN) $(FUZZ_SAN) -Itools/fuzz
+
+FUZZ_KOBJS := $(patsubst %.c,$(FUZZ_DIR)/%.o,$(FUZZ_KSRCS))
+ifeq ($(FUZZER),libfuzzer)
+  FUZZ_KFLAGS += -fsanitize=fuzzer
+  FUZZ_OBJS   := $(FUZZ_KOBJS)
+  FUZZ_LINK   := -fsanitize=fuzzer
+else
+  FUZZ_OBJS   := $(FUZZ_KOBJS) $(FUZZ_DIR)/tools/fuzz/driver.o
+  FUZZ_LINK   :=
+endif
+
+$(FUZZ_DIR)/tools/fuzz/driver.o: tools/fuzz/driver.c tools/fuzz/targets.h
+	@mkdir -p $(dir $@)
+	$(FUZZ_CC) $(FUZZ_DFLAGS) -c -o $@ $<
+
+$(FUZZ_DIR)/%.o: %.c $(wildcard tools/fuzz/*.h) $(wildcard tools/fuzz/shim/*.h)
+	@mkdir -p $(dir $@)
+	$(FUZZ_CC) $(FUZZ_KFLAGS) -c -o $@ $<
+
+$(FUZZ_DIR)/fuzz_net: $(FUZZ_OBJS)
+	$(FUZZ_CC) $(FUZZ_SAN) $(FUZZ_LINK) -o $@ $^
+
+fuzz-build: $(FUZZ_DIR)/fuzz_net
+
+T ?=
+N ?= 200000
+fuzz: $(FUZZ_DIR)/fuzz_net tools/fuzz/seeds
+	@set -e; for t in $(if $(T),$(T),$(FUZZ_TARGETS)); do \
+	  $(FUZZ_DIR)/fuzz_net $$t -runs=$(N) -seed=1 \
+	    -corpus=tools/fuzz/seeds/$$t -out=$(FUZZ_DIR); \
+	done
+	@if ls $(FUZZ_DIR)/crashes/* >/dev/null 2>&1; then \
+	  echo "FUZZ FOUND SOMETHING: $(FUZZ_DIR)/crashes/"; ls -1 $(FUZZ_DIR)/crashes/; exit 1; \
+	else echo "FUZZ OK (no crashes)"; fi
+
+# What the fuzzing actually reached, as source lines rather than edge counts.
+# A separate build with llvm's profiling instead of the sanitizers, replaying
+# every seed and every input the fuzzer kept. This is the number worth putting
+# in docs/security.md: "25 million runs" says nothing on its own, "every line
+# of parse_a and skip_name was executed" does.
+FUZZ_COVFLAGS := $(FUZZ_WARN) -fprofile-instr-generate -fcoverage-mapping
+$(FUZZ_DIR)/fuzz_cov: $(FUZZ_KSRCS) tools/fuzz/driver.c $(wildcard tools/fuzz/*.h)
+	@mkdir -p $(FUZZ_DIR)
+	@for s in $(FUZZ_KSRCS); do \
+	  o=$(FUZZ_DIR)/cov-$$(echo $$s | tr / _ | sed 's/\.c$$/.o/'); \
+	  $(FUZZ_CC) $(FUZZ_COVFLAGS) -Itools/fuzz/shim -Iinclude -Itools/fuzz -c -o $$o $$s || exit 1; \
+	done
+	$(FUZZ_CC) $(FUZZ_COVFLAGS) -Itools/fuzz -c -o $(FUZZ_DIR)/cov-driver.o tools/fuzz/driver.c
+	$(FUZZ_CC) $(FUZZ_COVFLAGS) -o $@ $(FUZZ_DIR)/cov-net_*.o \
+	  $(FUZZ_DIR)/cov-tools_fuzz_stubs.o $(FUZZ_DIR)/cov-tools_fuzz_targets.o \
+	  $(FUZZ_DIR)/cov-driver.o
+
+fuzz-coverage: $(FUZZ_DIR)/fuzz_cov
+	@rm -rf $(FUZZ_DIR)/prof && mkdir -p $(FUZZ_DIR)/prof
+	@for t in $(FUZZ_TARGETS); do \
+	  files=$$(ls tools/fuzz/seeds/$$t/* $(FUZZ_DIR)/corpus-$$t/* 2>/dev/null || true); \
+	  [ -z "$$files" ] && continue; \
+	  LLVM_PROFILE_FILE=$(FUZZ_DIR)/prof/$$t.profraw \
+	    $(FUZZ_DIR)/fuzz_cov $$t -replay $$files >/dev/null 2>&1 || true; \
+	done
+	@xcrun llvm-profdata merge -sparse $(FUZZ_DIR)/prof/*.profraw -o $(FUZZ_DIR)/prof/all.profdata
+	@xcrun llvm-cov report $(FUZZ_DIR)/fuzz_cov \
+	  -instr-profile=$(FUZZ_DIR)/prof/all.profdata $(FUZZ_KSRCS) \
+	  | sed -n '1,3p;/^net\//p;/^TOTAL/p'
+	@echo ""
+	@echo "per-function, the parsers:"
+	@xcrun llvm-cov report $(FUZZ_DIR)/fuzz_cov -show-functions \
+	  -instr-profile=$(FUZZ_DIR)/prof/all.profdata net/dns.c net/ipv4.c net/tcp.c net/udp.c \
+	  | awk 'NR<=2 || /parse_a|skip_name|on_ip|on_arp|udp_input|tcp_input|encode_name|remember|lookup/'
+
+# Replay everything already saved: fast, deterministic, and the thing to run
+# after touching net/ — a fixed bug must stay fixed.
+fuzz-replay: $(FUZZ_DIR)/fuzz_net
+	@set -e; for t in $(FUZZ_TARGETS); do \
+	  files=$$(ls tools/fuzz/seeds/$$t/* $(FUZZ_DIR)/corpus-$$t/* \
+	              $(FUZZ_DIR)/crashes/*-$$t-* 2>/dev/null || true); \
+	  if [ -n "$$files" ]; then \
+	    echo "--- $$t"; $(FUZZ_DIR)/fuzz_net $$t -replay $$files >/dev/null; \
+	  fi; \
+	done
+	@echo "FUZZ REPLAY OK"
 
 clean:
 	rm -rf $(BUILD)

@@ -39,7 +39,8 @@ struct idt_ptr {
 } __attribute__((packed));
 
 static struct idt_gate idt[256];
-static irq_handler_t irq_handlers[16];
+#define IRQ_SHARE 4
+static irq_handler_t irq_handlers[16][IRQ_SHARE];
 
 extern const uint32_t isr_stub_table[48];    /* from isr.asm */
 extern char isr_syscall[];
@@ -73,10 +74,17 @@ void idt_init(void)
     pic_init();
 }
 
+/* PCI devices share interrupt lines, so a line has up to IRQ_SHARE
+   handlers; each one checks whether its own device asked. */
 void irq_install(int irq, irq_handler_t handler)
 {
-    irq_handlers[irq] = handler;
-    pic_unmask(irq);
+    for (int k = 0; k < IRQ_SHARE; k++)
+        if (!irq_handlers[irq][k] || irq_handlers[irq][k] == handler) {
+            irq_handlers[irq][k] = handler;
+            pic_unmask(irq);
+            return;
+        }
+    kprintf("irq %d: too many devices share it\n", irq);
 }
 
 static const char *const exception_names[32] = {
@@ -206,8 +214,8 @@ void interrupt_dispatch(struct regs *r)
     cpu_idle_end();                 /* if the CPU was halted, it woke up now */
     if (pic_is_spurious(irq))
         return;
-    if (irq_handlers[irq])
-        irq_handlers[irq](r);
+    for (int k = 0; k < IRQ_SHARE && irq_handlers[irq][k]; k++)
+        irq_handlers[irq][k](r);
     pic_send_eoi(irq);
 
     /* If the timer said "time's up", switch threads now. This must come

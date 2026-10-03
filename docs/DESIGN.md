@@ -115,7 +115,13 @@ Decided (2026-10-03): the stack above that boundary follows Linux's shape too
 driver is not glued onto a foreign stack. This is step 10. Step 9 does not
 bring the network up. The earlier "lwIP or ours" choice is closed.
 Licence note: those drivers are GPLv2, so a MyOS image that includes them is effectively
-GPLv2 too; MyOS has no licence file yet — pick one before step 10.
+GPLv2 too; MyOS has no licence file yet — pick one before any Linux driver source is copied in.
+
+Decided (2026-10-03, later the same day): the first e1000 and the IPv4 path are
+original code, written against that same `net_device` / `sk_buff` / NAPI boundary,
+because the licence file is still missing. Porting a Linux driver later stays
+possible. "Better than Linux" is not a measured claim; a number from `make bench`
+has to come first, and a big TCP transfer is where Linux stays ahead.
 
 Decided (2026-10-01): **file systems and the VFS run in the kernel**, so every `read()` stays
 one syscall with no extra context switches. (Block *device drivers* still move to user space.)

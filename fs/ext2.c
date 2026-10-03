@@ -44,6 +44,7 @@
 #include <interrupts.h>
 #include <kheap.h>
 #include <kprintf.h>
+#include <memlayout.h>
 #include <pcache.h>
 #include <string.h>
 #include <thread.h>
@@ -115,6 +116,7 @@ struct ext2 {
     uint32_t bsize, ptrs;               /* block size; block numbers per block */
     uint32_t groups, ipg, bpg, isize;   /* inodes/blocks per group; inode size */
     uint32_t first_data, first_ino, blocks, inodes;
+    uint32_t next_blk;                  /* try here first: after the last block taken */
     uint32_t gd_block;                  /* the group descriptor table */
     int filetype, readonly;
     struct buf *sb_buf;                 /* the superblock: held while mounted */
@@ -192,6 +194,15 @@ static int take_bit(uint8_t *map, uint32_t n)
     return -1;
 }
 
+/* Bit i if it's free (set it, return 1), else 0. */
+static int take_this_bit(uint8_t *map, uint32_t i)
+{
+    if (map[i / 8] & (1u << (i % 8)))
+        return 0;
+    map[i / 8] |= 1u << (i % 8);
+    return 1;
+}
+
 static int clear_bit(uint8_t *map, uint32_t i)     /* 1 if it was set */
 {
     int was = (map[i / 8] >> (i % 8)) & 1;
@@ -201,7 +212,45 @@ static int clear_bit(uint8_t *map, uint32_t i)     /* 1 if it was set */
 
 /* A free block, near `group` if possible (data close to its inode means
    short seeks). 0: the disk is full. */
+static uint32_t alloc_block_scan(struct ext2 *fs, uint32_t group);
+
 static uint32_t alloc_block(struct ext2 *fs, uint32_t group)
+{
+    /* The block after the last one taken: a file written in order gets
+       consecutive blocks (one disk write later, see bcache) in O(1). */
+    uint32_t h = fs->next_blk;
+    if (h >= fs->first_data && h < fs->blocks) {
+        uint32_t g = (h - fs->first_data) / fs->bpg, bit = (h - fs->first_data) % fs->bpg;
+        struct ext2_gd *gd;
+        struct buf *gb = get_group(fs, g, &gd);
+        if (gb && gd->free_blocks_count) {
+            struct buf *bb = bread(fs->dev, gd->block_bitmap, fs->bsize);
+            int got = bb && take_this_bit(bb->data, bit);
+            if (got) {
+                bdirty(bb);
+                gd->free_blocks_count--;
+                bdirty(gb);
+                fs->sb->free_blocks_count--;
+                bdirty(fs->sb_buf);
+            }
+            if (bb)
+                brelse(bb);
+            brelse(gb);
+            if (got) {
+                fs->next_blk = h + 1;
+                return h;
+            }
+        } else if (gb) {
+            brelse(gb);
+        }
+    }
+    uint32_t b = alloc_block_scan(fs, group);
+    if (b)
+        fs->next_blk = b + 1;
+    return b;
+}
+
+static uint32_t alloc_block_scan(struct ext2 *fs, uint32_t group)
 {
     for (uint32_t t = 0; t < fs->groups; t++) {
         uint32_t g = (group + t) % fs->groups;
@@ -1060,48 +1109,142 @@ static int prefault(const void *user_buf, uint32_t n)
     return 0;
 }
 
+/*
+ * The disk blocks of file blocks n, n+1, ... — as many as one indirect
+ * block holds from there on, at most max — into out[] (0: a hole). For
+ * reading: allocates nothing. Returns how many, or -EIO. Cost: one cached
+ * block per level, for up to 256 blocks — not per block, like bmap.
+ */
+static int bmap_run(struct ext2 *fs, struct ext2_inode *di, uint32_t n, uint32_t max,
+                    uint32_t *out)
+{
+    uint32_t p = fs->ptrs, idx[3];
+    int depth;
+    if (n < 12) {
+        uint32_t k = min(max, 12 - n);
+        memcpy(out, &di->block[n], k * 4);
+        return k;
+    } else if ((n -= 12) < p) {
+        depth = 1;
+        idx[0] = n;
+    } else if ((n -= p) < p * p) {
+        depth = 2;
+        idx[0] = n / p;
+        idx[1] = n % p;
+    } else {
+        n -= p * p;
+        depth = 3;
+        idx[0] = n / (p * p);
+        idx[1] = n / p % p;
+        idx[2] = n % p;
+        if (idx[0] >= p)
+            return -EFBIG;
+    }
+    uint32_t next = di->block[11 + depth];
+    for (int level = 0; ; level++) {
+        if (!next) {
+            out[0] = 0;                 /* the whole subtree is a hole */
+            return 1;
+        }
+        struct buf *b = bread(fs->dev, next, fs->bsize);
+        if (!b)
+            return -EIO;
+        const uint32_t *slots = (const uint32_t *)b->data;
+        if (level == depth - 1) {
+            uint32_t k = min(max, p - idx[level]);
+            memcpy(out, slots + idx[level], k * 4);
+            brelse(b);
+            return k;
+        }
+        next = slots[idx[level]];
+        brelse(b);
+    }
+}
+
+/*
+ * Fill page frames for the page cache. Each file block is mapped (the
+ * indirect blocks come from the block cache) and runs of blocks that are
+ * next to each other on the disk become ONE scatter-gather read straight
+ * into the frames. A block the block cache holds is copied from there
+ * instead: it may have been changed and not yet written.
+ */
+static int ext2_readpages(struct inode *i, uint32_t index, uint32_t n, const uint32_t *frames)
+{
+    struct ext2 *fs = fs_of(i);
+    uint32_t flags = lock(fs);
+    struct ext2_inode *di;
+    struct buf *ib = get_inode(fs, i->fs_ino, &di);
+    int err = ib ? 0 : -EIO;
+    struct bio_vec v[BIO_VEC_MAX];
+    int nv = 0;
+    uint32_t first = 0, secs = 0;       /* the run being built: disk block, size */
+    uint32_t spb = fs->bsize / SECTOR_SIZE, per = PAGE_SIZE / fs->bsize;
+    uint32_t map[64], mbase = 0, mlen = 0;  /* file blocks [mbase, mbase+mlen) */
+    for (uint32_t p = 0; p < n && !err; p++) {
+        uint8_t *page = P2V(frames[p]);
+        for (uint32_t b = 0; b < per && !err; b++) {
+            uint32_t off = b * fs->bsize, pos = (index + p) * PAGE_SIZE + off, disk = 0;
+            if (pos < i->size) {
+                uint32_t fb = pos / fs->bsize;
+                if (fb - mbase >= mlen) {
+                    int got = bmap_run(fs, di, fb, 64, map);
+                    if (got < 0) {
+                        err = got;
+                        break;
+                    }
+                    mbase = fb;
+                    mlen = got;
+                }
+                disk = map[fb - mbase];
+            }
+            if (!err && disk && bpeek(fs->dev, disk, fs->bsize, page + off))
+                continue;
+            if (err || !disk) {
+                memset(page + off, 0, fs->bsize);      /* a hole, or past the end */
+                continue;
+            }
+            uint32_t pa = frames[p] + off;
+            int joins = nv && disk == first + secs / spb && secs + spb <= BIO_SECTORS;
+            int merges = joins && v[nv - 1].phys + v[nv - 1].len == pa;
+            if (nv && (!joins || (!merges && nv == BIO_VEC_MAX))) {
+                err = blockdev_readv(fs->dev, first * spb, v, nv) < 0 ? -EIO : 0;
+                nv = 0;
+            }
+            if (err)
+                break;
+            if (!nv) {
+                first = disk;
+                secs = 0;
+            }
+            if (nv && v[nv - 1].phys + v[nv - 1].len == pa)
+                v[nv - 1].len += fs->bsize;
+            else
+                v[nv++] = (struct bio_vec){ pa, fs->bsize };
+            secs += spb;
+        }
+    }
+    if (!err && nv)
+        err = blockdev_readv(fs->dev, first * spb, v, nv) < 0 ? -EIO : 0;
+    if (ib)
+        brelse(ib);
+    unlock(fs, flags);
+    return err;
+}
+
+/* read() is a copy out of the page cache: no file system lock, no block
+   lookups, when the pages are in RAM. */
 static int32_t ext2_read(struct file *f, void *user_buf, uint32_t n)
 {
-    static const uint8_t zeros[4096];
     struct inode *i = f->inode;
-    struct ext2 *fs = fs_of(i);
     if ((f->flags & O_ACCMODE) == O_WRONLY)
         return -EBADF;
     if (f->pos >= i->size)
         return 0;                       /* end of file */
     n = min(min(n, i->size - f->pos), RW_MAX);
-    if (prefault(user_buf, n) < 0)
-        return -EFAULT;
-    uint32_t flags = lock(fs);
-    struct ext2_inode *di;
-    struct buf *ib = get_inode(fs, i->fs_ino, &di);
-    int err = ib ? 0 : -EIO;
-    uint32_t done = 0;
-    while (!err && done < n) {
-        uint32_t pos = f->pos + done, in = pos % fs->bsize, k = min(fs->bsize - in, n - done);
-        uint32_t disk;
-        err = bmap(fs, di, NULL, 0, pos / fs->bsize, 0, &disk);
-        if (err)
-            break;
-        struct buf *b = disk ? bread(fs->dev, disk, fs->bsize) : NULL;
-        if (disk && !b) {
-            err = -EIO;
-            break;
-        }
-        if (copy_to_user((uint8_t *)user_buf + done, b ? b->data + in : zeros, k) < 0)
-            err = -EFAULT;
-        if (b)
-            brelse(b);
-        if (!err)
-            done += k;
-    }
-    if (ib)
-        brelse(ib);
-    unlock(fs, flags);
-    if (!done && err)
-        return err;
-    f->pos += done;
-    return done;
+    int r = pcache_read_user(i, f->pos, user_buf, n);
+    if (r > 0)
+        f->pos += r;
+    return r;
 }
 
 static int32_t ext2_write(struct file *f, const void *user_buf, uint32_t n)
@@ -1175,6 +1318,7 @@ static const struct fs_ops ext2_ops = {
     .setattr = ext2_setattr,
     .truncate = ext2_truncate,
     .read_kernel = ext2_read_kernel,
+    .readpages   = ext2_readpages,
     .statfs = ext2_statfs,
 };
 

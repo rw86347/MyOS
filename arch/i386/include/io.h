@@ -38,6 +38,19 @@ static inline uint16_t inw(uint16_t port)
     return value;
 }
 
+/* 32-bit versions. PCI configuration uses a 32-bit address and data port. */
+static inline void outl(uint16_t port, uint32_t value)
+{
+    __asm__ volatile ("outl %0, %1" : : "a"(value), "Nd"(port));
+}
+
+static inline uint32_t inl(uint16_t port)
+{
+    uint32_t value;
+    __asm__ volatile ("inl %1, %0" : "=a"(value) : "Nd"(port));
+    return value;
+}
+
 /* Read `count` 16-bit words from a port into memory ("rep insw").
    One instruction moves a whole disk sector — much faster than a C loop. */
 static inline void insw(uint16_t port, void *buf, uint32_t count)

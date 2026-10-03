@@ -12,7 +12,11 @@
  *   make bench   BENCH: runs the benchmarks, then switches QEMU off
  */
 #include <ata.h>
+#include <virtio_blk.h>
+#include <ahci.h>
+#include <nvme.h>
 #include <bcache.h>
+#include <pcache.h>
 #include <blockdev.h>
 #include <cpu.h>
 #include <ext2.h>
@@ -28,10 +32,12 @@
 #include <kprintf.h>
 #include <memlayout.h>
 #include <mouse.h>
+#include <netdevice.h>
 #include <mm.h>
 #include <proc.h>
 #include <vfs.h>
 #include <paging.h>
+#include <pci.h>
 #include <partition.h>
 #include <pmm.h>
 #include <sched.h>
@@ -137,10 +143,14 @@ static void mount_root(struct blockdev *d)
 static void storage_init(void)
 {
     ata_init();
+    virtio_blk_init();
+    ahci_init();
+    nvme_init();
     int ndisks = blockdev_count();      /* scanning adds the partitions */
     for (int i = 0; i < ndisks; i++)
         partition_scan(blockdev_get(i));
     bcache_init();                      /* and their blocks, cached */
+    pcache_init();                      /* and their files' pages */
 
     struct blockdev *rootdev = NULL, *datadev = NULL;
     for (int i = 0; i < blockdev_count(); i++) {
@@ -209,7 +219,9 @@ void kernel_main(void)
     time_init();            /* the date and time, from the CMOS clock */
     initrd_init();          /* the initramfs stage 2 loaded */
     thread_init();          /* kernel_main becomes thread 0, "main" */
+    pci_init();             /* which PCI devices are fitted: the IDE controller, the NIC */
     storage_init();         /* IDE disks and their partitions */
+    net_init();             /* loopback, then the e1000 and IPv4 if the card is there */
 
 #if defined(SELFTEST)
     run_selftests();        /* ends with the slot scheduler running */
@@ -227,6 +239,7 @@ void kernel_main(void)
     uint32_t last_secs = 0xFFFFFFFF;
     for (;;) {
         cpu_wait();
+        net_rx_action();            /* packets queued by a NIC interrupt */
 
         uint32_t secs = timer_ms() / 1000;
         if (secs != last_secs) {

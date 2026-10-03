@@ -14,8 +14,13 @@
 
 struct inode;
 
+void pcache_init(void);         /* after the heap; sized from RAM */
+
 /* Copy file bytes into kernel memory. Disk files come from this cache. */
 int pcache_read(struct inode *ino, uint32_t pos, void *dst, uint32_t n);
+
+/* The same into a user buffer (read()): bytes copied, or -EFAULT / -EIO. */
+int pcache_read_user(struct inode *ino, uint32_t pos, void *user_dst, uint32_t n);
 
 /* Forget every cached page of this file (after a write, or when it is freed). */
 void pcache_invalidate(struct inode *ino);

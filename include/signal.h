@@ -93,6 +93,13 @@ void signal_exec(struct process *p);
 /* The system calls. */
 int32_t sys_rt_sigaction_impl(int sig, uint32_t act, uint32_t oact, uint32_t size);
 int32_t sys_rt_sigprocmask_impl(int how, uint32_t set, uint32_t oset, uint32_t size);
+int32_t sys_alarm_impl(uint32_t seconds);
+int32_t sys_getitimer_impl(int which, uint32_t cur);
+int32_t sys_setitimer_impl(int which, uint32_t new, uint32_t old);
+
+/* Timer tick: send SIGALRM to processes whose alarm is due. */
+void signal_alarm_tick(uint32_t now);
+void signal_alarm_cancel(struct process *p);   /* on exit */
 int32_t sys_sigreturn_impl(int rt);
 int32_t sys_kill_impl(int pid, int sig);
 int32_t sys_rt_sigsuspend_impl(uint32_t set, uint32_t size);

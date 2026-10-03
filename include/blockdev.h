@@ -19,6 +19,18 @@
 
 #define SECTOR_SIZE 512
 #define BLOCKDEV_MAX 16
+#define BIO_VEC_MAX  64         /* pieces in one readv */
+#define BIO_SECTORS  256        /* sectors in one readv: 128 KiB */
+
+/* A piece of physical memory for scatter-gather I/O: one disk command
+   fills many page frames that are not next to each other. len is a
+   multiple of 512; the piece is in the kernel's direct map and may span
+   several frames that happen to be next to each other (drivers split it
+   to suit their hardware). */
+struct bio_vec {
+    uint32_t phys;
+    uint32_t len;
+};
 
 struct blockdev {
     char     name[16];          /* e.g. "hda", "hdb1" (Linux-style names) */
@@ -30,6 +42,10 @@ struct blockdev {
     int (*write)(struct blockdev *dev, uint32_t lba, uint32_t count, const void *buf);
     /* Make written data permanent (a drive's own write cache). May be NULL. */
     int (*flush)(struct blockdev *dev);
+    /* Read (write = 0) or write consecutive sectors from/to the pieces of v
+       (at most BIO_VEC_MAX pieces, BIO_SECTORS sectors) with as few
+       commands as possible. May be NULL: then it goes piece by piece. */
+    int (*rwv)(struct blockdev *dev, uint32_t lba, const struct bio_vec *v, int n, int write);
 
     struct blockdev *parent;    /* for partitions: the whole disk */
     uint32_t offset;            /* for partitions: first sector on the parent */
@@ -46,5 +62,11 @@ struct blockdev *blockdev_get(int index);
 int blockdev_read(struct blockdev *dev, uint32_t lba, uint32_t count, void *buf);
 int blockdev_write(struct blockdev *dev, uint32_t lba, uint32_t count, const void *buf);
 int blockdev_flush(struct blockdev *dev);
+int blockdev_readv(struct blockdev *dev, uint32_t lba, const struct bio_vec *v, int n);
+int blockdev_writev(struct blockdev *dev, uint32_t lba, const struct bio_vec *v, int n);
+
+/* For drivers: the physical pieces of a kernel buffer (pieces that touch
+   are merged). The count, or -1 if it is unmapped or needs more than max. */
+int blockdev_map(const void *buf, uint32_t bytes, struct bio_vec *v, int max);
 
 #endif

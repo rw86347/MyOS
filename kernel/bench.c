@@ -246,6 +246,9 @@ void run_benchmarks(uint64_t boot_start)
     bench_disk();
     run_program("/bin/bench");                          /* prints its own lines */
     bench_slots();                      /* starts the slot scheduler */
+    run_program("/bin/diskbench");      /* reads /data/big, /data/big2 if there */
+    run_program("/bin/netbench");       /* needs tools/echo-server.py; the net
+                                           thread needs the scheduler */
     uint32_t shell_us = bench_shell();  /* last: bash stays behind */
     kprintf("  %-28s %8lu us\n", "/init + bash, CPU work", shell_us);
     kprintf("Boot: command line ready after %lu us of CPU work (kernel ready + that)\n",

@@ -18,6 +18,7 @@
 #include <proc.h>
 #include <serial.h>
 #include <signal.h>
+#include <socket.h>
 #include <syscalls.h>
 #include <string.h>
 #include <syscall.h>
@@ -578,13 +579,6 @@ SYSCALL(sys_nop) { return 0; }
 SYSCALL(sys_sync)  { bsync(); return 0; }
 SYSCALL(sys_fsync) { return fd_get(a1) ? bsync() : -EBADF; }
 
-/* No networking yet (step 10), so no fd is a socket. Programs ask anyway:
-   bash checks whether its input is a network connection (getpeername). */
-SYSCALL(sys_notsock) { return fd_get(a1) ? -ENOTSOCK : -EBADF; }
-
-/* socketcall(call, args): the old all-in-one socket syscall. */
-SYSCALL(sys_socketcall) { return a1 == 7 ? -ENOTSOCK : -ENOSYS; }  /* 7: getpeername */
-
 /* sched_getaffinity(pid, size, mask): one CPU. (musl's sysconf asks.) */
 SYSCALL(sys_getaffinity)
 {
@@ -618,6 +612,9 @@ SYSCALL(sys_ioctl)
 
 SYSCALL(sys_rt_sigaction)   { return sys_rt_sigaction_impl(a1, a2, a3, a4); }
 SYSCALL(sys_rt_sigprocmask) { return sys_rt_sigprocmask_impl(a1, a2, a3, a4); }
+SYSCALL(sys_alarm) { return sys_alarm_impl(a1); }
+SYSCALL(sys_setitimer) { return sys_setitimer_impl(a1, a2, a3); }
+SYSCALL(sys_getitimer) { return sys_getitimer_impl(a1, a2); }
 SYSCALL(sys_sigreturn)      { return sys_sigreturn_impl(0); }
 SYSCALL(sys_rt_sigreturn)   { return sys_sigreturn_impl(1); }
 SYSCALL(sys_kill)           { return sys_kill_impl((int32_t)a1, a2); }
@@ -829,8 +826,21 @@ static const syscall_fn syscall_table[] = {
     [NR_renameat2]  = sys_renameat2,
     [NR_getrandom]  = sys_getrandom,
     [NR_socketcall] = sys_socketcall,
-    [NR_getsockname] = sys_notsock,
-    [NR_getpeername] = sys_notsock,
+    [NR_socket]     = sys_socket,
+    [NR_socketpair] = sys_socketpair,
+    [NR_bind]       = sys_bind,
+    [NR_connect]    = sys_connect,
+    [NR_listen]     = sys_listen,
+    [NR_accept4]    = sys_accept4,
+    [NR_getsockopt] = sys_getsockopt,
+    [NR_setsockopt] = sys_setsockopt,
+    [NR_getsockname] = sys_getsockname,
+    [NR_getpeername] = sys_getpeername,
+    [NR_sendto]     = sys_sendto,
+    [NR_sendmsg]    = sys_sendmsg,
+    [NR_recvfrom]   = sys_recvfrom,
+    [NR_recvmsg]    = sys_recvmsg,
+    [NR_shutdown]   = sys_shutdown,
     [NR_clock_gettime64]  = sys_clock_gettime64,
     [NR_clock_getres_time64] = sys_clock_getres64,
     [NR_clock_nanosleep_time64] = sys_clock_nanosleep64,
@@ -880,6 +890,9 @@ static const syscall_fn syscall_table[] = {
     [NR_rt_sigreturn]   = sys_rt_sigreturn,
     [NR_rt_sigaction]   = sys_rt_sigaction,
     [NR_rt_sigprocmask] = sys_rt_sigprocmask,
+    [NR_alarm]      = sys_alarm,
+    [NR_setitimer]  = sys_setitimer,
+    [NR_getitimer]  = sys_getitimer,
     [NR_rt_sigpending]  = sys_rt_sigpending,
     [NR_rt_sigsuspend]  = sys_rt_sigsuspend,
     [NR_tkill]      = sys_tkill,

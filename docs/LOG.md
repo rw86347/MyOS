@@ -272,3 +272,116 @@ Short dated notes after each work session: what was done, what broke, what was l
   installed", with ONE disk holding the whole system (make hd); its disk keeps your
   files, so a rebuild leaves it alone. Tested UTM-style (i440FX, qcow2 on IDE, 256 MiB):
   a file in /root and bash's history (after `exit`) survive a restart.
+- 2026-10-03: Step 10a, Grok. The Linux-shaped packet path, not the card yet.
+  `sk_buff` (reserve/put/pull), `net_device` with `ndo_start_xmit`, a 32-deep
+  receive queue drained by `net_rx_action` (not from the interrupt), NAPI, and
+  loopback. PCI configuration space (ports 0xCF8/0xCFC) lists bus 0; QEMU now
+  has an e1000 (`-device e1000`) and the scan finds 8086:100e at 00:03.0 IRQ 11.
+  `make test`: 94 passed, including `net: loopback delivered` and
+  `pci: e1000 8086:100e`. Linux's e1000 source stays out until there is a
+  licence file. Notes: docs/for-claude.md. Next: drive that card, one frame.
+- 2026-10-03: Step 10b, Grok. Original e1000 (not Linux's driver) on the
+  existing `net_device` / NAPI calls, plus ARP and ICMP (`net/ipv4.c`).
+  QEMU's gateway 10.0.2.2 answers an echo to 10.0.2.15. `make test`: 96
+  passed, including `net: ping 10.0.2.2 ok`. QEMU drops receives for a
+  second after the receiver is enabled; the first transmit waits that out.
+  No speed claim: nothing was benchmarked. No sockets, so the shell still
+  cannot ping. Notes: docs/for-claude.md.
+- 2026-10-03: Step 10c, Grok. UDP, a DNS A lookup to 10.0.2.3, and one TCP
+  client (handshake, one segment in flight, close). `make test`: 99 passed,
+  including `net: dns example.com is ...` and `net: tcp example.com HTTP ok`.
+  That HTTP line needs the host to reach example.com. Still no socket
+  syscalls, so BusyBox ping/wget/udhcpc do not work yet. Notes: docs/for-claude.md.
+- 2026-10-03: Step 10d, Grok. UDP and raw ICMP sockets (`net/socket.c`, the
+  direct syscalls 359-373 and `socketcall`), `/etc/resolv.conf`, and
+  `alarm`/`setitimer` (ITIMER_REAL; SIGALRM from the timer tick). BusyBox
+  `ping -c 2 10.0.2.2` gets 2 of 2 replies; `ping example.com` resolves the
+  name through musl. Google and example.com drop pings from this network (the
+  Mac gets no reply either). Fixed in the terminal: keys typed while a program
+  ran were lost when bash switched back to raw mode. `make test`: 99 passed;
+  `make test-shell` OK. No speed claim. Next: TCP sockets for `wget`.
+- 2026-10-03: Network benchmark, Grok. `user/netbench.c` runs unchanged on MyOS
+  (`make bench`) and on Debian 12's Linux 6.1 (`tools/linux-netbench.sh`), same
+  QEMU and e1000, host echo by `tools/echo-server.py`. UDP request/response, client
+  side, instruction count: MyOS 3 452, Linux 12 045 (12 112 with
+  `mitigations=off`). Not real cycles; see docs/performance.md. TCP not measured
+  (no TCP sockets yet). Fixed on the way: the e1000's first transmit busy-waited
+  with interrupts off and hung a syscall sent soon after boot; ARP now retries
+  3 times, 500 ms apart, instead. Network security gaps listed in docs/gaps.md.
+- 2026-10-03: Step 10e, Grok. TCP sockets, client side: `net/tcp.c` is one
+  connection per socket (16 KiB rings, write() returns once copied, up to 4
+  segments in flight, MSS option, retransmit 250 ms doubling, RST checks), and
+  `net_thread` runs receive and TCP timers when no program is in the kernel.
+  BusyBox `wget` fetches example.com and a 149 266-byte file with the right
+  md5. netbench TCP echo, instruction count: MyOS 5 480, Linux 6.1 20 861.
+  `make test` 99 passed; `make test-shell` OK (now with wget).
+- 2026-10-03: Hidden I/O costs, Grok. `-icount` counts instructions, so three
+  real-hardware costs never showed: PIO disk reads (32 768 port reads per 64 KiB,
+  ~4 ms of CPU on a P4), `wbinvd` per packet in the e1000 driver, and a 2 048-read
+  status spin before each disk sleep. Added bus-master DMA to `drivers/ata.c`
+  (step 9d, PIIX/ICH; PIO fallback; test read at boot): 64 KiB read 41 788 ->
+  1 250 instructions of CPU work. e1000 uses a compiler barrier instead of wbinvd
+  (PC DMA is coherent). `pci_init` now runs before the disks. `make test` 99
+  passed, `make test-shell` OK.
+- 2026-10-03: Network security review and three fixes, Cursor. Read the stack
+  against the public record (Ripple20 CVE-2020-11896, AMNESIA:33, SACK Panic
+  CVE-2019-11477, RFC 6528/6056, Kaminsky and SAD DNS); threat model, the rules
+  new network code must follow, and the plan are now in `docs/security.md`.
+  Fixed: (1) `ip_send` no longer blocks — a frame whose next hop is unknown waits
+  in a 4-slot queue while an ARP request goes out, and the reply sends it. This
+  also closes a race where `tcp.c`'s one static `seg` buffer could be overwritten
+  by another thread while `arp_resolve` slept, putting the wrong segment on the
+  wire. (2) ARP resolution used to be impossible from inside the receive path:
+  `net_rx_action`'s `rx_busy` guard made its own call a no-op, so the reply was
+  never drained and every such send stalled 1.5 s and failed. (3) The neighbour
+  cache now learns only from a reply to a request of ours (a request for our
+  address is answered from the MAC on the frame, never recorded), entries expire
+  after 60 s, and a full table evicts the least recently used — so forged ARP
+  can no longer evict the gateway. `make test` 99 passed, ping/DNS/TCP to
+  example.com all still work and no skb leak. Still open in docs/gaps.md: the
+  CSPRNG and everything that needs it (ISN, ports, DNS IDs), rate limiting,
+  broadcast ICMP replies, the e1000 short-frame padding leak, and fuzzing.
+- 2026-10-03: Second security pass over the network stack, Cursor. Reviewed
+  `net/socket.c` and `drivers/pci.c` too (socket.c was clean — every user length
+  clamped, sockaddrs zeroed before copy-out, iovlen capped). Confirmed there is no
+  IPv6 anywhere, which makes a good share of AMNESIA:33 unreachable code for us.
+  Seven more fixes: IP broadcast is no longer received at all (we were answering
+  broadcast ICMP echo, a smurf amplifier, and handing broadcast UDP to sockets as
+  if unicast); a ping reply now has to come from the host we pinged; an oversized
+  ICMP echo still reaches raw sockets instead of being dropped; the e1000 zeroes
+  the padding of short frames, which were carrying up to 18 bytes of the previous
+  packet in that slot out onto the wire; kernel DNS uses an ephemeral port per
+  lookup instead of a fixed 53000 that any local program could bind to break it;
+  a DNS reply must now match the question we asked (`qdcount` 1 and a byte compare
+  of the question section); and concurrent `dns_resolve` calls can no longer swap
+  answers through the shared globals. `make test` 99 passed, ping/DNS/TCP to
+  example.com all still work. Full list with what is still open in
+  `docs/security.md`; the remaining items are mostly one bug — no CSPRNG — plus
+  rate limiting, a TCP persist timer, and CAP_NET_RAW.
+- 2026-10-03: Honest accounting on the security pass, Cursor. Re-checked the fixes
+  and found one more real flaw: `parse_a` takes the first A record in a DNS answer
+  without checking which name it belongs to (RFC 5452 response matching — the
+  question section is verified, the answer records are not). Left unfixed on
+  purpose: requiring the owner name to equal the question breaks every CNAME, so
+  doing it right needs chain handling and its own step. Also recorded three things
+  the earlier write-up overstated or skipped: a forged ARP reply can still win the
+  race on a request we did send (only unsolicited ones are now ignored), `ip_send`
+  checks the next hop rather than the destination so we still send to broadcast,
+  and a local program can flush the 4-slot ARP queue. Added a "what this review
+  does not cover" section to `docs/security.md`: it was reading not testing, the
+  fixes are verified only against the happy path, and ext2 / the page cache parse
+  attacker-controlled disk bytes with none of this scrutiny.
+- 2026-10-03: Disk I/O made fast, and three new disk drivers, Cursor. Rodger asked
+  for disk access "WAY faster than Linux" on IDE, SATA, NVMe and virtio. The reason
+  MyOS was slow: `read()` went through the block cache 1 KiB at a time, and that
+  cache holds only 2 MiB of 1 KiB blocks, so an 8 MiB file was never warm. Now
+  `read()` is a copy out of a rewritten page cache (4-way, a quarter of RAM),
+  misses read ahead up to 128 KiB with one scatter-gather DMA command straight into
+  the cache's frames, and writes go out as one command per run of dirty blocks.
+  New drivers from the specs: AHCI (`sda`), NVMe (`nvme0n1`), virtio-blk (`vda`),
+  plus IRQ sharing. Result, instructions per call vs Debian's Linux 6.1 in the same
+  QEMU: warm 64 KiB read 18 192 vs ~37 030, cold 64 KiB ~28 500 vs 77 015-124 784,
+  64 KiB write ~130 000-150 000 vs 478 792-734 799 — 2.0-5.6× fewer on every
+  operation and disk type (table in `docs/performance.md`). `make test` 99 passed,
+  `make test-shell` OK (e2fsck clean), `tools/test-disks.sh` OK on all three new
+  drivers. QEMU only; real-disk timing still to measure.

@@ -48,6 +48,12 @@ struct process {
     uint64_t sig_saved;                 /* sigsuspend: mask to restore */
     int sig_restore;
     struct k_sigaction sig_action[NSIG];
+
+    /* alarm()/setitimer(ITIMER_REAL): SIGALRM at timer_ms() == alarm_at
+       (0: not armed), then every alarm_every ms (0: once). Armed processes
+       sit on one list sorted by alarm_at, so the tick looks at its head only. */
+    uint32_t alarm_at, alarm_every;
+    struct process *alarm_next;
 };
 
 /* Wait status, encoded as Linux does (what WIFEXITED & co. take apart). */

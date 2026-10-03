@@ -318,8 +318,11 @@ int32_t tty_ioctl(struct file *f, uint32_t cmd, uint32_t arg)
         if (!(tio.c_lflag & ICANON) && (t.c_lflag & ICANON) &&
             in_head != in_tail && nlines < MAX_LINES)
             lines[nlines++] = in_head - in_tail;   /* raw bytes: one "line" */
-        if ((tio.c_lflag & ICANON) && !(t.c_lflag & ICANON))
+        if ((tio.c_lflag & ICANON) && !(t.c_lflag & ICANON)) {
             nlines = 0;             /* raw: just bytes now */
+            if (line_len && push(line, line_len) == 0)
+                line_len = 0;       /* keys typed ahead stay readable */
+        }
         tio = t;
         irq_restore(flags);
         return 0;

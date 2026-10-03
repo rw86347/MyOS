@@ -12,8 +12,17 @@
  *   secondary   0x170-0x177     0x376          15    hdc (master), hdd (slave)
  *
  * "PIO" = Programmed I/O: the CPU copies every 16-bit word between the disk
- * and memory itself (rep insw / rep outsw). Simple, slow (~a few MB/s) and
- * always works. DMA (the disk writes to RAM by itself) comes later.
+ * and memory itself (rep insw / rep outsw). Simple and always works, but
+ * every word is a slow I/O-bus read (~100-600 ns): 64 KiB keeps the CPU
+ * busy for milliseconds.
+ *
+ * Bus-master DMA (PIIX/ICH, and QEMU): we hand the controller a table of
+ * physical memory ranges (the PRD table), send READ DMA, and sleep. The
+ * controller moves up to 128 KiB into RAM by itself and interrupts once at
+ * the end. The CPU's cost is a dozen port writes and one interrupt, no
+ * matter how big the transfer. PC DMA is cache-coherent: nothing to flush.
+ * PIO stays as the fallback (no controller, no IRQ, a drive without DMA,
+ * or a test read at boot that does not match).
  *
  * Interrupt driven: after giving the drive a command, the thread that asked
  * SLEEPS. The drive raises its IRQ when a sector is ready (or the command
@@ -34,6 +43,10 @@
 #include <interrupts.h>
 #include <io.h>
 #include <kprintf.h>
+#include <memlayout.h>
+#include <paging.h>
+#include <pci.h>
+#include <string.h>
 #include <thread.h>
 #include <timer.h>
 
@@ -62,6 +75,20 @@
 #define CMD_SET_MULTIPLE   0xC6     /* the block size for those two */
 #define CMD_CACHE_FLUSH    0xE7
 #define CMD_IDENTIFY       0xEC
+#define CMD_READ_DMA       0xC8
+#define CMD_WRITE_DMA      0xCA
+
+/* Bus-master registers, as offsets from the channel's BM base port. */
+#define BM_CMD     0
+#define BM_STATUS  2
+#define BM_PRDT    4
+#define BM_START   0x01
+#define BM_TO_MEM  0x08               /* direction: device -> memory */
+#define BMS_ERR    0x02
+#define BMS_IRQ    0x04
+
+#define PRD_MAX    64                 /* 128 KiB in 4 KiB pieces needs 33 */
+#define DMA_MAX    256                /* sectors per command (count 0 = 256) */
 
 /* Sectors per interrupt we ask for (drives offer up to 16, some more).
    One interrupt and two thread switches per 8 KiB instead of per 512 B. */
@@ -88,12 +115,26 @@ struct ata_channel {
     volatile uint8_t irq_status;    /* ...and this was its status */
     struct wait_queue irq_wait;     /* the thread waiting for the drive */
     struct wait_queue turn;         /* threads waiting for the channel */
+    uint16_t bm;                    /* bus-master base port, 0 = no DMA */
 };
+
+/* One PRD: a physical range for the controller. bytes 0 means 64 KiB; a
+   range must not cross a 64 KiB boundary. EOT marks the last one. */
+struct prd {
+    uint32_t addr;
+    uint16_t bytes;
+    uint16_t flags;
+};
+#define PRD_EOT 0x8000
+
+/* 512-byte aligned and 512 bytes long, so a table never crosses 64 KiB. */
+static struct prd prdt[2][PRD_MAX] __attribute__((aligned(512)));
 
 struct ata_drive {
     struct ata_channel *ch;
     uint8_t slave;                  /* 0 = master, 1 = slave */
     uint8_t multi;                  /* sectors per interrupt (1: plain commands) */
+    uint8_t dma;                    /* use bus-master DMA */
 };
 
 static struct ata_channel channels[2];
@@ -230,14 +271,172 @@ static int pio_read(struct ata_drive *d, uint32_t lba, uint32_t count, uint8_t *
     return 0;
 }
 
+/* --- bus-master DMA ------------------------------------------------------- */
+
+static uint32_t phys_of(uintptr_t va)
+{
+    if (va >= KERNEL_VBASE && va - KERNEL_VBASE < DIRECTMAP_LIMIT)
+        return V2P(va);
+    uint32_t pa = vmm_translate(va & ~(PAGE_SIZE - 1));
+    return pa ? pa | (va & (PAGE_SIZE - 1)) : 0;
+}
+
+/* Describe buf (bytes long) to the controller. Ranges that happen to be
+   physically next to each other are merged. Returns 0, or -1 if the buffer
+   can't be used for DMA (odd address, unmapped, too many pieces). */
+static int build_prd(struct prd *t, const void *buf, uint32_t bytes)
+{
+    uintptr_t va = (uintptr_t)buf;
+    int n = 0;
+    if (va & 1)
+        return -1;
+    while (bytes) {
+        uint32_t piece = PAGE_SIZE - (va & (PAGE_SIZE - 1));
+        if (piece > bytes)
+            piece = bytes;
+        uint32_t pa = phys_of(va);
+        if (!pa)
+            return -1;
+        struct prd *last = n ? &t[n - 1] : 0;
+        uint32_t last_len = last ? (last->bytes ? last->bytes : 0x10000) : 0;
+        if (last && last->addr + last_len == pa && last_len + piece <= 0x10000 &&
+            (last->addr >> 16) == ((pa + piece - 1) >> 16)) {
+            last->bytes = (uint16_t)(last_len + piece);     /* 64 KiB wraps to 0 */
+        } else {
+            if (n == PRD_MAX)
+                return -1;
+            t[n].addr = pa;
+            t[n].bytes = (uint16_t)piece;
+            t[n].flags = 0;
+            n++;
+        }
+        va += piece;
+        bytes -= piece;
+    }
+    t[n - 1].flags = PRD_EOT;
+    return 0;
+}
+
+/* One DMA command, count <= DMA_MAX sectors. 0, -1 (error), or 1 (this
+   buffer can't do DMA: use PIO). Interrupts are off. */
+static int dma_go(struct ata_drive *d, uint32_t lba, uint32_t count, int write);
+
+static int dma_xfer(struct ata_drive *d, uint32_t lba, uint32_t count, void *buf, int write)
+{
+    struct ata_channel *c = d->ch;
+    if (build_prd(prdt[c == &channels[1]], buf, count * SECTOR_SIZE) < 0)
+        return 1;
+    return dma_go(d, lba, count, write);
+}
+
+/* Run the command on the channel's PRD table, which is already filled. */
+static int dma_go(struct ata_drive *d, uint32_t lba, uint32_t count, int write)
+{
+    struct ata_channel *c = d->ch;
+    struct prd *t = prdt[c == &channels[1]];
+    uint8_t dir = write ? 0 : BM_TO_MEM;
+    outl(c->bm + BM_PRDT, V2P(t));
+    outb(c->bm + BM_CMD, dir);
+    outb(c->bm + BM_STATUS, BMS_ERR | BMS_IRQ);     /* write 1 to clear */
+    if (start(d, lba, count, write ? CMD_WRITE_DMA : CMD_READ_DMA) < 0)
+        return -1;
+    outb(c->bm + BM_CMD, dir | BM_START);
+    uint32_t deadline = timer_ms() + IRQ_TIMEOUT;
+    while (!c->irq_seen)
+        if (wq_sleep_until(&c->irq_wait, deadline) && !c->irq_seen)
+            break;                  /* timed out */
+    outb(c->bm + BM_CMD, dir);      /* stop the engine */
+    uint8_t bms = inb(c->bm + BM_STATUS);
+    outb(c->bm + BM_STATUS, BMS_ERR | BMS_IRQ);
+    if (!c->irq_seen || (bms & BMS_ERR) || bad(c->irq_status))
+        return -1;
+    return 0;
+}
+
+static int dma_rw(struct ata_drive *d, uint32_t lba, uint32_t count, uint8_t *p, int write)
+{
+    while (count) {
+        uint32_t n = count > DMA_MAX ? DMA_MAX : count;
+        int rc = dma_xfer(d, lba, n, p, write);
+        if (rc < 0)
+            return -1;
+        if (rc > 0)
+            return 1;               /* caller does the rest with PIO */
+        lba += n;
+        count -= n;
+        p += n * SECTOR_SIZE;
+    }
+    return 0;
+}
+
 static int ata_read(struct blockdev *dev, uint32_t lba, uint32_t count, void *buf)
 {
     struct ata_drive *d = dev->priv;
     uint32_t flags = irq_save();
     channel_take(d->ch);
-    int err = pio_read(d, lba, count, buf, IRQ_TIMEOUT);
+    int err = d->dma ? dma_rw(d, lba, count, buf, 0) : 1;
+    if (err > 0)
+        err = pio_read(d, lba, count, buf, IRQ_TIMEOUT);
     channel_give(d->ch);
     irq_restore(flags);
+    return err;
+}
+
+static int ata_write(struct blockdev *dev, uint32_t lba, uint32_t count, const void *buf);
+
+/* Scatter-gather: the pieces become one PRD table (pieces that touch are
+   merged; a PRD entry may not cross a 64 KiB boundary), so up to 128 KiB
+   of page-cache frames or dirty blocks move with one command and one
+   interrupt. The table belongs to the channel: fill it only while holding
+   the channel. */
+static int ata_rwv(struct blockdev *dev, uint32_t lba, const struct bio_vec *v, int nv, int write)
+{
+    struct ata_drive *d = dev->priv;
+    struct ata_channel *c = d->ch;
+    struct prd *t = prdt[c == &channels[1]];
+    uint32_t count = 0;
+    int n = 0, fits = d->dma;
+    uint32_t flags = irq_save();
+    channel_take(c);
+    for (int k = 0; k < nv && fits; k++) {
+        uint32_t pa = v[k].phys, len = v[k].len;
+        count += len / SECTOR_SIZE;
+        while (len) {
+            uint32_t piece = 0x10000 - (pa & 0xFFFF);       /* to the next 64 KiB line */
+            if (piece > len)
+                piece = len;
+            struct prd *last = n ? &t[n - 1] : 0;
+            uint32_t last_len = last ? (last->bytes ? last->bytes : 0x10000) : 0;
+            if (last && last->addr + last_len == pa && (last->addr >> 16) == (pa >> 16)) {
+                last->bytes = (uint16_t)(last_len + piece);  /* 64 KiB wraps to 0 */
+            } else if (n == PRD_MAX) {
+                fits = 0;
+                break;
+            } else {
+                t[n].addr = pa;
+                t[n].bytes = (uint16_t)piece;
+                t[n].flags = 0;
+                n++;
+            }
+            pa += piece;
+            len -= piece;
+        }
+    }
+    int err = 1;
+    if (fits) {
+        t[n - 1].flags = PRD_EOT;
+        err = dma_go(d, lba, count, write);
+    }
+    channel_give(c);
+    irq_restore(flags);
+    for (int k = 0; err > 0 && k < nv; k++) {   /* no DMA: PIO, piece by piece */
+        uint32_t s = v[k].len / SECTOR_SIZE;
+        int e = write ? ata_write(dev, lba, s, P2V(v[k].phys))
+                      : ata_read(dev, lba, s, P2V(v[k].phys));
+        if (e < 0 || k == nv - 1)
+            err = e < 0 ? -1 : 0;
+        lba += s;
+    }
     return err;
 }
 
@@ -254,6 +453,13 @@ static int ata_write(struct blockdev *dev, uint32_t lba, uint32_t count, const v
     int err = 0;
     uint32_t flags = irq_save();
     channel_take(c);
+    if (d->dma) {
+        err = dma_rw(d, lba, count, (uint8_t *)p, 1);
+        if (err == 0)
+            count = 0;              /* all done */
+        else if (err > 0)
+            err = 0;                /* odd buffer: PIO below */
+    }
     while (count && !err) {
         uint32_t n = count > 128 ? 128 : count;
         err = start(d, lba, n, cmd);
@@ -392,11 +598,51 @@ static void enable_irq(struct ata_channel *c, struct ata_drive *d)
     irq_restore(flags);
 }
 
+/* The PCI IDE controller (class 01:01) in compatibility mode: its BAR 4 is
+   the bus-master register block, 8 ports per channel. */
+static void dma_find(void)
+{
+    for (int i = 0; i < pci_count(); i++) {
+        struct pci_dev *p = pci_dev_at(i);
+        if ((p->class_rev >> 16) != 0x0101)
+            continue;
+        uint8_t progif = (uint8_t)(p->class_rev >> 8);
+        if (!(progif & 0x80) || !(p->bar[4] & 1))
+            continue;                       /* no bus master, or not I/O ports */
+        uint16_t bm = (uint16_t)(p->bar[4] & 0xFFFC);
+        pci_write_config(p, 0x04, (pci_read_config(p, 0x04) & 0xFFFF) | 0x05);  /* I/O + bus master */
+        if (!(progif & 0x01))
+            channels[0].bm = bm;            /* primary in legacy ports */
+        if (!(progif & 0x04))
+            channels[1].bm = (uint16_t)(bm + 8);
+        return;
+    }
+}
+
+/* DMA for this drive if it says it can (IDENTIFY word 49 bit 8) and a test
+   read of sector 0 matches what PIO reads. */
+static void dma_probe(struct ata_drive *d, const char *name, const uint16_t id[256])
+{
+    static uint8_t a[SECTOR_SIZE], b[SECTOR_SIZE];
+    struct ata_channel *c = d->ch;
+    if (!c->bm || !c->use_irq || !(id[49] & 0x100))
+        return;
+    uint32_t flags = irq_save();
+    int ok = pio_read(d, 0, 1, a, PROBE_TIMEOUT) == 0;
+    memset(b, 0xA5, sizeof b);
+    ok = ok && dma_xfer(d, 0, 1, b, 0) == 0 && memcmp(a, b, sizeof a) == 0;
+    irq_restore(flags);
+    d->dma = (uint8_t)ok;
+    kprintf("ata: %s: %s\n", name, ok ? "bus-master DMA" : "DMA test failed, using PIO");
+}
+
 void ata_init(void)
 {
     static const uint16_t bases[2] = { 0x1F0, 0x170 };
     static const uint16_t ctrls[2] = { 0x3F6, 0x376 };
     static uint16_t id[256];
+    static uint16_t ids[4][256];
+    dma_find();
 
     for (int ch = 0; ch < 2; ch++) {
         struct ata_channel *c = &channels[ch];
@@ -416,6 +662,7 @@ void ata_init(void)
 
             if (identify(d, id) < 0)
                 continue;
+            memcpy(ids[ch * 2 + sl], id, sizeof id);
             uint32_t sectors = id[60] | ((uint32_t)id[61] << 16);
             if (sectors == 0)
                 continue;                   /* drive doesn't support LBA */
@@ -426,6 +673,7 @@ void ata_init(void)
                 .read    = ata_read,
                 .write   = ata_write,
                 .flush   = ata_flush,
+                .rwv     = ata_rwv,
                 .priv    = d,
             };
             char model[41];
@@ -439,5 +687,12 @@ void ata_init(void)
         }
         if (first)
             enable_irq(c, first);
+        for (int sl = 0; sl < 2 && first; sl++) {
+            struct ata_drive *d = &drives[ch * 2 + sl];
+            if (d->ch == c && ids[ch * 2 + sl][0] | ids[ch * 2 + sl][60]) {
+                char name[4] = { 'h', 'd', (char)('a' + ch * 2 + sl), '\0' };
+                dma_probe(d, name, ids[ch * 2 + sl]);
+            }
+        }
     }
 }

@@ -339,6 +339,7 @@ void proc_exit(int status)
 {
     struct process *p = proc_current();
     irq_save();
+    signal_alarm_cancel(p);
 
     fd_close_all(p);
     vfs_put(p->cwd);

@@ -25,6 +25,7 @@
 #include <stddef.h>
 #include <string.h>
 #include <thread.h>
+#include <timer.h>
 #include <uaccess.h>
 
 /* --- Linux's i386 signal frame -------------------------------------------- */
@@ -232,6 +233,8 @@ void signal_fork(struct process *child, struct process *parent)
     memcpy(child->sig_action, parent->sig_action, sizeof child->sig_action);
     child->sig_blocked = parent->sig_blocked;
     child->sig_pending = 0;             /* pending signals aren't inherited */
+    child->alarm_at = child->alarm_every = 0;   /* timers aren't inherited */
+    child->alarm_next = NULL;
 }
 
 void signal_exec(struct process *p)
@@ -404,4 +407,140 @@ int32_t sys_rt_sigpending_impl(uint32_t set, uint32_t size)
         return -EINVAL;
     uint64_t s = p->sig_pending & p->sig_blocked;
     return copy_to_user((void *)set, &s, 8);
+}
+
+/* --- alarm and setitimer(ITIMER_REAL) ------------------------------------------ */
+
+static struct process *alarm_list;      /* armed processes, soonest first */
+
+static void alarm_unlink(struct process *p)
+{
+    for (struct process **pp = &alarm_list; *pp; pp = &(*pp)->alarm_next)
+        if (*pp == p) {
+            *pp = p->alarm_next;
+            break;
+        }
+    p->alarm_next = NULL;
+}
+
+/* Sorted insert: O(armed processes), at most PROC_MAX. */
+static void alarm_insert(struct process *p)
+{
+    struct process **pp = &alarm_list;
+    while (*pp && (int32_t)((*pp)->alarm_at - p->alarm_at) <= 0)
+        pp = &(*pp)->alarm_next;
+    p->alarm_next = *pp;
+    *pp = p;
+}
+
+void signal_alarm_tick(uint32_t now)
+{
+    while (alarm_list && (int32_t)(now - alarm_list->alarm_at) >= 0) {
+        struct process *p = alarm_list;
+        alarm_list = p->alarm_next;
+        p->alarm_next = NULL;
+        p->alarm_at = 0;
+        signal_send(p, SIGALRM);
+        if (p->alarm_every) {
+            p->alarm_at = now + p->alarm_every;
+            if (!p->alarm_at)
+                p->alarm_at = 1;        /* 0 means "not armed" */
+            alarm_insert(p);
+        }
+    }
+}
+
+void signal_alarm_cancel(struct process *p)
+{
+    uint32_t flags = irq_save();
+    if (p->alarm_at)
+        alarm_unlink(p);
+    p->alarm_at = p->alarm_every = 0;
+    irq_restore(flags);
+}
+
+/* Arm (value_ms > 0) or disarm (0); returns the ms that were left. */
+static uint32_t alarm_set(struct process *p, uint32_t value_ms, uint32_t every_ms)
+{
+    uint32_t flags = irq_save();
+    uint32_t now = timer_ms(), left = 0;
+    if (p->alarm_at) {
+        int32_t d = (int32_t)(p->alarm_at - now);
+        left = d > 0 ? (uint32_t)d : 1;
+        alarm_unlink(p);
+    }
+    p->alarm_at = 0;
+    p->alarm_every = value_ms ? every_ms : 0;
+    if (value_ms) {
+        p->alarm_at = now + value_ms;
+        if (!p->alarm_at)
+            p->alarm_at = 1;
+        alarm_insert(p);
+    }
+    irq_restore(flags);
+    return left;
+}
+
+int32_t sys_alarm_impl(uint32_t seconds)
+{
+    if (seconds > 0x7FFFFFFFu / 1000)
+        seconds = 0x7FFFFFFFu / 1000;
+    uint32_t left = alarm_set(proc_current(), seconds * 1000, 0);
+    return (int32_t)((left + 999) / 1000);
+}
+
+/* struct itimerval on i386: { interval {sec, usec}, value {sec, usec} } */
+struct itimerval32 { int32_t i_sec, i_usec, v_sec, v_usec; };
+
+static int tv_to_ms(int32_t sec, int32_t usec, uint32_t *ms)
+{
+    if (sec < 0 || usec < 0 || usec >= 1000000)
+        return -EINVAL;
+    if ((uint32_t)sec > 0x7FFFFFFFu / 1000 - 1)
+        sec = 0x7FFFFFFF / 1000 - 1;
+    *ms = (uint32_t)sec * 1000 + (uint32_t)(usec + 999) / 1000;  /* round up */
+    return 0;
+}
+
+static void get_itimer(struct process *p, struct itimerval32 *v)
+{
+    uint32_t flags = irq_save();
+    uint32_t left = 0;
+    if (p->alarm_at) {
+        int32_t d = (int32_t)(p->alarm_at - timer_ms());
+        left = d > 0 ? (uint32_t)d : 1;
+    }
+    v->i_sec = p->alarm_every / 1000;
+    v->i_usec = (p->alarm_every % 1000) * 1000;
+    v->v_sec = left / 1000;
+    v->v_usec = (left % 1000) * 1000;
+    irq_restore(flags);
+}
+
+int32_t sys_getitimer_impl(int which, uint32_t cur)
+{
+    if (which != 0)                     /* ITIMER_REAL only */
+        return -EINVAL;
+    struct itimerval32 v;
+    get_itimer(proc_current(), &v);
+    return copy_to_user((void *)cur, &v, sizeof v);
+}
+
+int32_t sys_setitimer_impl(int which, uint32_t new, uint32_t old)
+{
+    struct process *p = proc_current();
+    struct itimerval32 v, o;
+    uint32_t value_ms, every_ms;
+    if (which != 0)
+        return -EINVAL;
+    if (copy_from_user(&v, (void *)new, sizeof v) < 0)
+        return -EFAULT;
+    if (tv_to_ms(v.v_sec, v.v_usec, &value_ms) < 0 ||
+        tv_to_ms(v.i_sec, v.i_usec, &every_ms) < 0)
+        return -EINVAL;
+    get_itimer(p, &o);
+    alarm_set(p, value_ms, every_ms);
+    if (old && copy_to_user((void *)old, &o, sizeof o) < 0)
+        return -EFAULT;
+    return 0;
 }
