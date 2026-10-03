@@ -385,3 +385,22 @@ Short dated notes after each work session: what was done, what broke, what was l
   operation and disk type (table in `docs/performance.md`). `make test` 99 passed,
   `make test-shell` OK (e2fsck clean), `tools/test-disks.sh` OK on all three new
   drivers. QEMU only; real-disk timing still to measure.
+
+## 2026-10-03 — 9d-2: writes through the page cache, a cache as big as free RAM
+- Writes now copy into the file's pages in the page cache and mark them dirty;
+  the disk gets runs of up to 32 pages as one command (on `fsync`, `sync`, once a
+  second, or when RAM/8 — at most 32 MiB — is dirty). File data no longer passes
+  through the block cache at all, which also removed a lookup per block from
+  reads. 64 KiB write: ~130 000 → ~100 800 instructions on all four disk types
+  (NVMe 150 174 → 101 006, no bounce copies); cold random 4 KiB 6 335 → 4 204.
+- The cache may hold all free RAM; when the page allocator runs out it takes
+  clean pages back (`pcache_reclaim`). Found by running the benchmark in 20 MiB:
+  the first version only cleared "used" bits on its first call, freed nothing,
+  and a page fault killed `init`. Now a second round takes the pages.
+- The cache slot went back to 16 bytes (one set per cache line): warm 64 KiB read
+  18 736 → 18 144.
+- Why all of RAM: on the old PC's disk a miss costs ~4 000 hits, so each extra
+  "9" of hit rate makes the average access 10× faster — the math is in
+  `docs/performance.md` ("Cache sizing").
+- New test: `ext2test` writes a 300 000-byte pattern in odd pieces, overwrites,
+  truncates, leaves a gap; the Makefile checks the bytes on the disk with debugfs.

@@ -157,10 +157,8 @@ instructions than Linux 6.1 on every operation and every type.
   to 64 blocks per indirect-block lookup, runs of consecutive disk blocks become
   one `blockdev_readv` straight into the frames. Read-ahead window per inode
   (`ra_next`, `ra_win`): 4 pages, doubling to 32 while the file is read in order.
-- Concern (correctness): a data block changed through the block cache may not be
-  on the disk yet, so `ext2_readpages` copies any block the block cache holds
-  (`bpeek`) instead of reading the disk. Keep that if you touch it. A write
-  racing a fill is caught by `pc_id` changing; the fill is thrown away.
+- (Superseded by 9d-2 below: `bpeek` is gone.) A write racing a fill is caught
+  by `pc_id` changing; the fill is thrown away.
 - `struct blockdev` has `.rwv` (scatter-gather read/write of `struct bio_vec`
   physical pieces, ≤ 64 pieces, ≤ 256 sectors). All four drivers implement it.
   `blockdev_map` turns a kernel buffer into pieces for drivers.
@@ -175,8 +173,38 @@ instructions than Linux 6.1 on every operation and every type.
   channel (could corrupt another thread's DMA). `kernel/bench.c` ran diskbench
   twice (the second run's "cold" was partly cached); now once.
 - Writes: `bcache.c` `write_run` sends dirty neighbours as one command (sync and
-  eviction); `ext2` `alloc_block` tries `next_blk` first. Writes still don't go
-  through the page cache — the next big write win (see gaps).
+  eviction); `ext2` `alloc_block` tries `next_blk` first.
+
+### 9d-2 writes through the page cache; the cache uses all free RAM — done
+
+- **Invariant: file data never lives in the block cache.** The page cache has it;
+  the disk has whatever isn't dirty there. `bmap(..., alloc=2, ...)` allocates a
+  file's data block without zeroing it in the block cache and calls `bforget` (drops
+  any stale cached copy of the block, e.g. a freed directory block, dirty or not).
+  Indirect blocks are still zeroed through the block cache (they are metadata).
+  `ext2_read_kernel` was removed (unused once `readpages` existed; it read data
+  through the block cache).
+- `ext2_write`: per page — `pcache_get_write(ino, idx, need_old)` (reads the page
+  only if the write keeps some old bytes), `alloc_page_blocks` (fs lock held only
+  for that), `copy_from_user` with no lock held (so a fault on an mmap of a disk
+  file can take the lock — `prefault` is gone), `pcache_put_write(dirty)`, then
+  `i->size`. The on-disk inode (size, mtime) is updated once per call.
+- Write-back: `pcache_flush(ino)` (runs of ≤ 32 dirty pages → `fs->writepages` =
+  `ext2_writepages`, the same `pages_io` as `readpages` but skipping holes and
+  bytes past `i->size`). It holds a `vfs_get` reference: the file may be deleted
+  while the disk works. Called by `fsync`, `sync` (`pcache_sync`, then `bsync`),
+  the block cache's flusher thread every second, a writer over `pcache_too_dirty`
+  (RAM/8, ≤ 32 MiB), `victim` when a set has only dirty pages, and truncate.
+- `ext2_truncate`: zero the cut-off tail of the last page through the cache, flush
+  the file, `pcache_invalidate`, then free blocks. Never zero data via `bread`.
+- Memory: the table has a slot per frame (pow2, ≤ 2^18), 16-byte slots
+  (`_Static_assert`) plus a side table `owner[]` for dirty pages. `pmm_alloc`
+  calls `pcache_reclaim(32)` when out of frames: clean unpinned pages, clock
+  order, 2 rounds (the second ignores the used bit). `pmm`'s `take()` scans bitmap
+  words from `search_from`.
+- Tests: `ext2test` section 6 (odd-size writes, overwrite, ftruncate, a gap) and
+  `tools/check-pattern.py` checks the same bytes on the disk via debugfs after
+  `make test`. `MEM=12M tools/diskbench.sh virtio myos` exercises reclaim.
 
 ### 9e FAT32 in the VFS — read only
 

@@ -483,6 +483,9 @@ check-selftests: $(IMG) $(USB)
 	  grep -q "Kernel read of address 00000000 (page not mapped)" $$L || { echo "FAIL: NULL page fault"; ok=0; }; \
 	  [ $$ok = 1 ] || { echo "TEST FAILED"; exit 1; }
 	$(call check-test-disk,$(DATA),/persist.txt,written by MyOS)
+	@$(DEBUGFS) -R 'dump /pattern.bin $(BUILD)/pattern.bin' $(DATA) >/dev/null 2>&1; \
+	  python3 tools/check-pattern.py $(BUILD)/pattern.bin \
+	  || { echo "FAIL: /pattern.bin on the disk isn't what ext2test wrote"; exit 1; }
 	@echo "TEST OK"
 
 # Boot the normal image (/init starts bash) and type commands at it through

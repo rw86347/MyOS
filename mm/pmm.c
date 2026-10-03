@@ -200,17 +200,40 @@ int pmm_shared(uint32_t phys)
     return extra_refs && extra_refs[phys / PAGE_SIZE] != 0;
 }
 
+static uint32_t (*reclaim)(uint32_t want);
+
+void pmm_set_reclaim(uint32_t (*fn)(uint32_t want))
+{
+    reclaim = fn;
+}
+
+/* The lowest free frame. Every frame below search_from is used, so the
+   search starts there and tests 32 frames per step (a whole bitmap word). */
+static uint32_t take(void)
+{
+    for (uint32_t w = search_from / 32; w * 32 < nframes; w++) {
+        if (bitmap[w] == 0xFFFFFFFFu)
+            continue;
+        uint32_t f = w * 32 + __builtin_ctz(~bitmap[w]);
+        if (f >= nframes)
+            break;
+        set_used(f);
+        free_frames--;
+        search_from = f + 1;
+        return f * PAGE_SIZE;
+    }
+    search_from = nframes;
+    return 0;
+}
+
+/* Out of frames: the page cache gives clean pages back (it may use all
+   free RAM — idle RAM is wasted RAM — but programs come first). */
 uint32_t pmm_alloc(void)
 {
-    for (uint32_t f = search_from; f < nframes; f++) {
-        if (!is_used(f)) {
-            set_used(f);
-            free_frames--;
-            search_from = f + 1;
-            return f * PAGE_SIZE;
-        }
-    }
-    return 0;           /* out of memory (frame 0 is never free, so 0 = failure) */
+    uint32_t pa = take();
+    if (!pa && reclaim && reclaim(32))
+        pa = take();
+    return pa;          /* 0: out of memory (frame 0 is never free) */
 }
 
 void pmm_free(uint32_t phys)

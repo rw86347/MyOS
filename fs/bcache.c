@@ -24,6 +24,7 @@
  * after each one the code looks at the state again.
  */
 #include <bcache.h>
+#include <pcache.h>
 #include <errno.h>
 #include <interrupts.h>
 #include <kprintf.h>
@@ -121,15 +122,22 @@ struct buf *bread(struct blockdev *dev, uint32_t block, uint32_t size)
     return get(dev, block, size, 1);
 }
 
-int bpeek(struct blockdev *dev, uint32_t block, uint32_t size, void *dst)
+void bforget(struct blockdev *dev, uint32_t block, uint32_t size)
 {
     uint32_t flags = irq_save();
     struct buf *b = lookup(dev, block, size);
-    int hit = b && b->valid;
-    if (hit)
-        memcpy(dst, b->data, size);
+    if (b && b->valid) {
+        if (b->dirty) {
+            b->dirty = 0;
+            ndirty--;
+        }
+        if (b->refs == 0) {
+            hash_remove(b);
+            b->dev = NULL;
+            b->valid = 0;
+        }
+    }
     irq_restore(flags);
-    return hit;
 }
 
 struct buf *bclear(struct blockdev *dev, uint32_t block, uint32_t size)
@@ -310,6 +318,7 @@ static void flusher(void *arg)
         uint32_t deadline = timer_ms() + FLUSH_MS;
         wq_sleep_until(&flusher_wait, deadline ? deadline : 1);
         irq_restore(flags);
+        pcache_sync();                  /* file data first, then metadata */
         if (ndirty)
             bsync();
     }

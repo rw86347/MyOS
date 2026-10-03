@@ -105,7 +105,7 @@ when it's fixed. File references point at the comment that mentions the gap.
 - **File mappings are private copies** (made per page on first touch), so `MAP_SHARED`
   file mappings behave like `MAP_PRIVATE`: a program writing through one doesn't change
   the file. A program written at run time is copied into one buffer for the ELF loader
-  (initramfs programs are read in place). Disk file systems will need a page cache.
+  (initramfs programs are read in place). Disk files are copied from the page cache.
 - **Dynamic linking**: one interpreter level; the interpreter is put at the first free
   place in the mmap area (no randomisation).
 - **Arguments + environment: 64 KiB, 1024 entries; paths 255 bytes** (Linux: 128 KiB+, 4096).
@@ -126,11 +126,15 @@ when it's fixed. File references point at the comment that mentions the gap.
   controller. Takes 128 KiB at boot for bounce pages: block-cache writes are 1 KiB
   pieces in separate pages, which NVMe's PRP lists can't describe in one command.
 - **virtio-blk**: the legacy (0.9.5) PCI interface only, one disk.
-- **The page cache doesn't hold writes**: `write()` goes through the block cache
-  (1 KiB blocks, one 4 KiB frame each: 2 MiB of data at most in 64 MiB of RAM) and
-  makes the file's cached pages stale. A page cache that takes writes (Linux's way)
-  would halve the write cost again and let NVMe write without bounce pages. It holds
-  a quarter of RAM at most and gives nothing back under memory pressure.
+- **The page cache** (`fs/pcache.c`) holds reads and writes and may use all free RAM;
+  the page allocator takes clean pages back when it runs out. Dirty pages (at most
+  RAM/8, at most 32 MiB) are written about once a second, by `sync`/`fsync`, or when
+  a writer goes over the limit — by the writer itself, so it waits. A write error is
+  reported and the changes are dropped (no retry, no error for a later `fsync`).
+  `fsync` writes the file's pages, then the whole block cache (metadata). A write that
+  races a `truncate` of the same file may be lost. Dirty pages are never taken back
+  under memory pressure without being written first, and nothing writes them early
+  when free memory runs low (only the RAM/8 limit). Up to 1 GiB of cache (2^18 slots).
 - **Only legacy IDE ports** (0x1F0/0x170, IRQ 14/15): a controller in "native PCI" mode
   (some SATA chipsets) isn't found. A channel whose IRQ never arrives is polled.
 - **The block cache is an eighth of RAM (at most 2048 blocks)** and writes back about
@@ -165,9 +169,8 @@ when it's fixed. File references point at the comment that mentions the gap.
   hash index (as with Linux's own ext2 driver). Hard links can't be made, and a file
   with two names (made by Linux) becomes two separate nodes here, whose sizes can drift
   apart until a reboot. Every directory looked at stays in memory (no eviction). File
-  data goes through the block cache: reading a block costs ~4 cache lookups (inode,
-  indirect blocks, data) — a page cache with the block list cached is step 11. One lock
-  per file system. Block allocation scans the group's bitmap (bounded by its size).
+  data lives in the page cache; mapping a miss costs one indirect-block lookup per 64
+  blocks. One lock per file system. Block allocation scans the group's bitmap (bounded by its size).
   Times are 32-bit seconds. Only on IDE disks (the USB-stick image has no /data).
 - **No hard links**: a file and its name are one struct, so `link()` returns `-EPERM`
   (what Linux says on FAT). Hard links in the cpio archive become separate files.

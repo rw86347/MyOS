@@ -75,6 +75,13 @@ Mark a step `[x]` only when its "Done when" check works.
     sized from RAM, read-ahead up to 128 KiB in one command); writes cluster into
     one command per run of blocks. `tools/diskbench.sh` (MyOS vs Linux 6.1 on all
     four types) and `tools/test-disks.sh` (self-tests on AHCI/NVMe/virtio).
+  - [x] 9d-2: writes go through the page cache (dirty pages written back in runs of
+    up to 128 KiB); the cache may use all free RAM and gives clean pages back when
+    memory runs out. 64 KiB write ~130 000 → ~100 800 instructions on every type.
+    Sizing math in `docs/performance.md` ("Cache sizing").
+  - [ ] 9d-3: several commands in flight (NVMe queue depth, virtio chains, AHCI
+    NCQ) and read-ahead that runs while the program copies; driver limits
+    (several disks per driver, LBA48, AHCI BIOS hand-off).
   - [ ] 9e: FAT32 in the VFS: read, then write (USB sticks, swapping files with a Mac/PC).
     Read is in: the first FAT32 partition is mounted at /mnt (read-only). Write,
     which has to allocate clusters and update the FAT, is still open.

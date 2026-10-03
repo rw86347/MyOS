@@ -364,7 +364,8 @@ static void free_inode(struct ext2 *fs, uint32_t ino, int is_dir)
 /*
  * The disk block holding block n of a file (0: a hole). With `alloc`,
  * missing blocks — and the indirect blocks on the way to them — are
- * allocated and zeroed; `dib` is the buffer holding the inode (dirty if
+ * allocated and zeroed (alloc 2: a file's data block is not zeroed — its
+ * page in the page cache holds the bytes); `dib` is the buffer holding the inode (dirty if
  * it changed). Cost: one cached block per indirection level.
  */
 static int bmap(struct ext2 *fs, struct ext2_inode *di, struct buf *dib, uint32_t goal,
@@ -408,14 +409,18 @@ static int bmap(struct ext2 *fs, struct ext2_inode *di, struct buf *dib, uint32_
                 err = -ENOSPC;
                 break;
             }
-            struct buf *z = bclear(fs->dev, nb, fs->bsize);     /* zeros, no read */
-            if (!z) {
-                free_block(fs, nb);
-                err = -EIO;
-                break;
+            if (alloc == 2 && level == depth) {
+                bforget(fs->dev, nb, fs->bsize);    /* file data: the page cache has it */
+            } else {
+                struct buf *z = bclear(fs->dev, nb, fs->bsize);     /* zeros, no read */
+                if (!z) {
+                    free_block(fs, nb);
+                    err = -EIO;
+                    break;
+                }
+                bdirty(z);
+                brelse(z);
             }
-            bdirty(z);
-            brelse(z);
             *slot = nb;
             di->blocks += fs->bsize / 512;
             bdirty(holder ? holder : dib);
@@ -1021,66 +1026,36 @@ static int ext2_truncate(struct inode *i, uint32_t size)
     struct ext2 *fs = fs_of(i);
     if (fs->readonly)
         return -EROFS;
+    if (size < i->size && size % PAGE_SIZE) {
+        /* Zero the cut-off end of the last page: growing the file again
+           must show zeros there, not the old bytes. */
+        int err;
+        struct pc_page *pg = pcache_get_write(i, size / PAGE_SIZE, 1, &err);
+        if (!pg)
+            return err;
+        memset((uint8_t *)pcache_page_data(pg) + size % PAGE_SIZE, 0,
+               PAGE_SIZE - size % PAGE_SIZE);
+        pcache_put_write(i, pg, 1);
+    }
+    int err = pcache_flush(i);          /* the disk gets every change first... */
+    if (err)
+        return err;
     uint32_t flags = lock(fs);
-    pcache_invalidate(i);               /* cached pages would keep the old bytes */
+    pcache_invalidate(i);               /* ...then the pages are dropped */
     struct ext2_inode *di;
     struct buf *ib = get_inode(fs, i->fs_ino, &di);
     if (!ib) {
         unlock(fs, flags);
         return -EIO;
     }
-    if (size < di->size) {
+    if (size < di->size)
         free_from(fs, di, size / fs->bsize + (size % fs->bsize != 0));
-        /* Zero the cut-off end of the last block: growing the file again
-           must show zeros there, not the old bytes. */
-        uint32_t disk;
-        if (size % fs->bsize &&
-            bmap(fs, di, NULL, 0, size / fs->bsize, 0, &disk) == 0 && disk) {
-            struct buf *b = bread(fs->dev, disk, fs->bsize);
-            if (b) {
-                memset(b->data + size % fs->bsize, 0, fs->bsize - size % fs->bsize);
-                bdirty(b);
-                brelse(b);
-            }
-        }
-    }
     di->size = i->size = size;          /* growing just leaves a hole */
     di->mtime = di->ctime = i->mtime = i->ctime = time_now();
     bdirty(ib);
     brelse(ib);
     unlock(fs, flags);
     return 0;
-}
-
-static int ext2_read_kernel(struct inode *i, uint32_t pos, void *kbuf, uint32_t n)
-{
-    struct ext2 *fs = fs_of(i);
-    uint32_t flags = lock(fs);
-    struct ext2_inode *di;
-    struct buf *ib = get_inode(fs, i->fs_ino, &di);
-    int err = ib ? 0 : -EIO;
-    uint8_t *dst = kbuf;
-    while (n) {
-        uint32_t in = pos % fs->bsize, k = min(fs->bsize - in, n), disk = 0;
-        struct buf *b = NULL;
-        if (!err && bmap(fs, di, NULL, 0, pos / fs->bsize, 0, &disk) == 0 && disk)
-            b = bread(fs->dev, disk, fs->bsize);
-        if (b) {
-            memcpy(dst, b->data + in, k);
-            brelse(b);
-        } else {
-            memset(dst, 0, k);          /* a hole (or a read error) */
-            if (disk)
-                err = -EIO;
-        }
-        dst += k;
-        pos += k;
-        n -= k;
-    }
-    if (ib)
-        brelse(ib);
-    unlock(fs, flags);
-    return err;
 }
 
 static int ext2_statfs(struct mount *m, uint32_t *bsize, uint32_t *blocks, uint32_t *bfree,
@@ -1096,18 +1071,6 @@ static int ext2_statfs(struct mount *m, uint32_t *bsize, uint32_t *blocks, uint3
 }
 
 /* --- read() and write() --------------------------------------------------------- */
-
-/* Touch every page of a user buffer before taking the lock: a page of an
-   mmap'd disk file that isn't in memory yet is read by the page fault —
-   which needs this same lock. */
-static int prefault(const void *user_buf, uint32_t n)
-{
-    uint8_t c;
-    for (uintptr_t p = (uintptr_t)user_buf, end = p + n; p < end; p = (p & ~4095u) + 4096)
-        if (copy_from_user(&c, (const void *)p, 1) < 0)
-            return -EFAULT;
-    return 0;
-}
 
 /*
  * The disk blocks of file blocks n, n+1, ... — as many as one indirect
@@ -1165,10 +1128,14 @@ static int bmap_run(struct ext2 *fs, struct ext2_inode *di, uint32_t n, uint32_t
  * Fill page frames for the page cache. Each file block is mapped (the
  * indirect blocks come from the block cache) and runs of blocks that are
  * next to each other on the disk become ONE scatter-gather read straight
- * into the frames. A block the block cache holds is copied from there
- * instead: it may have been changed and not yet written.
+ * into the frames. (File data never lives in the block cache — see
+ * bforget — so the disk always has the newest bytes not in the page cache.)
  */
-static int ext2_readpages(struct inode *i, uint32_t index, uint32_t n, const uint32_t *frames)
+/* Move pages [index, index + n) between the frames and the file's blocks.
+   Read: holes and the part past the end become zeros. Write: only blocks
+   the file has (the write allocated them) and only up to its end. */
+static int pages_io(struct inode *i, uint32_t index, uint32_t n, const uint32_t *frames,
+                    int write)
 {
     struct ext2 *fs = fs_of(i);
     uint32_t flags = lock(fs);
@@ -1197,17 +1164,17 @@ static int ext2_readpages(struct inode *i, uint32_t index, uint32_t n, const uin
                 }
                 disk = map[fb - mbase];
             }
-            if (!err && disk && bpeek(fs->dev, disk, fs->bsize, page + off))
-                continue;
             if (err || !disk) {
-                memset(page + off, 0, fs->bsize);      /* a hole, or past the end */
+                if (!write)
+                    memset(page + off, 0, fs->bsize);  /* a hole, or past the end */
                 continue;
             }
             uint32_t pa = frames[p] + off;
             int joins = nv && disk == first + secs / spb && secs + spb <= BIO_SECTORS;
             int merges = joins && v[nv - 1].phys + v[nv - 1].len == pa;
             if (nv && (!joins || (!merges && nv == BIO_VEC_MAX))) {
-                err = blockdev_readv(fs->dev, first * spb, v, nv) < 0 ? -EIO : 0;
+                err = (write ? blockdev_writev : blockdev_readv)(fs->dev, first * spb, v, nv)
+                      < 0 ? -EIO : 0;
                 nv = 0;
             }
             if (err)
@@ -1224,11 +1191,22 @@ static int ext2_readpages(struct inode *i, uint32_t index, uint32_t n, const uin
         }
     }
     if (!err && nv)
-        err = blockdev_readv(fs->dev, first * spb, v, nv) < 0 ? -EIO : 0;
+        err = (write ? blockdev_writev : blockdev_readv)(fs->dev, first * spb, v, nv)
+              < 0 ? -EIO : 0;
     if (ib)
         brelse(ib);
     unlock(fs, flags);
     return err;
+}
+
+static int ext2_readpages(struct inode *i, uint32_t index, uint32_t n, const uint32_t *frames)
+{
+    return pages_io(i, index, n, frames, 0);
+}
+
+static int ext2_writepages(struct inode *i, uint32_t index, uint32_t n, const uint32_t *frames)
+{
+    return pages_io(i, index, n, frames, 1);
 }
 
 /* read() is a copy out of the page cache: no file system lock, no block
@@ -1247,6 +1225,30 @@ static int32_t ext2_read(struct file *f, void *user_buf, uint32_t n)
     return r;
 }
 
+/* Give the blocks of page `index` that [from, to) touches a place on the
+   disk (file bytes). Holds the lock briefly. */
+static int alloc_page_blocks(struct ext2 *fs, struct inode *i, uint32_t from, uint32_t to)
+{
+    uint32_t flags = lock(fs);
+    struct ext2_inode *di;
+    struct buf *ib = get_inode(fs, i->fs_ino, &di);
+    int err = ib ? 0 : -EIO;
+    uint32_t goal = group_of(fs, i->fs_ino), disk;
+    for (uint32_t b = from / fs->bsize; !err && b <= (to - 1) / fs->bsize; b++)
+        err = bmap(fs, di, ib, goal, b, 2, &disk);
+    if (ib)
+        brelse(ib);
+    unlock(fs, flags);
+    return err;
+}
+
+/*
+ * write() copies into the page cache, a page at a time: the page is pinned
+ * in the cache (read first only if the write keeps some of its old bytes),
+ * its blocks are allocated, the bytes are copied in, and it is marked
+ * dirty. The disk gets it later in runs (pcache_flush). New blocks are
+ * only ever seen through the pinned page, never read stale from the disk.
+ */
 static int32_t ext2_write(struct file *f, const void *user_buf, uint32_t n)
 {
     struct inode *i = f->inode;
@@ -1258,53 +1260,52 @@ static int32_t ext2_write(struct file *f, const void *user_buf, uint32_t n)
     n = min(n, RW_MAX);
     if (n == 0)
         return 0;
-    if (prefault(user_buf, n) < 0)
-        return -EFAULT;
-    uint32_t flags = lock(fs);
-    pcache_invalidate(i);               /* the next read fills from the new bytes */
     if (f->flags & O_APPEND)
         f->pos = i->size;               /* every write goes to the end */
     uint32_t pos = f->pos;
-    if (pos + n < pos) {
-        unlock(fs, flags);
+    if (pos + n < pos)
         return -EFBIG;                  /* past 4 GiB */
-    }
-    struct ext2_inode *di;
-    struct buf *ib = get_inode(fs, i->fs_ino, &di);
-    int err = ib ? 0 : -EIO;
-    uint32_t done = 0, goal = group_of(fs, i->fs_ino);
+    int err = 0;
+    uint32_t done = 0;
     while (!err && done < n) {
-        uint32_t p = pos + done, in = p % fs->bsize, k = min(fs->bsize - in, n - done);
-        uint32_t disk;
-        err = bmap(fs, di, ib, goal, p / fs->bsize, 1, &disk);
+        uint32_t p = pos + done, idx = p / PAGE_SIZE, in = p % PAGE_SIZE;
+        uint32_t k = min(PAGE_SIZE - in, n - done), start = idx * PAGE_SIZE;
+        /* Old bytes in this page that the write doesn't cover? */
+        uint32_t old_end = i->size > start ? min(i->size - start, PAGE_SIZE) : 0;
+        int need_old = old_end && (in > 0 || in + k < old_end);
+        struct pc_page *pg = pcache_get_write(i, idx, need_old, &err);
+        if (!pg)
+            break;
+        uint8_t *data = pcache_page_data(pg);
+        if (need_old && old_end < PAGE_SIZE)
+            memset(data + old_end, 0, PAGE_SIZE - old_end);    /* past the old end */
+        err = alloc_page_blocks(fs, i, p, p + k);
+        if (!err && copy_from_user(data + in, (const uint8_t *)user_buf + done, k) < 0)
+            err = -EFAULT;
+        pcache_put_write(i, pg, !err);
         if (err)
             break;
-        /* A whole block replaced needn't be read first. */
-        struct buf *b = (in == 0 && k == fs->bsize) ? bclear(fs->dev, disk, fs->bsize)
-                                                    : bread(fs->dev, disk, fs->bsize);
-        if (!b) {
-            err = -EIO;
-            break;
+        done += k;
+        if (pos + done > i->size)
+            i->size = pos + done;       /* readers may see the new bytes now */
+    }
+    if (done) {
+        uint32_t flags = lock(fs);
+        struct ext2_inode *di;
+        struct buf *ib = get_inode(fs, i->fs_ino, &di);
+        if (ib) {
+            if (i->size > di->size)
+                di->size = i->size;
+            di->mtime = di->ctime = i->mtime = i->ctime = time_now();
+            bdirty(ib);
+            brelse(ib);
         }
-        if (copy_from_user(b->data + in, (const uint8_t *)user_buf + done, k) < 0)
-            err = -EFAULT;
-        bdirty(b);
-        brelse(b);
-        if (!err)
-            done += k;
+        unlock(fs, flags);
+        f->pos += done;
+        if (pcache_too_dirty())
+            pcache_flush(i);            /* don't let a writer fill RAM with changes */
     }
-    if (ib) {
-        if (pos + done > di->size)
-            di->size = i->size = pos + done;
-        di->mtime = di->ctime = i->mtime = i->ctime = time_now();
-        bdirty(ib);
-        brelse(ib);
-    }
-    unlock(fs, flags);
-    if (!done)
-        return err;
-    f->pos += done;
-    return done;
+    return done ? (int32_t)done : err;
 }
 
 static const struct file_ops ext2_file_ops = { .read = ext2_read, .write = ext2_write };
@@ -1317,8 +1318,8 @@ static const struct fs_ops ext2_ops = {
     .evict = ext2_evict,
     .setattr = ext2_setattr,
     .truncate = ext2_truncate,
-    .read_kernel = ext2_read_kernel,
     .readpages   = ext2_readpages,
+    .writepages  = ext2_writepages,
     .statfs = ext2_statfs,
 };
 

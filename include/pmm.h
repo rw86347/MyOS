@@ -15,4 +15,8 @@ uint32_t pmm_free_count(void);       /* frames currently free */
 uint32_t pmm_usable_count(void);     /* frames of usable RAM in total */
 uint32_t pmm_end(void);              /* physical end of usable RAM (bytes) */
 
+/* Called by pmm_alloc when no frame is free: free up to `want` frames
+   (the page cache's clean pages) and say how many. */
+void     pmm_set_reclaim(uint32_t (*fn)(uint32_t want));
+
 #endif

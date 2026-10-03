@@ -168,22 +168,22 @@ time the benchmark's own calls took away from it, so this is CPU work per call,
 including interrupts and threads, not waiting for the disk. Instructions per call
 (lower is better):
 
-| operation                     | type   | Linux 6.1 | MyOS before | MyOS now | Linux / MyOS |
-|-------------------------------|--------|----------:|------------:|---------:|-----:|
-| cold read 64 KiB, in order    | IDE    |   124 784 |     126 238 |   28 556 | 4.4× |
-|                               | AHCI   |    77 015 |           — |   28 494 | 2.7× |
-|                               | NVMe   |    97 977 |           — |   28 425 | 3.4× |
-|                               | virtio |    91 602 |           — |   27 969 | 3.3× |
-| warm read 64 KiB, in order    | all    |   ~37 030 |     125 765 |   18 192 | 2.0× |
-| warm read 4 KiB, random       | all    |    ~3 528 |       8 490 |    1 626 | 2.2× |
-| cold read 4 KiB, random       | IDE    |    29 678 |       8 662 |    6 335 | 4.7× |
-|                               | AHCI   |    17 782 |           — |    6 349 | 2.8× |
-|                               | NVMe   |    16 483 |           — |    6 439 | 2.6× |
-|                               | virtio |    18 257 |           — |    6 287 | 2.9× |
-| write 64 KiB (+ one fsync)    | IDE    |   711 578 |     317 091 |  133 961 | 5.3× |
-|                               | AHCI   |   734 799 |           — |  130 077 | 5.6× |
-|                               | NVMe   |   486 119 |           — |  150 174 | 3.2× |
-|                               | virtio |   478 792 |           — |  129 721 | 3.7× |
+| operation                     | type   | Linux 6.1 | MyOS before | 9d (bcache writes) | MyOS now | Linux / MyOS |
+|-------------------------------|--------|----------:|------------:|---------:|---------:|-----:|
+| cold read 64 KiB, in order    | IDE    |   124 784 |     126 238 |   28 556 |   27 618 | 4.5× |
+|                               | AHCI   |    77 015 |           — |   28 494 |   27 174 | 2.8× |
+|                               | NVMe   |    97 977 |           — |   28 425 |   27 883 | 3.5× |
+|                               | virtio |    91 602 |           — |   27 969 |   27 505 | 3.3× |
+| warm read 64 KiB, in order    | all    |   ~37 030 |     125 765 |   18 192 |   18 144 | 2.0× |
+| warm read 4 KiB, random       | all    |    ~3 528 |       8 490 |    1 626 |    1 623 | 2.2× |
+| cold read 4 KiB, random       | IDE    |    29 678 |       8 662 |    6 335 |    4 204 | 7.1× |
+|                               | AHCI   |    17 782 |           — |    6 349 |    4 205 | 4.2× |
+|                               | NVMe   |    16 483 |           — |    6 439 |    4 350 | 3.8× |
+|                               | virtio |    18 257 |           — |    6 287 |    4 128 | 4.4× |
+| write 64 KiB (+ one fsync)    | IDE    |   711 578 |     317 091 |  133 961 |  100 977 | 7.0× |
+|                               | AHCI   |   734 799 |           — |  130 077 |  100 538 | 7.3× |
+|                               | NVMe   |   486 119 |           — |  150 174 |  101 006 | 4.8× |
+|                               | virtio |   478 792 |           — |  129 721 |  100 707 | 4.8× |
 
 "Before" is IDE only (the other drivers didn't exist). What changed, in order, with
 the IDE number after each step:
@@ -204,10 +204,84 @@ the IDE number after each step:
    in `alloc_block` instead of a bitmap scan from the start (files also end up
    contiguous). Write 321 700 → 182 395 → 133 961.
 
-Warm 64 KiB is now within 2 000 instructions of the 64 KiB copy to the user buffer
+5. **Writes into the page cache** (`ext2_write`, `pcache_get_write`): a write copies
+   into the file's page and marks it dirty; a page replaced whole is never read
+   first. Write-back sends runs of up to 32 dirty pages as one scatter-gather command
+   (`ext2_writepages`). New data blocks skip the block cache (`bforget`) — they were
+   zeroed there, written, then overwritten. Whole pages need no NVMe bounce copies.
+   Write 133 961 → 100 977 (NVMe 150 174 → 101 006). Cold random 4 KiB 6 335 →
+   4 204: the read path no longer asks the block cache about every block (`bpeek`).
+6. **A 16-byte cache slot** (the owner of a dirty page moved to a side table only
+   write-back touches): one set of 4 slots is one 64-byte cache line, and a slot
+   index is a shift, not a multiply. Warm 64 KiB 18 736 → 18 144.
+
+Warm 64 KiB is now within 1 800 instructions of the 64 KiB copy to the user buffer
 itself (`rep movsd`: 16 384). Going lower needs zero-copy (`mmap`, which already
-maps cache pages). NVMe writes cost more because block-cache pieces go through
-bounce pages (`docs/gaps.md`).
+maps cache pages).
+
+The same benchmark with less RAM (`MEM=20M`, `MEM=12M tools/diskbench.sh virtio
+myos`) checks that the cache gives memory back: at 20 MiB the numbers are within 3%
+(write 104 227); at 12 MiB an 8 MiB file no longer fits, so "warm" reads are partly
+misses (warm 64 KiB 25 717, 4 KiB 3 209) — and nothing runs out of memory.
+
+### Cache sizing: why all free RAM, with numbers (2026-10-03)
+
+**Cost of a hit and of a miss.** A hit is the 1 623 instructions above (lookup + 4 KiB
+copy): on a 2.4 GHz Pentium 4 about 1–2 µs, plus the copy's memory traffic (DDR-era
+memory copies ~1–2 GB/s, so ~2–4 µs), call it **3 µs**. A miss on the old PC's disk is
+a seek plus half a rotation: a 7200 rpm IDE disk ~8.5 ms + 4.2 ms ≈ **12.7 ms**; a
+5400 rpm laptop disk (Pentium M) ~12 ms + 5.6 ms ≈ 17.6 ms. A SATA SSD: ~0.1 ms.
+(Datasheet-typical figures, not measured here.) So:
+
+| disk          | miss       | hit   | a miss costs |
+|---------------|-----------:|------:|-------------:|
+| 7200 rpm IDE  | 12 700 µs  | 3 µs  | ~4 000 hits  |
+| 5400 rpm      | 17 600 µs  | 3 µs  | ~6 000 hits  |
+| SATA SSD      |    100 µs  | 3 µs  |    ~30 hits  |
+
+**Average access time** is `T = h·t_hit + (1−h)·t_miss`. On the IDE disk:
+
+| hit rate h | average T | vs. all hits |
+|-----------:|----------:|-------------:|
+| 90%        | 1 273 µs  | 424× slower  |
+| 99%        |   130 µs  |  43× slower  |
+| 99.9%      |    16 µs  |   5× slower  |
+| 99.99%     |     4 µs  | 1.4× slower  |
+
+Each extra "9" of hit rate makes the average 10× faster, while the hit path itself
+(what the CPU work above optimizes) only matters past 99.9%. **The hit rate is worth
+more than any instruction count**, and the hit rate is set by one thing: whether the
+working set fits in the cache. So the cache gets every frame no one else wants:
+
+- It may hold all free RAM; the page allocator calls `pcache_reclaim` when it runs
+  out, which gives back clean pages (clock order, bounded: 2 rounds × 1 024 pages).
+  Programs always win over cached data; idle RAM is just wasted.
+- The table has a slot for every frame (next power of two, at most 2^18 = 1 GiB):
+  16 bytes + 4 bytes of owner = **20 bytes per 4 KiB, 0.5% of RAM** (320 KiB at
+  64 MiB). The frames, not the table, are the limit.
+- 4 ways per set: a page can only go in 4 slots, so two hot pages can push each
+  other out early. With slots ≥ frames and a file's pages in consecutive sets, a file
+  only collides with itself when it is bigger than the cache; between files the
+  chance that 5 hot pages share one set is small when the cache is not full.
+
+**Working sets on the old PC** (estimates, to size against): a shell session with
+busybox and a few tools is ~2–5 MiB; compiling a small C program with gcc touches
+`cc1` (~20 MiB), `as`, `ld`, libc headers (~5–10 MiB): ~30–40 MiB; a P4 had
+256 MiB–1 GiB of RAM. So everyday work fits in RAM with room to spare — after the
+first touch the disk is only needed for writes — if, and only if, the cache can grow
+into free RAM. The old fixed quarter of RAM (16 MiB at 64 MiB) did not fit a compile.
+
+**Dirty pages: RAM/8, at most 32 MiB.** Dirty pages can't be dropped, only written;
+a `sync` or `fsync` waits for them. At an old disk's ~50 MB/s sequential, 32 MiB is
+**~0.6 s** — the longest a `sync` can wait on queued writes, whatever the RAM size
+(RAM/8 alone would be 2.6 s at 1 GiB). The background writer runs every second.
+
+**Read-ahead: 4 pages, doubling to 32 (128 KiB).** One seek (12.7 ms) buys 128 KiB
+(2.1 ms at 60 MB/s): only ~14% of the disk's streaming speed if every window costs a
+seek. In order it doesn't — the next window is the next sectors and the drive's own
+buffer has read them — but the reader still waits for each window before the next is
+asked for (`docs/gaps.md`, one command at a time). Reading the next window *while*
+the program copies this one is the next step.
 
 What this does not show: the disk. QEMU's disks answer at once; a real disk's seek
 (ms) and an SSD's latency are the same for both kernels. It also hides the cost of

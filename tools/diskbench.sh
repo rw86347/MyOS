@@ -2,10 +2,12 @@
 # Disk benchmark, MyOS vs Linux, on one disk type: ide, ahci, nvme, virtio.
 # Both kernels run user/diskbench.c on a copy of the same ext2 image (two
 # 8 MiB files of random data), in the same QEMU (-icount, pentium3, 64 MiB).
-# Usage: tools/diskbench.sh TYPE [myos|linux|both]
+# Usage: [MEM=20M] tools/diskbench.sh TYPE [myos|linux|both]
+# (MEM smaller than the files makes the page cache give memory back.)
 set -e
 TYPE=$1
 WHO=${2:-both}
+MEM=${MEM:-64M}
 cd "$(dirname "$0")/.."
 D=/tmp/dbench
 if [ ! -f $D/disk.img ]; then
@@ -28,7 +30,7 @@ if [ $WHO != linux ]; then
     echo "== MyOS, $TYPE"
     cp build/bench/myos.img $D/boot-$TYPE.img       # own copies: runs can go in parallel
     cp build/usb.img $D/usb-$TYPE.img
-    qemu-system-i386 -m 64M -cpu pentium3 \
+    qemu-system-i386 -m ${MEM:-64M} -cpu pentium3 \
         -drive format=raw,file=$D/boot-$TYPE.img,index=0,media=disk \
         -drive format=raw,file=$D/usb-$TYPE.img,index=1,media=disk $DISK \
         -netdev user,id=net0 -device e1000,netdev=net0 -display none \

@@ -27,6 +27,7 @@ static int checks;
     } while (0)
 
 #define SYS_sync     36
+#define SYS_ftruncate 93
 #define SYS_rename   38
 #define SYS_rmdir    40
 #define SYS_statfs64 268
@@ -45,6 +46,20 @@ static int file_is(const char *path, const char *want, int len)
 }
 
 static char buf[1000];
+
+/* Section 6's file; tools/check-pattern.py computes the same bytes. */
+static uint8_t pattern(uint32_t pos) { return (uint8_t)((pos ^ (pos >> 9)) * 31); }
+
+static uint8_t expect_at(uint32_t pos)
+{
+    if (pos == 200000)
+        return 'Z';
+    if (pos >= 123457)
+        return 0;
+    if (pos >= 5000 && pos < 14000)
+        return 0xAA;
+    return pattern(pos);
+}
 
 int main(void)
 {
@@ -93,6 +108,37 @@ int main(void)
     /* 5. Leave a file behind for the Makefile (debugfs) to find. */
     fd = (int)syscall3(SYS_open, (long)"/data/persist.txt", O_CREAT | O_WRONLY | O_TRUNC, 0644);
     CHECK(fd >= 3 && write(fd, "written by MyOS\n", 16) == 16);
+    close(fd);
+    CHECK(syscall3(SYS_sync, 0, 0, 0) == 0);
+
+    /* 6. The page cache write path: 300 000 bytes in odd 777-byte pieces
+          (pages split across writes), overwrite a span, cut the file at an
+          odd size, write one byte far past the end (a gap that must read
+          as zeros). The Makefile checks the same bytes on the disk. */
+    fd = (int)syscall3(SYS_open, (long)"/data/pattern.bin", O_CREAT | O_RDWR | O_TRUNC, 0644);
+    CHECK(fd >= 3);
+    int ok = 1;
+    for (uint32_t pos = 0; pos < 300000 && ok; pos += 777) {
+        uint32_t k = 300000 - pos < 777 ? 300000 - pos : 777;
+        for (uint32_t i = 0; i < k; i++)
+            buf[i] = pattern(pos + i);
+        ok = write(fd, buf, k) == (long)k;
+    }
+    CHECK(ok);
+    memset(buf, 0xAA, sizeof buf);
+    CHECK(lseek(fd, 5000, 0) == 5000);
+    for (int i = 0; i < 9; i++)
+        ok &= write(fd, buf, 1000) == 1000;
+    CHECK(ok);
+    CHECK(syscall3(SYS_ftruncate, fd, 123457, 0) == 0);
+    CHECK(lseek(fd, 200000, 0) == 200000 && write(fd, "Z", 1) == 1);
+    CHECK(lseek(fd, 0, 0) == 0);
+    uint32_t pos = 0;
+    while ((n = read(fd, buf, sizeof buf)) > 0) {
+        for (long i = 0; i < n; i++, pos++)
+            ok &= (uint8_t)buf[i] == expect_at(pos);
+    }
+    CHECK(n == 0 && ok && pos == 200001);
     close(fd);
     CHECK(syscall3(SYS_sync, 0, 0, 0) == 0);
 

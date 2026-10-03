@@ -15,6 +15,7 @@
 #include <bcache.h>
 #include <kprintf.h>
 #include <mm.h>
+#include <pcache.h>
 #include <proc.h>
 #include <serial.h>
 #include <signal.h>
@@ -576,8 +577,17 @@ SYSCALL(sys_nop) { return 0; }
 
 /* sync(): write every changed disk block now. fsync(fd) / fdatasync(fd):
    the same (the cache doesn't know which blocks belong to which file). */
-SYSCALL(sys_sync)  { bsync(); return 0; }
-SYSCALL(sys_fsync) { return fd_get(a1) ? bsync() : -EBADF; }
+/* File data first (it is in the page cache), then the metadata. */
+SYSCALL(sys_sync)  { pcache_sync(); bsync(); return 0; }
+SYSCALL(sys_fsync)
+{
+    struct file *f = fd_get(a1);
+    if (!f)
+        return -EBADF;
+    int err = f->inode ? pcache_flush(f->inode) : 0;
+    int err2 = bsync();
+    return err ? err : err2;
+}
 
 /* sched_getaffinity(pid, size, mask): one CPU. (musl's sysconf asks.) */
 SYSCALL(sys_getaffinity)

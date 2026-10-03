@@ -91,6 +91,9 @@ struct fs_ops {
     /* Fill n page frames with pages [index, index + n) of the file, zeros
        past its end — for the page cache. May be NULL (read_kernel is used). */
     int (*readpages)(struct inode *i, uint32_t index, uint32_t n, const uint32_t *frames);
+    /* Write those pages (dirty, from the page cache) to the file's blocks.
+       Blocks were allocated by the write. NULL: the file system can't. */
+    int (*writepages)(struct inode *i, uint32_t index, uint32_t n, const uint32_t *frames);
     int (*statfs)(struct mount *m, uint32_t *bsize, uint32_t *blocks, uint32_t *bfree,
                   uint32_t *files, uint32_t *ffree);
 };
@@ -127,6 +130,9 @@ struct inode {
     uint32_t pc_id;                 /* page cache: its pages' tag (0: none yet) */
     uint32_t ra_next;               /* page cache: a miss here means "read in order" */
     uint16_t ra_win;                /* page cache: last read-ahead, pages */
+    uint32_t pc_ndirty;             /* page cache: dirty pages, all in */
+    uint32_t dirty_lo, dirty_hi;    /*   [dirty_lo, dirty_hi] */
+    struct inode *dirty_next;       /*   the list of files with dirty pages */
 
     /* Who is using it: open files, mmap'd areas, current directories. A
        file that's deleted while in use (`rm` of a running log file, of a
