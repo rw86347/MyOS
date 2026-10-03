@@ -550,6 +550,7 @@ check-selftests: $(IMG) $(USB)
 SHELL_TEST_CMDS := 'echo hello from $$0 $$BASH_VERSION' 'ls /' 'echo one two three | wc -w' \
                    'cat /etc/hostname' 'cd /etc; pwd' 'uname -sm' \
                    'ping -c 2 10.0.2.2' 'ping -c 1 -W 1 example.com' \
+                   'cmp /proc/net/dns /etc/resolv.conf && echo resolv from kernel' \
                    'wget -q -O /tmp/e.html http://example.com/ && echo wget ok $$(wc -c < /tmp/e.html); rm -f /tmp/e.html' \
                    'cd /tmp; mkdir -p a/b; echo saved > a/b/f; cp a/b/f a/g; mv a/g a/h; echo more >> a/h; echo lines=$$(wc -l < a/h)' \
                    'sed -i s/saved/edited/ a/h; head -n 1 a/h' 'rm -r a && echo removed $$(ls -A | wc -l)' \
@@ -581,6 +582,7 @@ test-shell: $(IMG) $(USB)
 	  grep -q "^Linux i686" $$L || { echo "FAIL: uname"; ok=0; }; \
 	  grep -q "^2 packets transmitted, 2 packets received" $$L || { echo "FAIL: ping 10.0.2.2 (raw ICMP socket, alarm)"; ok=0; }; \
 	  grep -q "^PING example.com ([0-9]" $$L || { echo "FAIL: DNS through musl (UDP socket, resolv.conf)"; ok=0; }; \
+	  grep -q "^resolv from kernel$$" $$L || { echo "FAIL: /etc/resolv.conf was not taken from /proc/net/dns (so DNS only works where 10.0.2.3 exists)"; ok=0; }; \
 	  grep -q "^wget ok [1-9]" $$L || { echo "FAIL: wget (TCP socket)"; ok=0; }; \
 	  grep -q "^lines=2" $$L || { echo "FAIL: mkdir, >, >>, cp, mv"; ok=0; }; \
 	  grep -q "^edited" $$L || { echo "FAIL: sed -i (temp file + rename)"; ok=0; }; \

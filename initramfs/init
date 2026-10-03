@@ -5,6 +5,18 @@
 export HOME=/root
 export PATH=/bin:/sbin:/usr/bin:/usr/sbin
 export TERM=linux
+
+# /proc, for the things the kernel knows and user space cannot work out:
+# musl's ttyname() reads /proc/self/fd/0, and /proc/net/dns says which
+# nameserver this network has. The kernel is the DHCP client (net/dhcp.c), so
+# it is the only thing that knows -- and the resolv.conf shipped in the image
+# can only name QEMU's 10.0.2.3, which is wrong on any real machine. Failures
+# are ignored: then the shipped resolv.conf stands and DNS works wherever that
+# address happens to be right.
+mkdir -p /proc
+mount -t proc proc /proc 2>/dev/null
+[ -r /proc/net/dns ] && cp /proc/net/dns /etc/resolv.conf 2>/dev/null
+
 cat /etc/motd
 SHELL=/bin/sh
 [ -x /bin/bash ] && SHELL=/bin/bash

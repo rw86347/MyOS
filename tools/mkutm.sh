@@ -74,6 +74,21 @@ else
     DISK_UUID=BD3A2E96-4AD2-421D-8562-3C6563FD797D
 fi
 DATA_UUID=6A1F0C52-8E3B-4C1D-9F27-5B0D3E8A7C41
+
+# The card's MAC address, derived from the VM's UUID rather than fixed.
+#
+# A fixed one is a trap in "shared" mode: Apple's vmnet is one network shared
+# by every guest on the Mac, so two MyOS VMs started together would have the
+# same address, and DHCP would hand them the same lease or neither. Bridged
+# mode is worse -- that collision would be on the real LAN. Deriving it from
+# the UUID keeps a rebuilt VM's address stable (UTM sees the same machine, and
+# a DHCP server offers it the same lease) while making two VMs differ.
+#
+# 5A:4D:59 is "ZMY" and is locally administered (bit 1 of the first byte set),
+# so it cannot collide with a real manufacturer's range.
+mac_suffix=$(echo "$VM_UUID" | tr -d - | tr 'A-F' 'a-f' | cut -c1-6)
+MAC="5A:4D:59:${mac_suffix:0:2}:${mac_suffix:2:2}:${mac_suffix:4:2}"
+MAC=$(echo "$MAC" | tr 'a-f' 'A-F')
 name=$(basename "$out" .utm)
 
 mkdir -p "$out/Data"
@@ -192,7 +207,7 @@ $DATA_DRIVE
 			<key>IsolateFromHost</key>
 			<false/>
 			<key>MacAddress</key>
-			<string>5A:4D:59:4F:53:01</string>
+			<string>$MAC</string>
 			<key>Mode</key>
 			<string>$net</string>
 			<key>PortForward</key>

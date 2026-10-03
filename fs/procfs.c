@@ -21,11 +21,50 @@
  * per-process directories, ROADMAP 8j.)
  */
 #include <errno.h>
+#include <ipv4.h>
 #include <string.h>
 #include <vfs.h>
 
 /* The links' names, "0".."31": nodes point at their name, not a copy. */
 static char fd_names[FD_MAX][3];
+
+/*
+ * /proc/net/dns — the nameserver, in resolv.conf's own format, so bringing
+ * the machine up is `cp /proc/net/dns /etc/resolv.conf` and no script has to
+ * know how to format it.
+ *
+ * It exists because the address is no longer a constant. The kernel is the
+ * DHCP client (net/dhcp.c), so it is the only thing that knows which
+ * nameserver this network has, and musl reads /etc/resolv.conf as an ordinary
+ * file. A hard-coded resolv.conf naming QEMU's 10.0.2.3 is right in QEMU and
+ * wrong everywhere else, which is exactly the machine DHCP was added for.
+ *
+ * Filled in once, at mount time, because /proc is mounted by init and DHCP
+ * finished before init started. A lease that could change later would have to
+ * rebuild this -- see the renewal gap in docs/gaps.md.
+ */
+static char dns_text[32];
+
+/* "nameserver 1.2.3.4\n". Written by hand: the kernel has no snprintf, and
+   this wants a length back rather than a console. */
+static uint32_t fmt_dns(uint32_t ip)
+{
+    static const char label[] = "nameserver ";
+    uint32_t n = sizeof label - 1;
+    memcpy(dns_text, label, n);
+    for (int shift = 24; shift >= 0; shift -= 8) {
+        uint32_t b = (ip >> shift) & 0xFF;
+        if (b >= 100)
+            dns_text[n++] = '0' + b / 100;
+        if (b >= 10)
+            dns_text[n++] = '0' + (b / 10) % 10;
+        dns_text[n++] = '0' + b % 10;
+        if (shift)
+            dns_text[n++] = '.';
+    }
+    dns_text[n++] = '\n';
+    return n;                           /* at most 11 + 15 + 1 = 27 */
+}
 
 int procfs_mount(const char *path)
 {
@@ -52,6 +91,14 @@ int procfs_mount(const char *path)
         l->fs_ino = n;
         l->size = 64;                   /* Linux shows that for these too */
     }
+    /* The node's data points straight at dns_text rather than owning a copy of
+       it -- the same zero-copy trick initramfs files use. */
+    struct inode *net = vfs_add(proc, "net", 3, S_IFDIR | 0555);
+    struct inode *dns = net ? vfs_add(net, "dns", 3, S_IFREG | 0444) : NULL;
+    if (!dns)
+        return -ENOMEM;
+    dns->size = fmt_dns(ipv4_dns);
+    dns->data = (const uint8_t *)dns_text;
     return 0;
 }
 
