@@ -566,3 +566,24 @@ Where that lands against the rules:
   still shares will unshare every page of the request, including pages the short read
   never fills. Not measured; it needs a benchmark that forks and then reads into a
   large buffer, which does not exist yet.
+
+## Memory areas: a growable array (2026-10-03)
+
+A process's memory areas (`struct mm`, `mm/mm.c`) were a fixed array of 32 searched in
+order. A program linked against a few dozen shared libraries has hundreds (musl's loader
+`mprotect`s each library's RELRO part, which splits an area), so the live disk's programs
+died with "RELRO protection failed". The array now starts at 32 and doubles up to 1024,
+and lookups are a binary search (O(log n), 10 steps at most) instead of a scan. Growing is
+a `kmalloc` + copy inside `mmap`/`mprotect`, never in the page-fault path.
+
+`make bench`, QEMU, cycles (median), same build otherwise:
+
+| | before | after |
+|---|---|---|
+| `exec + exit` | 35345 | 35259 |
+| `fork + exit + wait` | 51703 | 51606 |
+| `fork + exec + exit + wait` | 86069 | 85881 |
+
+Unchanged within noise: small programs have few areas, and `fork` copies one array as
+before. Not measured: a page fault in a process with hundreds of areas, where the
+binary search replaces what would have been a long scan.

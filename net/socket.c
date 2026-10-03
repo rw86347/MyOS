@@ -585,7 +585,7 @@ SYSCALL_DEF(sys_bind)
     int rc = read_addr(a2, a3, &ip, &port, 0);
     if (rc < 0)
         return rc;
-    if (ip != 0 && ip != IPV4_ADDR)
+    if (ip != 0 && ip != ipv4_addr)
         return -EADDRNOTAVAIL;
     if (s->type != SOCK_DGRAM)
         return 0;
@@ -648,9 +648,9 @@ SYSCALL_DEF(sys_getsockname)
         uint16_t lp, rp;
         uint32_t ra;
         tcp_names(s->tcp, &lp, &ra, &rp);
-        return write_addr(a2, a3, lp ? IPV4_ADDR : 0, lp);
+        return write_addr(a2, a3, lp ? ipv4_addr : 0, lp);
     }
-    return write_addr(a2, a3, s->connected ? IPV4_ADDR : 0, s->lport);
+    return write_addr(a2, a3, s->connected ? ipv4_addr : 0, s->lport);
 }
 
 SYSCALL_DEF(sys_getpeername)

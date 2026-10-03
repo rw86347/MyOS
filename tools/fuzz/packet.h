@@ -46,7 +46,7 @@
 #define ARP_TPA    24
 #define ARP_LEN    28
 
-#define OUR_IP    IPV4_ADDR         /* 10.0.2.15 */
+#define OUR_IP    ipv4_addr         /* 10.0.2.15 */
 #define PEER_IP   0x0A000202u       /* 10.0.2.2, on our subnet */
 #define PEER_PORT 80
 

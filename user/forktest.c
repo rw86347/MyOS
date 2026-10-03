@@ -7,7 +7,8 @@
  *   many        several children alive at once, all reaped
  *   brk, mmap   heap and anonymous memory, pages created on first touch
  *   stack       deep recursion: the stack grows on demand
- *   execve      fork + exec of another program, and of a #! script
+ *   execve      fork + exec of another program, and of a #! script; and two
+ *               argument shapes that used to corrupt kernel memory
  *
  * Exits 0 if all is well, else the number of the first failed check.
  */
@@ -122,6 +123,59 @@ int main(int argc, char **argv)
     CHECK(wait4(pid, &status, 0, 0) == pid);
     /* args prints its argv and exits with argc: "/bin/args -v /bin/script.sh x" = 4 */
     CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 4);
+
+    /*
+     * 11. Two shapes of execve argument that used to corrupt the kernel.
+     * Both are legal calls, so the kernel has to survive them; what they do
+     * is up to it, and the test asserts only that it comes back and the
+     * machine is still here. The old behaviour was a kernel-mode store to a
+     * corrupted address, which does not come back.
+     */
+
+    /*
+     * A NULL argv and envp are legal and mean "empty". The kernel used to
+     * return from copying them without writing the terminating NULL, and then
+     * walk uninitialised heap as a vector of char * -- copying kernel memory
+     * onto the new program's stack as argv, or faulting in kernel mode.
+     *
+     * /bin/args, not /bin/true: it exits with its own argc, so "the kernel
+     * invented some arguments" is visible. /bin/true ignores argv, exits 0
+     * either way, and the test passed with the bug in place -- which is the
+     * usual reason a test for memory disclosure measures nothing. The exec
+     * calls above have already been through this heap block, so what it holds
+     * is a previous exec's pointers rather than zeroes.
+     */
+    pid = fork();
+    if (pid == 0) {
+        execve("/bin/args", 0, 0);
+        _exit(99);
+    }
+    CHECK(wait4(pid, &status, 0, 0) == pid);
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);   /* argc == 0 */
+
+    /*
+     * Exactly as many argv entries as the kernel's limit, with a non-empty
+     * envp. argv and envp share one array in the kernel, so filling it
+     * entirely with argv left envp's share of it negative -- and a negative
+     * bound is one that the loop's `n == room` test can never reach, so it
+     * ran until it had written over the kernel's own bookkeeping and then
+     * copied these strings to whatever address that left behind.
+     *
+     * 1024 is EXEC_MAX_ARGS in kernel/proc.c. The call may succeed or fail
+     * with E2BIG; a child that comes back either way is the whole point.
+     */
+    static char *big[1026];
+    for (int i = 0; i < 1024; i++)
+        big[i] = "";
+    big[1024] = 0;
+    char *two_env[] = { "A=1", "B=2", 0 };
+    pid = fork();
+    if (pid == 0) {
+        execve("/bin/true", big, two_env);
+        _exit(7);                       /* refused, which is allowed */
+    }
+    CHECK(wait4(pid, &status, 0, 0) == pid);
+    CHECK(WIFEXITED(status) && (WEXITSTATUS(status) == 0 || WEXITSTATUS(status) == 7));
 
     put("forktest: all ");
     put_u64(checks);

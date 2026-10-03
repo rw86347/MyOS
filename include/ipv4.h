@@ -4,21 +4,46 @@
 #include <stdint.h>
 
 /*
- * A small IPv4 stack: ARP, ICMP, UDP, TCP, DNS. One address (QEMU's
- * 10.0.2.15 until DHCP exists). No IP options, no fragments. A packet
- * whose lengths do not fit is dropped.
+ * A small IPv4 stack: ARP, ICMP, UDP, TCP, DNS. One address, one subnet,
+ * one gateway. No IP options, no fragments. A packet whose lengths do not
+ * fit is dropped.
  */
 
 #define IPPROTO_ICMP 1
 #define IPPROTO_TCP  6
 #define IPPROTO_UDP  17
 
-/* QEMU user-net, until DHCP exists. Host order. */
-#define IPV4_ADDR  0x0A00020Fu      /* 10.0.2.15 */
-#define IPV4_GW    0x0A000202u      /* 10.0.2.2 */
-#define IPV4_DNS   0x0A000203u      /* 10.0.2.3 */
+/*
+ * This machine's address, learned by DHCP at boot (net/dhcp.c). Host order.
+ * Zero until a lease arrives, which is also how the receive path knows it
+ * has no address yet.
+ *
+ * Plain words rather than a struct behind an accessor because every send
+ * reads one: a load, not a call. They are written once, by the DHCP client,
+ * before any socket exists, and read-only afterwards — so nothing has to
+ * reason about them changing under it. Renewing a lease (which we do not do
+ * yet) would be the first thing to break that, and would need the sockets to
+ * be told.
+ */
+extern uint32_t ipv4_addr, ipv4_mask, ipv4_gw, ipv4_dns;
+
+/* What to use if no DHCP server answers. These are QEMU user-net's own
+   numbers, which is also what its built-in DHCP server hands out, so a
+   fallback and a lease look the same there. */
+#define IPV4_ADDR_STATIC  0x0A00020Fu   /* 10.0.2.15 */
+#define IPV4_MASK_STATIC  0xFFFFFF00u
+#define IPV4_GW_STATIC    0x0A000202u   /* 10.0.2.2 */
+#define IPV4_DNS_STATIC   0x0A000203u   /* 10.0.2.3 */
 
 void ipv4_init(void);
+
+/*
+ * DHCP's one exception to the rules in here: a UDP datagram sent from 0.0.0.0
+ * to 255.255.255.255, which every other path refuses. Broadcast is how a
+ * machine with no address asks for one, and it is also how a machine becomes
+ * an amplifier, so the exception is one function with one caller.
+ */
+int ip_send_bootp(const void *udp, uint32_t len);
 
 /* ICMP echo to dst (host order). 0 if a reply arrives within a second. */
 int net_ping(uint32_t dst);

@@ -39,6 +39,7 @@
 #include <memlayout.h>
 #include <paging.h>
 #include <pmm.h>
+#include <string.h>
 
 #define ALIGN       16                  /* every allocation is 16-byte aligned */
 
@@ -247,13 +248,40 @@ static void big_free(void *ptr)
 
 /* --- the interface ------------------------------------------------------- */
 
+/*
+ * `make test` builds fill every allocation with a pattern that is not a valid
+ * pointer and not a NUL, because the one bug class no sanitiser here can see
+ * is memory that was validly allocated, never written, and then used -- or
+ * handed to user space. Zero-filled memory hides it: an uninitialised
+ * pointer reads as NULL, every loop looking for a terminator stops at once,
+ * and the test passes. That happened: execve with a NULL argv walked an
+ * unterminated vector of stale heap, and the test for it could not tell,
+ * because the recycled block read back as zeroes.
+ *
+ * 0xA5 was chosen so a word of it (0xA5A5A5A5) is above KERNEL_VBASE but
+ * unmapped, so dereferencing one faults instead of quietly working.
+ *
+ * Test builds only: a normal kmalloc does not touch the memory it returns.
+ */
+#ifdef SELFTEST
+#define HEAP_POISON 0xA5
+static void poison(void *p, uint32_t n)
+{
+    if (p)
+        memset(p, HEAP_POISON, n);
+}
+#else
+#define poison(p, n) ((void)0)
+#endif
+
 void *kmalloc(size_t size)
 {
     if (size == 0)
         return NULL;
-    if (size <= SMALL_MAX)
-        return small_alloc(size);
-    return big_alloc(round_up(size, ALIGN));
+    void *p = size <= SMALL_MAX ? small_alloc(size)
+                                : big_alloc(round_up(size, ALIGN));
+    poison(p, size);
+    return p;
 }
 
 void kfree(void *ptr)

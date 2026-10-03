@@ -339,10 +339,30 @@ struct exec_args {
 
 /* Copy a NULL-terminated user array of strings into a. Returns the number
    copied, or -errno. */
+/*
+ * Copy one NULL-terminated vector of user strings into `a`, writing the
+ * pointers to `out` and the bytes to a->str. Returns how many, not counting
+ * the NULL it writes at out[n] -- so `out` must have room + 1 slots.
+ *
+ * `room < 0` is refused rather than trusted. The caller computes envp's room
+ * by subtraction, and a negative one would make the `n == room` test below
+ * unreachable (n is never negative) and the loop unbounded.
+ */
 static int copy_strings(struct exec_args *a, char **out, int room, uint32_t user_vec)
 {
-    if (!user_vec)
-        return 0;                       /* NULL argv/envp: treat as empty */
+    if (room < 0)
+        return -E2BIG;
+    if (!user_vec) {
+        /* A NULL argv or envp is legal and means an empty vector -- but it
+           still has to be terminated. Returning without writing the NULL left
+           out[0] holding whatever kmalloc last had there, and count() in
+           kernel/usermode.c walks that as a char * until it happens to find a
+           zero word, then memcpy's each stale word onto the new program's
+           stack: kernel heap handed to user space as argv, or a fault in
+           kernel mode with no fixup. */
+        out[0] = NULL;
+        return 0;
+    }
     for (int n = 0; ; n++) {
         uint32_t ptr;
         if (get_user32(&ptr, user_vec + n * 4) < 0)
@@ -405,7 +425,20 @@ int proc_execve(uint32_t user_path, uint32_t user_argv, uint32_t user_envp)
     long err = strncpy_from_user(path, (const char *)user_path, PATH_MAX);
     if (err == 0)
         err = -ENOENT;
-    int argc = err < 0 ? (int)err : copy_strings(a, a->argv, EXEC_MAX_ARGS, user_argv);
+    /*
+     * EXEC_MAX_ARGS - 1, not EXEC_MAX_ARGS. argv and envp share one array and
+     * each needs a NULL after it, so argc + envc + 2 pointers must fit in
+     * EXEC_MAX_ARGS + 1 slots -- which bounds argc at EXEC_MAX_ARGS - 1.
+     *
+     * Letting argc reach EXEC_MAX_ARGS put envp at &a->argv[EXEC_MAX_ARGS + 1],
+     * one past the end of the array, which is the address of the envp field
+     * itself; and its room came out as -1, which no `n == room` can match. The
+     * envp loop then ran with no bound, writing a pointer over `envp`, then
+     * over `used`, and then copying user strings to wherever the corrupted
+     * `used` pointed -- a kernel-mode store with no exception-table entry.
+     * Reachable with 1024 argv entries and two envp entries.
+     */
+    int argc = err < 0 ? (int)err : copy_strings(a, a->argv, EXEC_MAX_ARGS - 1, user_argv);
     int envc = argc < 0 ? argc
              : copy_strings(a, a->envp = &a->argv[argc + 1],
                             EXEC_MAX_ARGS - argc - 1, user_envp);

@@ -924,3 +924,72 @@ machinery that checks for *that* needs the same suspicion pointed at it.
   reintroduced the bug and the test stayed green. An attacker chooses buffer sizes, timing,
   heap contents and deletion order; a test that fixes all four picks the easy combination
   roughly always.
+- 2026-10-03: The live disk boots to a login and logs in. `make live-hd` builds
+  `build/myos-live.img` (boot area + 1.5 GiB ext2 root from `rootfs.tar`; the tar is
+  unpacked with Python onto a case-sensitive disk image because Homebrew's mke2fs
+  can't read tars, then debugfs sets the owners), `make utm-live` the UTM VM. Each
+  step of the boot stopped at the next missing piece, in order: musl's "RELRO
+  protection failed" was really 32 memory areas running out (now a growable array,
+  binary search, up to 1024; bench unchanged); runsv needed `flock`, then named pipes;
+  `su` needed real users (uid/euid/suid/fsuid, groups, setuid exec, `AT_SECURE`) and
+  then `getpriority`/`setpriority` for PAM's limits; `useradd` needs hard links, so
+  the user `myos` is written into the tar at build time. `login` exited silently:
+  musl's `ttyname` reads `/proc/self/fd/0`, so `mount -t proc` now gives
+  `/proc/self/fd/N` — links whose target is the caller's own open file, looked up in
+  O(1) (`fs/procfs.c`). Then login crashed writing past the top of its stack:
+  util-linux rewrites its process title over argv[0]..end of the environment,
+  assuming Linux's layout (strings ascending from argv[0]); ours were pushed downward,
+  so the "length" was negative. Now laid out as Linux does, with a boottest check.
+  Lesson: "runs unmodified Linux programs" includes layouts nobody documents — the
+  order of strings on the start-up stack is ABI because sendmail-era code depends on it.
+
+## 2026-10-03 — DHCP, and two bugs in `execve`
+
+The address stopped being a `#define`. `net/ipv4.c` holds four words — address,
+netmask, gateway, nameserver — and `net/dhcp.c` fills them in at boot:
+DISCOVER, OFFER, REQUEST, ACK, with a CSPRNG transaction id, 1/2/4/8-second
+backoff, and the old static 10.0.2.15 as a fallback. This was a prerequisite,
+not a feature: UTM's `Shared` mode is Apple's vmnet, which hands out addresses
+by DHCP and has none to hard-code, so until now a VM built for real hardware
+had no working network.
+
+Two things were awkward. A machine with no address has to send from 0.0.0.0 to
+255.255.255.255, and has to *receive* a reply addressed to 255.255.255.255 —
+both of which every other path in the stack refuses, on purpose, because
+broadcast is how a machine becomes an amplifier. Each is now one exception,
+gated as narrowly as it can be: the send is one function with one caller; the
+receive requires an open transaction (a few seconds at boot, never again), UDP,
+and a bound port, of which there is one. Details in `docs/security.md`.
+
+The `make test` grep is worth a note. It checks the `ipv4: eth0 is 10.0.2.15/24`
+line *and* a `dhcp: lease from 10.0.2.2` line, because under QEMU the fallback
+produces exactly the same four addresses as a real lease — so the address alone
+cannot distinguish a working client from one that never got a reply. Confirmed
+by negating the xid check and watching the log say `dhcp: no answer` with an
+identical `ipv4:` line. A test that cannot tell the two apart is not a test.
+
+Separately, a review of the ELF and signal paths turned up two bugs in
+`copy_strings`, which copies `argv` and `envp` into the kernel. An `execve`
+with 1024 arguments and two environment variables ran the envp loop with no
+bound at all and ended up storing user strings through a corrupted kernel
+pointer. And a NULL `argv` — legal, meaning "empty" — was not terminated, so
+the kernel walked uninitialised heap as a vector of `char *` and copied it onto
+the new program's stack.
+
+The first was easy to test. The second taught the more useful lesson: three
+tests for it passed with the bug in place. `/bin/true` ignores `argv`, so
+nothing showed; `/bin/args` exits with its own `argc`, and still nothing
+showed, because the recycled heap block read back as zeroes and the walk
+stopped at the first word with the right answer. **Zero-filled memory hides
+every uninitialised-memory bug** — the wrong code produces the right result.
+So `make test` builds now fill every `kmalloc` with `0xA5` (`mm/kheap.c`,
+`#ifdef SELFTEST`), a value that is neither a NUL nor a mapped address. The bug
+is caught immediately, and turning poisoning on broke nothing else, which is
+evidence no kernel code was relying on `kmalloc` returning zeroes.
+
+Lesson, for the third time this week: a fix needs a test that fails against the
+unfixed code, and the reason a test silently measures nothing is almost always
+that the broken path still produces a valid-looking answer. The same week's
+other two: the fuzz harness over-allocating its packet buffer so a four-byte
+overread stayed inside the allocation, and a readdir race test whose deleted
+entries still pointed at live memory.

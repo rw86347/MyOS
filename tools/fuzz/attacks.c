@@ -808,7 +808,7 @@ static void test_dns(void)
     uint32_t ans_n = a_record(ans, ptr_q, 2, GOOD_ADDR);
     uint32_t ip = 0;
 
-    struct inject base = { .src = IPV4_DNS, .sport = 53, .ancount = 1,
+    struct inject base = { .src = ipv4_dns, .sport = 53, .ancount = 1,
                            .answer = ans, .answer_n = ans_n };
 
     reset();
@@ -1005,7 +1005,7 @@ static void test_unpredictable(void)
         uint32_t ip = 0;
         static const uint8_t ptr_q[2] = { 0xC0, 0x0C };     /* -> the question */
         uint8_t ans[64];
-        struct inject base = { .src = IPV4_DNS, .sport = 53, .ancount = 1,
+        struct inject base = { .src = ipv4_dns, .sport = 53, .ancount = 1,
                                .answer = ans,
                                .answer_n = a_record(ans, ptr_q, 2, GOOD_ADDR) };
         dns_seen_id = dns_seen_port = 0;

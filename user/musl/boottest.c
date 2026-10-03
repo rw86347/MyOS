@@ -315,6 +315,7 @@ int main(int argc, char **argv)
 {
     if (argc > 1 && strcmp(argv[1], "--ids") == 0)    /* run by users(), setuid */
         return getuid() == 1000 && geteuid() == 0 && getauxval(AT_SECURE) == 1 ? 0 : 0x7D;
+    stack_strings(argc, argv);
     hostname();
     priority();
     tmpfs();

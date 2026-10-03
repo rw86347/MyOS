@@ -518,6 +518,8 @@ check-selftests: $(IMG) $(USB)
 	  grep -q "fatvfs: HELLO.TXT read through the VFS" $$L || { echo "FAIL: step 9e FAT32 in the VFS"; ok=0; }; \
 	  grep -q "net: loopback delivered" $$L || { echo "FAIL: step 10 loopback"; ok=0; }; \
 	  grep -q "pci: e1000 8086:100e" $$L || { echo "FAIL: step 10 PCI e1000"; ok=0; }; \
+	  grep -q "dhcp: lease from 10.0.2.2" $$L || { echo "FAIL: DHCP (the address alone proves nothing: the static fallback is the same one)"; ok=0; }; \
+	  grep -q "ipv4: eth0 is 10.0.2.15/24 gateway 10.0.2.2 dns 10.0.2.3" $$L || { echo "FAIL: the lease was not applied"; ok=0; }; \
 	  grep -q "net: ping 10.0.2.2 ok" $$L || { echo "FAIL: step 10 e1000 ping"; ok=0; }; \
 	  grep -q "net: dns example.com is " $$L || { echo "FAIL: step 10 DNS"; ok=0; }; \
 	  grep -q "net: tcp example.com HTTP ok" $$L || { echo "FAIL: step 10 TCP"; ok=0; }; \
@@ -622,8 +624,9 @@ run-bench: $(IMG) $(USB) $(DATA)
 FUZZ_CC    ?= clang
 FUZZ_DIR   := build/fuzz
 FUZZ_KSRCS := kernel/random.c net/skbuff.c net/ipv4.c net/udp.c net/tcp.c net/dns.c \
+              net/dhcp.c \
               tools/fuzz/stubs.c tools/fuzz/packet.c tools/fuzz/targets.c
-FUZZ_TARGETS := wire ip arp dns tcp
+FUZZ_TARGETS := wire ip arp dns tcp dhcp
 FUZZ_SAN   := -fsanitize=address,undefined -fno-sanitize-recover=all \
               -fsanitize-coverage=trace-pc-guard
 FUZZ_WARN  := -std=c11 -g -O1 -Wall -Wextra -fno-omit-frame-pointer
@@ -761,7 +764,17 @@ verify-tests:
 
 T ?=
 N ?= 200000
+# Crashes from earlier runs are moved aside first, so what this reports is
+# what THIS run found. Without that, a crash saved while the source was
+# deliberately broken -- which is how the targets get checked for being able
+# to see anything at all -- is reported again by the next honest run, and the
+# next twenty minutes go on investigating a bug that was fixed before the run
+# started. That happened twice. Kept rather than deleted: a real crash found
+# yesterday is still worth having.
 fuzz: $(FUZZ_DIR)/fuzz_net tools/fuzz/seeds
+	@if ls $(FUZZ_DIR)/crashes/* >/dev/null 2>&1; then \
+	  mkdir -p $(FUZZ_DIR)/crashes-old; mv $(FUZZ_DIR)/crashes/* $(FUZZ_DIR)/crashes-old/; \
+	  echo "note: earlier crashes moved to $(FUZZ_DIR)/crashes-old/"; fi
 	@set -e; for t in $(if $(T),$(T),$(FUZZ_TARGETS)); do \
 	  $(FUZZ_DIR)/fuzz_net $$t -runs=$(N) -seed=1 \
 	    -corpus=tools/fuzz/seeds/$$t -corpus=tools/fuzz/corpus/$$t \

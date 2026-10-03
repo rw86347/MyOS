@@ -46,6 +46,8 @@ Mark a step `[x]` only when its "Done when" check works.
     while reading a directory. Done: `make test` (fstest) and `make test-shell`
     (`mkdir -p`, `>`, `>>`, `cp`, `mv`, `sed -i`, `rm -r`).
   - [ ] 8j: /proc (`ps`, `top`, `free`, `uptime`), `mount`/`umount`, /proc/mounts (`df`).
+    Started (2026-10-03): `mount -t proc` gives `/proc/self/fd/N` (what `ttyname`
+    and `login` need); `getcwd` and those links share `vfs_path`.
   - Later, as programs need them: job control stops (Ctrl-Z, `fg`, `bg`), named pipes,
     `alarm`/`setitimer`, `times`/`getrusage`, `reboot`, hard links.
 - [ ] **9. Disks & file systems** — native drivers (see `docs/DESIGN.md`), old PCs first.
@@ -81,12 +83,21 @@ Mark a step `[x]` only when its "Done when" check works.
       (restart through the keyboard controller, power off on QEMU/UTM, halt
       elsewhere; Ctrl-Alt-Del to init), `mount -t tmpfs`, `umount2` (errors only).
       Done: `make test` (boottest), `poweroff -f` / `reboot -f` stop QEMU.
-    - [ ] Still missing for it: `/proc` and `/sys` (8j), device nodes `/dev/tty1`…
-      and `/dev/ttyS0`, block device files (so `mount /dev/sda1` works), undoing
-      a mount, `utmp` writes.
-    - [ ] Users: a uid/gid per process, permission checks in the VFS, setuid on exec,
-      `setgroups`. Today every program runs as root, so login and passwords are
-      only for show until this is done.
+    - [x] What runit, runsv and login needed next (2026-10-03): `flock`, named
+      pipes (FIFOs), `getpriority`/`setpriority`, memory areas without a fixed
+      limit (32 → up to 1024), `/proc/self/fd`, and the start-up strings in Linux's
+      order. `make live-hd` builds `build/myos-live.img`; `make utm-live` the UTM VM.
+      Done: it boots to "myos login:", user `myos` logs in, `doas id` is root,
+      `doas poweroff` and Ctrl-Alt-Del shut down cleanly.
+    - [ ] Still missing for it: the rest of `/proc`, `/sys` (8j), device nodes
+      `/dev/tty1`… and `/dev/ttyS0`, block device files (so `mount /dev/sda1`
+      works), undoing a mount, `utmp` writes, UNIX sockets (syslog), hard links
+      (`useradd`, `passwd`), fds above 31 (bash's job control).
+    - [x] Users (part, 2026-10-03): real/effective/saved/fs uid and gid per process,
+      supplementary groups, the `set*id` family, setuid/setgid on exec with
+      `AT_SECURE`, files owned by their creator, setgid directories.
+    - [ ] Users: permission checks in the VFS and on `kill`. Until then any user
+      can read and write every file, so the logins are not yet a security boundary.
   - [x] 9d (part): PCI scan + bus-master DMA (PIIX/ICH), reads and writes, PIO
     fallback. 64 KiB read: 1 250 instructions of CPU work (PIO: 41 788).
   - [x] 9d (rest): AHCI (SATA), NVMe and virtio-blk drivers, all scatter-gather DMA
@@ -137,7 +148,18 @@ Mark a step `[x]` only when its "Done when" check works.
     16 KiB rings, up to 4 segments in flight, MSS option, backed-off retransmits)
     and a network thread for receive and TCP timers. BusyBox `wget` works;
     `make test-shell` greps `wget ok`.
-  - [ ] 10f: DHCP (`udhcpc`): AF_PACKET, interface ioctls, a settable address.
+  - [x] 10f: DHCP, in the kernel (`net/dhcp.c`), not `udhcpc`. The address, netmask,
+    gateway and nameserver are runtime values learned at boot: DISCOVER, OFFER,
+    REQUEST, ACK, with a CSPRNG transaction id, exponential backoff, and a fall back
+    to the old static 10.0.2.15 if nobody answers. `make test` greps
+    `dhcp: lease from 10.0.2.2` *and* the `ipv4: eth0 is ...` line — the address
+    alone proves nothing, because under QEMU the fallback hands out exactly the same
+    four numbers, so only the "lease from" line distinguishes a working client from
+    one that gave up. The reply parser is a fuzz target (`make fuzz TARGET=dhcp`).
+    This is what UTM's `Shared` (Apple vmnet) mode needed: it hands out addresses by
+    DHCP and has no fixed ones to hard-code.
+    Still missing: `AF_PACKET` and interface ioctls, so `udhcpc` itself cannot run,
+    and no lease renewal (see `docs/gaps.md`).
 - [ ] **11. Fuller Linux ABI** — `mmap`, `brk`, dynamic linking (`ld.so`), more syscalls as programs need them.
   Done when: ordinary dynamically linked GNU programs run.
   - [x] Pulled forward (2026-10-02): dynamic linking — the kernel loads a program's

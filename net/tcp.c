@@ -140,7 +140,7 @@ static int emit(struct tcp_conn *c, uint8_t flags, uint32_t seq, uint32_t off, u
         memcpy(seg + hlen, c->tx + at, first);
         memcpy(seg + hlen + first, c->tx, len - first);
     }
-    uint16_t sum = ip_transport_csum(IPV4_ADDR, c->remote, IPPROTO_TCP, seg, hlen + len);
+    uint16_t sum = ip_transport_csum(ipv4_addr, c->remote, IPPROTO_TCP, seg, hlen + len);
     wr16(seg + 16, sum);
     return ip_send(c->remote, IPPROTO_TCP, seg, hlen + len);
 }
@@ -216,7 +216,7 @@ static void send_rst(uint32_t to, uint16_t lport, uint16_t rport,
     wr32(seg + 8, ack);
     seg[12] = 5 << 4;
     seg[13] = flags;
-    wr16(seg + 16, ip_transport_csum(IPV4_ADDR, to, IPPROTO_TCP, seg, 20));
+    wr16(seg + 16, ip_transport_csum(ipv4_addr, to, IPPROTO_TCP, seg, 20));
     ip_send(to, IPPROTO_TCP, seg, 20);
 }
 
@@ -262,7 +262,7 @@ static int port_used(uint16_t p)
  */
 static uint32_t isn(uint16_t lport, uint32_t remote, uint16_t rport)
 {
-    struct { uint32_t l, r; uint16_t lp, rp; } t = { IPV4_ADDR, remote, lport, rport };
+    struct { uint32_t l, r; uint16_t lp, rp; } t = { ipv4_addr, remote, lport, rport };
     /* No padding, or the padding bytes would be unspecified and the same
        four-tuple could hash two ways — which RFC 6528 relies on not happening. */
     _Static_assert(sizeof t == 12, "the four-tuple must pack");
@@ -575,7 +575,7 @@ static void take_ack(struct tcp_conn *c, uint32_t ack)
 void tcp_input(uint32_t src, uint32_t dst, const uint8_t *pkt, uint32_t len)
 {
     (void)dst;
-    if (len < 20 || ip_transport_csum(src, IPV4_ADDR, IPPROTO_TCP, pkt, len) != 0)
+    if (len < 20 || ip_transport_csum(src, ipv4_addr, IPPROTO_TCP, pkt, len) != 0)
         return;
     uint32_t hlen = (uint32_t)(pkt[12] >> 4) * 4;
     if (hlen < 20 || hlen > len)

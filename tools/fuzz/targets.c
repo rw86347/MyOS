@@ -27,6 +27,7 @@
  *         and timeout code is reachable.
  */
 
+#include <dhcp.h>
 #include <dns.h>
 #include <ipv4.h>
 #include <random.h>
@@ -86,7 +87,7 @@ static void t_ip(const uint8_t *d, size_t n)
     wr16(pkt + IP_TOT_LEN, (uint16_t)n);        /* match what we hand over */
     wr16(pkt + IP_FRAG, 0);                     /* not a fragment: all are dropped */
     wr32(pkt + IP_SADDR, PEER_IP);
-    wr32(pkt + IP_DADDR, 0x0A00020Fu);          /* IPV4_ADDR: only ours is taken */
+    wr32(pkt + IP_DADDR, 0x0A00020Fu);          /* ipv4_addr: only ours is taken */
     wr16(pkt + IP_CHECK, 0);
     wr16(pkt + IP_CHECK, pk_csum(pkt, IP_HLEN));
 
@@ -200,7 +201,7 @@ static void dns_reply(const uint8_t *ip, uint32_t len)
     wr16(pkt + 2, our_port);
     wr16(pkt + 4, (uint16_t)o);
     wr16(pkt + 6, 0);                           /* no UDP checksum */
-    udp_input(IPV4_DNS, IPV4_ADDR, pkt, o);
+    udp_input(ipv4_dns, ipv4_addr, pkt, o);
 }
 
 static void t_dns(const uint8_t *d, size_t n)
@@ -308,10 +309,10 @@ static void t_tcp(const uint8_t *d, size_t n)
         }
         if (ctl & 1) {
             wr16(seg + 16, 0);
-            wr16(seg + 16, ip_transport_csum(PEER_IP, IPV4_ADDR, IPPROTO_TCP, seg, slen));
+            wr16(seg + 16, ip_transport_csum(PEER_IP, ipv4_addr, IPPROTO_TCP, seg, slen));
         }
 
-        tcp_input(PEER_IP, IPV4_ADDR, seg, slen);
+        tcp_input(PEER_IP, ipv4_addr, seg, slen);
         pump();                 /* drain and record whatever it answered */
 
         if (ctl & 4) {
@@ -338,7 +339,89 @@ static void t_tcp(const uint8_t *d, size_t n)
         ;
 }
 
+
+/* --- DHCP: a hostile server's reply -------------------------------------- */
+
+static const uint8_t *dhcp_in;
+static size_t dhcp_in_n;
+
+/*
+ * Answer the BOOTP broadcast the client just sent, with options from the
+ * fuzzer.
+ *
+ * The fixed part is built here rather than taken from the input. A reply
+ * whose op is not 2, whose transaction id is wrong, or which has no magic
+ * cookie is thrown out in one line each, and if the input had to get all
+ * three right by chance then nothing past them would ever be reached. The
+ * first input byte picks which of the three to get wrong instead, so the
+ * rejections are still exercised and most runs reach read_options -- which,
+ * being the part that walks attacker-chosen lengths, is the part worth
+ * fuzzing.
+ */
+static void dhcp_reply(const uint8_t *req, uint32_t len)
+{
+    if (len < IP_HLEN + 8 + 240)
+        return;
+    const uint8_t *bootp = req + IP_HLEN + 8;
+    uint8_t ctl = dhcp_in_n ? dhcp_in[0] : 0;
+    const uint8_t *opts = dhcp_in_n ? dhcp_in + 1 : dhcp_in;
+    uint32_t on = dhcp_in_n ? (uint32_t)dhcp_in_n - 1 : 0;
+
+    uint8_t pkt[8 + 576];
+    memset(pkt, 0, sizeof pkt);
+    uint8_t *b = pkt + 8;
+    b[0] = (ctl & 1) ? 1 : 2;                   /* op: a reply, usually */
+    b[1] = 1;                                   /* Ethernet */
+    b[2] = 6;
+    memcpy(b + 4, bootp + 4, 4);                /* the xid we were asked with */
+    if (ctl & 2)
+        b[4] ^= 0xFF;                           /* ... or a wrong one */
+    wr32(b + 16, (ctl & 4) ? 0 : 0x0A00020Fu);  /* yiaddr, or a refused one */
+    wr32(b + 236, (ctl & 8) ? 0 : 0x63825363u); /* the magic cookie */
+    uint32_t room = (uint32_t)sizeof pkt - 8 - 240;
+    if (on > room)
+        on = room;
+    memcpy(b + 240, opts, on);
+
+    uint16_t ulen = (uint16_t)(8 + 240 + on);
+    wr16(pkt, 67);                              /* from a server's port */
+    wr16(pkt + 2, 68);
+    wr16(pkt + 4, ulen);
+    wr16(pkt + 6, 0);                           /* no UDP checksum */
+
+    uint8_t frame[IP_HLEN + 8 + 576];
+    uint32_t n = pk_ip(frame, sizeof frame, IPPROTO_UDP, pkt, ulen);
+    /* To the broadcast address, which is how a server answers a machine that
+       has no address yet -- and the only reason on_ip lets this through. */
+    pk_ip_set_dst(frame, 0xFFFFFFFFu);
+    pk_feed(ETH_P_IP, frame, n, peer_mac);
+}
+
+static void t_dhcp(const uint8_t *d, size_t n)
+{
+    dhcp_in = d;
+    dhcp_in_n = n;
+    ipv4_addr = 0;                  /* as at boot: no address yet */
+    set_ip_sink(dhcp_reply);
+    fuzz_set_inject(pump);
+
+    dhcp_configure();
+
+    fuzz_set_inject(NULL);
+    set_ip_sink(NULL);
+    /* Whatever the run decided, leave the addresses as every other target
+       expects to find them. */
+    ipv4_addr = IPV4_ADDR_STATIC;
+    ipv4_mask = IPV4_MASK_STATIC;
+    ipv4_gw = IPV4_GW_STATIC;
+    ipv4_dns = IPV4_DNS_STATIC;
+    struct fuzz_frame drain;
+    while (fuzz_take(&drain))
+        ;
+}
+
 /* --- the table ----------------------------------------------------------- */
+
 
 static const struct fuzz_target table[] = {
     { "wire", t_wire },
@@ -346,6 +429,7 @@ static const struct fuzz_target table[] = {
     { "arp",  t_arp  },
     { "dns",  t_dns  },
     { "tcp",  t_tcp  },
+    { "dhcp", t_dhcp },
 };
 
 const struct fuzz_target *fuzz_targets(unsigned *n)

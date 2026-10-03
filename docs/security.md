@@ -961,6 +961,142 @@ would take the shell's input away from it, so the `tty_read` fix is still only
 an argument. The shape is identical to the pipe's, which is tested, but that is
 an analogy and not a test.
 
+## Two bugs in `execve`'s argument copying
+
+Found by a review of the ELF loader and signal paths, not by a test, and both
+in code that had been read several times. Both are in `copy_strings`
+(`kernel/proc.c`), which copies a user's `argv` or `envp` into a kernel buffer.
+
+**argv was allowed to fill the array that argv and envp share.** `struct
+exec_args` has one `char *argv[EXEC_MAX_ARGS + 1]` array; `envp` is placed just
+after argv's terminating NULL, and its room worked out by subtraction. With
+`argc == EXEC_MAX_ARGS` (1024, which was allowed), `envp` landed one slot past
+the end of the array — the address of the `envp` field itself — and its room
+came out as `-1`. The loop's only stopping condition is `n == room`, and `n` is
+never negative, so the envp loop had no bound at all. It wrote a pointer over
+`envp`, then over `used`, then copied user strings to wherever the corrupted
+`used` pointed: a kernel-mode store with no exception-table entry. Reachable
+from an ordinary `execve` with 1024 arguments and two environment variables.
+
+The bound is now `EXEC_MAX_ARGS - 1`, which is what "argc + envc + 2 pointers
+must fit" actually implies, and `copy_strings` refuses a negative room rather
+than trusting its caller's arithmetic. Either change alone closes it; both are
+there because the arithmetic was wrong in two places and fixing only one leaves
+the next reader to rediscover why it is safe.
+
+**A NULL argv or envp was not terminated.** A NULL vector is legal and means
+"empty", and the early return for it forgot to write the terminating NULL —
+leaving `out[0]` holding whatever `kmalloc` last had at that address. `count()`
+in `kernel/usermode.c` then walks that as a vector of `char *` until it finds a
+zero word, and `memcpy`s each stale word's contents onto the new program's
+stack. Kernel heap handed to user space as `argv`, or a fault in kernel mode.
+
+### Heap poisoning, because the test for the second one passed
+
+The first bug's test works immediately: 1024 arguments, and with the bug
+reintroduced the kernel page-faults and `make test` fails. The second one was
+the interesting one. Three successive attempts at a test for it passed with the
+bug in place:
+
+- `execve("/bin/true", 0, 0)` — survived, because `/bin/true` ignores `argv`.
+  The kernel copying stale heap into it changes nothing observable.
+- `execve("/bin/args", 0, 0)`, which exits with its own `argc` — still passed,
+  because the recycled `exec_args` block read back as zeroes, so `count()`
+  stopped at the first word and found `argc == 0`, which is the right answer.
+
+The second failure is the general case, and it is not specific to `execve`:
+**zero-filled memory hides every uninitialised-memory bug.** An uninitialised
+pointer reads as NULL, every loop looking for a terminator stops at once, and
+the wrong code produces the right answer. There is no sanitiser on the kernel
+itself to catch this — the fuzz targets run on the host, this runs on the
+metal.
+
+So `make test` builds now fill every `kmalloc` with `0xA5` (`mm/kheap.c`,
+`#ifdef SELFTEST`). `0xA5A5A5A5` is above `KERNEL_VBASE` but unmapped, so
+dereferencing one faults instead of quietly working, and it is not a NUL, so no
+terminator search stops early. With poisoning on, the second bug is caught:
+`count()` walks into the poison and the kernel faults. Normal builds do not
+touch the memory `kmalloc` returns, so nothing on a hot path pays for this.
+
+Worth noting that turning poisoning on broke nothing: 132 self-tests still
+pass, which is evidence that nothing in the kernel was relying on `kmalloc`
+returning zeroed memory. That is the other thing this flushes out, and it found
+nothing, which is the result you want.
+
+## DHCP, and the two holes it had to open
+
+`net/dhcp.c` exists because UTM's `Shared` mode (Apple's vmnet) hands out
+addresses by DHCP and has no fixed ones to hard-code, so without a client
+there was no working network on a real machine at all. The address, netmask,
+gateway and nameserver moved from compile-time `#define`s to four words in
+`net/ipv4.c`, written once by the client before any socket exists.
+
+DHCP is a protocol for taking configuration from a stranger, so the threat
+model is the server. Nothing it says is trusted beyond being a plausible
+answer:
+
+- **The transaction id comes from the CSPRNG.** A guessable one lets anyone on
+  the segment answer a request they never saw, and matching the xid is the
+  whole of DHCP's (weak) defence against that.
+- **The address offered is checked**: zero, 255.255.255.255, multicast
+  (224/4) and loopback (127/8) are refused, because accepting any of them
+  would make every subsequent send invalid or send our own traffic back to us.
+  A server offering one is broken or hostile; either way we keep waiting.
+- **The ACK must acknowledge the address we asked for**, not a different one.
+- **Option parsing walks the bytes we actually have.** An option header needs
+  two bytes and its body needs its length byte more; anything that does not
+  fit ends the walk rather than being clamped, because a truncated option
+  means the packet is not what it claims and the rest cannot be trusted
+  either. This is a fuzz target (`make fuzz TARGET=dhcp`), and the bounds
+  check was verified by deleting it and watching the fuzzer find the overread
+  — which it only could after the harness stopped over-allocating the packet
+  buffer (see below).
+- **A netmask of zero is replaced** with the class-C guess, because a zero
+  netmask puts every address off-subnet.
+
+Two things had to be opened up, and both are as narrow as they can be made.
+
+**Sending from 0.0.0.0 to 255.255.255.255.** Every other path refuses to send
+a broadcast, because broadcast is how a machine becomes an amplifier. A
+machine with no address has no other way to ask for one, so the exception is
+one function (`ip_send_bootp`) with one caller. `ip_send` itself now refuses
+to send anything at all while `ipv4_addr` is zero.
+
+**Receiving a datagram addressed to 255.255.255.255.** The receive path drops
+anything not addressed to us, for the same amplifier reason — and a bound UDP
+port cannot tell a broadcast datagram from a unicast one, so it cannot be left
+to make that distinction itself. A DHCP server has no way to reach a machine
+with no address, so its reply comes to the broadcast address. The exception is
+gated on four things at once: a transaction must be open (`dhcp_open()`, which
+is true for a few seconds at boot and never again), the protocol must be UDP,
+the datagram must still reach a bound port, and the only port bound is 68. A
+broadcast ping during those seconds is dropped like any other, because only
+UDP gets that far.
+
+### The harness was blind again, the same way
+
+The DHCP fuzz target did not notice a deliberately deleted bounds check. The
+reason was in the harness, not the target: `pk_feed` did `alloc_skb(n + 64)`
+with a 16-byte reserve, leaving 48 bytes of slack behind the packet. An option
+claiming a body longer than the packet made the parser read four bytes past the
+end — and all four were still inside the allocation, so ASan had nothing to
+report. Now `alloc_skb(n + 16)`, exactly the headroom, so the packet ends where
+the allocation ends.
+
+This is the third time this exact mistake has cost a day: the ext2 target gave
+1 KiB blocks a whole page each, and then this. **A buffer must exactly fill its
+allocation or the sanitiser cannot see a small overread**, and the only way to
+know it can is to break the code on purpose and check that the harness
+notices.
+
+### Not done
+
+No lease renewal: the lease time is parsed but ignored, and the address is kept
+forever. On a network whose server reassigns it, this machine would keep using
+an address that belongs to someone else. Renewal also means the four words
+could change under a live socket, which nothing is currently written to expect
+— so it needs the sockets to be told, not just a timer.
+
 ## Plan
 
 In rough dependency order. Each step should end with something testable, and anything on a

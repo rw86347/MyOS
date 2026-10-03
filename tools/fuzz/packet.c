@@ -25,7 +25,20 @@ void pk_feed(uint16_t type, const uint8_t *b, uint32_t n, const uint8_t mac[6])
     int (*fn)(struct sk_buff *) = fuzz_handler(type);
     if (!fn)
         return;
-    struct sk_buff *skb = alloc_skb(n + 64);
+    /*
+     * Exactly the headroom we reserve and not one byte more, so the frame
+     * ends where the allocation ends and a read one byte past the packet is a
+     * read past the allocation, which is the only kind the sanitiser can see.
+     *
+     * This was `n + 64`, leaving 48 bytes of slack behind the data, and it
+     * made every parser target blind to the overreads they exist to find: a
+     * DHCP option header says its body is longer than the packet, the parser
+     * reads four bytes past the end, and they were all still inside the
+     * allocation. Deleting the bounds check that stops it changed nothing the
+     * fuzzer could detect. Same mistake as the block buffers in the disk
+     * target, which got a whole page each -- see docs/security.md.
+     */
+    struct sk_buff *skb = alloc_skb(n + 16);
     if (!skb)
         return;
     skb_reserve(skb, 16);
@@ -137,7 +150,7 @@ void pk_prime_arp(void)
     ip_sink = NULL;
     ip_send(PEER_IP, IPPROTO_UDP, pad, sizeof pad);
     pk_pump();
-    ip_send(IPV4_DNS, IPPROTO_UDP, pad, sizeof pad);
+    ip_send(ipv4_dns, IPPROTO_UDP, pad, sizeof pad);
     pk_pump();
     fuzz_sent_reset();
     ip_sink = save;

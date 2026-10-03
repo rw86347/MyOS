@@ -22,18 +22,38 @@ when it's fixed. File references point at the comment that mentions the gap.
 - **E820 map holds at most 32 entries.** (`layout.inc`, `E820_MAX`)
 
 ## Live disk userland (`live/`, 2026-10-03)
-- **Built, never booted.** `build/live/rootfs.tar` (runit, agetty, login, GNU tools)
-  can't run until the kernel has `/proc` and `/dev/tty1`/`ttyS0` (ROADMAP 9c-3), and
-  separate users. (`vhangup`, `sethostname`, `reboot`, `mount -t tmpfs` exist now.) Alpine's apk was
-  never run against the generated database either (no Docker).
-- **mount/umount2 are partial** (`kernel/sys_fs.c`). Only `tmpfs` can be mounted
-  (`mode=` is the one option read; `size=` is ignored: it shares the RAM file system's
-  pages). No proc, sysfs, devpts (`-ENODEV`); no block device files, so ext2/vfat
+- **Boots and logs in, on the console only** (`make live-hd`, `make utm-live`). agetty
+  runs on `/dev/console`: there are no `/dev/tty1`/`ttyS0` nodes yet. Alpine's apk was
+  never run against the generated database (no Docker), and the desktop (`startx`)
+  was not tried on it.
+- **The live user is made at build time** (`tools/fetch-live.py`, `add_live_user`):
+  shadow's `useradd` and `passwd` lock `/etc/passwd` with a hard link, and the VFS has
+  none (each name is its inode). Until `link()` exists, adding users or changing a
+  password inside the running system fails.
+- **No UNIX sockets.** syslog() goes nowhere ("agetty: cannot open UNIX socket"), so
+  login failures aren't logged; D-Bus and X11's local socket can't work either.
+- **32 fds per process** (`PROC_FILES`). bash moves its terminal to fd 255 for job
+  control and gets `EBADF`, so the login shell has no Ctrl-Z / `fg`. `cloexec` is a
+  32-bit mask; growing the table means a bitmap.
+- **No permission checks.** Processes have real users now (uid, groups, setuid exec),
+  but `open`, `unlink`, `kill`... don't check them: user `myos` can write `/etc/shadow`.
+  The scheduler also ignores nice values (`setpriority` stores them).
+- **/proc is only `/proc/self/fd`** (`fs/procfs.c`). No `/proc/<pid>`, `meminfo`,
+  `mounts`, `self/exe`; `self` is a directory, not a link to the pid. Listing
+  `/proc/self/fd` shows all 32 slots, open or not (opening or reading a closed one
+  is `ENOENT`). A pipe or socket fd can't be reopened through it (`ENXIO`), so
+  bash's `<(...)` can't use `/dev/fd`. A deleted file's link names just the file,
+  not its old directory.
+- **Named pipes: at most 64 open at once** (`FIFO_MAX`, `fs/pipe.c`), and a process
+  may have at most 1024 memory areas (`MM_AREAS_MAX`, `mm/mm.c`; Linux allows 65530).
+- **mount/umount2 are partial** (`kernel/sys_fs.c`). Only `tmpfs` and `proc` can be
+  mounted (`mode=` is the one option read; `size=` is ignored: it shares the RAM file
+  system's pages). No sysfs, devpts (`-ENODEV`); no block device files, so ext2/vfat
   give `-ENOTBLK`; no bind or move mounts. A mount can't be undone: `umount2` says
   `-EBUSY`, because the VFS doesn't count open files and cwds per mount. Remount
-  accepts nosuid/nodev/noexec without enforcing them (nothing is setuid, all root) and
-  refuses read-only. tmpfs mounts don't show in `vfs_mount_count` (`df` misses them).
-  Anyone may mount, reboot and set the host name until there are users.
+  accepts nosuid/nodev/noexec without enforcing them and refuses read-only. tmpfs and
+  proc mounts don't show in `vfs_mount_count` (`df` misses them). Anyone may mount,
+  reboot and set the host name: those calls don't check for root yet.
 - **Power off is only real on QEMU** (`drivers/power.c`): it writes "soft off" to the
   PIIX4/ICH9 power-management port when the PCI subsystem vendor is QEMU's (0x1AF4).
   Real PCs need the sleep type from the ACPI tables (`_S5` in the DSDT); until we read
@@ -310,6 +330,30 @@ when it's fixed. File references point at the comment that mentions the gap.
 - `drivers/tty.c` still has no attack-path test: reading `/dev/console` from a
   test would take the shell's input away. Its fix is the same shape as the
   pipe's, which is tested, but an analogy is not a test.
+
+## Networking configuration (step 10f, 2026-10-03)
+
+- **No DHCP lease renewal.** `net/dhcp.c` parses the lease time and ignores
+  it: the address is kept until reboot. On a network whose server hands it to
+  someone else when the lease expires, two machines end up with one address.
+  Renewal is not just a timer — `ipv4_addr` and friends are plain words read
+  directly by every send, on the stated assumption that they are written once
+  before any socket exists. Changing one under a live TCP connection would
+  need the sockets told, so this is a design change rather than a loop.
+- **No DHCP DECLINE, and no ARP probe before accepting an offer.** RFC 2131
+  says to check the offered address is not already in use and decline it if it
+  is. We take the server's word for it.
+- **`AF_PACKET` and the interface ioctls still do not exist**, so BusyBox
+  `udhcpc` cannot run even though the kernel now does the same job. If a
+  user-space client ever matters, that is what it needs — along with a way for
+  user space to *set* the address, which also does not exist.
+- **ICMP through Apple's vmnet is unverified.** `tools/mkutm.sh --net shared`
+  builds a VM on Apple's vmnet, which NATs like a real router and should
+  forward ICMP, unlike QEMU's SLIRP (where `ping 8.8.8.8` gets nothing — a
+  packet capture shows MyOS emitting correct echo requests and SLIRP dropping
+  them, because forwarding them would need a raw socket and therefore root).
+  Verifying this from a script needs either UTM automation permission or root
+  for `-netdev vmnet-shared`, so it has been reasoned about and not measured.
 
 ## Drivers
 

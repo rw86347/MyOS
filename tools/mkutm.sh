@@ -17,7 +17,17 @@
 #   - USB off and the PS/2 controller on: with USB on, UTM gives the machine
 #     a USB keyboard (and with "PS/2" unticked removes the PS/2 controller
 #     altogether) — MyOS only has a PS/2 keyboard driver so far
-#   - an Intel e1000 network card, for step 10
+#   - an Intel e1000 network card, in one of UTM's three QEMU network modes
+#     (--net, default "shared"):
+#       shared    Apple's vmnet, NAT'd behind the Mac. A real router: it
+#                 forwards ICMP, so `ping google.com` works. Hands out an
+#                 address by DHCP, which is why MyOS needed a DHCP client
+#                 before this mode was any use (net/dhcp.c).
+#       emulated  QEMU's own SLIRP. 10.0.2.15/24, also by DHCP. TCP, UDP and
+#                 DNS reach the internet but ICMP to anywhere except the
+#                 gateway does not, because SLIRP would need a raw socket and
+#                 therefore root. Ping the gateway, not google.com.
+#       bridged   on the real LAN, with an address from the real router.
 #   - a second IDE disk, 256 MiB of ext2: MyOS mounts it at /data, and
 #     files there survive a restart
 #
@@ -33,13 +43,27 @@
 # once: running this again keeps it (delete it for a fresh one).
 set -e
 installed=0
-if [ "$1" = --installed ]; then
-    installed=1
-    shift
-fi
+net=Shared
+debug_dir=
+while :; do
+    case "$1" in
+    --installed) installed=1; shift ;;
+    # shared | emulated | bridged; see the note above. Capitalised for the
+    # plist, which is how UTM writes it.
+    --net) net=$(echo "$2" | tr '[:lower:]' '[:upper:]' | cut -c1)$(echo "$2" | cut -c2-); shift 2 ;;
+    # Add a serial port writing to DIR/serial.log and a QEMU monitor socket at
+    # DIR/monitor.sock, so the machine can be booted and driven from a script
+    # (tools/qemu-type.sh speaks to that socket). Left out of a VM meant for a
+    # person: it would scatter files and hold a socket nobody asked for.
+    --debug-dir) debug_dir=$2; shift 2 ;;
+    *) break ;;
+    esac
+done
 img=$1
 out=$2
-[ -f "$img" ] && [ -n "$out" ] || { echo "usage: $0 [--installed] disk.img out.utm" >&2; exit 1; }
+[ -f "$img" ] && [ -n "$out" ] || {
+    echo "usage: $0 [--installed] [--net shared|emulated|bridged] [--debug-dir DIR] disk.img out.utm [uuid]" >&2
+    exit 1; }
 MKE2FS=${MKE2FS:-/opt/homebrew/opt/e2fsprogs/sbin/mke2fs}
 
 if [ $installed = 1 ]; then
@@ -86,6 +110,18 @@ if [ $installed = 0 ] && [ ! -f "$out/Data/$DATA_UUID.qcow2" ]; then
     qemu-img convert -q -f raw -O qcow2 "$tmp" "$out/Data/$DATA_UUID.qcow2"
     rm -f "$tmp"
     echo "New data disk (256 MiB, ext2) in $out"
+fi
+
+EXTRA_ARGS=
+if [ -n "$debug_dir" ]; then
+    mkdir -p "$debug_dir"
+    : > "$debug_dir/serial.log"
+    rm -f "$debug_dir/monitor.sock"
+    EXTRA_ARGS="
+			<string>-serial</string>
+			<string>file:$debug_dir/serial.log</string>
+			<string>-monitor</string>
+			<string>unix:$debug_dir/monitor.sock,server,nowait</string>"
 fi
 
 cat > "$out/config.plist" <<EOF
@@ -158,7 +194,7 @@ $DATA_DRIVE
 			<key>MacAddress</key>
 			<string>5A:4D:59:4F:53:01</string>
 			<key>Mode</key>
-			<string>Shared</string>
+			<string>$net</string>
 			<key>PortForward</key>
 			<array/>
 		</dict>
@@ -166,7 +202,8 @@ $DATA_DRIVE
 	<key>QEMU</key>
 	<dict>
 		<key>AdditionalArguments</key>
-		<array/>
+		<array>$EXTRA_ARGS
+		</array>
 		<key>BalloonDevice</key>
 		<false/>
 		<key>DebugLog</key>
@@ -224,4 +261,4 @@ $DATA_DRIVE
 </plist>
 EOF
 plutil -lint -s "$out/config.plist"
-echo "Built $out"
+echo "Built $out (network: $net)"

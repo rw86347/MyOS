@@ -29,7 +29,7 @@ static uint32_t dns_qlen;
 static void on_dns(void *ctx, uint32_t src, uint16_t sport, const uint8_t *data, uint32_t len)
 {
     (void)ctx;
-    if (src != IPV4_DNS || sport != 53 || len < 12 || len > sizeof dns_pkt)
+    if (src != ipv4_dns || sport != 53 || len < 12 || len > sizeof dns_pkt)
         return;
     if ((uint16_t)((data[0] << 8) | data[1]) != dns_wait_id)
         return;
@@ -270,7 +270,7 @@ static int dns_lookup(const char *name, uint32_t *ip)
     dns_len = 0;
     int rc = -ETIMEDOUT;
     for (int try = 0; try < 2 && rc == -ETIMEDOUT; try++) {
-        if (udp_sendto(IPV4_DNS, port, 53, q, qlen) < 0) {
+        if (udp_sendto(ipv4_dns, port, 53, q, qlen) < 0) {
             rc = -EIO;
             break;
         }

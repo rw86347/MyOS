@@ -1,8 +1,11 @@
 /*
  * ipv4.c — ARP, ICMP, and the IP header check (step 10)
  *
- * QEMU's user network gives the guest 10.0.2.15, with the gateway at
- * 10.0.2.2 and DNS at 10.0.2.3. Those are the addresses until DHCP exists.
+ * The address, netmask and gateway come from DHCP at boot (net/dhcp.c) and
+ * live in ipv4_addr / ipv4_mask / ipv4_gw. They are zero until a lease
+ * arrives, so every path in here has to cope with having no address -- which
+ * mostly means refusing to do anything, the one exception being the BOOTP
+ * broadcast the DHCP client sends to ask.
  * The parser trusts lengths only after checking them against the bytes we
  * actually have. IP options and fragments are dropped. UDP and TCP sit on
  * top of ip_send / the demux at the bottom of on_ip.
@@ -18,6 +21,7 @@
  * own. Unsolicited replies and other stations' requests are how ARP caches
  * get poisoned, so they are answered where appropriate but never recorded.
  */
+#include <dhcp.h>
 #include <errno.h>
 #include <interrupts.h>
 #include <ipv4.h>
@@ -30,9 +34,12 @@
 #include <timer.h>
 #include <udp.h>
 
-#define OUR_IP    IPV4_ADDR
-#define OUR_MASK  0xFFFFFF00u
-#define OUR_GW    IPV4_GW
+/* Set once by the DHCP client before any socket exists; see include/ipv4.h. */
+uint32_t ipv4_addr, ipv4_mask = IPV4_MASK_STATIC, ipv4_gw, ipv4_dns;
+
+#define OUR_IP    ipv4_addr
+#define OUR_MASK  ipv4_mask
+#define OUR_GW    ipv4_gw
 
 struct arp_pkt {
     uint16_t htype, ptype;
@@ -396,7 +403,7 @@ static uint16_t next_ip_id(uint32_t dst)
    The destination MAC is left blank for xmit_to, so a frame can be built
    before we know it. The caller's payload is copied here and nowhere else,
    which is what lets ip_send return without blocking. */
-static struct sk_buff *ip_frame(uint32_t dst, uint8_t proto,
+static struct sk_buff *ip_frame(uint32_t src, uint32_t dst, uint8_t proto,
                                 const void *payload, uint32_t len)
 {
     if (!eth || len > ETH_DATA_LEN - sizeof(struct iphdr))
@@ -418,7 +425,7 @@ static struct sk_buff *ip_frame(uint32_t dst, uint8_t proto,
     ip->id = htons(next_ip_id(dst));
     ip->ttl = 64;
     ip->protocol = proto;
-    ip->saddr = htonl(OUR_IP);
+    ip->saddr = htonl(src);
     ip->daddr = htonl(dst);
     ip->check = htons(checksum(ip, sizeof *ip));
     memcpy(p + ETH_HLEN + sizeof *ip, payload, len);
@@ -439,7 +446,7 @@ static int xmit_to(struct sk_buff *skb, const uint8_t mac[6])
 static int ip_send_mac(uint32_t dst, const uint8_t mac[6], uint8_t proto,
                        const void *payload, uint32_t len)
 {
-    struct sk_buff *skb = ip_frame(dst, proto, payload, len);
+    struct sk_buff *skb = ip_frame(OUR_IP, dst, proto, payload, len);
     if (!skb)
         return -EMSGSIZE;
     return xmit_to(skb, mac);
@@ -450,16 +457,36 @@ static int ip_send_mac(uint32_t dst, const uint8_t mac[6], uint8_t proto,
    the receive path and from a caller whose payload buffer is reused. */
 int ip_send(uint32_t dst, uint8_t proto, const void *payload, uint32_t len)
 {
+    /* No address yet means no route: a packet with a source of 0.0.0.0 would
+       be answered to nowhere, and asking the gateway before we know it is
+       asking 0.0.0.0. Only ip_send_bootp may send before a lease. */
+    if (!OUR_IP)
+        return -ENETDOWN;
     uint32_t next = ((dst ^ OUR_IP) & OUR_MASK) ? OUR_GW : dst;
     if (!ip_ok(next))
         return -EINVAL;
-    struct sk_buff *skb = ip_frame(dst, proto, payload, len);
+    struct sk_buff *skb = ip_frame(OUR_IP, dst, proto, payload, len);
     if (!skb)
         return -EMSGSIZE;
     uint8_t mac[6];
     if (lookup(next, mac) == 0)
         return xmit_to(skb, mac);
     return arp_queue(skb, next);
+}
+
+/*
+ * The one send that is allowed before we have an address: see include/ipv4.h.
+ * A source of 0.0.0.0 and a destination of 255.255.255.255, to the broadcast
+ * MAC, so no ARP is needed -- which matters, because ARP would have to send
+ * from an address we do not have.
+ */
+int ip_send_bootp(const void *udp, uint32_t len)
+{
+    static const uint8_t bcast[6] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
+    struct sk_buff *skb = ip_frame(0, 0xFFFFFFFFu, IPPROTO_UDP, udp, len);
+    if (!skb)
+        return -EMSGSIZE;
+    return xmit_to(skb, bcast);
 }
 
 static int on_ip(struct sk_buff *skb)
@@ -490,13 +517,27 @@ static int on_ip(struct sk_buff *skb)
         kfree_skb(skb);
         return 0;
     }
-    /* Addressed to us, and only to us. Nothing here has a use for broadcast
-       or multicast yet, and the two things we would do with them are both
-       bad: answering a broadcast ping makes this machine a smurf amplifier,
-       and a bound UDP port cannot tell a broadcast datagram from a unicast
-       one. DHCP will need an exception for its own port when it arrives. */
+    /*
+     * Addressed to us, and only to us. Answering a broadcast ping makes this
+     * machine a smurf amplifier, and a bound UDP port cannot tell a broadcast
+     * datagram from a unicast one, so broadcast is dropped.
+     *
+     * DHCP is the exception, because a server has no way to reach a machine
+     * that has no address yet: its reply comes to 255.255.255.255. The
+     * exception is as narrow as it can be made -- only while a transaction is
+     * open (dhcp_open(), a few seconds at boot and never again), only UDP,
+     * and the datagram still has to reach a bound port, which is 68. A
+     * broadcast ping during those few seconds is dropped below like any
+     * other, because only UDP gets this far.
+     */
     uint32_t dst = ntohl(ip.daddr);
-    if (dst != OUR_IP) {
+    if (dst != OUR_IP &&
+        !(dst == 0xFFFFFFFFu && ip.protocol == IPPROTO_UDP && dhcp_open())) {
+        kfree_skb(skb);
+        return 0;
+    }
+    if (dst != OUR_IP) {                /* a BOOTP broadcast: UDP and nothing else */
+        udp_input(ntohl(ip.saddr), dst, skb->data + ihl, total - ihl);
         kfree_skb(skb);
         return 0;
     }
@@ -661,6 +702,14 @@ int ip_rate_ok(uint32_t peer)
     return 1;
 }
 
+/* Four decimals and three dots. The casts are not decoration: uint32_t is
+   `unsigned long` on i686-elf, and %u would read the wrong width. */
+static void print_ip(const char *label, uint32_t ip)
+{
+    kprintf("%s%u.%u.%u.%u", label, (unsigned)(ip >> 24), (unsigned)(ip >> 16) & 0xFF,
+            (unsigned)(ip >> 8) & 0xFF, (unsigned)ip & 0xFF);
+}
+
 void ipv4_init(void)
 {
     /* Unguessable before the first packet: the IP ID counters start at a
@@ -673,7 +722,17 @@ void ipv4_init(void)
         return;
     dev_add_pack(&arp_pt);
     dev_add_pack(&ip_pt);
-    kprintf("ipv4: eth0 is 10.0.2.15/24 gateway 10.0.2.2\n");
+    /* The packet handlers have to be registered before this: the reply to our
+       own first broadcast arrives inside it. */
+    dhcp_configure();
+    int bits = 0;
+    for (uint32_t m = ipv4_mask; m & 0x80000000u; m <<= 1)
+        bits++;
+    print_ip("ipv4: eth0 is ", ipv4_addr);
+    kprintf("/%d", bits);
+    print_ip(" gateway ", ipv4_gw);
+    print_ip(" dns ", ipv4_dns);
+    kprintf("\n");
 }
 
 int net_ping(uint32_t dst)

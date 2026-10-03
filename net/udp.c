@@ -95,7 +95,7 @@ int udp_sendto(uint32_t dst, uint16_t sport, uint16_t dport,
     pkt[7] = 0;
     if (len)
         memcpy(pkt + 8, data, len);
-    uint16_t sum = ip_transport_csum(IPV4_ADDR, dst, IPPROTO_UDP, pkt, ulen);
+    uint16_t sum = ip_transport_csum(ipv4_addr, dst, IPPROTO_UDP, pkt, ulen);
     if (sum == 0)
         sum = 0xFFFF;               /* a computed checksum is never stored as 0 */
     pkt[6] = (uint8_t)(sum >> 8);
@@ -107,15 +107,19 @@ int udp_sendto(uint32_t dst, uint16_t sport, uint16_t dport,
 
 void udp_input(uint32_t src, uint32_t dst, const uint8_t *pkt, uint32_t len)
 {
-    (void)dst;
     if (len < 8)
         return;
     uint16_t ulen = (uint16_t)((pkt[4] << 8) | pkt[5]);
     if (ulen < 8 || ulen > len)
         return;
     uint16_t check = (uint16_t)((pkt[6] << 8) | pkt[7]);
+    /* The pseudo-header has to carry the address the datagram was actually
+       sent to, not ours: a DHCP reply arrives addressed to 255.255.255.255
+       (we have no address yet) and its checksum was computed over that.
+       Using ipv4_addr here worked only because every other datagram that
+       gets this far is addressed to us. */
     if (check != 0 &&
-        ip_transport_csum(src, IPV4_ADDR, IPPROTO_UDP, pkt, ulen) != 0)
+        ip_transport_csum(src, dst, IPPROTO_UDP, pkt, ulen) != 0)
         return;
     uint16_t dport = (uint16_t)((pkt[2] << 8) | pkt[3]);
     uint16_t sport = (uint16_t)((pkt[0] << 8) | pkt[1]);
