@@ -35,6 +35,7 @@
 #include <pcache.h>
 #include <pmm.h>
 #include <string.h>
+#include <thread.h>
 #include <uaccess.h>
 #include <vfs.h>
 
@@ -44,9 +45,12 @@
 #define RA_MAX     (BIO_SECTORS * SECTOR_SIZE / PAGE_SIZE)   /* 32: 128 KiB */
 #define SCAN_MAX   1024                 /* pages one reclaim round looks at */
 #define DIRTY_CAP  8192                 /* pages: 32 MiB */
+#define RA_REQS    8                    /* read-ahead requests on their way at once */
 
 #define P_USED   1                      /* clock bit */
 #define P_DIRTY  2                      /* changed since it was last written */
+#define P_IO     4                      /* the disk is still filling it (pinned) */
+#define P_RA     8                      /* reaching it starts the next read-ahead */
 
 struct pc_page {
     uint32_t id;                        /* the file's cache id (0: empty slot) */
@@ -61,7 +65,7 @@ static struct pc_page *table;
 static struct inode **owner;            /* per slot, only for dirty pages (for write-back) */
 static uint32_t nslots, set_mask, hand;
 static uint32_t next_id = 1;
-static uint32_t hits, misses, nframes, ndirty, dirty_max;
+static uint32_t hits, misses, ra_pages, nframes, ndirty, dirty_max;
 static struct inode *dirty_list;        /* files with dirty pages */
 
 static uint32_t min_u32(uint32_t a, uint32_t b) { return a < b ? a : b; }
@@ -375,6 +379,143 @@ static uint32_t window(struct inode *ino, uint32_t id, uint32_t index, uint32_t 
     return n;
 }
 
+/* --- read-ahead that doesn't wait ------------------------------------------ */
+
+/*
+ * The first page of each read-ahead window is marked P_RA. When a reader
+ * gets there, the NEXT window goes to the disk at once (blockdev_submit)
+ * and the reader goes on copying this one: the disk and the CPU work at
+ * the same time. Pages on their way are in the table, pinned by the request
+ * and marked P_IO; a reader that gets there first sleeps until the disk is
+ * done (io_wait). A failed read drops its pages: the reader then reads them
+ * the ordinary way and gets the error.
+ */
+struct ra_req {
+    struct bio bio;
+    struct bio_vec v[RA_MAX];
+    struct pc_page *pg[RA_MAX];
+    uint8_t npg, used;
+};
+static struct ra_req ra_pool[RA_REQS];
+static struct wait_queue io_wait;
+
+/* The disk is done (in its worker thread or its interrupt: short, no sleeping). */
+static void ra_done(struct bio *b)
+{
+    struct ra_req *r = b->priv;
+    for (int k = 0; k < r->npg; k++) {
+        struct pc_page *p = r->pg[k];
+        if (b->status)
+            p->id = 0;                  /* never matches: read again, the slow way */
+        p->flags &= ~(P_IO | P_RA);
+        p->readers--;
+    }
+    r->used = 0;
+    wq_wake_all(&io_wait);
+}
+
+static struct ra_req *ra_get(void)
+{
+    for (int k = 0; k < RA_REQS; k++)
+        if (!ra_pool[k].used) {
+            ra_pool[k].used = 1;
+            ra_pool[k].npg = 0;
+            return &ra_pool[k];
+        }
+    return NULL;
+}
+
+/* A reader reached page `at`, marked P_RA: start the window after it. */
+static void readahead(struct inode *ino, uint32_t at)
+{
+    uint32_t index = ino->ra_next;
+    if (!ino->fs->map_pages || index <= at || index > at + 2 * RA_MAX || !ino->size)
+        return;                         /* not reading in order (any more) */
+    uint32_t id = id_of(ino), last = (ino->size - 1) / PAGE_SIZE;
+    uint32_t n = min_u32(ino->ra_win ? ino->ra_win * 2u : RA_START, RA_MAX);
+    if (index > last)
+        return;
+    n = min_u32(n, last - index + 1);
+    for (uint32_t k = 0; k < n; k++)
+        if (find(id, index + k)) {
+            n = k;
+            break;
+        }
+    uint32_t lba[RA_MAX];
+    uint8_t secs[RA_MAX];
+    struct blockdev *dev;
+    int got = n ? ino->fs->map_pages(ino, index, n, lba, secs, &dev) : 0;
+    if (got <= 0 || ino->pc_id != id)
+        return;
+
+    /* Pages next to each other on the disk go in one request. */
+    int k = 0, stop = 0, sent = 0;
+    while (k < got && !stop) {
+        struct ra_req *r = ra_get();
+        if (!r)
+            break;
+        uint32_t first = lba[k];
+        while (k < got && r->npg < RA_MAX &&
+               (!r->npg || (secs[k - 1] == PAGE_SIZE / SECTOR_SIZE && lba[k] == lba[k - 1] + secs[k - 1]))) {
+            uint32_t frame = pmm_alloc();
+            struct pc_page *p = frame ? install(id, index + k, frame) : NULL;
+            if (!p) {
+                if (frame)
+                    pmm_free(frame);
+                stop = 1;
+                break;
+            }
+            if (secs[k] < PAGE_SIZE / SECTOR_SIZE)      /* the file's last page */
+                memset((uint8_t *)P2V(frame) + secs[k] * SECTOR_SIZE, 0,
+                       PAGE_SIZE - secs[k] * SECTOR_SIZE);
+            p->flags = P_IO | (k == 0 ? P_RA : 0);
+            p->readers = 1;             /* pinned by the request */
+            r->pg[r->npg] = p;
+            r->v[r->npg++] = (struct bio_vec){ frame, secs[k] * SECTOR_SIZE };
+            k++;
+        }
+        if (!r->npg) {
+            r->used = 0;
+            break;
+        }
+        r->bio = (struct bio){ .lba = first, .v = r->v, .nv = r->npg, .done = ra_done, .priv = r };
+        ra_pages += r->npg;
+        if (blockdev_submit(dev, &r->bio) < 0) {
+            r->bio.status = -1;
+            ra_done(&r->bio);
+        }
+        sent = 1;
+    }
+    if (k) {
+        ino->ra_next = index + k;
+        ino->ra_win = (uint16_t)k;
+    }
+    if (sent)
+        thread_yield();                 /* let the disk's worker start the command */
+}
+
+/* A page found in the table: pin it, start the next read-ahead if it is
+   marked, and wait if the disk is still filling it. NULL: that read failed
+   (look again). */
+static struct pc_page *use(struct inode *ino, struct pc_page *p)
+{
+    p->flags |= P_USED;
+    p->readers++;
+    if (p->flags & P_RA) {
+        p->flags &= ~P_RA;
+        readahead(ino, p->index);       /* before waiting: keep the disk busy */
+    }
+    uint32_t id = p->id;
+    while ((p->flags & P_IO) && p->id == id)
+        wq_sleep(&io_wait);
+    if (p->id != id) {
+        p->readers--;
+        return NULL;
+    }
+    hits++;
+    return p;
+}
+
 /* Page `index` of the file, pinned. `want`: pages the caller is about to
    read (the read-ahead hint). NULL: -EIO / -ENOMEM in *err. */
 static struct pc_page *get_read(struct inode *ino, uint32_t index, uint32_t want, int *err)
@@ -383,14 +524,19 @@ static struct pc_page *get_read(struct inode *ino, uint32_t index, uint32_t want
         uint32_t id = id_of(ino);
         struct pc_page *p = find(id, index);
         if (p) {
-            hits++;
-            p->flags |= P_USED;
-            p->readers++;
-            return p;
+            if ((p = use(ino, p)) != NULL)
+                return p;
+            continue;
         }
-        *err = fill(ino, index, window(ino, id, index, want));
+        uint32_t n = window(ino, id, index, want);
+        *err = fill(ino, index, n);
         if (*err)
             return NULL;
+        if (want < n) {                 /* read ahead of the caller: mark where to go on */
+            struct pc_page *t = find(id, index + want);
+            if (t)
+                t->flags |= P_RA;
+        }
     }
     *err = -EIO;                        /* writes keep racing us, or no room */
     return NULL;
@@ -407,11 +553,12 @@ static int copy_out(struct inode *ino, uint32_t pos, void *dst, uint32_t n, int 
         uint32_t index = pos / PAGE_SIZE, in = pos % PAGE_SIZE;
         uint32_t k = min_u32(PAGE_SIZE - in, n);
         struct pc_page *p = find(id_of(ino), index);
-        if (p) {                        /* the hit, inline: the common case */
+        if (p && !(p->flags & (P_IO | P_RA))) {     /* the plain hit, inline */
             hits++;
             p->flags |= P_USED;
             p->readers++;
-        } else if (!(p = get_read(ino, index, (pos + n - 1) / PAGE_SIZE - index + 1, &err))) {
+        } else if (!(p && (p = use(ino, p))) &&
+                   !(p = get_read(ino, index, (pos + n - 1) / PAGE_SIZE - index + 1, &err))) {
             break;
         }
         const uint8_t *src = (const uint8_t *)P2V(p->frame) + in;
@@ -453,10 +600,15 @@ struct pc_page *pcache_get_write(struct inode *ino, uint32_t index, int need_old
     }
     if (need_old)
         return get_read(ino, index, 1, err);
-    uint32_t id = id_of(ino);
-    struct pc_page *p = find(id, index);
-    if (!p) {                           /* replaced whole, or new: no disk read */
-        uint32_t frame = pmm_alloc();
+    for (int tries = 0; tries < 8; tries++) {
+        uint32_t id = id_of(ino);
+        struct pc_page *p = find(id, index);
+        if (p) {
+            if ((p = use(ino, p)) != NULL)  /* (waits if the disk is filling it) */
+                return p;
+            continue;
+        }
+        uint32_t frame = pmm_alloc();   /* replaced whole, or new: no disk read */
         if (!frame && ino->pc_ndirty) {
             pcache_flush(ino);          /* RAM full of our changes: clean them, retry */
             frame = pmm_alloc();
@@ -467,18 +619,19 @@ struct pc_page *pcache_get_write(struct inode *ino, uint32_t index, int need_old
         }
         memset(P2V(frame), 0, PAGE_SIZE);
         p = install(id, index, frame);
-        if (!p) {
-            pmm_free(frame);
-            p = find(id, index);        /* it appeared while we slept */
-            if (!p) {
-                *err = -ENOMEM;
-                return NULL;
-            }
+        if (p) {
+            p->flags |= P_USED;
+            p->readers++;
+            return p;
+        }
+        pmm_free(frame);
+        if (!find(id, index)) {         /* not "it appeared while we slept": no room */
+            *err = -ENOMEM;
+            return NULL;
         }
     }
-    p->flags |= P_USED;
-    p->readers++;
-    return p;
+    *err = -EIO;
+    return NULL;
 }
 
 void *pcache_page_data(struct pc_page *p)
@@ -529,4 +682,9 @@ void pcache_stats(uint32_t *h, uint32_t *m)
 uint32_t pcache_pages(void)
 {
     return nframes;
+}
+
+uint32_t pcache_ra_pages(void)
+{
+    return ra_pages;
 }

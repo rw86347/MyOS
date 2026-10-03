@@ -68,6 +68,25 @@ Mark a step `[x]` only when its "Done when" check works.
     not re-measured.
   - [ ] 9c-3: the live disk's installer (partition, mke2fs, copy, boot area), raw block
     devices (/dev/hda...), and the UTM VM on the installed layout.
+    - [x] The live disk's software: `make live-root` gathers `live/packages.txt`
+      (IceWM desktop, logins, AbiWord, gcc/make/python3/adb, apk) as pinned Alpine
+      packages plus the MyOS source into `build/live/rootfs.tar`.
+    - [x] A normal userland instead of BusyBox (2026-10-03): GNU coreutils,
+      findutils, grep, sed, gawk, util-linux, procps; dash as /bin/sh, bash for
+      people; runit as process 1 (Void Linux layout, `/etc/runit/1-3`, `/etc/sv`),
+      agetty + util-linux login; man pages. `!busybox` in `packages.txt` makes the
+      build fail if anything pulls BusyBox in. BusyBox stays in the test initramfs.
+      The kernel now looks for `/sbin/init` after `/init`, like Linux.
+    - [x] Kernel calls for it (2026-10-03): `sethostname`, `vhangup`, `reboot`
+      (restart through the keyboard controller, power off on QEMU/UTM, halt
+      elsewhere; Ctrl-Alt-Del to init), `mount -t tmpfs`, `umount2` (errors only).
+      Done: `make test` (boottest), `poweroff -f` / `reboot -f` stop QEMU.
+    - [ ] Still missing for it: `/proc` and `/sys` (8j), device nodes `/dev/tty1`…
+      and `/dev/ttyS0`, block device files (so `mount /dev/sda1` works), undoing
+      a mount, `utmp` writes.
+    - [ ] Users: a uid/gid per process, permission checks in the VFS, setuid on exec,
+      `setgroups`. Today every program runs as root, so login and passwords are
+      only for show until this is done.
   - [x] 9d (part): PCI scan + bus-master DMA (PIIX/ICH), reads and writes, PIO
     fallback. 64 KiB read: 1 250 instructions of CPU work (PIO: 41 788).
   - [x] 9d (rest): AHCI (SATA), NVMe and virtio-blk drivers, all scatter-gather DMA
@@ -79,9 +98,12 @@ Mark a step `[x]` only when its "Done when" check works.
     up to 128 KiB); the cache may use all free RAM and gives clean pages back when
     memory runs out. 64 KiB write ~130 000 → ~100 800 instructions on every type.
     Sizing math in `docs/performance.md` ("Cache sizing").
-  - [ ] 9d-3: several commands in flight (NVMe queue depth, virtio chains, AHCI
-    NCQ) and read-ahead that runs while the program copies; driver limits
-    (several disks per driver, LBA48, AHCI BIOS hand-off).
+  - [ ] 9d-3: several commands in flight and driver limits.
+    - [x] requests that don't wait (`blockdev_submit`, a worker per disk) and
+      read-ahead that runs while the program copies (68 of 71 pages in the test).
+    - [ ] drivers that take several commands at once (NVMe queue depth, virtio
+      chains, AHCI NCQ) instead of the worker thread.
+    - [ ] driver limits: several disks per driver, LBA48, AHCI BIOS hand-off.
   - [ ] 9e: FAT32 in the VFS: read, then write (USB sticks, swapping files with a Mac/PC).
     Read is in: the first FAT32 partition is mounted at /mnt (read-only). Write,
     which has to allocate clusters and update the FAT, is still open.
@@ -121,13 +143,37 @@ Mark a step `[x]` only when its "Done when" check works.
   - [x] Pulled forward (2026-10-02): dynamic linking — the kernel loads a program's
     interpreter (PT_INTERP: musl's ld.so), file-backed mmap (demand-paged from the
     initramfs). Alpine's unmodified, dynamically linked bash runs as the login shell.
+  - [x] Pulled forward (2026-10-03): threads, for GLib (GTK, AbiWord) and the X
+    server — `clone(CLONE_THREAD)` thread groups, `futex` (wait/wake/requeue, both
+    timeout forms), `gettid`, `set_tid_address` + clear-on-exit, `exit` vs
+    `exit_group`, per-thread signal masks, `tgkill`, execve/fork from a threaded
+    process. `user/musl/pthreadtest` (linked against Alpine's real musl) passes.
 - [ ] **11b. Graphics** (after the network: X needs sockets too) — the boot loader picks a
   VESA graphics mode (UEFI GOP on the Pocket 4): a framebuffer, marked write-combining.
   A pixel console with big, scalable text; PS/2 mouse; `/dev/fb0`, `/dev/input/event*`,
   AF_UNIX sockets. Then Alpine's X server (fbdev), a small window manager, `xterm`.
-  Done when: `xterm` windows can be moved with the mouse. No chip-specific video driver.
+  Done when: `xterm` windows can be moved with the mouse.
+  Display drivers use Linux's DRM/KMS shape (decided 2026-10-03, `docs/DESIGN.md`):
+  `include/drm/` keeps Linux's header paths and names, and programs get `/dev/fb0`
+  through fbdev emulation, as on a modern Linux.
   - [x] PS/2 mouse driver (IRQ 12, IntelliMouse wheel); `make test` moves and clicks it
     through QEMU's monitor.
+  - [x] Console split: `drivers/vt.c` (VT100 parser + cell grid) and backends:
+    80x25 text (`vga.c`) or pixels (`drivers/video/fbcon.c`). `TIOCGWINSZ` follows the
+    screen; `SIGWINCH` on a change.
+  - [x] DRM core subset (`drivers/gpu/drm/drm_core.c`): modes with VESA timings,
+    connectors, the simple display pipe. Our own driver for the Bochs/QEMU std VGA
+    (`drivers/gpu/drm/tiny/bochs.c`, PCI 1234:1111, UTM's "VGA" display): any
+    standard mode up to 2560x1600, 1920x1200 at boot.
+  - [x] Framebuffer write-combining (PAT, `arch/i386/pat.c`) with 4 MiB pages.
+  - [x] Pixel console: the VGA BIOS's 8x16 font (copied by `stage2.asm`), 2x on big
+    screens (120x37 at 1920x1200), scrolling by panning.
+  - [x] `/dev/fb0` (29:0): Linux's fbdev ioctls and structs, `mmap` (device memory,
+    shared across `fork`), mode changes at run time, `KDSETMODE`. `make test` runs
+    `user/fbtest.c` and checks a QEMU screendump (`tools/check-screen.py`).
+  - [ ] VESA boot framebuffer for real hardware (Linux's `simpledrm` shape): `stage2.asm`
+    picks the mode, the same DRM core drives it.
+  - [ ] `/dev/input/event*`, AF_UNIX sockets, then the X server (fbdev driver).
 - [ ] **12. Real hardware** — boot from USB/CD on an old Pentium 4 / Pentium M machine.
 - [ ] **12b. GPD Pocket 4** (`docs/hardwareRequirements.md`) — `arch/x86_64`, a UEFI loader,
   ACPI, PCIe with MSI/MSI-X; then NVMe (its boot SSD, native driver) and xHCI; then the

@@ -12,6 +12,7 @@
  *   make bench   BENCH: runs the benchmarks, then switches QEMU off
  */
 #include <ata.h>
+#include <drm/drm_drv.h>
 #include <virtio_blk.h>
 #include <ahci.h>
 #include <nvme.h>
@@ -40,6 +41,7 @@
 #include <pci.h>
 #include <partition.h>
 #include <pmm.h>
+#include <random.h>
 #include <sched.h>
 #include <serial.h>
 #include <sysenter.h>
@@ -48,6 +50,7 @@
 #include <timer.h>
 #include <tty.h>
 #include <vga.h>
+#include <vt.h>
 #ifdef SELFTEST
 #include <selftest.h>
 #endif
@@ -58,28 +61,36 @@
 extern char _start[];       /* first byte of the kernel (entry.asm) */
 
 #if !defined(SELFTEST) && !defined(BENCH)
-/* Start /init from the initramfs as process 1, like Linux does, and wait
-   for it (main sleeps, so its system slots go to the programs). Returns
-   only if there is no /init. */
+/* Start process 1 and wait for it (main sleeps, so its system slots go to
+   the programs). Like Linux: /init first (the initramfs's: BusyBox), then
+   where a distribution's root file system keeps its init (the live disk:
+   /sbin/init is runit). Returns only if none of them exists. */
 static void run_init(void)
 {
-    static const char *const argv[] = { "/init", NULL };
+    static const char *const paths[] = {
+        "/init", "/sbin/init", "/etc/init", "/bin/init", "/bin/sh",
+    };
     static const char *const envp[] = {
         "HOME=/", "PATH=/bin:/sbin:/usr/bin:/usr/sbin", "TERM=linux", NULL,
     };
     struct inode *ino;
-    if (vfs_lookup("/init", &ino) < 0)
+    const char *path = NULL;
+    for (unsigned i = 0; i < sizeof paths / sizeof paths[0] && !path; i++)
+        if (vfs_lookup(paths[i], &ino) == 0)
+            path = paths[i];
+    if (!path)
         return;                         /* nothing to run: stay in the kernel */
-    struct process *p = proc_spawn("/init", argv, envp);
+    const char *const argv[] = { path, NULL };
+    struct process *p = proc_spawn(path, argv, envp);
     if (!p) {
-        kprintf("Could not start /init\n");
+        kprintf("Could not start %s\n", path);
         return;
     }
     proc_set_init(p);
     tty_set_foreground(p->pgid);        /* Ctrl-C reaches init's group */
     tty_attach_keyboard();              /* keys go to the terminal now */
     int status = proc_wait_kernel(p);
-    kprintf("\n/init exited (status %d). System halted.\n", status);
+    kprintf("\n%s exited (status %d). System halted.\n", path, status);
     serial_flush();
     for (;;)
         __asm__ volatile ("cli; hlt");
@@ -94,7 +105,7 @@ static void show_uptime(uint32_t secs)
     s[3] = '0' + h % 10;
     s[5] = '0' + m / 10;   s[6] = '0' + m % 10;
     s[8] = '0' + sec / 10; s[9] = '0' + sec % 10;
-    vga_write_at(80 - sizeof s + 1, 0, s, VGA_BLACK, VGA_LIGHT_GREY);
+    vt_write_at(vt_cols() - (int)sizeof s + 1, 0, s, VT_BLACK, VT_LIGHT_GREY);
 }
 
 /* Echo typed keys. Control characters are shown as ^C, ^D, ... */
@@ -189,10 +200,11 @@ void kernel_main(void)
     uint64_t boot_start = cycles_now();     /* for the boot-time benchmark */
 #endif
     serial_init();
-    vga_clear();
-    vga_set_color(VGA_LIGHT_GREEN, VGA_BLACK);
+    vga_text_init();        /* the console on the BIOS's 80x25 text screen */
+    vt_clear();
+    vt_set_color(VT_LIGHT_GREEN, VT_BLACK);
     kprintf("Hello world from MyOS!  (protected mode, own boot loader)\n");
-    vga_set_color(VGA_LIGHT_GREY, VGA_BLACK);
+    vt_set_color(VT_LIGHT_GREY, VT_BLACK);
 
     cpu_init();             /* what can this CPU do? (stops if too old) */
 
@@ -217,9 +229,12 @@ void kernel_main(void)
             pmm_usable_count() / 256, (void *)_start, (void *)KHEAP_START);
 
     time_init();            /* the date and time, from the CMOS clock */
+    random_init();          /* measure boot entropy, key the CSPRNG: before
+                               anything that needs an unguessable number */
     initrd_init();          /* the initramfs stage 2 loaded */
     thread_init();          /* kernel_main becomes thread 0, "main" */
     pci_init();             /* which PCI devices are fitted: the IDE controller, the NIC */
+    drm_init();             /* a display card: the console moves to pixels, /dev/fb0 */
     storage_init();         /* IDE disks and their partitions */
     net_init();             /* loopback, then the e1000 and IPv4 if the card is there */
 

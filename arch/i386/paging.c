@@ -184,6 +184,16 @@ int vmm_map(uint32_t va, uint32_t pa, uint32_t flags)
     return 0;
 }
 
+int vmm_map_big(uint32_t va, uint32_t pa, uint32_t flags)
+{
+    uint32_t *pde = &kernel_pd[PDE_INDEX(va)];
+    if (va < KERNEL_VBASE || ((va | pa) & (BIG_PAGE - 1)) || (*pde & PTE_PRESENT))
+        return -1;
+    *pde = pa | (flags & 0xFFF) | PTE_PRESENT | PTE_PS | global_bit;
+    invlpg(va);
+    return 0;
+}
+
 uint32_t vmm_unmap(uint32_t va)
 {
     uint32_t *pte = get_pte(va, 0, 0);

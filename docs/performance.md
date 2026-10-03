@@ -29,7 +29,7 @@ QEMU, instruction-count mode (lower is better):
 
 | benchmark                         | baseline | now    | change                     |
 |-----------------------------------|---------:|-------:|----------------------------|
-| boot: kernel ready, 64 MiB (µs)   |   11 608 |    763 | CPU work; 119 before BusyBox + bash (~330 initramfs entries, ~1.7 µs each); 9b: +36 finding disks, mounting /data |
+| boot: kernel ready, 64 MiB (µs)   |   11 608 |  1 111 | CPU work; 119 before BusyBox + bash (~330 initramfs entries, ~1.7 µs each); 9b: +36 finding disks, mounting /data; +18 for the CSPRNG's boot entropy (1 093 without it) |
 | boot: bash prompt, 64 MiB (µs)    |        — |  2 024 | CPU work. Was 6 907 (kernel + 6 144 for /init and bash). 9c-2 maps the files and faults pages in, so that part is 1 204 µs |
 | boot: kernel ready, 512 MiB (µs)  |        — |    181 | was 4 181 before the bitmap fix (23×) |
 | memcpy 4 KiB                      |   12 315 |  1 053 | 11.7× (`rep movsd`)        |
@@ -116,6 +116,33 @@ hardware. Three costs were invisible that way:
 Rule from this: a path's instruction count is only half the story. Port I/O, MMIO
 reads, cache flushes and serializing instructions must be counted separately and
 kept out of hot paths; real-hardware `rdtsc` numbers settle it.
+
+### What the CSPRNG cost (2026-10-03)
+
+Four network values that had to stop being guessable (`docs/security.md`) all needed one
+generator, so the question was what it costs.
+
+| path | before | after | note |
+|---|---:|---:|---|
+| boot: kernel ready, 64 MiB (µs) | 1 093 | 1 111 | +18 µs, measured by removing the `random_init()` call and re-running |
+| slot start jitter, worst (µs) | 4 | 4 | unchanged — the thing that matters most |
+| null syscall, `int 0x80` (cycles) | 130 | 130 | unchanged |
+| null syscall, `sysenter` (cycles) | 158 | 158 | unchanged |
+| kernel size (bytes) | 160 404 | 162 512 | +2 108 for ChaCha20, the generator and the rate limiter |
+
+**The boot number is the one QEMU lies about**, in exactly the way the section above warns.
+The entropy comes from timing 512 reads of port 0x80, and `-icount` charges one instruction
+for a port read that costs about a microsecond on a real Pentium 4. So expect nearer 0.5 ms
+on the target hardware rather than 18 µs — under 2% of a boot that already spends 27 ms
+waiting for disks, and it buys the key that every other secret in the stack hangs off. It is
+also the reason the sample count is 512 and not 5 000.
+
+Nothing else moved, by design. Every caller of the generator wants a few bytes once per
+connection or once per lookup, so a ChaCha20 block (20 rounds of 32-bit adds, xors and
+rotates, no tables, no SSE) never lands on a hot path. The two values that *are* per-packet
+were written to avoid it: the IP ID is a counter in a bucket chosen by one multiply and a
+shift, and the rate limiter's jitter draws 32 bits once and spends them eight at a time.
+Slot jitter staying at 4 µs is the number that proves none of it reached the scheduler.
 
 ### Network happy path: MyOS vs Linux (2026-10-03)
 
@@ -223,6 +250,39 @@ The same benchmark with less RAM (`MEM=20M`, `MEM=12M tools/diskbench.sh virtio
 myos`) checks that the cache gives memory back: at 20 MiB the numbers are within 3%
 (write 104 227); at 12 MiB an 8 MiB file no longer fits, so "warm" reads are partly
 misses (warm 64 KiB 25 717, 4 KiB 3 209) — and nothing runs out of memory.
+
+### Read-ahead that doesn't wait (2026-10-03, step 9d-3 part 1)
+
+`blockdev_submit` starts a disk request and returns; the page cache uses it to read
+the next read-ahead window while the program copies the current one (`fs/pcache.c`,
+P_RA / P_IO). `make test` shows it working: of the 71 pages of `numbers.txt` read in
+order, 68 arrive this way.
+
+**What QEMU can't show.** The point is that the disk and the CPU work at the same
+time. QEMU's "disk" is the Mac's RAM (~400–550 MB/s), so there is almost no waiting
+to hide. Its disk throttle (`BPS=` in `tools/diskbench.sh`) is a token bucket that
+saves up credit while the guest computes, so even the old synchronous code looks
+overlapped (both ~110 ms per 8 MiB at 60 MiB/s). `tools/diskbench.sh` with
+`ICOUNT=0` runs `user/streambench.c` on wall-clock time: no measurable difference
+in either direction (IDE 21–25 ms before vs 17–28 ms after, virtio 36–37 vs
+34–35 ms, 8 MiB read + checksum; host noise is larger than the change).
+
+**What it should do on the old PC** (estimate, not measured): reading 8 MiB at an
+old disk's ~60 MB/s is ~140 ms of disk time. A program that does ~4 instructions
+per byte (`cksum`) adds ~15 ms of CPU, so waiting for each window costs ~10%. A
+program like `gzip` (~50–100 instructions a byte) adds ~200–400 ms of CPU. Waiting
+for each window then costs the whole disk time on top: ~350–550 ms, instead of the
+larger of the two (~200–400 ms) when they overlap. That is up to ~40% less time.
+The real number needs the old PC.
+
+**What it costs** (instructions per call, `diskbench`, all four types): cold 64 KiB
+~27 600 → ~28 500 (+3%: building the requests, and a thread switch to the disk's
+worker); warm 64 KiB 18 144 → 18 293 (+1%, the "is this page still being read?"
+check on every hit); cold random 4 KiB ~4 200 → ~4 300. Writes unchanged.
+
+The IDE driver's short spin before sleeping (`POLL_FIRST`, for QEMU's slow wakeup)
+now happens only when no other thread could use the CPU; before, it would have
+spun in the worker while the program waited to copy.
 
 ### Cache sizing: why all free RAM, with numbers (2026-10-03)
 
@@ -353,3 +413,156 @@ cache misses and `rep movsd` speed on a P4. Real numbers need `rdtsc` on the tar
 - Lazy FPU switching — insecure (LazyFP, 2018).
 - User-space drivers cost extra context switches per I/O: decide per driver, keep the hottest
   in the kernel.
+
+## What the kernel-wide audit fixes cost (2026-10-03)
+
+None of this round was a speed change, but the rules say measure, so:
+
+| | recorded before | after |
+|---|---|---|
+| null syscall, `int 0x80` (cycles) | 130 | 136 |
+| null syscall, `sysenter` (cycles) | 158 | 162 |
+| thread switch (cycles) | 97 | 97 |
+| `open` + `close`, 2-part path (cycles) | 1 441 | 1 472 |
+| boot, CPU work (us) | 1 111 | 1 121 |
+
+**Read the syscall rows with care: they are not mine to claim or disown.**
+Another agent was changing `kernel/signal.c`, adding `kernel/futex.c` and
+touching the block layer in the same tree while this ran, and the syscall entry
+path runs the signal check. Nothing I changed is on the null-syscall path at
+all, so the +6 and +4 are either theirs or noise, and I have not separated
+them.
+
+What the fixes actually add, in places the benchmarks do not cover:
+
+- **Receive path:** `ip_source_ok` is four compares and a mask per arriving
+  packet, on a path that already does a header parse and a checksum. Below the
+  noise floor of anything measurable here.
+- **Directory walks:** `dirent_ok` adds one compare per entry (`name_len + 8`
+  against `rec_len`) to the three ext2 entry loops. `open + close` moved
+  1 441 → 1 472 cycles, +2%, which is the closest thing to a real reading of
+  it — though that path also goes through the block layer the other agent was
+  editing.
+- **Pipe, TCP and socket reads and writes:** no added work. The commit of
+  `head`/`tail`/`len` moved from after the copy to before it, and the TCP
+  rings' `min` now has one more argument. The rollback on `-EFAULT` is on an
+  error path.
+- **ext2 mount:** six more compares, once per mount.
+- **`rt_sigreturn`:** `gdt_user_seg_ok` is two loads and three mask tests, per
+  signal return rather than per syscall.
+
+The numbers that matter most for this project are unchanged: thread switch 97
+cycles, and the slot scheduler still places every task in its own slot.
+
+
+## Threads: the signal check went to one word (2026-10-03)
+
+Threads (`clone(CLONE_THREAD)`, `futex`) moved the signal mask and a pending
+set onto each thread. The first version made the check on every return to user
+mode read both the thread's and the process's 64-bit pending sets — four
+loads instead of two. That is the +6 / +4 on the null syscall the section
+above saw while this was in progress. The fix is Linux's `TIF_SIGPENDING`: one
+32-bit `sig_check` word per thread, set by whoever makes a signal pending and
+recomputed by `signal_check()`. It is one load and no pointer chase to the
+process, which is cheaper than before threads existed.
+
+`make bench` (QEMU, cycles; "before" is the tree just before threads):
+
+| | before threads | threads, two pending sets | threads, `sig_check` |
+|---|---|---|---|
+| null syscall, `int 0x80` | 130 | 136 | **127** |
+| null syscall, `sysenter` | 158 | 162 | **155** |
+| null syscall from musl (netbench `getpid`) | 169 | 173 | **166** |
+| thread switch | 97 | 97 | 97 |
+| exec + exit (`true`) | 34 971 | 35 059 | 35 052 |
+| fork + exit + wait | 51 575 | 51 677 | 51 645 |
+| fork + exec + exit + wait | 85 655 | 85 782 | 85 720 |
+
+The fork/exec rows are +0.1–0.2%: the thread list bookkeeping and a few more
+fields to reset per thread, at noise level.
+
+Costs of the new paths, by construction (no benchmark yet):
+- `futex` wait/wake: a hash (64 buckets keyed by address space + address),
+  then a walk of that bucket only. Waking one waiter takes the *oldest*
+  (fairness), which walks the whole bucket — fine while buckets hold a
+  handful of sleepers.
+- `pthread_create` is a `thread_fork` (an 8 KiB kernel stack and a register
+  frame copy); no address-space work at all.
+- `tkill`/`tgkill` scan the 64-entry thread table — not a hot path.
+
+## The pixel console and `/dev/fb0` (2026-10-03, step 11b)
+
+QEMU's std VGA at 1920x1200x32, console 120x37 with the 8x16 font drawn 2x. All numbers
+are `make bench` instruction counts; "text" is the same kernel on `-vga cirrus`, where
+no driver binds and the 80x25 text screen stays.
+
+| | text (80x25) | fbcon v1 | glyph unrolled per scale | + skip blank cells on a fresh screen |
+|---|---:|---:|---:|---:|
+| boot: kernel ready (µs) | 1 230 | 32 779 | 9 471 | **3 313** |
+| console: one line + scroll, average | 21 565 | 2 179 802 | 649 569 | 651 138 |
+| console: one line + scroll, worst | — | 25 721 168 | 6 938 862 | 6 940 431 |
+| fbcon full redraw (120x37) | — | 25 042 183 | 6 754 091 | 6 763 341 |
+
+Slot start jitter (worst) stayed at 234–284 µs in all four runs: the boot console isn't
+drawn inside the measured window.
+
+- **v1** drew each glyph pixel by pixel with a loop over the scale: ~25 instructions per
+  pixel written. **Unrolling** (`#pragma GCC unroll`, one copy of the glyph routine per
+  scale 1-4, chosen by a `switch` once per cell) brings it to ~7 per pixel — close to
+  the store itself. fbcon is 4.4 KiB of code.
+- **The fresh-screen skip:** QEMU clears video memory on a mode set, so the first
+  draw after it needn't write blank black cells. That's the boot console's whole
+  screen: kernel ready went from 9.5 to 3.3 ms of CPU.
+- **The average scroll** is the new line's 120 cells; scrolling itself is one
+  register write (Y panning). **The worst** is when panning reaches the end of video
+  memory (every ~30 scrolls at 16 MiB): the whole screen is redrawn at the top, ~9 MiB of
+  writes. On a Pentium 4 over PCI/AGP that is a few ms with interrupts off — listed in
+  `docs/gaps.md`.
+- **Write-combining** (PAT entry 1, 4 MiB pages for the 16 MiB of video memory): a 1 MiB
+  framebuffer write is 655 449 instructions WC and 655 448 uncached. QEMU can't show
+  the difference; on real hardware uncached video memory takes one bus cycle per 4-byte
+  store, WC bursts 32-64 bytes — Linux measured 5-10× for framebuffer writes when it
+  switched. Confirm on the target machine (step 12).
+- Unchanged: syscalls, context switches, exec/fork (no hot path touched; the mmap path
+  checks one more flag only for device files).
+
+## Pre-faulting user buffers (2026-10-03)
+
+`fault_in_user()` touches one byte of every page of a user range before a syscall
+looks at any shared state, so the `copy_to_user` that follows cannot fault and
+therefore cannot sleep. The reason is in `docs/security.md`: a sleeping copy let two
+processes act on one ring-buffer snapshot, which was seven real bugs. This is the
+cost of closing the common case.
+
+Measured on a snapshot of the tree with nothing else running (a second QEMU on the
+same machine moves these numbers by more than the effect does), the same build twice
+each way:
+
+| | without | with | change |
+|---|---|---|---|
+| `lseek + read 4 KiB` | 1506 | 1506 | — |
+| `lseek + read 4 KiB` | **1506** | **1540** | **+34 cycles, +2.3%** |
+| `null syscall, int 0x80` | 127 | 127 | none |
+| `null syscall, sysenter` | 155 | 155 | none |
+| `open + close`, `statx`, `fork + exit + wait` | unchanged | unchanged | none |
+
+Both runs each way gave the identical figure, so the 34 cycles is the effect and not
+noise. It buys one page probe: the range check, the call, and one `or byte [addr], 0`.
+
+Where that lands against the rules:
+
+- **Proportional to the request, not to the transfer.** A 4 KiB read probes one page;
+  a 256 KiB read probes 64, which is a few hundred cycles against roughly 64 000 spent
+  copying — under half a percent. The bad case is the opposite shape: a caller that
+  offers a large buffer and receives little, e.g. `read(fd, buf, 65536)` on a pipe
+  holding ten bytes, which probes 16 pages for ten bytes. Bounded, but wasteful.
+- **`RW_MAX` is what bounds it.** It moved from four separate `#define`s in the
+  filesystems into `include/vfs.h` and is now applied in `rw()`, so the clamp happens
+  once, before the probe, and no caller can choose how many pages get touched. 64 is
+  the worst case for any `read` or `write`; the socket calls use the smaller bound the
+  protocol gives (`tcp_buf_max()`, or the datagram maximum) rather than `RW_MAX`,
+  precisely so they do not probe pages the call could never reach.
+- **It breaks copy-on-write pages eagerly.** A `read()` into a buffer a forked child
+  still shares will unshare every page of the request, including pages the short read
+  never fills. Not measured; it needs a benchmark that forks and then reads into a
+  large buffer, which does not exist yet.

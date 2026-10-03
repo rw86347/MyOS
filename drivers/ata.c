@@ -186,6 +186,10 @@ static void irq15(struct regs *r) { (void)r; channel_irq(&channels[1]); }
  * and a sleep/wake costs far more there (QEMU takes ~2.5 ms to wake a
  * halted virtual CPU). Only then sleep until the drive's interrupt.
  *
+ * The spin is only worth it if the CPU would otherwise idle: when another
+ * thread is ready (a program copying the last read-ahead window while this
+ * one is read), it gets the CPU at once and we wait for the interrupt.
+ *
  * The interrupt is just a nudge: after waking we look at the drive again.
  * So an interrupt left over from a block we already took by polling (it
  * arrives later) is harmless — the drive is still busy, and we wait on.
@@ -198,7 +202,8 @@ static int wait_drive(struct ata_channel *c, uint32_t timeout_ms)
         return wait_not_busy(c);
     uint32_t deadline = timer_ms() + timeout_ms;
     for (;;) {
-        for (int i = 0; i < POLL_FIRST; i++)
+        int spins = thread_next_ready() ? 1 : POLL_FIRST;
+        for (int i = 0; i < spins; i++)
             if (!(inb(c->ctrl) & ST_BSY))
                 return inb(c->base + REG_STATUS);   /* (and clear the IRQ) */
         c->irq_seen = 0;

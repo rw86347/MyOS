@@ -17,6 +17,7 @@
 #define ENOMEM   12     /* out of memory */
 #define EACCES   13     /* permission denied */
 #define EFAULT   14     /* bad address */
+#define ENOTBLK  15     /* mount needs a block device */
 #define EBUSY    16     /* in use ("/" can't be removed) */
 #define ENOTDIR  20     /* a path component is not a directory */
 #define EISDIR   21     /* is a directory */
@@ -24,6 +25,7 @@
 #define EEXIST   17     /* file exists */
 #define EXDEV    18     /* cross-device link */
 #define EINVAL   22     /* invalid argument */
+#define ENFILE   23     /* too many open files in the system */
 #define EMFILE   24     /* too many open files */
 #define ENOTTY   25     /* not a terminal */
 #define EFBIG    27     /* file too large */

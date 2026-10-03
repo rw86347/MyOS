@@ -16,7 +16,8 @@
  *                             page by page; its page tables exist from boot
  *                             so every process's page directory shares them
  *   0xF4000000 - 0xF7FFFFFF   device registers, uncached (e1000, then pci_map_mmio)
- *   0xF8000000 - 0xFFFFFFFF   unused for now
+ *   0xF8000000 - 0xFFFFFFFF   framebuffers, write-combined (ioremap_wc, pat.c),
+ *                             4 MiB pages where the memory allows
  *
  * The kernel half is identical in every process, so a system call or
  * interrupt can run kernel code without switching page tables.

@@ -8,6 +8,7 @@
 #include <mm.h>
 #include <pmm.h>
 #include <proc.h>
+#include <random.h>
 #include <signal.h>
 #include <rtc.h>
 #include <string.h>
@@ -23,28 +24,261 @@
 /* struct utsname: six fields of 65 bytes. We report "Linux" as the system
    name, because programs (and C libraries) check it to decide what the
    kernel can do — and MyOS speaks Linux's system call language. The
-   release string says what it really is. */
+   release string says what it really is. The second field, the host's
+   name, is set by sethostname() (from /etc/hostname at boot). */
+static char uts[6][65] = {
+    "Linux", "myos", "6.1.0-MyOS", "#1 MyOS", "i686", "(none)",
+};
+
 SYSCALL_DEF(sys_uname)
 {
-    static const char fields[6][65] = {
-        "Linux", "myos", "6.1.0-MyOS", "#1 MyOS", "i686", "(none)",
-    };
-    return copy_to_user((void *)a1, fields, sizeof fields);
+    return copy_to_user((void *)a1, uts, sizeof uts);
 }
 
-/* --- users and groups: everything runs as root (uid 0) -------------------------- */
-
-SYSCALL_DEF(sys_getid)    { return 0; }
-SYSCALL_DEF(sys_setid)    { return a1 == 0 || a1 == 0xFFFFFFFF ? 0 : -EPERM; }
-SYSCALL_DEF(sys_getgroups) { return 0; }        /* no supplementary groups */
-
-/* getresuid(&r, &e, &s) / getresgid: all three are 0. */
-SYSCALL_DEF(sys_getresid)
+/* sethostname(name, len): name need not end in a 0 byte. */
+SYSCALL_DEF(sys_sethostname)
 {
-    uint32_t zero = 0;
-    if (copy_to_user((void *)a1, &zero, 4) < 0 || copy_to_user((void *)a2, &zero, 4) < 0 ||
-        copy_to_user((void *)a3, &zero, 4) < 0)
+    char name[65];
+    if (a2 > 64)
+        return -EINVAL;
+    if (copy_from_user(name, (const void *)a1, a2) < 0)
         return -EFAULT;
+    memset(name + a2, 0, sizeof name - a2);
+    memcpy(uts[1], name, sizeof name);
+    return 0;
+}
+
+/* --- users and groups (cred.h) -------------------------------------------------- */
+
+/*
+ * The rules are Linux's. Root (euid 0) may set any id. Anyone else may only
+ * move between the ids it already has (real, effective, saved): that's how
+ * a setuid program drops its privilege and, through the saved id, takes it
+ * back. -1 means "leave this one as it is". The file-access id follows the
+ * effective one.
+ */
+#define KEEP 0xFFFFFFFFu
+
+static struct cred *cred(void) { return &proc_current()->cred; }
+static int is_root(void) { return cred()->euid == 0; }
+
+static int one_of(uint32_t x, uint32_t a, uint32_t b, uint32_t c)
+{
+    return x == a || x == b || x == c;
+}
+
+SYSCALL_DEF(sys_getuid)  { return cred()->uid; }
+SYSCALL_DEF(sys_geteuid) { return cred()->euid; }
+SYSCALL_DEF(sys_getgid)  { return cred()->gid; }
+SYSCALL_DEF(sys_getegid) { return cred()->egid; }
+
+/* setresuid(r, e, s) and setresgid: the general one. */
+static int32_t set_res(uint32_t *r, uint32_t *e, uint32_t *s, uint32_t *fs,
+                       uint32_t nr, uint32_t ne, uint32_t ns)
+{
+    if (!is_root() && ((nr != KEEP && !one_of(nr, *r, *e, *s)) ||
+                       (ne != KEEP && !one_of(ne, *r, *e, *s)) ||
+                       (ns != KEEP && !one_of(ns, *r, *e, *s))))
+        return -EPERM;
+    if (nr != KEEP) *r = nr;
+    if (ne != KEEP) *e = ne;
+    if (ns != KEEP) *s = ns;
+    *fs = *e;
+    return 0;
+}
+
+SYSCALL_DEF(sys_setresuid)
+{
+    struct cred *c = cred();
+    return set_res(&c->uid, &c->euid, &c->suid, &c->fsuid, a1, a2, a3);
+}
+
+SYSCALL_DEF(sys_setresgid)
+{
+    struct cred *c = cred();
+    return set_res(&c->gid, &c->egid, &c->sgid, &c->fsgid, a1, a2, a3);
+}
+
+/* setreuid(r, e) and setregid: the real id may become the effective one,
+   the effective any of the three. Changing the real id, or the effective
+   to something other than the real, also sets the saved id. */
+static int32_t set_re(uint32_t *r, uint32_t *e, uint32_t *s, uint32_t *fs,
+                      uint32_t nr, uint32_t ne)
+{
+    if (!is_root() && ((nr != KEEP && nr != *r && nr != *e) ||
+                       (ne != KEEP && !one_of(ne, *r, *e, *s))))
+        return -EPERM;
+    uint32_t old_r = *r;
+    if (nr != KEEP) *r = nr;
+    if (ne != KEEP) *e = ne;
+    if (nr != KEEP || (ne != KEEP && ne != old_r))
+        *s = *e;
+    *fs = *e;
+    return 0;
+}
+
+SYSCALL_DEF(sys_setreuid)
+{
+    struct cred *c = cred();
+    return set_re(&c->uid, &c->euid, &c->suid, &c->fsuid, a1, a2);
+}
+
+SYSCALL_DEF(sys_setregid)
+{
+    struct cred *c = cred();
+    return set_re(&c->gid, &c->egid, &c->sgid, &c->fsgid, a1, a2);
+}
+
+/* setuid(id) and setgid: root sets all of them (a login dropping to the
+   user for good), anyone else only the effective one. */
+static int32_t set_one(uint32_t *r, uint32_t *e, uint32_t *s, uint32_t *fs, uint32_t id)
+{
+    if (is_root())
+        *r = *s = id;
+    else if (!one_of(id, *r, *e, *s))
+        return -EPERM;
+    *e = *fs = id;
+    return 0;
+}
+
+SYSCALL_DEF(sys_setuid)
+{
+    struct cred *c = cred();
+    return set_one(&c->uid, &c->euid, &c->suid, &c->fsuid, a1);
+}
+
+SYSCALL_DEF(sys_setgid)
+{
+    struct cred *c = cred();
+    return set_one(&c->gid, &c->egid, &c->sgid, &c->fsgid, a1);
+}
+
+/* setfsuid(id) / setfsgid: returns the old one; fails silently. */
+SYSCALL_DEF(sys_setfsuid)
+{
+    struct cred *c = cred();
+    uint32_t old = c->fsuid;
+    if (is_root() || one_of(a1, c->uid, c->euid, c->suid))
+        c->fsuid = a1;
+    return old;
+}
+
+SYSCALL_DEF(sys_setfsgid)
+{
+    struct cred *c = cred();
+    uint32_t old = c->fsgid;
+    if (is_root() || one_of(a1, c->gid, c->egid, c->sgid))
+        c->fsgid = a1;
+    return old;
+}
+
+/* getresuid(&r, &e, &s) / getresgid */
+static int32_t get_res(uint32_t r, uint32_t e, uint32_t s, uint32_t ur, uint32_t ue, uint32_t us)
+{
+    if (copy_to_user((void *)ur, &r, 4) < 0 || copy_to_user((void *)ue, &e, 4) < 0 ||
+        copy_to_user((void *)us, &s, 4) < 0)
+        return -EFAULT;
+    return 0;
+}
+
+SYSCALL_DEF(sys_getresuid)
+{
+    struct cred *c = cred();
+    return get_res(c->uid, c->euid, c->suid, a1, a2, a3);
+}
+
+SYSCALL_DEF(sys_getresgid)
+{
+    struct cred *c = cred();
+    return get_res(c->gid, c->egid, c->sgid, a1, a2, a3);
+}
+
+/* getpriority(which, who) / setpriority(which, who, nice): "nice" values,
+   per process. which: 0 a process (who 0: me), 1 a process group, 2 a
+   user's processes. Only root may make one nicer than it is (lower);
+   anyone may set their own processes' higher. getpriority returns 20 - nice
+   (1..40), so the C library can tell it from an error. */
+#define PRIO_PROCESS 0
+#define PRIO_PGRP    1
+#define PRIO_USER    2
+
+static int prio_match(struct process *p, uint32_t which, uint32_t who)
+{
+    struct process *me = proc_current();
+    if (p->state != PROC_ALIVE)
+        return 0;
+    switch (which) {
+    case PRIO_PROCESS: return p->pid == (int)(who ? who : (uint32_t)me->pid);
+    case PRIO_PGRP:    return p->pgid == (int)(who ? who : (uint32_t)me->pgid);
+    case PRIO_USER:    return p->cred.uid == (who ? who : me->cred.uid);
+    }
+    return 0;
+}
+
+SYSCALL_DEF(sys_getpriority)
+{
+    if (a1 > PRIO_USER)
+        return -EINVAL;
+    int best = 21, found = 0;           /* the most favoured of them */
+    for (int i = 0; i < PROC_MAX; i++) {
+        struct process *p = proc_at(i);
+        if (prio_match(p, a1, a2)) {
+            found = 1;
+            if (p->nice < best)
+                best = p->nice;
+        }
+    }
+    return found ? 20 - best : -ESRCH;
+}
+
+SYSCALL_DEF(sys_setpriority)
+{
+    if (a1 > PRIO_USER)
+        return -EINVAL;
+    int nice = (int32_t)a3 < -20 ? -20 : (int32_t)a3 > 19 ? 19 : (int32_t)a3;
+    struct cred *me = cred();
+    int found = 0, err = 0;
+    for (int i = 0; i < PROC_MAX; i++) {
+        struct process *p = proc_at(i);
+        if (!prio_match(p, a1, a2))
+            continue;
+        found = 1;
+        if (!is_root() && me->euid != p->cred.uid && me->euid != p->cred.euid)
+            err = -EPERM;               /* someone else's process */
+        else if (!is_root() && nice < p->nice)
+            err = -EACCES;              /* only root makes it more favoured */
+        else
+            p->nice = nice;
+    }
+    return found ? err : -ESRCH;
+}
+
+/* getgroups(size, list): size 0 asks how many. */
+SYSCALL_DEF(sys_getgroups)
+{
+    struct cred *c = cred();
+    if (a1 == 0)
+        return c->ngroups;
+    if (a1 < c->ngroups)
+        return -EINVAL;
+    if (copy_to_user((void *)a2, c->groups, c->ngroups * 4) < 0)
+        return -EFAULT;
+    return c->ngroups;
+}
+
+/* setgroups(size, list): root only (login and su call it). */
+SYSCALL_DEF(sys_setgroups)
+{
+    uint32_t groups[NGROUPS];
+    if (!is_root())
+        return -EPERM;
+    if (a1 > NGROUPS)
+        return -EINVAL;
+    if (copy_from_user(groups, (const void *)a2, a1 * 4) < 0)
+        return -EFAULT;
+    struct cred *c = cred();
+    memcpy(c->groups, groups, a1 * 4);
+    c->ngroups = a1;
     return 0;
 }
 
@@ -258,17 +492,39 @@ SYSCALL_DEF(sys_sysinfo)
     return copy_to_user((void *)a1, &si, sizeof si);
 }
 
-/* getrandom(buf, len, flags): not cryptographic — there's no entropy
-   source yet — but different every call (cycle counter + xorshift). */
+/* getrandom(buf, len, flags): ChaCha20, see kernel/random.c. Copied out in
+   chunks so a huge length cannot hold the CPU in one syscall, and the chunk
+   is wiped afterwards so the next caller cannot be handed it from the stack
+   if the copy faults halfway. */
+#define GRND_NONBLOCK 0x0001
+#define GRND_RANDOM   0x0002
+#define GRND_INSECURE 0x0004
+
 SYSCALL_DEF(sys_getrandom)
 {
-    static uint64_t s;
-    s ^= cycles_now();
+    if (a3 & ~(GRND_NONBLOCK | GRND_RANDOM | GRND_INSECURE))
+        return -EINVAL;
+    if ((a3 & GRND_RANDOM) && (a3 & GRND_INSECURE))
+        return -EINVAL;             /* contradictory, as Linux says */
+    /* The flags otherwise change nothing: there is one source, it is always
+       ready, and it never blocks, so GRND_NONBLOCK has nothing to not-wait
+       for and GRND_INSECURE has nothing weaker to offer. */
+    uint8_t buf[64];
     uint32_t done = 0;
     while (done < a2) {
-        s ^= s << 13; s ^= s >> 7; s ^= s << 17;
-        uint32_t n = a2 - done < 8 ? a2 - done : 8;
-        if (copy_to_user((uint8_t *)a1 + done, &s, n) < 0)
+        /* A caller may ask for a gigabyte, and a syscall that works through it
+           in one go would hold the CPU for millions of ChaCha20 blocks and
+           blow its scheduler slot. So this is interruptible and returns what
+           it managed, which is what getrandom() promises. Checked a page at a
+           time, as Linux does; requests of 256 bytes or less — every real one —
+           finish in one pass and cannot come back short. */
+        if (done && !(done % 4096) && signal_pending())
+            return (int32_t)done;
+        uint32_t n = a2 - done < sizeof buf ? a2 - done : sizeof buf;
+        random_bytes(buf, n);
+        int rc = copy_to_user((uint8_t *)a1 + done, buf, n);
+        memset(buf, 0, n);          /* do not leave it on the kernel stack */
+        if (rc < 0)
             return done ? (int32_t)done : -EFAULT;
         done += n;
     }
@@ -323,8 +579,11 @@ SYSCALL_DEF(sys_get_thread_area)
     return copy_to_user((void *)a1, d, sizeof d);
 }
 
-/* set_tid_address(int *tidptr): (for threads; we just answer the tid) */
+/* set_tid_address(int *tidptr): when this thread ends, write 0 to *tidptr
+   and futex-wake it (how pthread_join learns a thread is gone). */
 SYSCALL_DEF(sys_set_tid_address)
 {
-    return proc_current()->pid;
+    struct thread *t = thread_current();
+    t->clear_tid = a1;
+    return t->tid;
 }

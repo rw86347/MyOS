@@ -26,9 +26,6 @@
 #include <uaccess.h>
 #include <vfs.h>
 
-/* 256 KiB is about 0.1 ms of copying on a Pentium 4. */
-#define RW_MAX (256 * 1024)
-
 /* Frames holding file contents. At most half of RAM, like Linux's tmpfs:
    a runaway `yes > file` gets "No space left on device" instead of
    starving every program of memory. */

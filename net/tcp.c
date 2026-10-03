@@ -28,6 +28,7 @@
 #include <ipv4.h>
 #include <kheap.h>
 #include <netdevice.h>
+#include <random.h>
 #include <signal.h>
 #include <stddef.h>
 #include <string.h>
@@ -82,7 +83,6 @@ struct tcp_conn {
 };
 
 static struct tcp_conn *conns[TCP_MAX];
-static uint16_t next_port = 49152;
 static uint8_t seg[24 + MSS_MAX];   /* the one segment being built */
 
 static uint32_t rd32(const uint8_t *p)
@@ -201,9 +201,14 @@ static void output(struct tcp_conn *c)
 }
 
 /* Answer a segment for no connection of ours. */
+/* The reset for a segment that belongs to no connection of ours. Sent to
+   whoever the source address claims to be, so it is a reflector like an echo
+   reply, and it gets the same per-peer budget. */
 static void send_rst(uint32_t to, uint16_t lport, uint16_t rport,
                      uint32_t seq, uint32_t ack, uint8_t flags)
 {
+    if (!ip_rate_ok(to))
+        return;
     memset(seg, 0, 20);
     wr16(seg, lport);
     wr16(seg + 2, rport);
@@ -238,6 +243,30 @@ static int port_used(uint16_t p)
         if (conns[i] && conns[i]->lport == p)
             return 1;
     return 0;
+}
+
+/*
+ * The initial sequence number, RFC 6528: ISN = M + F(four-tuple, secret).
+ *
+ * M is a timer ticking every 4 microseconds, so numbers still climb with time
+ * the way a peer holding a stale connection from a previous incarnation of
+ * this four-tuple expects. F is a keyed hash, so the offset is different and
+ * unrelated for every four-tuple and an attacker who sees one connection's
+ * sequence number learns nothing about the next.
+ *
+ * What this replaces was `timer_ms() * 64000 + 0x10000000` — the same number
+ * for every connection at a given millisecond, derived from a clock the
+ * attacker can read by other means. Knowing the sequence space is what lets
+ * an off-path attacker inject data into or reset a connection blind, so this
+ * was the RFC 6528 attack with nothing left to work out.
+ */
+static uint32_t isn(uint16_t lport, uint32_t remote, uint16_t rport)
+{
+    struct { uint32_t l, r; uint16_t lp, rp; } t = { IPV4_ADDR, remote, lport, rport };
+    /* No padding, or the padding bytes would be unspecified and the same
+       four-tuple could hash two ways — which RFC 6528 relies on not happening. */
+    _Static_assert(sizeof t == 12, "the four-tuple must pack");
+    return random_keyed(&t, sizeof t) + timer_ms() * 250u;   /* 250 per ms = 4 us */
 }
 
 struct tcp_conn *tcp_open(void)
@@ -281,20 +310,12 @@ int tcp_connect(struct tcp_conn *c, uint32_t dst, uint16_t port, int nonblock)
         return -EISCONN;
     if (!dst || !port)
         return -EINVAL;
-    for (int tries = 0; tries < 16384; tries++) {
-        uint16_t p = next_port++;
-        if (next_port == 0)
-            next_port = 49152;
-        if (!port_used(p)) {
-            c->lport = p;
-            break;
-        }
-    }
+    c->lport = ip_ephemeral_port(port_used);
     if (!c->lport)
         return -EADDRNOTAVAIL;
     c->remote = dst;
     c->rport = port;
-    uint32_t iss = timer_ms() * 64000u + 0x10000000u;   /* guessable: docs/gaps.md */
+    uint32_t iss = isn(c->lport, dst, port);
     c->snd_una = iss;
     c->snd_nxt = iss + 1;
     c->state = ST_SYN_SENT;
@@ -316,6 +337,11 @@ int tcp_connect(struct tcp_conn *c, uint32_t dst, uint16_t port, int nonblock)
         return e ? e : -ECONNREFUSED;
     }
     return 0;
+}
+
+uint32_t tcp_buf_max(void)
+{
+    return TXBUF > RXBUF ? TXBUF : RXBUF;
 }
 
 int tcp_write(struct tcp_conn *c, const void *src, uint32_t len, int user, int nonblock)
@@ -342,18 +368,34 @@ int tcp_write(struct tcp_conn *c, const void *src, uint32_t len, int user, int n
         if (rc < 0)
             return rc;
     }
-    uint32_t n = TXBUF - c->tx_len < len ? TXBUF - c->tx_len : len;
+    /* room, not TXBUF - tx_len: copy_from_user can sleep (it may demand-page
+       an mmap'd file), so a second writer on the same socket -- a fork shares
+       it -- can run between the length being read here and being committed
+       below. If tx_len has overshot TXBUF, the subtraction would wrap to
+       about four billion, stop clamping n, and run the copy off the end of a
+       16 KiB array inside the connection with as much data as the caller
+       liked. Written this way the raced case copies nothing instead. */
+    uint32_t room = c->tx_len < TXBUF ? TXBUF - c->tx_len : 0;
+    uint32_t n = room < len ? room : len;
     uint32_t at = (c->tx_head + c->tx_len) % TXBUF;
     uint32_t first = TXBUF - at < n ? TXBUF - at : n;
+    c->tx_len += n;                 /* claim it before the copy can sleep */
+    uint32_t claimed = c->tx_len;
     if (user) {
         if (copy_from_user(c->tx + at, src, first) < 0 ||
-            copy_from_user(c->tx, (const uint8_t *)src + first, n - first) < 0)
+            copy_from_user(c->tx, (const uint8_t *)src + first, n - first) < 0) {
+            if (c->tx_len == claimed)
+                c->tx_len -= n;     /* nobody else claimed after us: give it back */
+            else {
+                memset(c->tx + at, 0, first);    /* do not put stale kernel */
+                memset(c->tx, 0, n - first);     /* bytes on the wire */
+            }
             return -EFAULT;
+        }
     } else {
         memcpy(c->tx + at, src, first);
         memcpy(c->tx, (const uint8_t *)src + first, n - first);
     }
-    c->tx_len += n;
     output(c);
     return (int)n;
 }
@@ -375,21 +417,30 @@ int tcp_read(struct tcp_conn *c, void *dst, uint32_t len, int user, int nonblock
         if (rc < 0)
             return rc;
     }
-    uint32_t n = c->rx_len < len ? c->rx_len : len;
+    /* Clamped to RXBUF as well as to rx_len, and consumed before the copy:
+       copying can sleep, so a second reader on the same socket can run in
+       between, and two readers that both subtract an rx_len they both read
+       drive it below zero. The clamp keeps that from turning into a read off
+       the end of the connection's 16 KiB buffer, and consuming first keeps
+       it from happening. A peek cannot consume, so it relies on the clamp. */
+    uint32_t avail = c->rx_len < RXBUF ? c->rx_len : RXBUF;
+    uint32_t n = avail < len ? avail : len;
     uint32_t first = RXBUF - c->rx_head < n ? RXBUF - c->rx_head : n;
+    uint32_t before = rx_window(c), head = c->rx_head;
+    if (!peek) {
+        c->rx_head = (c->rx_head + n) % RXBUF;
+        c->rx_len -= n;
+    }
     if (user) {
-        if (copy_to_user(dst, c->rx + c->rx_head, first) < 0 ||
+        if (copy_to_user(dst, c->rx + head, first) < 0 ||
             copy_to_user((uint8_t *)dst + first, c->rx, n - first) < 0)
             return -EFAULT;
     } else {
-        memcpy(dst, c->rx + c->rx_head, first);
+        memcpy(dst, c->rx + head, first);
         memcpy((uint8_t *)dst + first, c->rx, n - first);
     }
     if (peek)
         return (int)n;
-    uint32_t before = rx_window(c);
-    c->rx_head = (c->rx_head + n) % RXBUF;
-    c->rx_len -= n;
     if (before < RXBUF / 2 && rx_window(c) >= RXBUF / 2 && c->state != ST_CLOSED)
         send_ack(c);                /* window update: it had nearly closed */
     return (int)n;

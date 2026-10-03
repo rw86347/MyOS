@@ -17,12 +17,15 @@
 #include <io.h>
 #include <kheap.h>
 #include <kprintf.h>
+#include <linux/fb.h>
+#include <linux/io.h>
 #include <sched.h>
 #include <serial.h>
 #include <string.h>
 #include <thread.h>
 #include <proc.h>
 #include <tty.h>
+#include <vt.h>
 
 static void report(const char *what, uint64_t total, uint32_t n)
 {
@@ -45,6 +48,68 @@ static void bench_memory(void)
     for (int i = 0; i < N; i++)
         memset(buf_a, i, sizeof buf_a);
     report("memset 4 KiB", cycles_now() - t, N);
+}
+
+/* --- the screen (step 11b) ------------------------------------------------
+   A console line with a scroll (fbcon pans; every ~30th scroll it runs out
+   of video memory and redraws the whole screen — the worst case), a full
+   redraw, and 1 MiB of framebuffer writes write-combined against uncached.
+   QEMU doesn't model caches, so the last two only differ on real hardware. */
+static void fill_words(volatile uint32_t *p, uint32_t n, uint32_t v)
+{
+    for (uint32_t i = 0; i < n; i++)
+        p[i] = v;
+}
+
+static void bench_screen(void)
+{
+    struct fb_info *fb = fb_get(0);
+    if (!vt_cols())
+        return;
+    enum { N = 100, MIB = 1 << 20 };
+    static char line[VT_MAX_COLS + 1];
+    int cols = vt_cols();
+    memset(line, 'x', (size_t)cols);
+    line[cols] = '\n';
+
+    uint64_t total = 0, worst = 0;
+    uint32_t flags = irq_save();
+    for (int i = 0; i < N; i++) {
+        uint64_t t = cycles_now();
+        vt_write(line, (size_t)cols + 1);
+        uint64_t d = cycles_now() - t;
+        total += d;
+        if (d > worst)
+            worst = d;
+    }
+    irq_restore(flags);
+    report(fb ? "console line+scroll, fbcon" : "console line+scroll, text", total, N);
+    kprintf("  %-28s %8lu cycles\n", "  ... worst", (uint32_t)worst);
+    if (!fb)
+        return;
+
+    uint32_t off = fb->fix.smem_len - MIB;      /* below what's shown, mostly */
+    volatile uint32_t *wc = (volatile uint32_t *)(fb->screen_base + off);
+    volatile uint32_t *uc = ioremap((uint32_t)fb->fix.smem_start + off, MIB);
+    uint64_t t = cycles_now();
+    for (int i = 0; i < 4; i++)
+        fill_words(wc, MIB / 4, (uint32_t)i);
+    report("fb write 1 MiB, WC", cycles_now() - t, 4);
+    if (uc) {
+        t = cycles_now();
+        for (int i = 0; i < 4; i++)
+            fill_words(uc, MIB / 4, (uint32_t)i);
+        report("fb write 1 MiB, uncached", cycles_now() - t, 4);
+    }
+
+    flags = irq_save();
+    t = cycles_now();
+    for (int i = 0; i < 4; i++) {
+        vt_set_graphics(1);
+        vt_set_graphics(0);                     /* redraws every cell */
+    }
+    irq_restore(flags);
+    report("fbcon full redraw", cycles_now() - t, 4);
 }
 
 /* --- kmalloc ------------------------------------------------------------- */
@@ -244,8 +309,10 @@ void run_benchmarks(uint64_t boot_start)
     bench_switch();
     bench_exec();
     bench_disk();
+    bench_screen();
     run_program("/bin/bench");                          /* prints its own lines */
     bench_slots();                      /* starts the slot scheduler */
+    run_program("/bin/streambench");    /* reads /data/big3, big4 (wall clock) */
     run_program("/bin/diskbench");      /* reads /data/big, /data/big2 if there */
     run_program("/bin/netbench");       /* needs tools/echo-server.py; the net
                                            thread needs the scheduler */

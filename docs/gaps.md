@@ -21,6 +21,42 @@ when it's fixed. File references point at the comment that mentions the gap.
   mounted — any other (someone's Linux disk in an old PC) is left alone.
 - **E820 map holds at most 32 entries.** (`layout.inc`, `E820_MAX`)
 
+## Live disk userland (`live/`, 2026-10-03)
+- **Built, never booted.** `build/live/rootfs.tar` (runit, agetty, login, GNU tools)
+  can't run until the kernel has `/proc` and `/dev/tty1`/`ttyS0` (ROADMAP 9c-3), and
+  separate users. (`vhangup`, `sethostname`, `reboot`, `mount -t tmpfs` exist now.) Alpine's apk was
+  never run against the generated database either (no Docker).
+- **mount/umount2 are partial** (`kernel/sys_fs.c`). Only `tmpfs` can be mounted
+  (`mode=` is the one option read; `size=` is ignored: it shares the RAM file system's
+  pages). No proc, sysfs, devpts (`-ENODEV`); no block device files, so ext2/vfat
+  give `-ENOTBLK`; no bind or move mounts. A mount can't be undone: `umount2` says
+  `-EBUSY`, because the VFS doesn't count open files and cwds per mount. Remount
+  accepts nosuid/nodev/noexec without enforcing them (nothing is setuid, all root) and
+  refuses read-only. tmpfs mounts don't show in `vfs_mount_count` (`df` misses them).
+  Anyone may mount, reboot and set the host name until there are users.
+- **Power off is only real on QEMU** (`drivers/power.c`): it writes "soft off" to the
+  PIIX4/ICH9 power-management port when the PCI subsystem vendor is QEMU's (0x1AF4).
+  Real PCs need the sleep type from the ACPI tables (`_S5` in the DSDT); until we read
+  them, power off halts with "safe to turn off". Restart uses the keyboard controller,
+  then a triple fault. `reboot()` syncs first (Linux leaves that to the caller).
+- **vhangup doesn't revoke open files** (`drivers/tty.c`): it flushes input and sends
+  SIGHUP/SIGCONT to the foreground group, but a process that kept the terminal open
+  can still read the next user's typing. Linux makes those file descriptors fail.
+- **Alpine's package scripts assume BusyBox.** They call `adduser -S`, `addgroup`,
+  `add-shell`... `/usr/sbin/{adduser,addgroup,deluser,delgroup,add-shell,remove-shell}`
+  are our small front ends over shadow with BusyBox's syntax. A package whose script
+  uses another BusyBox-only command would fail its install step (check
+  `/var/log/first-boot.log`, or apk's output).
+- **dash as /bin/sh runs scripts written for BusyBox ash.** `ca-certificates`'s
+  trigger uses `&>` (an ash/bash-ism): under dash it backgrounds the command instead
+  of silencing it. Harmless there; Debian fixes such scripts, Alpine doesn't need to.
+- **No /bin/kill**: outside BusyBox, Alpine has none (procps-ng's is not built);
+  bash and dash have it built in.
+- **Coreutils is one program**: Alpine builds GNU coreutils as a single binary with
+  `/bin/ls`, `/bin/cp`... as links to it (Debian has separate files). Same code.
+- **No device manager** (udev/mdev): the kernel makes the /dev nodes itself, and
+  with no /sys udev would have nothing to read.
+
 ## CPU / interrupts
 - **Uses the old 8259 PIC and PIT**; real machines from ~2005 have the APIC. Switch to the
   local APIC timer / IOAPIC later. (`arch/i386/pic.c`)
@@ -53,8 +89,23 @@ when it's fixed. File references point at the comment that mentions the gap.
   `thread_create` needs the slot. (`kernel/thread.c`)
 - **Fixed tables: 64 threads, 64 processes, 32 fds and 32 memory areas per process.**
   (`THREAD_MAX`, `PROC_MAX`, `PROC_FILES`, `MM_AREAS`)
-- **One thread per process**: `clone(CLONE_THREAD)` returns `-ENOSYS`, no `futex`.
-  `vfork` is plain fork (copy-on-write makes it cheap), and `clone(CLONE_VM)` gets a copy.
+- **Threads (2026-10-03): what's missing.** `vfork` is plain fork (copy-on-write
+  makes it cheap), and `clone(CLONE_VM)` *without* `CLONE_THREAD` gets a copy.
+  - **Shared futexes are keyed by address space**, not by physical page, so a
+    futex in `MAP_SHARED` memory can't link two processes (Linux supports
+    that). Fine for every thread of one process. (`kernel/futex.c`)
+  - **No `FUTEX_WAIT_BITSET`, `FUTEX_WAKE_OP`, PI futexes or robust lists**
+    (`set_robust_list` is accepted and ignored): musl and GLib don't use them;
+    glibc programs would.
+  - **Futex timeouts have 1 ms resolution** (the timer tick), rounded up.
+  - **`MM_AREAS` (32) limits a process to roughly 13 threads**: musl gives each
+    thread stack its own mmap plus a guard page (two areas). Raise it when a
+    real program needs more. (`include/mm.h`)
+  - **execve vs. exit_group race**: if one thread calls `exit_group` while
+    another is in `execve` killing its siblings, the exec wins and the exit
+    status is lost (Linux fails the exec instead).
+  - **No `CLONE_SETTLS` beyond the 3 GDT TLS slots**, the same limit as
+    `set_thread_area`.
 - **No stack overflow detection.** A thread that uses more than 8 KiB silently overwrites
   the heap. Fix: guard pages (an unmapped page below each stack).
 - **The slot table is compiled into the kernel.** Today `config/slots.conf` is turned into a
@@ -72,6 +123,13 @@ when it's fixed. File references point at the comment that mentions the gap.
 - **The first slot after `sched_start()` is shorter than 1 ms** (the frame starts mid-tick).
 
 ## Processes, signals, terminal (step 8)
+- `select()` reads and writes only the first 32 bits of each `fd_set`, so bits
+  32-1023 of a caller's set are never cleared. Harmless while `FD_MAX` is 32
+  and programs call `FD_ZERO`, but it is not what POSIX says.
+- `ppoll`/`select` compute the timeout as a signed `tv_sec * 1000`, which
+  overflows on a large value and is then treated as "no timeout", turning a
+  short wait into an indefinite one. Interruptible, so it only affects the
+  caller.
 - **No job control stops**: SIGSTOP/SIGTSTP/SIGTTIN/SIGTTOU are ignored, so Ctrl-Z does
   nothing and `fg`/`bg` can't work. No SIGTTOU/SIGTTIN for background terminal access.
 - **No syscall restart**: a signal makes a sleeping syscall return `-EINTR` even with
@@ -117,9 +175,13 @@ when it's fixed. File references point at the comment that mentions the gap.
 
 ## Disk / file systems
 - **One command at a time per disk** on every driver (IDE, AHCI, NVMe, virtio): no
-  NCQ, no NVMe queue depth > 1, no MSI/MSI-X. Read-ahead is synchronous: the reader
-  waits for the whole window (up to 128 KiB) instead of the next window being read
-  while it copies. (`drivers/ahci.c`, `nvme.c`, `virtio_blk.c`)
+  NCQ, no NVMe queue depth > 1, no MSI/MSI-X. Read-ahead no longer waits (the next
+  window is read while the program copies this one), but requests that don't wait
+  (`blockdev_submit`) go through a worker thread per disk that runs them one by one
+  through the driver — one thread switch per request, and no second command on the
+  disk while one runs. Read-ahead stops at the first page whose blocks aren't next
+  to each other on the disk (that window is read the waiting way), and at most 8
+  read-ahead requests are on their way at once. (`kernel/blockdev.c`, `fs/pcache.c`)
 - **AHCI**: no BIOS hand-off (BOHC; some boards need it), no hot plug, no port
   multipliers or ATAPI, LBA48 disks only, at most 4 disks, one controller.
 - **NVMe**: namespace 1 only, 512-byte sectors only, registers below 4 GiB only, one
@@ -158,8 +220,9 @@ when it's fixed. File references point at the comment that mentions the gap.
   `myos-root` counts. A program is mapped from its file and paged in on touch
   (the page cache, 9c-2); it is no longer copied whole at exec.
 - **The disk driver spins up to 2048 status reads** before sleeping on the interrupt (fast
-  in QEMU, where waking a halted CPU is slow); on real hardware that's up to ~2 ms of CPU
-  per seek. (`drivers/ata.c`, `POLL_FIRST`)
+  in QEMU, where waking a halted CPU is slow) — but only when no other thread is ready
+  to run; on real hardware that's up to ~2 ms of otherwise idle CPU per seek.
+  (`drivers/ata.c`, `POLL_FIRST`)
 - **ext2** (`fs/ext2.c`): the first ext2 file system found (a type-0x83 partition or a
   whole disk without a partition table) is mounted at /data; no `mount`/`umount` calls
   yet. No journal: switching off mid-change can leave the disk
@@ -190,7 +253,126 @@ when it's fixed. File references point at the comment that mentions the gap.
   (the kernel itself isn't rebuilt, only the archive and the disk image).
 - **The "USB stick" is an IDE disk in QEMU**: there's no USB stack.
 
+## Concurrency (found 2026-10-03)
+
+- **`copy_to_user`/`copy_from_user` can sleep, and most of the kernel was
+  written as if they cannot.** A fault on a page of an `mmap`'d file goes
+  through `mm_fault` into the page cache and waits for the disk, so another
+  thread runs in the middle of the copy. "A syscall runs with interrupts off,
+  so it is atomic" is the assumption behind a lot of this code (it is stated
+  outright in `net/netdevice.c`) and it is only true between copies.
+
+  Both halves of the answer are now in place, and **neither is sufficient on
+  its own**:
+
+  1. `fault_in_user()` (`arch/i386/include/uaccess.h`) touches a byte of every
+     page of a user range before any shared state is read, so the copy that
+     follows has nothing left to fault on. It is applied centrally in
+     `rw()` — the one door `read()`, `write()`, `readv()` and `writev()` go
+     through — and in `sys_getdents64` and the four socket send/receive
+     syscalls. Cost: **+34 cycles on a 4 KiB read**, 1506 -> 1540
+     (`docs/performance.md`).
+  2. Each site that could become memory-unsafe is correct across a sleep
+     anyway: the ring index is committed before the copy (`fs/pipe.c`,
+     `net/tcp.c`, `drivers/tty.c`), the object is detached first
+     (`net/socket.c`), the zombie is reaped first (`kernel/proc.c`), or a
+     reference is held (`sys_getdents64`).
+
+  **Why (1) alone is not enough:** `clone(CLONE_THREAD)` gives one address
+  space several threads, so a sibling can `munmap` the range and map a file
+  over it. It can only run while we are asleep, and we do not sleep after the
+  pre-fault returns — but the pre-fault itself sleeps, so a thread woken while
+  a later page is being probed can pull an earlier one out from under us.
+  Pre-faulting removes the sleep that happens with **no attacker present**,
+  which is the ordinary case and the one that made pipe and socket reads racy;
+  it does not survive a deliberate race. `mm_fault` also holds the file across
+  its own sleep and looks the area up again afterwards, so a sibling's
+  `munmap` mid-fault cannot make it use a stale area or a freed inode.
+- **The kernel has now been audited for this class once** (2026-10-03, by
+  working from shared mutable state rather than from the 126 copy sites).
+  Three more real bugs came out of it — `sys_getdents64`, `drivers/tty.c`,
+  `kernel/proc.c`'s `wait4` — and are fixed; see `docs/security.md`. Checked
+  and found safe: `fs/pcache.c`'s `copy_out` (it pins the page with `readers`
+  across the copy, which is the right pattern), `fs/ramfs.c` (`file_truncate`
+  keeps the page table and `page_at` re-reads it), signal delivery and
+  `sigreturn` (thread-local state only). `f->pos` in the read and write paths
+  of ramfs, ext2 and FAT can still be double-used by two threads sharing one
+  `struct file`, which costs duplicate data but is not memory-unsafe.
+- **The class is now tested.** `make test` can arm the nth copy by a thread to
+  yield before copying (`include/uaccess_test.h`, syscall 423, `#ifdef
+  SELFTEST` only), and `user/musl/racetest.c` uses it to race a sibling against
+  a sleeping copy in `read`, `write`, `wait4` and `getdents64`.
+  `make verify-racetests` reintroduces each of the six fixes one at a time and
+  checks racetest notices. Running it found an eighth bug: the `getdents64` fix
+  pinned the entry being copied but not `next`, which is fetched before the
+  loop and goes stale during the copies that emit `.` and `..` — a name read
+  out of a recycled inode and copied to user space. Both are pinned now.
+- `drivers/tty.c` still has no attack-path test: reading `/dev/console` from a
+  test would take the shell's input away. Its fix is the same shape as the
+  pipe's, which is tested, but an analogy is not a test.
+
 ## Drivers
+
+- The e1000's transmit descriptors are only reclaimed inside `e1000_poll`,
+  which runs from `net_rx_action`. Nothing on the transmit path calls it and a
+  completed transmit raises no interrupt (only `IMS_RXT0|IMS_LSC` are
+  unmasked), so 15 sends with no inbound traffic fill the ring and every
+  further `sendto` returns `EAGAIN` until something happens to receive. Found
+  2026-10-03, not fixed: it wants either `IMS_TXDW` or a reap at the top of
+  `e1000_xmit`.
+- `net_rx_action` re-polls up to 8 times at a weight of 16 but only `drain()`s
+  before and after the loop, into a 32-slot queue — so a receive flood
+  allocates and copies up to 128 frames and throws ~96 away. Bounded, but it
+  is four times the work and the loss happens after the copy instead of at the
+  ring.
+- `skb_reserve` has no bounds check at all, unlike `skb_put`/`skb_pull`/
+  `skb_push`. Every caller today reserves a few bytes out of an allocation
+  sized to include them, so it is safe; it is one changed size expression away
+  from not being.
+- `net/ipv4.c`'s ARP builder ignores `skb_put`'s NULL return and writes
+  immediately. Safe only because the allocation is exactly the right size.
+- `net/skbuff.c`'s double-free guard reads `skb->users` after `kfree(skb)`
+  would have returned the block to the allocator, so on a reused block it
+  reads garbage and proceeds. No path reaches it today — ownership is single
+  and was traced end to end — but it should not be mistaken for protection.
+  Nothing ever increments `users`, so it is a flag, not a refcount.
+- `drain()` reads `rx_count` outside `irq_save`. Safe only because `netif_rx`
+  is never actually called from an interrupt handler, which the `irq_save`
+  inside it suggests was once the intent.
+
+### Display (step 11b, 2026-10-03)
+- **Only QEMU/UTM's std VGA (Bochs, 1234:1111) gets graphics.** Real old PCs and every
+  other card stay on the 80x25 text screen until the VESA boot framebuffer
+  (`simpledrm` shape) is written. (`drivers/gpu/drm/tiny/bochs.c`)
+- **No EDID**: the mode list is the fixed VESA table up to 2560x1600, whatever the
+  window or monitor is. QEMU can offer an EDID blob; we don't read it.
+  (`drm_add_modes_noedid`, `drivers/gpu/drm/drm_core.c`)
+- **No `/dev/dri/card0`**: no KMS ioctls, no GEM buffer objects, no dumb buffers. Programs
+  use `/dev/fb0`. One screen, one framebuffer at the start of video memory.
+- **32 bits per pixel only** (XRGB8888); `FBIOPUT_VSCREENINFO` with another depth fails.
+  No colour map (`FBIOGETCMAP`/`PUTCMAP`), no `read`/`write` on `/dev/fb0` (only `mmap`).
+- **No horizontal panning**, and `yres_virtual` is "all of video memory" at boot.
+- **Mode sets are standard modes only** (the exact size must be in the list).
+- **The console's worst scroll redraws the whole screen** (about every 30th scroll at
+  1920x1200: panning runs out of video memory). It runs inside `console_write` with
+  interrupts off: 6.9 M instructions in QEMU, probably 5-10 ms of bus writes on a
+  Pentium 4. Fine for a console, not for the 1 ms slot budget; move console drawing to
+  a thread if it shows up in the jitter numbers. (`drivers/video/fbcon.c`)
+- **A mode change from `/dev/fb0` redraws the console in the syscall** (interrupts off),
+  same cost as above.
+- **No hardware cursor**, no blinking; the cursor is an underline we draw.
+- **Display ports are written without a lock.** The console and `FBIOPAN_DISPLAY` both
+  write the Bochs registers; both run with interrupts off on one CPU, so they can't
+  interleave today. SMP will need a lock.
+- **A program that exits in `KD_GRAPHICS` leaves the console off** (as on Linux). There is
+  no `VT_SETMODE`/`VT_PROCESS` switching yet.
+- **A mapped `/dev/fb0` is always shared**: `MAP_PRIVATE` gets the device pages too, not a
+  private copy. Pages past the device's end give SIGSEGV (Linux: SIGBUS).
+- **The font comes from the BIOS** (`stage2.asm` copies it); a boot without our stage 2
+  has no font and fbcon doesn't start. CP437 glyphs only (no Unicode).
+- **`ioremap_wc` mappings are never undone**, and must be made before the first process
+  starts (process page directories copy the kernel half once). (`arch/i386/pat.c`)
+
 - **Keyboard ignores extended keys** (arrows, Home/End, right Ctrl/Alt…). Scancodes are
   parsed correctly, just not mapped. (`drivers/keyboard.c`)
 - **Keyboard drops keys when its ring buffer is full.** (`drivers/keyboard.c`)
@@ -237,19 +419,29 @@ when it's fixed. File references point at the comment that mentions the gap.
     (94–100% of lines) and `tcp_input` at 86%. It sends one packet per run except on
     the `tcp` target, so bugs needing a particular sequence of packets are mostly
     out of reach. Host `irq_save` is a no-op, so interrupt races are invisible to it.
-  - TCP initial sequence number is `timer_ms()` + a constant: guessable, so a
-    connection can be hijacked or reset blind. Linux: keyed hash (RFC 6528).
-  - Ephemeral UDP ports are handed out in order from 49152, and the kernel's own
-    DNS uses port 53000 and sequential IDs: open to DNS cache poisoning.
-    Linux randomizes the port (RFC 6056).
-  - IP ID is a global counter (leaks traffic rate). Linux: per-destination hash.
-  - Any program can open `SOCK_RAW`. Linux requires CAP_NET_RAW. MyOS has no
-    users or capabilities yet.
+  - Any program can open `SOCK_RAW` and read every ICMP packet, including other
+    programs'. Sending is restricted to echo requests, so the attack *on other
+    hosts* is gone, but Linux requires CAP_NET_RAW for the socket itself and
+    MyOS cannot: every id is 0 and `setuid` is a stub, so the check would be
+    granted to everything and would only look like security.
   - No Spectre v1 barriers on user-controlled indexes (syscall number, fd) and no
     retpolines; Pentium 4 and Pentium M are affected. Linux 6.1's cost for these
     is under 1% of the UDP path in instruction count (docs/performance.md); on a
     real P4 it is more and must be measured.
-  - The parsers check lengths and checksums but have never been fuzzed.
+- **The CSPRNG's entropy is measured, not given, and the estimate is a guess.** Neither
+  target CPU has RDRAND or RDSEED, so the boot key comes from timing 512 ISA port cycles
+  against the cycle counter and keeping the jitter. Each sample is worth perhaps half a bit
+  to two bits, which is an estimate and not a measurement: the honest claim is "probably
+  enough for a 128-bit key on real hardware". **Under QEMU with `-icount` the cycle counter
+  is deterministic, so the emulator produces the same key every boot** — do not treat a QEMU
+  boot as having any secrets. Real entropy accounting would need a health test on the samples
+  (NIST SP 800-90B's repetition-count and adaptive-proportion tests) and a refusal to proceed
+  when it fails, the way Linux blocks `getrandom` until its pool is credited.
+- **One rate-limit budget covers every kind of reply.** An ICMP flood from a peer therefore
+  suppresses the resets we would send that same peer. That is acceptable — both are replies
+  to that peer's own packets — but it is one bucket doing two jobs. Also: 16 slots, so two
+  peers can share one, and an attacker who can spoof source addresses can evict a victim's
+  slot. Linux has a route cache to hang this on; we do not.
 - **Zero-window probing gives up, where RFC 1122 says not to.** §4.2.2.17 says a connection
   must stay open for as long as the peer keeps answering probes, even if its window never
   reopens. MyOS probes a shut window with one byte, backing off to 60 s, and then fails the
@@ -269,7 +461,8 @@ when it's fixed. File references point at the comment that mentions the gap.
   is probed on the same timer, doubling to 60 s, 10 tries). No Nagle
   (every write goes out at once, like TCP_NODELAY). TIME_WAIT is 2 s, not 60.
   At most 16 connections. Closing with unread data sends RST (as Linux does).
-  Local ports are sequential (see network security above).
+  Local ports are random in 49152..65535 and the initial sequence number is a
+  keyed hash of the four-tuple (RFC 6056, RFC 6528).
 - **Disk DMA** (9d): bus-master IDE (PIIX/ICH legacy mode); AHCI, NVMe and virtio-blk
   are separate drivers (see Disk above). None tried on real hardware yet. We don't
   pick a transfer mode ourselves (SET FEATURES, PIIX timing registers): DMA runs at

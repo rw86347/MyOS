@@ -133,6 +133,21 @@ static void enqueue(struct sock *s, uint32_t src, uint16_t sport,
     wake();
 }
 
+/* Put a peeked datagram back at the front of the queue. If it filled up
+   while we were copying, the datagram is dropped: losing one is allowed for
+   UDP, and it beats leaving a pointer that the next reader would free. */
+static void requeue(struct sock *s, struct dgram *d)
+{
+    uint32_t at = (s->head + RXQ - 1) % RXQ;
+    if (s->count < RXQ && !s->q[at]) {
+        s->q[at] = d;
+        s->head = at;
+        s->count++;
+    } else {
+        kfree(d);
+    }
+}
+
 static void dequeue(struct sock *s)
 {
     kfree(s->q[s->head]);
@@ -252,6 +267,29 @@ static int autobind(struct sock *s)
     return 0;
 }
 
+/*
+ * What a raw socket may put on the wire.
+ *
+ * A raw ICMP socket that can send any message type is a weapon aimed at the
+ * rest of the network rather than at this machine. An ICMP redirect reroutes a
+ * neighbour's traffic through whoever sent it. A forged "fragmentation
+ * needed" or "destination unreachable" tears down connections between two
+ * other hosts — the ICMP blind-reset attack. Linux keeps all of that behind
+ * CAP_NET_RAW, and MyOS has no users to withhold a capability from.
+ *
+ * But only one program ever wants a raw socket, and ping sends exactly one
+ * thing: an echo request. Allowing exactly that removes the attack instead of
+ * gating it, and costs nothing we have a use for. The length check is here
+ * because an ICMP message shorter than its own header is not one.
+ *
+ * When users exist, this is the place to ask for CAP_NET_RAW and let a
+ * privileged program send the rest. docs/security.md has the entry.
+ */
+static int raw_send_ok(const uint8_t *buf, uint32_t len)
+{
+    return len >= 8 && buf[0] == 8 /* echo request */ && buf[1] == 0;
+}
+
 /* Send len bytes already in kernel memory. Returns len or -errno. */
 static int32_t send_k(struct sock *s, const uint8_t *buf, uint32_t len,
                       uint32_t ip, uint16_t port)
@@ -266,6 +304,8 @@ static int32_t send_k(struct sock *s, const uint8_t *buf, uint32_t len,
         if (rc == 0)
             rc = udp_sendto(ip, s->lport, port, buf, len);
     } else {
+        if (!raw_send_ok(buf, len))
+            return -EPERM;          /* what Linux returns without the capability */
         rc = ip_send(ip, IPPROTO_ICMP, buf, len);
     }
     if (rc == -EIO)
@@ -276,6 +316,35 @@ static int32_t send_k(struct sock *s, const uint8_t *buf, uint32_t len,
 static uint32_t max_len(struct sock *s)
 {
     return s->type == SOCK_DGRAM ? UDP_MAX : RAW_MAX;
+}
+
+/* The most one send or receive on this socket can move, which is also the
+   most of a user buffer worth faulting in: a datagram is bounded by its
+   protocol's maximum, a stream by the ring in tcp.c. Probing further would
+   allocate pages the call cannot reach. */
+static uint32_t move_max(struct sock *s)
+{
+    return s->type == SOCK_STREAM ? tcp_buf_max() : max_len(s);
+}
+
+/*
+ * Fault in the buffers a send or receive is about to use, before the socket's
+ * own state has been looked at. The copies below must not be able to sleep:
+ * by the time they run, a datagram has been taken off the queue or a window
+ * has been consumed, and a second process entering here would see state that
+ * is mid-update. fault_in_user() in uaccess.h has the long version.
+ *
+ * `write` is the kernel's direction: 1 for a receive.
+ */
+static int fault_in_iov(const struct iovec32 *iov, uint32_t n, uint32_t cap, int write)
+{
+    for (uint32_t i = 0; i < n && cap; i++) {
+        uint32_t len = iov[i].len < cap ? iov[i].len : cap;
+        if (len && fault_in_user((const void *)iov[i].base, len, write) < 0)
+            return -EFAULT;
+        cap -= len;
+    }
+    return 0;
 }
 
 /* A stream write to a closed connection also raises SIGPIPE (Linux). */
@@ -341,22 +410,40 @@ static int32_t do_recv(struct sock *s, struct file *f, const struct iovec32 *iov
     int rc = wait_rx(s, nonblock);
     if (rc < 0)
         return rc;
+    /* Take the datagram out of the queue before copying out of it. Copying
+       can sleep -- copy_to_user faults on a page of an mmap'd file that is
+       not resident, and mm_fault reads it from the disk and waits -- so a
+       second reader on the same socket (a fork shares it) runs here in the
+       middle. Were the queue advanced afterwards, both would take this same
+       pointer: the first to finish frees the datagram, the other keeps
+       reading it and copying freed memory out to user space, then frees it
+       again and takes s->count below zero, which makes wait_rx report data
+       on an empty queue and the next read dereference NULL in ring 0.
+       Holding it out of the queue for the duration makes this one the owner. */
     struct dgram *d = s->q[s->head];
-    uint32_t done = 0;
-    for (uint32_t i = 0; i < niov && done < d->len; i++) {
-        uint32_t n = d->len - done < iov[i].len ? d->len - done : iov[i].len;
+    s->q[s->head] = 0;
+    s->head = (s->head + 1) % RXQ;
+    s->count--;
+
+    uint32_t done = 0, full = d->len;
+    int32_t rc2 = -EFAULT;
+    for (uint32_t i = 0; i < niov && done < full; i++) {
+        uint32_t n = full - done < iov[i].len ? full - done : iov[i].len;
         if (copy_to_user((void *)iov[i].base, d->data + done, n) < 0)
-            return -EFAULT;
+            goto out;
         done += n;
     }
     if (write_addr(uaddr, ulenp, d->src, d->sport) < 0)
-        return -EFAULT;
-    uint32_t full = d->len;
+        goto out;
     if (msg_flags)
         *msg_flags = done < full ? MSG_TRUNC : 0;
-    if (!(flags & MSG_PEEK))
-        dequeue(s);
-    return (int32_t)((flags & MSG_TRUNC) ? full : done);
+    rc2 = (int32_t)((flags & MSG_TRUNC) ? full : done);
+out:
+    if (flags & MSG_PEEK)
+        requeue(s, d);              /* a peek does not consume it */
+    else
+        kfree(d);
+    return rc2;
 }
 
 /* --- file ops ------------------------------------------------------------ */
@@ -592,6 +679,9 @@ SYSCALL_DEF(sys_sendto)
     struct sock *s = sock_of(a1, &f);
     if (!s)
         return bad_fd(a1);
+    struct iovec32 v = { a2, a3 };
+    if (fault_in_iov(&v, 1, move_max(s), 0) < 0)
+        return -EFAULT;
     return do_send(s, a2, a3, a5, a6, (f->flags & O_NONBLOCK) || (a4 & MSG_DONTWAIT), a4);
 }
 
@@ -604,6 +694,8 @@ SYSCALL_DEF(sys_recvfrom)
     if (!s)
         return bad_fd(a1);
     struct iovec32 v = { a2, a3 };
+    if (fault_in_iov(&v, 1, move_max(s), 1) < 0)
+        return -EFAULT;
     return do_recv(s, f, &v, 1, a4, a5, a6, 0);
 }
 
@@ -632,6 +724,8 @@ SYSCALL_DEF(sys_sendmsg)
     int rc = read_msg(a2, &m, iov);
     if (rc < 0)
         return rc;
+    if (fault_in_iov(iov, m.iovlen, move_max(s), 0) < 0)
+        return -EFAULT;
     if (s->type == SOCK_STREAM) {
         int nonblock = (f->flags & O_NONBLOCK) || (a3 & MSG_DONTWAIT);
         int32_t done = 0;
@@ -690,6 +784,8 @@ SYSCALL_DEF(sys_recvmsg)
     int rc = read_msg(a2, &m, iov);
     if (rc < 0)
         return rc;
+    if (fault_in_iov(iov, m.iovlen, move_max(s), 1) < 0)
+        return -EFAULT;
     int32_t mflags = 0;
     uint32_t namelen_at = a2 + 4;   /* &msg->msg_namelen */
     int32_t r = do_recv(s, f, iov, m.iovlen, a3, m.name, m.name ? namelen_at : 0, &mflags);

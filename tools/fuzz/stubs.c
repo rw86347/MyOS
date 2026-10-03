@@ -42,9 +42,17 @@ void  kfree(void *ptr)     { free(ptr); }
    A fake clock the fuzzer owns. Real time would make runs non-reproducible,
    and waiting for a 1-second ARP timeout would cap us at one run a second. */
 
+static uint64_t fuzz_cycles;
 static uint32_t now_ms = 1;
 
 uint32_t timer_ms(void)             { return now_ms; }
+
+/* A counting stand-in for the cycle counter: kernel/random.c is compiled into
+   this build for real, so the tests drive the actual ChaCha20 generator, and
+   it has to produce the same stream on every run for -replay to mean
+   anything. Advancing by a prime keeps the low bits moving. */
+uint64_t cycles_now(void)           { return (fuzz_cycles += 1000003); }
+void     fuzz_cycles_reset(void)    { fuzz_cycles = 0; }
 void     fuzz_clock_set(uint32_t t) { now_ms = t; }
 void     fuzz_clock_add(uint32_t d) { now_ms += d; }
 

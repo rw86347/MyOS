@@ -45,16 +45,18 @@ void cpu_init(void)
     if (family == 6 && model < 3 && stepping < 3)
         cpu_features &= ~CPU_SEP;
 
-    kprintf("CPU: %s family %lu model %lu:%s%s%s%s%s%s\n", vendor, family, model,
+    kprintf("CPU: %s family %lu model %lu:%s%s%s%s%s%s%s\n", vendor, family, model,
             cpu_has(CPU_PSE) ? " pse" : "", cpu_has(CPU_PGE) ? " pge" : "",
             cpu_has(CPU_SEP) ? " sysenter" : "", cpu_has(CPU_FXSR) ? " fxsr" : "",
-            cpu_has(CPU_SSE) ? " sse" : "", cpu_has(CPU_SSE2) ? " sse2" : "");
+            cpu_has(CPU_SSE) ? " sse" : "", cpu_has(CPU_SSE2) ? " sse2" : "",
+            cpu_has(CPU_PAT) ? " pat" : "");
 
     if ((cpu_features & CPU_REQUIRED) != CPU_REQUIRED) {
         kprintf("This CPU is too old for MyOS (needs a Pentium Pro or later).\n");
         for (;;)
             __asm__ volatile ("cli; hlt");
     }
+    pat_init();
 }
 
 /* Calibration runs in the background, so boot doesn't wait 10 ms for it:
@@ -80,4 +82,18 @@ uint32_t cycles_per_us(void)
     while (!calibrated)         /* only the first ~12 ms after boot */
         cpu_wait();
     return per_us;
+}
+
+void cpu_reset(void)
+{
+    static const struct { uint16_t limit; uint32_t base; } __attribute__((packed))
+        no_idt = { 0, 0 };
+    __asm__ volatile ("cli; lidt %0; int3" : : "m"(no_idt));
+    cpu_halt_forever();
+}
+
+void cpu_halt_forever(void)
+{
+    for (;;)
+        __asm__ volatile ("cli; hlt");
 }

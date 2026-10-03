@@ -57,7 +57,9 @@
 #define NR_mmap2       192
 #define NR_getdents64  220
 #define NR_fcntl64     221
+#define NR_gettid      224
 #define NR_tkill       238
+#define NR_futex       240
 #define NR_exit_group  252
 #define NR_tgkill      270
 #define NR_openat      295
@@ -77,6 +79,14 @@
 #define NR_chmod        15
 #define NR_getuid       24
 #define NR_sync         36
+#define NR_mount        21
+#define NR_umount2      52
+#define NR_sethostname  74
+#define NR_reboot       88
+#define NR_vhangup     111
+#define NR_flock       143
+#define NR_getpriority  96
+#define NR_setpriority  97
 #define NR_rename       38
 #define NR_mkdir        39
 #define NR_rmdir        40
@@ -168,6 +178,12 @@
 #define NR_utimensat_time64 412
 #define NR_pselect6_time64 413
 #define NR_ppoll_time64 414
+#define NR_futex_time64 422
+
+/* Not a Linux syscall and not in a normal build: `make test` only, so that a
+   user-space test can arm the deliberate sleep inside copy_to_user (see
+   include/uaccess_test.h). The number is past everything we implement. */
+#define NR_uaccess_test 423
 
 /* Arguments with Linux values */
 #define AT_FDCWD      (-100)        /* "relative to the current directory" */

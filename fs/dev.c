@@ -11,14 +11,18 @@
  *   5,0  tty       the terminal of the process  } both the console here
  *   5,1  console   the system console           }
  *   4,n  ttyN      virtual terminals: the console too, for now
+ *  29,0  fb0       the screen's pixels (drivers/video/fbmem.c), once a
+ *                  display driver has registered one
  */
 #include <errno.h>
 #include <kprintf.h>
+#include <linux/fb.h>
 #include <serial.h>
 #include <string.h>
 #include <tty.h>
 #include <uaccess.h>
 #include <vfs.h>
+
 
 #define DEV(major, minor) (((major) << 8) | (minor))
 
@@ -81,6 +85,12 @@ static int32_t zero_read(struct file *f, void *user_buf, uint32_t n)
 {
     (void)f;
     static const uint8_t zeros[256];
+    /* The same cap the real filesystems use (ramfs.c): a syscall runs with
+       interrupts off, so without it read(fd, buf, 0x7fffffff) holds the CPU
+       for two million copies and the 1 ms slot is long gone. A short count is
+       what read() is allowed to return, and C libraries loop on it. */
+    if (n > RW_MAX)
+        n = RW_MAX;
     uint32_t done = 0;
     while (done < n) {
         uint32_t k = n - done < sizeof zeros ? n - done : sizeof zeros;
@@ -103,6 +113,7 @@ void dev_attach(struct inode *i)
     case DEV(1, 5): i->ops = &zero_ops;    break;
     case DEV(5, 0):
     case DEV(5, 1): i->ops = &console_ops; break;
+    case DEV(29, 0): i->ops = fb_file_ops(); break;     /* fb0 (NULL: no screen) */
     default:
         if ((i->rdev >> 8) == 4)
             i->ops = &console_ops;          /* tty0, tty1, ... */
@@ -120,6 +131,18 @@ static void make_node(struct inode *dev, const char *name, uint32_t rdev)
         i->rdev = rdev;
         dev_attach(i);
     }
+}
+
+void dev_make_node(const char *name, uint32_t rdev)
+{
+    struct inode *dev = vfs_child(vfs_root(), "dev", 3);
+    if (!dev)
+        return;
+    struct inode *i = vfs_child(dev, name, strlen(name));
+    if (i && i->rdev == rdev)
+        dev_attach(i);                      /* the initramfs has it: give it ops */
+    else
+        make_node(dev, name, rdev);
 }
 
 void dev_init(void)

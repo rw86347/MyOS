@@ -530,3 +530,397 @@ Short dated notes after each work session: what was done, what broke, what was l
   and the tcp target found 3 new inputs — the probe path is new reachable code.
   `make test` still reports 99 passed / DISK OK / TEST OK with a real DNS lookup and
   a real HTTP fetch over TCP. Kernel 160404 bytes.
+
+- 2026-10-03: A CSPRNG, and the four predictable numbers it unblocked, Cursor.
+  Rodger's summary of what was left: "mostly one bug wearing four hats — no
+  CSPRNG, which blocks the keyed ISN, random ephemeral ports, random DNS
+  transaction IDs, and per-destination IP IDs — plus rate limiting and
+  CAP_NET_RAW." That is the right diagnosis, so the generator came first.
+  `kernel/random.c` is ChaCha20 with fast key erasure: every block of output
+  also produces the next key and the old one is overwritten, so reading kernel
+  memory now does not reveal the bytes already handed out. ChaCha20 suits this
+  machine — 32-bit adds, xors and rotates, no tables to miss in the cache, no
+  SSE, which matters because the kernel may not touch the FPU registers at all.
+  The cipher is the easy half. Neither target CPU has RDRAND or RDSEED (Intel
+  added them years later), so there is no generator to ask and the entropy has
+  to be *measured*. What is measurable is how long things take: a read of port
+  0x80 is an ISA bus cycle, and the cycle counter says how long it really took,
+  which is not constant on real hardware because DRAM refresh, bus contention,
+  cache state and SMIs all move the low bits. 512 samples, keeping the second
+  difference (the change in the interval, not the interval — only its variation
+  is unpredictable), folded into a rotating pool. Linux does the same in
+  `try_to_generate_entropy()` when it has nothing better. Honest limits written
+  down in docs/security.md: each sample is worth maybe half a bit to two bits,
+  which is an estimate and not a measurement, and under QEMU with `-icount` the
+  cycle counter is deterministic so the emulator gets the same key every boot.
+  A broken ChaCha20 still produces output that looks perfectly random, so no
+  statistical test would catch a wrong rotation — `kernel/random_test.c` checks
+  it against the RFC 8439 vector at every boot instead. 107 self-tests now.
+  Then the four, each a few lines once the generator existed. The ISN is
+  `M + F(four-tuple, secret)` per RFC 6528, M a 4 us timer so numbers still
+  climb with time; it was `timer_ms() * 64000 + 0x10000000`, the same value for
+  every connection in a millisecond. Ephemeral ports are random in
+  49152..65535 through one shared `ip_ephemeral_port` — random choice, not a
+  random start then a scan, because with a scan one port tells you the next.
+  The DNS transaction id is random (it was a counter: one subtraction from free
+  after a single observed lookup, which is Kaminsky's arithmetic). The IP ID is
+  per destination in 64 secret-keyed buckets with random starts; one global
+  counter let any peer subtract two ids and read off the machine's whole
+  traffic rate, which is what nmap's idle scan counts. `getrandom` and
+  AT_RANDOM were on the same xorshift — and AT_RANDOM is what musl builds its
+  stack guard from, so that was a predictable canary.
+  Rate limiting is a token bucket, 64/s with a burst of 64, in 16 slots. The
+  key is *where the reply is going*, so the protected party is the victim being
+  aimed at; it is per-peer because a global counter is itself an oracle (watch
+  it run out and you learn someone else is talking to us — CVE-2016-5696, SAD
+  DNS); and the cutoff is jittered because a limit at exactly N is a clean edge
+  to measure. Covers echo replies, ARP replies and the reset for an unknown
+  connection. Not the ACK for in-window data: that one is required, not a
+  reflector.
+  CAP_NET_RAW is the one item that cannot be done, and the honest reason is
+  that every uid is 0 and `setuid` is a stub, so the check would be granted to
+  everything and would only look like security. What *was* possible: a raw
+  socket could send any ICMP type, which is a weapon aimed at other hosts — a
+  redirect reroutes a neighbour's traffic, a forged "fragmentation needed"
+  tears down connections between two other machines. Nothing in the tree uses
+  SOCK_RAW yet and ping sends exactly one thing, so a raw socket may now send
+  an echo request and nothing else. That removes the attack rather than gating
+  it. The remaining half (any program may open the socket and read every ICMP
+  packet) is documented as blocked on users.
+  11 new checks in `make attacks` (51 passed, 0 failed), and a new
+  `make verify-tests` that reintroduces each of seven bugs by patching the
+  source and checks a test notices. It earned its keep immediately: three cases
+  reported the *wrong* test failing, because a patch and a build inside the same
+  second leave make thinking the binary is current, so the previous case's
+  binary was answering for the next one. Same trap as earlier today.
+  The fuzzer needed work too. kernel/random.c is compiled into that build for
+  real — a stand-in would mean the tests were not exercising the generator the
+  kernel uses — but the generator carries its key forward, so the stream used
+  to depend on how many runs had gone before, and the rate limiter now *drops*
+  packets on an unpredictable budget. A saved crash would have quietly stopped
+  reproducing. Each run re-keys now: 40% of the throughput (167k to 100k
+  runs/s) for a crash that can actually be replayed. 3M runs on each of the
+  five targets, no crashes, and 22 new corpus inputs between them.
+  Measured, per the rules: boot CPU work 1093 -> 1111 us (+18), slot jitter
+  unchanged at 4 us, both null-syscall costs unchanged, kernel +2108 bytes.
+  QEMU undercounts the boot cost badly here — it charges one instruction for a
+  port read that takes a microsecond on a real P4 — so expect nearer 0.5 ms on
+  the target, which is why the sample count is 512 and not 5000.
+  `make test`: 107 passed, 0 failed, DISK OK, TEST OK, with a real DNS lookup
+  and a real HTTP fetch over TCP still working.
+
+## 2026-10-03 — 9d-3 part 1: read-ahead that doesn't wait
+- Rodger: "one command at a time" is a big issue. Split it into steps; this is
+  the first. New block-layer call `blockdev_submit`: a request that returns at
+  once and calls `done` when the disk finishes (for now a worker thread per disk
+  runs them). The page cache uses it to read the next read-ahead window while the
+  program copies this one; pages on their way are pinned and marked, and a reader
+  who gets there first sleeps until they arrive.
+- Found on the way: the IDE driver's short spin before sleeping would now spin in
+  the worker while the program waits for the CPU. It spins only when nothing else
+  could run.
+- Measured honestly: QEMU can't show the gain (its disk is RAM, and its throttle
+  saves up credit while the guest computes). Cost: +1–3% instructions per read.
+  The win is for real disks, estimated in `docs/performance.md`.
+- Tests: `kernel/bio_test.c` (submit doesn't wait, same bytes), pcache reads
+  `numbers.txt` in order with 68 of 71 pages read ahead. `make test` 114 passed,
+  test-shell, AHCI/NVMe/virtio OK, and the 12 MiB low-memory run is fine.
+
+## 2026-10-03 — The live disk's software
+- Rodger wants an XP-like live disk with a word processor, dev tools, the MyOS
+  source, a package manager, and logins for several users. `live/packages.txt`
+  lists them in groups; `tools/fetch-live.py --update` resolves them against
+  Alpine 3.20 x86 (main + community, `so:`/`cmd:` dependencies) and pins all
+  239 packages with SHA-256 in `live/packages.lock`; `make live-root` rebuilds
+  from the lock.
+- Output is one archive, `build/live/rootfs.tar` (8 814 entries), not a folder:
+  the Mac can't unpack Linux trees faithfully (case, and files owned by root;
+  setuid `passwd`, `doas`, `bbsuid` keep their bits in the archive). It has
+  apk's database (`lib/apk/db/installed`, all 239), `/etc/apk/world`, the source
+  in `/usr/src/myos`, and `live/overlay` on top: BusyBox init with a console
+  login, xdm (commented out until /dev/fb0), IceWM with `OpaqueMove`/
+  `OpaqueResize`, a passwordless live user "myos" in wheel, `doas`.
+- Alpine's 14 install scripts can't run on the Mac; `/etc/myos/rc.boot` runs
+  them on the first boot, in install order.
+- Size before compression: base 8.3 MiB, login 9.4, desktop 58.4, office
+  (AbiWord) 40.0, dev 238.6, source 1.5; 357 MiB in all, 151 MiB of packages.
+- Not checked: Alpine's apk reading that database (Docker wasn't running). Not
+  yet possible on MyOS: separate users (every process is root), threads
+  (GLib, gdb, adb), more than 32 memory areas per process (X, gcc, AbiWord).
+
+## 2026-10-03 — audit of the kernel outside the network stack
+
+Pointed the method that had been used on the network code at the filesystem,
+the syscall layer and the drivers, with two attackers in mind: a crafted disk
+image, and a hostile unprivileged program. Fifteen bugs, thirteen fixed.
+
+The important one is not a bug but a wrong belief: `copy_to_user` and
+`copy_from_user` **can sleep**, because a fault on an `mmap`'d file page is
+handled by the page cache, which waits for the disk. "A syscall is atomic
+because interrupts are off" is therefore false, and three ring buffers — the
+pipe, the socket datagram queue, and both TCP rings — had committed their
+head/tail/length *after* the copy. Since a `fork` shares those objects, two
+processes could make the counters diverge, underflow an unsigned difference,
+and turn the next call into an unbounded out-of-bounds kernel write. All three
+now commit before copying, and the TCP rings clamp as well, so a raced count
+cannot leave the array. The class is written up in `docs/gaps.md`, because the
+rest of the kernel has not been checked for it.
+
+ext2 gave up seven out-of-bounds accesses against a crafted image, all from
+trusting a field on the disk: an unchecked `rec_len` that put a 4-byte write
+anywhere in the 64 KiB past a page, a `name_len` never compared with `rec_len`
+that made `ls` print the next page, an `inode_size` that was not required to be
+a power of two, group counts that could exceed the bits in a bitmap block, a
+fast symlink reporting 196 bytes of unzeroed heap through `readlink`, an
+ignored `load_symlink` failure that dereferenced NULL in ring 0, and a
+`blocks_count` of zero dividing by zero at mount. Real images still mount and
+e2fsck stays clean.
+
+An unprivileged program could halt the machine with one `rt_sigreturn`: `gs`
+and `fs` were restored from the program's own signal frame after checking only
+that the low bits said ring 3, and a selector like `0x0B` faults in `pop gs`
+while still at CPL 0, which is fatal. `gdt_user_seg_ok` now checks the live
+descriptor, which also handles a TLS slot nobody has filled in.
+
+Also: the network stack now drops a packet whose *source* is a broadcast,
+multicast, loopback or our own address. The destination was already checked,
+but the source is what decides where a reply goes — and it let an attacker
+choose which per-destination IP-ID counter a reply disclosed, which is the idle
+scan the per-destination counters exist to stop. Seven new checks in
+`make attacks`, all verified to fail without the fix; `make verify-tests` now
+reintroduces eight bugs and requires each to be caught.
+
+Left open and written down: the e1000 only reclaims transmit descriptors from
+the receive poll, so 15 sends with no inbound traffic wedge transmit with
+`EAGAIN`; `select` only handles the first 32 bits of an `fd_set`; and there is
+still no hostile-disk-image fuzz target, which is the gap that would have found
+the ext2 bugs instead of a reading.
+
+
+## 2026-10-03 — Threads (for GLib)
+- A process is now a Linux thread group. `clone(CLONE_THREAD|CLONE_VM|CLONE_SIGHAND
+  |CLONE_SETTLS|CLONE_PARENT_SETTID|CLONE_CHILD_CLEARTID)` — exactly what musl's
+  `pthread_create` asks for — adds a thread to the calling process: same memory,
+  files and handlers, its own registers, stack, TLS, signal mask and tid
+  (`gettid`, 224). Tids come from the pid counter.
+- `futex` (240) and `futex_time64` (422) in the new `kernel/futex.c`: WAIT, WAKE,
+  REQUEUE, CMP_REQUEUE, private or not, with timeouts. A hash of wait queues
+  keyed by (address space, address); interrupts are off for the whole call, so
+  check-and-sleep is atomic on one CPU.
+- `set_tid_address` and `CLONE_CHILD_CLEARTID` work: a dying thread writes 0 to
+  its tid word and futex-wakes it, which is how `pthread_join` returns.
+- `exit` (1) ends one thread; `exit_group` (252) and fatal signals end them all
+  (the others get a SIGKILL and die on their way back to user mode; the last one
+  out tears the process down). `execve` kills the siblings and waits for them;
+  `fork` copies only the calling thread.
+- Signals: masks are per thread; `kill` marks the process and wakes one thread
+  that doesn't block the signal; `tkill`/`tgkill` and CPU faults go to one
+  thread. A one-word `sig_check` flag per thread keeps the return-to-user check
+  at a single load (a null syscall got 3 cycles cheaper, see performance.md).
+- `mm_fault` now survives a sibling thread's `munmap` while it sleeps reading a
+  file page (it holds the file and looks the area up again).
+- Test: `user/musl/pthreadtest.c`, the first test linked against Alpine's real
+  musl (`musl-dev` added to `tools/fetch-alpine.sh`; new Makefile rule for
+  `user/musl/*.c`). 12 checks: mutex under contention, condvar, `__thread`,
+  join values, 20 detached threads, `pthread_kill`, process-directed `kill` with
+  masks, `sem_timedwait` timeout, fork/exit/exit-from-thread/main-exits-first/
+  execve from a threaded process. `make test` (115/115), `make test-shell` pass.
+- Still missing (`docs/gaps.md`): cross-process shared futexes, WAIT_BITSET /
+  WAKE_OP / PI / robust lists, and `MM_AREAS` = 32 caps a process at ~13 threads.
+
+## 2026-10-03 — The live disk gets a normal userland (no BusyBox)
+- Rodger: BusyBox is right for testing the kernel, not for the live disk; do it
+  the way other distributions do. They all ship the real tools on the root file
+  system (Debian, Fedora, Void, Arch); BusyBox shows up only in some initramfs
+  images (Ubuntu's initramfs-tools, Arch's mkinitcpio) for early boot. MyOS now
+  does the same: BusyBox stays in the test initramfs (`make test`, unchanged);
+  the live disk has none.
+- `live/packages.txt`: GNU coreutils, findutils, grep, sed, gawk, diffutils, tar,
+  util-linux (+ mount, lsblk, fdisk...), procps-ng, psmisc, htop, iproute2,
+  net-tools, ping; dash as /bin/sh (Debian's choice), bash for people; man pages
+  for the commands people type (mandoc, man-pages and 40 -doc packages — not
+  Alpine's "docs", which adds every library's API reference: 113 MiB).
+  `!busybox` forbids it: the build stops and prints who wanted it. It also goes
+  into `/etc/apk/world`, so apk on MyOS refuses it too.
+- Init: Alpine has no BusyBox-free init for its OpenRC scripts (openrc-init is
+  compiled out, no sysvinit), so process 1 is **runit**, set up like Void Linux:
+  `/sbin/init` -> `runit-init`; `/etc/runit/1` (mounts, first-boot install,
+  hostname), `2` (`runsvdir` on `/var/service`), `3` (stop services, sync,
+  read-only); services in `/etc/sv` (`agetty-console` enabled; `agetty-tty1`,
+  `agetty-ttyS0`, `xdm` ready); runit's control files and supervise folders in
+  /run, so the root can be read-only. `reboot`, `poweroff`, `halt`, `shutdown` go
+  through `runit-init`. Login is util-linux's agetty + login, through PAM.
+- Alpine's install scripts call BusyBox's `adduser`/`addgroup`/`add-shell`:
+  small front ends over shadow in `/usr/sbin` keep them (and later `apk add`s)
+  working. Tested against the exact calls in Alpine's scripts.
+- `tools/fetch-live.py`: `!name` forbids; a provider named in packages.txt wins
+  (dash-binsh over busybox-binsh for /bin/sh); apk's `install_if` is followed
+  (util-linux brings lsblk/findmnt/blkid, bash-completion the completions);
+  triggers on first boot now get the folders their patterns match (they got the
+  version before, so pango's wrote "1.52.2-r0.cache"), and scripts run from /
+  (alpine-baselayout's `chown root:shadow etc/shadow` is relative); overlay
+  symlinks are kept.
+- Kernel: process 1 is `/init`, else `/sbin/init`, `/etc/init`, `/bin/init`,
+  `/bin/sh` — Linux's order — so a distribution's root file system boots its
+  own init.
+- Result: 368 packages, 431 MiB before compression (base 32.7, init 9.8, desktop
+  56.2, office 40.0, dev 253.3, docs 32.4, source 5.6). Not bootable yet: the
+  kernel needs `vhangup`, `sethostname`, `reboot`, `mount`, /proc, /dev/tty1
+  (ROADMAP 9c-3).
+
+## 2026-10-03 — A Linux-shaped screen driver (step 11b)
+- Display drivers now have Linux's DRM shape (`docs/DESIGN.md`): `include/drm/`
+  holds the subset of Linux's headers one screen needs (modes, connector,
+  simple display pipe, framebuffer, fourcc, VRAM helper), at Linux's paths,
+  so a driver ported later keeps its `#include`s and callbacks.
+  `drivers/gpu/drm/drm_core.c` has the VESA mode table up to 2560x1600 and
+  the probe/mode-set glue.
+- First driver: our own `drivers/gpu/drm/tiny/bochs.c` for QEMU/UTM's std VGA
+  (PCI 1234:1111, the "Bochs DISPI" registers). Any standard mode that fits
+  video memory and is a multiple of 8 wide; 1920x1200 is chosen at boot.
+- The console was split: `drivers/vt.c` keeps the VT100 parser and the text
+  in RAM; the old 80x25 screen and the new pixel console (`drivers/video/fbcon.c`)
+  are backends. fbcon uses the VGA BIOS's 8x16 font, which stage 2 now copies
+  to 0x2000 (`bootinfo.font_phys`), drawn 2x at 1920x1200: 120x37 characters.
+  Scrolling pans the screen (one register write); `TIOCGWINSZ` follows the size.
+- `/dev/fb0` (29:0) via fbdev emulation (`drivers/gpu/drm/drm_fbdev.c`,
+  `drivers/video/fbmem.c`): Linux's `fb_var_screeninfo` / `fb_fix_screeninfo`,
+  GET/PUT_VSCREENINFO (mode changes at run time), GET_FSCREENINFO, PAN_DISPLAY,
+  BLANK, and `mmap`. Device mmaps are a new kind of area (`VM_PFNMAP`): pages
+  are mapped on fault, shared by `fork`, never freed. `KDSETMODE` hands the
+  screen to a program and back.
+- Video memory is write-combining: `arch/i386/pat.c` sets PAT entry 1 to WC
+  (`ioremap_wc`), mapped with 4 MiB pages. Uncached on CPUs without PAT.
+- Tests: kernel self-tests for the mode helpers and the Bochs driver (`kernel/drm_test.c`),
+  `user/fbtest.c` (43 checks: struct sizes, ioctls, drawing through mmap, fork,
+  mode change and back, bad requests), and a QEMU screendump checked by
+  `tools/check-screen.py`. `make test` passes (131 self-tests).
+- Speed: see performance.md. The first fbcon made boot 27x slower (pixel-by-pixel
+  glyphs); unrolled glyphs and skipping blank cells on a fresh screen got it to
+  3.3 ms of CPU. The worst scroll (a full redraw) is in gaps.md.
+- UTM: choose the "VGA" display (`-vga std`). Other display cards and real
+  hardware keep the text screen until the VESA framebuffer step.
+- 2026-10-03: The live userland's missing kernel calls. `sethostname` (uname's node name is
+  now writable), `vhangup` (flush input, SIGHUP+SIGCONT to the foreground group), `reboot`
+  (magic numbers checked; sync, then the 8042's reset line or a triple fault; power off on
+  QEMU by writing SLP_EN to the PIIX4/ICH9 PM port, found through PCI and only when the
+  subsystem vendor is QEMU's — a real board needs ACPI's `_S5`; CAD_ON/OFF switch
+  Ctrl-Alt-Del between "restart now" and SIGINT to init, which runit asks for).
+  `mount -t tmpfs` mounts a fresh RAM directory (`vfs_mount_ram`); proc/sysfs say ENODEV,
+  ext2/vfat ENOTBLK (no block device files yet); `umount2` only reports. Keyboard driver
+  tracks Alt now. New musl test `boottest` (22 checks) in `make test`; 131/131 pass.
+  By hand in QEMU: `hostname livebox` works, `poweroff -f` switches QEMU off, `reboot -f`
+  resets it. No hot path changed (two table entries, one key check in the keyboard IRQ),
+  so no benchmark. Lesson: Linux allows stacking mounts on one directory; so do we.
+
+### 2026-10-03 — hostile disk images, and the copies that sleep
+
+Two jobs, and each turned up bugs the other could not have.
+
+**A fuzz target for hostile disk images.** `storage_init` mounts anything labelled
+`myos-root` or `myos-data` automatically, and read-write, so plugging in a USB stick is
+the whole attack — no port to close, no user to deny. `make diskattacks` builds the real
+`fs/ext2.c`, `fs/bcache.c`, `fs/pcache.c`, `fs/partition.c` and the VFS on the host
+against stubs, under AddressSanitizer and UBSan, and mounts a byte array: 30 cases that
+each corrupt one field, then walk, read, write, rename and symlink. `make diskfuzz`
+mutates bytes at random on top of that, biased at the superblock, the group descriptors,
+the inode table and the directory blocks, forking per run so a crash is evidence rather
+than the end.
+
+Most of the work was not writing cases, it was making the harness able to *see* one.
+**Six of the first eight measured nothing**, all for the same reason: `bcache` gives
+every buffer a whole page, so with 1 KiB blocks a four-byte overrun lands in 3 KiB of
+slack and nobody notices. The base image is now built with `mke2fs -b 4096` so a block
+exactly fills its allocation and the next byte is a poisoned redzone. `kmalloc` maps to
+plain `malloc` (a size class would round 100 bytes to 128 and hide a 20-byte overflow),
+and fresh allocations are filled with `0xA5` rather than zeroed, which is the only way to
+catch the bug no sanitizer can see: memory validly allocated, never written, handed to
+user space. That is how the fast-symlink disclosure shows up.
+
+Then the fuzzer found three bugs in minutes that two careful readings had missed. Two
+were alignment: `rec_len` was not required to be a multiple of four, so the walk read a
+`uint16_t` at an odd address, and the `..` fixup — whose *bounds* I had just fixed — did
+a misaligned four-byte **write**. Harmless on x86, which is exactly why reading missed
+them, and not harmless on the Raspberry Pi that is on the roadmap. The third is the one
+worth generalising from: `fs->groups` divided by `blocks_per_group` three lines **above**
+the check for `blocks_per_group == 0`. The check existed and was correct. The rule it
+broke is not "validate your inputs" but **nothing may be derived from a field before that
+field is checked**, which is an ordering property — the thing reading code is worst at and
+running it is best at. Eleven ext2 bugs now, each with a case, and
+`make verify-disktests` reintroduces all eleven one at a time and requires that the
+matching case, and not a different one, fails.
+
+**The copies that sleep.** `copy_to_user` can sleep, because a fault on an `mmap`'d file
+page waits for the disk — so "a syscall is atomic because interrupts are off", written
+out in `net/netdevice.c` and assumed all over, is false. A second pass that worked from
+*shared mutable state* rather than from the 126 copy sites found three more bugs beyond
+the four already fixed. The worst is `sys_getdents64`: it held raw `struct inode *`
+pointers across the copy with no reference, and `detach()` frees an unlinked inode the
+moment `refs` hits 0 — so a sibling's `unlink` during the sleep left us reading a freed
+node's `name` pointer and length and `memcpy`ing that to user space. Also `tty_read`
+(every reader shares one ring; the underflow makes `--nlines` turn a `memmove` into a
+four-billion-byte one) and `wait4` (two threads reap one zombie, the slot is reused by
+`fork`, and the stale reap then drops a *live* process's `cwd` reference).
+
+The fix is `fault_in_user()`, which touches every page of a user range before any shared
+state is read, applied centrally in `rw()` — the one door `read`/`write`/`readv`/`writev`
+now go through — plus `getdents64` and the socket calls. **+34 cycles on a 4 KiB read**
+(1506 → 1540, measured twice each way). But `clone(CLONE_THREAD)` landed in this tree
+today, so a sibling thread can unmap the buffer while the pre-fault is still probing
+later pages: it removes the sleep that happens with *no attacker present*, and nothing
+more. So each site is also correct across a sleep by construction — commit the index
+first, detach first, reap first, or hold a reference.
+
+Three near-misses worth keeping. I wrote a comment claiming a race that could not happen,
+then rewrote it to deny one that could, before getting it right — the file now records
+the wrong argument *as* wrong, because it is a tempting one. Piping `make verify-disktests`
+into `head` killed it with SIGPIPE before its restore trap ran, leaving a deliberately
+reintroduced bug sitting in the tree for half an hour; both verify scripts ignore SIGPIPE
+now. And a patch that no longer matched the source made the same script rebuild the
+*unmodified* file, watch every case pass, and report "NOT CAUGHT" — a script written to
+catch tests that measure nothing, measuring nothing. It says "PATCH DID NOT APPLY" now,
+and it deletes the binary on the way out, because the one it leaves behind is built from
+the last reintroduced bug and I spent twenty minutes investigating a "new" bug that was
+exactly that.
+
+Lesson, twice over: a test that passes against the broken code measures nothing, and the
+machinery that checks for *that* needs the same suspicion pointed at it.
+- 2026-10-03: Attack-path tests for the sleeping copy. The previous entry ended with seven
+  fixes whose whole justification was an interleaving nobody had ever made happen, which is
+  not evidence. `make test` now makes it happen. `include/uaccess_test.h` + syscall 423 let a
+  thread arm the nth `copy_to_user`/`copy_from_user` it performs to `thread_yield()` before
+  copying; a yield is what a sleep looks like from the sibling's side, and is deterministic,
+  and `wq_sleep` leaves the kernel in exactly that state anyway (inside a syscall, interrupts
+  off), so it is faithful rather than merely convenient. Both halves are `#ifdef SELFTEST`:
+  no branch and no symbol in a normal build. `user/musl/racetest.c` races a sibling against a
+  sleeping copy in `read`, `write`, `wait4` and `getdents64`, asserting conservation laws
+  (eight bytes in a pipe are read exactly once in total; one child is reaped by one waiter;
+  every name `readdir` returns is really there) rather than implementation details.
+  `make verify-racetests` puts each of the six fixes back and checks racetest notices.
+
+  The first run found an eighth bug, in my own fix. `sys_getdents64` pinned the entry it was
+  copying — the pointer the code obviously holds — but `next` is fetched before the loop and
+  the copies that emit "." and ".." sleep before it is ever used, so a sibling frees it and
+  the first real iteration reads a name pointer and length out of a recycled inode and copies
+  that name to user space. The test printed `unexpected entry "\xe9b"`. Both pointers are held
+  now, with one exit path. Two careful readings of that function produced a fix that was still
+  memory-unsafe; the first run of the test caught it.
+
+  Then verify-racetests caught the test itself measuring nothing, five times, each for a
+  different reason, and each of them a thing I would not have thought to check: the buffer was
+  too small, so the call returned after "." and ".." and never touched an entry; the single
+  arming always landed on the same copy, so two of three bugs were out of reach (it sweeps
+  1..10 now); a directory lists in reverse creation order, so the entry I kept alive was the
+  *first* one reported and the pointer held across the sleep stayed valid; freed memory still
+  held the old name, so a walk reading a dangling pointer read "aaa" back and saw nothing
+  wrong (the sibling grooms the heap now — creating files with names of its own choosing after
+  deleting, which is what an exploit does, and the test was not an attack path until it did);
+  and the deletion order mattered, because `sibling_remove` leaves the removed node's own
+  `next_sibling` alone, so deleting in creation order leaves every detached node pointing at a
+  *live* entry and the bug gets away with it. Deleting newest-first makes them dangle.
+
+  Lesson: writing a test for a race is mostly discovering the reasons it cannot fire. Five of
+  the six reasons here were invisible from the test's source and obvious the moment something
+  reintroduced the bug and the test stayed green. An attacker chooses buffer sizes, timing,
+  heap contents and deletion order; a test that fixes all four picks the easy combination
+  roughly always.

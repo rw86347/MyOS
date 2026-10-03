@@ -62,9 +62,10 @@ int main(int argc, char **argv)
     n = read(0, buf, sizeof buf);
     CHECK(n == -EINTR && interrupted);
 
-    /* Window size; and a pipe is not a terminal (isatty() = 0). */
+    /* Window size (80x25 on the text screen, more on a framebuffer);
+       and a pipe is not a terminal (isatty() = 0). */
     unsigned short ws[4];
-    CHECK(ioctl(1, TIOCGWINSZ, ws) == 0 && ws[0] == 25 && ws[1] == 80);
+    CHECK(ioctl(1, TIOCGWINSZ, ws) == 0 && ws[0] >= 25 && ws[1] >= 80);
     int p[2];
     CHECK(pipe(p) == 0 && ioctl(p[0], TCGETS, &t) == -ENOTTY);
 

@@ -16,10 +16,25 @@
 /* kernel/sys_info.c */
 void time_init(void);                   /* read the CMOS clock */
 SYSCALL_DEF(sys_uname);
-SYSCALL_DEF(sys_getid);                 /* getuid & co.: we're all root */
-SYSCALL_DEF(sys_setid);
+SYSCALL_DEF(sys_sethostname);
+SYSCALL_DEF(sys_getuid);                /* users and groups (cred.h) */
+SYSCALL_DEF(sys_geteuid);
+SYSCALL_DEF(sys_getgid);
+SYSCALL_DEF(sys_getegid);
+SYSCALL_DEF(sys_setuid);
+SYSCALL_DEF(sys_setgid);
+SYSCALL_DEF(sys_setreuid);
+SYSCALL_DEF(sys_setregid);
+SYSCALL_DEF(sys_setresuid);
+SYSCALL_DEF(sys_setresgid);
+SYSCALL_DEF(sys_getresuid);
+SYSCALL_DEF(sys_getresgid);
+SYSCALL_DEF(sys_setfsuid);
+SYSCALL_DEF(sys_setfsgid);
 SYSCALL_DEF(sys_getgroups);
-SYSCALL_DEF(sys_getresid);
+SYSCALL_DEF(sys_setgroups);
+SYSCALL_DEF(sys_getpriority);
+SYSCALL_DEF(sys_setpriority);
 SYSCALL_DEF(sys_time);
 SYSCALL_DEF(sys_gettimeofday);
 SYSCALL_DEF(sys_clock_gettime);
@@ -73,6 +88,11 @@ SYSCALL_DEF(sys_truncate64);
 SYSCALL_DEF(sys_ftruncate64);
 SYSCALL_DEF(sys_statfs64);
 SYSCALL_DEF(sys_fstatfs64);
+SYSCALL_DEF(sys_mount);
+SYSCALL_DEF(sys_umount2);
+
+/* fs/flock.c */
+SYSCALL_DEF(sys_flock);
 
 /* fs/poll.c */
 SYSCALL_DEF(sys_poll);

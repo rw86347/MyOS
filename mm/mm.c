@@ -4,9 +4,13 @@
  * The CPU-specific work (page directories, copy-on-write bits) is in
  * arch/<cpu>/paging.c; this file decides what is allowed where.
  *
- * Speed: an address space has at most MM_AREAS areas, kept sorted, so every
- * lookup is a short scan of a small array that fits in a few cache lines.
- * Programs typically have 4-6 areas (code, data, heap, stack, a few mmaps).
+ * Speed: an address space's areas are one array, kept sorted, so a lookup
+ * (every page fault) is a binary search: 5 steps for 32 areas, 9 for 400.
+ * A small program has 4-6 areas (code, data, heap, stack, a few mmaps); each
+ * shared library adds 4-5, so a GTK program has hundreds. The array starts
+ * with room for MM_AREAS_FIRST (896 bytes, a kmalloc size class) and
+ * doubles when full, up to MM_AREAS_MAX. Growing copies it: a pointer into
+ * the array is stale after anything that adds an area.
  */
 #include <errno.h>
 #include <kheap.h>
@@ -52,8 +56,11 @@ struct mm *mm_create(void)
     if (!mm)
         return NULL;
     memset(mm, 0, sizeof *mm);
-    mm->pd = vmm_pd_create();
+    mm->area = kmalloc(MM_AREAS_FIRST * sizeof *mm->area);
+    mm->cap = MM_AREAS_FIRST;
+    mm->pd = mm->area ? vmm_pd_create() : 0;
     if (!mm->pd) {
+        kfree(mm->area);
         kfree(mm);
         return NULL;
     }
@@ -65,12 +72,16 @@ struct mm *mm_fork(struct mm *mm)
     struct mm *child = kmalloc(sizeof *child);
     if (!child)
         return NULL;
-    memcpy(child, mm, sizeof *child);   /* same areas, same brk */
-    child->pd = vmm_pd_fork();          /* same pages, shared copy-on-write */
+    memcpy(child, mm, sizeof *child);   /* same brk */
+    child->cap = mm->cap ? mm->cap : MM_AREAS_FIRST;
+    child->area = kmalloc(child->cap * sizeof *mm->area);
+    child->pd = child->area ? vmm_pd_fork() : 0;    /* same pages, copy-on-write */
     if (!child->pd) {
+        kfree(child->area);
         kfree(child);
         return NULL;
     }
+    memcpy(child->area, mm->area, mm->nareas * sizeof *mm->area);   /* same areas */
     for (int i = 0; i < child->nareas; i++)
         if (child->area[i].file)
             vfs_get(child->area[i].file);   /* the child maps the files too */
@@ -83,26 +94,64 @@ void mm_destroy(struct mm *mm)
         if (mm->area[i].file)
             vfs_put(mm->area[i].file);
     vmm_pd_destroy(mm->pd);
+    kfree(mm->area);
     kfree(mm);
 }
 
 /* The area containing addr, or NULL. */
 static struct vma *find(struct mm *mm, uint32_t addr)
 {
-    for (int i = 0; i < mm->nareas; i++) {
-        if (addr < mm->area[i].start)
-            return NULL;                /* sorted: no later area can match */
-        if (addr < mm->area[i].end)
-            return &mm->area[i];
+    int lo = 0, hi = mm->nareas;        /* the answer is in [lo, hi) */
+    while (lo < hi) {
+        int mid = (lo + hi) / 2;
+        struct vma *v = &mm->area[mid];
+        if (addr < v->start)
+            hi = mid;
+        else if (addr >= v->end)
+            lo = mid + 1;
+        else
+            return v;
     }
     return NULL;
 }
 
+/* The first area that ends after addr (so it contains addr or is the
+   next one up), as an index; nareas if none. */
+static int first_after(struct mm *mm, uint32_t addr)
+{
+    int lo = 0, hi = mm->nareas;
+    while (lo < hi) {
+        int mid = (lo + hi) / 2;
+        if (mm->area[mid].end <= addr)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    return lo;
+}
+
 static int overlaps(struct mm *mm, uint32_t start, uint32_t end)
 {
-    for (int i = 0; i < mm->nareas; i++)
-        if (mm->area[i].start < end && start < mm->area[i].end)
-            return 1;
+    int i = first_after(mm, start);
+    return i < mm->nareas && mm->area[i].start < end;
+}
+
+/* Make room for one more area: double the array if it's full. Moves the
+   areas, so pointers into the array are stale afterwards. */
+static int room_for_one(struct mm *mm)
+{
+    if (mm->nareas < mm->cap)
+        return 0;
+    int cap = mm->cap ? 2 * mm->cap : MM_AREAS_FIRST;
+    if (cap > MM_AREAS_MAX)
+        return -ENOMEM;
+    struct vma *a = kmalloc(cap * sizeof *a);
+    if (!a)
+        return -ENOMEM;
+    memcpy(a, mm->area, mm->nareas * sizeof *a);
+    kfree(mm->area);
+    mm->area = a;
+    mm->cap = cap;
     return 0;
 }
 
@@ -111,9 +160,11 @@ int mm_add(struct mm *mm, uint32_t start, uint32_t end, uint32_t flags)
     return mm_add_file(mm, start, end, flags, NULL, 0, 0);
 }
 
-int mm_add_file(struct mm *mm, uint32_t start, uint32_t end, uint32_t flags,
-                struct inode *file, uint32_t file_off, uint32_t file_end)
+/* Add area *n ([n->start, n->end), its flags and file part). */
+static int add_area(struct mm *mm, const struct vma *n)
 {
+    uint32_t start = n->start, end = n->end, flags = n->flags;
+    struct inode *file = n->file;
     if (start >= end || end > KERNEL_VBASE || overlaps(mm, start, end))
         return -EINVAL;
 
@@ -123,9 +174,10 @@ int mm_add_file(struct mm *mm, uint32_t start, uint32_t end, uint32_t flags,
        with the same end-of-data, so one ELF segment is one area. */
     for (int i = 0; i < mm->nareas; i++) {
         struct vma *v = &mm->area[i];
-        if (v->flags != flags || v->file != file || v->file_end != file_end)
+        if (v->flags != flags || v->file != file || v->file_end != n->file_end ||
+            v->phys != n->phys)
             continue;
-        if (file && v->file_off + (v->end - v->start) != file_off)
+        if (file && v->file_off + (v->end - v->start) != n->file_off)
             continue;
         if (v->end == start && (i + 1 == mm->nareas || mm->area[i + 1].start >= end)) {
             v->end = end;
@@ -137,18 +189,26 @@ int mm_add_file(struct mm *mm, uint32_t start, uint32_t end, uint32_t flags,
         }
     }
 
-    if (mm->nareas == MM_AREAS)
+    if (room_for_one(mm) < 0)
         return -ENOMEM;
     int i = mm->nareas;
     while (i > 0 && mm->area[i - 1].start > start) {    /* keep them sorted */
         mm->area[i] = mm->area[i - 1];
         i--;
     }
-    mm->area[i] = (struct vma){ start, end, flags, file, file_off, file_end };
+    mm->area[i] = *n;
     mm->nareas++;
     if (file)
         vfs_get(file);      /* a mapped file stays readable, even if deleted */
     return 0;
+}
+
+int mm_add_file(struct mm *mm, uint32_t start, uint32_t end, uint32_t flags,
+                struct inode *file, uint32_t file_off, uint32_t file_end)
+{
+    struct vma n = { .start = start, .end = end, .flags = flags, .file = file,
+                     .file_off = file_off, .file_end = file_end };
+    return add_area(mm, &n);
 }
 
 int mm_remove(struct mm *mm, uint32_t start, uint32_t end)
@@ -158,13 +218,14 @@ int mm_remove(struct mm *mm, uint32_t start, uint32_t end)
         if (v->end <= start || end <= v->start)
             continue;
         if (start > v->start && end < v->end) {         /* a hole in the middle */
-            if (mm->nareas == MM_AREAS)
+            if (room_for_one(mm) < 0)
                 return -ENOMEM;
+            v = &mm->area[i];
             memmove(&mm->area[i + 2], &mm->area[i + 1],
                     (mm->nareas - i - 1) * sizeof *v);
-            mm->area[i + 1] = (struct vma){ end, v->end, v->flags, v->file,
-                                            v->file_off + (end - v->start),
-                                            v->file_end };
+            mm->area[i + 1] = *v;
+            mm->area[i + 1].start = end;
+            mm->area[i + 1].file_off = v->file_off + (end - v->start);
             if (v->file)
                 vfs_get(v->file);
             v->end = start;
@@ -206,6 +267,16 @@ int mm_fault(uint32_t va, uint32_t err)
     if (write && !(v->flags & VM_WRITE))
         return -1;
 
+    /* Device memory: map the device's page. Nothing to allocate or copy. */
+    if (v->flags & VM_PFNMAP) {
+        uint32_t page = PAGE_DOWN(va), off = v->file_off + (page - v->start);
+        if (off >= v->file_end)
+            return -1;                  /* past the device: SIGSEGV (Linux: SIGBUS) */
+        uint32_t flags = PTE_USER | PTE_SHARED | (v->flags & VM_WRITE ? PTE_WRITABLE : 0) |
+                         (v->flags & VM_WC ? pte_write_combining() : PTE_PCD);
+        return vmm_map(page, v->phys + off, flags) < 0 ? -1 : 0;
+    }
+
     /* Demand paging: the first touch of a page in an area creates it —
        zero-filled, or for a mapped file, a copy of that part of the file
        (straight from the initramfs, or from its RAM pages). Pages never
@@ -223,9 +294,24 @@ int mm_fault(uint32_t va, uint32_t err)
             limit = v->file->size;
         if (off < limit)
             n = limit - off < PAGE_SIZE ? limit - off : PAGE_SIZE;
-        if (n && file_copy_out(v->file, off, P2V(frame), n) < 0) {
-            pmm_free(frame);
-            return -1;
+        if (n) {
+            /* The copy may sleep on the disk. Meanwhile another thread of
+               this process can munmap the area (dropping the file) or
+               fault the same page in: hold the file, and look again. */
+            struct inode *file = v->file;
+            vfs_get(file);
+            int err = file_copy_out(file, off, P2V(frame), n);
+            v = find(current_mm, va);
+            int same = v && v->file == file && v->file_off + (page - v->start) == off;
+            vfs_put(file);
+            if (err < 0) {
+                pmm_free(frame);
+                return -1;
+            }
+            if (!same || vmm_translate(page)) {
+                pmm_free(frame);
+                return 0;               /* run it again: it faults afresh */
+            }
         }
     }
     memset((uint8_t *)P2V(frame) + n, 0, PAGE_SIZE - n);
@@ -310,6 +396,53 @@ int32_t mm_mmap(uint32_t addr, uint32_t len, uint32_t prot, uint32_t flags,
     return err ? err : (int32_t)addr;
 }
 
+int vm_iomap_memory(struct vma *vma, uint32_t phys, uint32_t size)
+{
+    uint32_t len = vma->end - vma->start;
+    if (vma->file_off > size || len > size - vma->file_off)
+        return -EINVAL;
+    vma->flags |= VM_PFNMAP;
+    vma->phys = phys;
+    vma->file_end = size;
+    return 0;
+}
+
+int32_t mm_mmap_device(uint32_t addr, uint32_t len, uint32_t prot, uint32_t flags,
+                       struct file *f, uint32_t off)
+{
+    if (len == 0 || ((addr | off) & (PAGE_SIZE - 1)))
+        return -EINVAL;
+    if ((f->flags & O_ACCMODE) == O_WRONLY)
+        return -EACCES;
+    if ((prot & PROT_WRITE) && (f->flags & O_ACCMODE) != O_RDWR)
+        return -EACCES;
+    len = PAGE_UP(len);
+    if (len == 0)
+        return -EINVAL;
+    struct vma n = { .start = 0, .end = len, .file = f->inode, .file_off = off,
+                     .flags = VM_READ | (prot & PROT_WRITE ? VM_WRITE : 0) |
+                              ((f->flags & O_ACCMODE) == O_RDWR ? VM_MAYWRITE : 0) };
+    int err = f->ops->mmap(f, &n);
+    if (err < 0)
+        return err;
+    if (!(n.flags & VM_PFNMAP))
+        return -ENODEV;
+
+    if (flags & MAP_FIXED) {
+        if (addr + len > KERNEL_VBASE || addr + len < addr)
+            return -EINVAL;
+        mm_remove(current_mm, addr, addr + len);
+    } else {
+        addr = mm_find_gap(current_mm, len);
+        if (!addr)
+            return -ENOMEM;
+    }
+    n.start = addr;
+    n.end = addr + len;
+    err = add_area(current_mm, &n);
+    return err ? err : (int32_t)addr;
+}
+
 int32_t mm_munmap(uint32_t addr, uint32_t len)
 {
     if ((addr & (PAGE_SIZE - 1)) || len == 0 || addr + len > KERNEL_VBASE)
@@ -325,9 +458,9 @@ static int split_at(struct mm *mm, uint32_t addr)
     struct vma *v = find(mm, addr);
     if (!v || v->start == addr)
         return 0;
-    if (mm->nareas == MM_AREAS)
-        return -ENOMEM;
     int i = v - mm->area;
+    if (room_for_one(mm) < 0)
+        return -ENOMEM;
     memmove(&mm->area[i + 1], &mm->area[i], (mm->nareas - i) * sizeof *v);
     mm->area[i].end = addr;
     mm->area[i + 1].file_off += addr - mm->area[i + 1].start;
@@ -348,6 +481,8 @@ int32_t mm_mprotect(uint32_t addr, uint32_t len, uint32_t prot)
         struct vma *v = find(mm, a);
         if (!v)
             return -ENOMEM;
+        if ((v->flags & VM_PFNMAP) && (prot & PROT_WRITE) && !(v->flags & VM_MAYWRITE))
+            return -EACCES;             /* a device opened read-only */
         a = v->end;
     }
     if (split_at(mm, addr) < 0 || split_at(mm, end) < 0)
@@ -356,7 +491,8 @@ int32_t mm_mprotect(uint32_t addr, uint32_t len, uint32_t prot)
                       (prot & 4 ? VM_EXEC : 0);
     for (int i = 0; i < mm->nareas; i++)
         if (mm->area[i].start >= addr && mm->area[i].end <= end)
-            mm->area[i].flags = vflags;
+            mm->area[i].flags = vflags |
+                                (mm->area[i].flags & (VM_PFNMAP | VM_WC | VM_MAYWRITE));
     /* Pages that exist get the new write permission (a copy-on-write page
        stays read-only: its fault handler makes it writable). */
     for (uint32_t a = addr; a < end; a += PAGE_SIZE) {

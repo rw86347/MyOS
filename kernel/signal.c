@@ -79,29 +79,58 @@ static int default_ignored(int sig)
 
 /* --- sending ---------------------------------------------------------------- */
 
+/* Would this signal be ignored anyway? Then it's dropped when sent. */
+static int ignored(struct process *p, int sig)
+{
+    uint32_t h = p->sig_action[sig - 1].handler;
+    return sig != SIGKILL && (h == SIG_IGN || (h == SIG_DFL && default_ignored(sig)));
+}
+
 int signal_send(struct process *p, int sig)
 {
     if (sig < 0 || sig > NSIG)
         return -EINVAL;
-    if (sig == 0)
-        return 0;                       /* "does it exist?" */
-    uint32_t h = p->sig_action[sig - 1].handler;
-    if (sig != SIGKILL && (h == SIG_IGN || (h == SIG_DFL && default_ignored(sig))))
-        return 0;                       /* would be ignored: drop it now */
+    if (sig == 0 || ignored(p, sig))
+        return 0;                       /* sig 0: "does it exist?" */
 
     uint32_t flags = irq_save();
     p->sig_pending |= SIGBIT(sig);
-    if (sig == SIGKILL || !(p->sig_blocked & SIGBIT(sig)))
-        if (p->thread && p->state == PROC_ALIVE)
-            thread_wake(p->thread);     /* its sleep ends with -EINTR */
+    /* Any one thread that doesn't block it may take it; wake that one (its
+       sleep ends with -EINTR). If all block it, it waits for one to
+       unblock it. A SIGKILL wakes one, which then ends them all. Every
+       thread looks on its way out to user mode. */
+    struct thread *taker = NULL;
+    for (struct thread *t = p->threads; t; t = t->proc_next) {
+        t->sig_check = 1;
+        if (!taker && (sig == SIGKILL || !(t->sig_blocked & SIGBIT(sig))))
+            taker = t;
+    }
+    if (taker && p->state == PROC_ALIVE)
+        thread_wake(taker);
+    irq_restore(flags);
+    return 0;
+}
+
+int signal_send_thread(struct thread *t, int sig)
+{
+    if (sig < 0 || sig > NSIG)
+        return -EINVAL;
+    if (sig == 0 || ignored(t->proc, sig))
+        return 0;
+    uint32_t flags = irq_save();
+    t->sig_pending |= SIGBIT(sig);
+    t->sig_check = 1;
+    if (sig == SIGKILL || !(t->sig_blocked & SIGBIT(sig)))
+        thread_wake(t);
     irq_restore(flags);
     return 0;
 }
 
 int signal_pending(void)
 {
-    struct process *p = proc_current();
-    return p && (p->sig_pending & ~p->sig_blocked);
+    struct thread *t = thread_current();
+    struct process *p = t->proc;
+    return p && ((p->sig_pending | t->sig_pending) & ~t->sig_blocked);
 }
 
 /* --- delivering --------------------------------------------------------------- */
@@ -126,11 +155,11 @@ static void save_context(struct sigcontext *sc, const struct regs *r, uint64_t m
 
 /* Build the frame and point the program at its handler. 0, or -1 if the
    program's stack is unusable (then it dies with SIGSEGV). */
-static int setup_frame(struct process *p, int sig, struct k_sigaction *a, struct regs *r)
+static int setup_frame(int sig, struct k_sigaction *a, struct regs *r)
 {
     struct thread *t = thread_current();
-    uint64_t mask = p->sig_restore ? p->sig_saved : p->sig_blocked;
-    p->sig_restore = 0;
+    uint64_t mask = t->sig_restore ? t->sig_saved : t->sig_blocked;
+    t->sig_restore = 0;
 
     /* The FPU registers: save them below the frame (16-byte aligned for
        fxsave), and give the handler a clean FPU. */
@@ -184,10 +213,10 @@ static int setup_frame(struct process *p, int sig, struct k_sigaction *a, struct
     }
 
     /* While the handler runs, its mask (and the signal itself) are blocked. */
-    p->sig_blocked |= a->mask;
+    t->sig_blocked |= a->mask;
     if (!(a->flags & SA_NODEFER))
-        p->sig_blocked |= SIGBIT(sig);
-    p->sig_blocked &= ~(SIGBIT(SIGKILL) | SIGBIT(SIGSTOP));
+        t->sig_blocked |= SIGBIT(sig);
+    t->sig_blocked &= ~(SIGBIT(SIGKILL) | SIGBIT(SIGSTOP));
     if (a->flags & SA_RESETHAND)
         a->handler = SIG_DFL;
     return 0;
@@ -195,22 +224,28 @@ static int setup_frame(struct process *p, int sig, struct k_sigaction *a, struct
 
 void signal_check(struct regs *r)
 {
-    struct process *p = proc_current();
+    struct thread *t = thread_current();
+    struct process *p = t->proc;
     if (!p || !(r->cs & 3))
         return;
     for (;;) {
-        uint64_t ready = p->sig_pending & ~p->sig_blocked;
-        if (p->sig_pending & SIGBIT(SIGKILL))
+        uint64_t pending = t->sig_pending | p->sig_pending;
+        t->sig_check = pending != 0;    /* blocked ones: look again later */
+        uint64_t ready = pending & ~t->sig_blocked;
+        if (pending & SIGBIT(SIGKILL))
             ready |= SIGBIT(SIGKILL);   /* can't be blocked */
         if (!ready) {
-            if (p->sig_restore) {       /* sigsuspend ended without a handler */
-                p->sig_blocked = p->sig_saved;
-                p->sig_restore = 0;
+            if (t->sig_restore) {       /* sigsuspend ended without a handler */
+                t->sig_blocked = t->sig_saved;
+                t->sig_restore = 0;
             }
             return;
         }
         int sig = __builtin_ctzll(ready) + 1;   /* lowest number first */
-        p->sig_pending &= ~SIGBIT(sig);
+        if (t->sig_pending & SIGBIT(sig))       /* this thread's own first */
+            t->sig_pending &= ~SIGBIT(sig);
+        else
+            p->sig_pending &= ~SIGBIT(sig);
 
         struct k_sigaction *a = &p->sig_action[sig - 1];
         if (sig == SIGKILL || a->handler == SIG_DFL) {
@@ -220,7 +255,7 @@ void signal_check(struct regs *r)
         }
         if (a->handler == SIG_IGN)
             continue;
-        if (setup_frame(p, sig, a, r) < 0)
+        if (setup_frame(sig, a, r) < 0)
             proc_exit(W_SIGNALED(SIGSEGV));     /* no usable stack */
         return;                                 /* one handler at a time */
     }
@@ -230,8 +265,8 @@ void signal_check(struct regs *r)
 
 void signal_fork(struct process *child, struct process *parent)
 {
+    /* (The mask is the thread's: thread_fork copies it.) */
     memcpy(child->sig_action, parent->sig_action, sizeof child->sig_action);
-    child->sig_blocked = parent->sig_blocked;
     child->sig_pending = 0;             /* pending signals aren't inherited */
     child->alarm_at = child->alarm_every = 0;   /* timers aren't inherited */
     child->alarm_next = NULL;
@@ -266,8 +301,11 @@ int32_t sys_rt_sigaction_impl(int sig, uint32_t act, uint32_t oact, uint32_t siz
             return -EFAULT;
         n.mask &= ~(SIGBIT(SIGKILL) | SIGBIT(SIGSTOP));
         *a = n;
-        if (n.handler == SIG_IGN || (n.handler == SIG_DFL && default_ignored(sig)))
+        if (n.handler == SIG_IGN || (n.handler == SIG_DFL && default_ignored(sig))) {
             p->sig_pending &= ~SIGBIT(sig);     /* pending ones are dropped */
+            for (struct thread *t = p->threads; t; t = t->proc_next)
+                t->sig_pending &= ~SIGBIT(sig);
+        }
     }
     return 0;
 }
@@ -278,23 +316,23 @@ int32_t sys_rt_sigaction_impl(int sig, uint32_t act, uint32_t oact, uint32_t siz
 
 int32_t sys_rt_sigprocmask_impl(int how, uint32_t set, uint32_t oset, uint32_t size)
 {
-    struct process *p = proc_current();
+    struct thread *t = thread_current();
     if (size != 8)
         return -EINVAL;
-    uint64_t old = p->sig_blocked;
+    uint64_t old = t->sig_blocked;
     if (set) {
         uint64_t s;
         if (copy_from_user(&s, (void *)set, 8) < 0)
             return -EFAULT;
         if (how == SIG_BLOCK)
-            p->sig_blocked |= s;
+            t->sig_blocked |= s;
         else if (how == SIG_UNBLOCK)
-            p->sig_blocked &= ~s;
+            t->sig_blocked &= ~s;
         else if (how == SIG_SETMASK)
-            p->sig_blocked = s;
+            t->sig_blocked = s;
         else
             return -EINVAL;
-        p->sig_blocked &= ~(SIGBIT(SIGKILL) | SIGBIT(SIGSTOP));
+        t->sig_blocked &= ~(SIGBIT(SIGKILL) | SIGBIT(SIGSTOP));
     }
     if (oset && copy_to_user((void *)oset, &old, 8) < 0)
         return -EFAULT;
@@ -303,7 +341,6 @@ int32_t sys_rt_sigprocmask_impl(int how, uint32_t set, uint32_t oset, uint32_t s
 
 int32_t sys_sigreturn_impl(int rt)
 {
-    struct process *p = proc_current();
     struct thread *t = thread_current();
     struct regs *r = t->uregs;
     struct sigcontext sc;
@@ -335,10 +372,13 @@ int32_t sys_sigreturn_impl(int rt)
     r->eflags = (r->eflags & ~FLAGS_USER) | (sc.eflags & FLAGS_USER);
     r->cs = GDT_USER_CODE;
     r->user_ss = GDT_USER_DATA;
-    r->gs = (sc.gs & 3) == 3 ? sc.gs : GDT_USER_DATA;   /* TLS segment */
-    r->fs = (sc.fs & 3) == 3 ? sc.fs : GDT_USER_DATA;
+    /* TLS segments. The ring-3 bits are not enough on their own: the frame is
+       the program's to write, and a selector that cannot be loaded faults in
+       the kernel's own return path, which is fatal. */
+    r->gs = gdt_user_seg_ok(sc.gs) ? sc.gs : GDT_USER_DATA;
+    r->fs = gdt_user_seg_ok(sc.fs) ? sc.fs : GDT_USER_DATA;
     r->ds = r->es = GDT_USER_DATA;
-    p->sig_blocked = mask & ~(SIGBIT(SIGKILL) | SIGBIT(SIGSTOP));
+    t->sig_blocked = mask & ~(SIGBIT(SIGKILL) | SIGBIT(SIGSTOP));
 
     if (sc.fpstate && t->uses_fpu) {
         if (copy_from_user(t->fpu_state, (void *)sc.fpstate, FPU_STATE_SIZE) < 0)
@@ -357,6 +397,10 @@ int32_t sys_kill_impl(int pid, int sig)
         return -EINVAL;
     if (pid > 0) {
         struct process *p = proc_find(pid);
+        if (!p) {                       /* a thread's tid names its process */
+            struct thread *t = thread_by_tid(pid);
+            p = t ? t->proc : NULL;
+        }
         return p ? signal_send(p, sig) : -ESRCH;
     }
     int pgid = pid == 0 ? me->pgid : -pid;
@@ -385,15 +429,15 @@ void signal_send_group(int pgid, int sig)
 
 int32_t sys_rt_sigsuspend_impl(uint32_t set, uint32_t size)
 {
-    struct process *p = proc_current();
+    struct thread *t = thread_current();
     uint64_t s;
     if (size != 8)
         return -EINVAL;
     if (copy_from_user(&s, (void *)set, 8) < 0)
         return -EFAULT;
-    p->sig_saved = p->sig_blocked;      /* restored after the handler */
-    p->sig_restore = 1;
-    p->sig_blocked = s & ~(SIGBIT(SIGKILL) | SIGBIT(SIGSTOP));
+    t->sig_saved = t->sig_blocked;      /* restored after the handler */
+    t->sig_restore = 1;
+    t->sig_blocked = s & ~(SIGBIT(SIGKILL) | SIGBIT(SIGSTOP));
     struct wait_queue never = { 0 };    /* only a signal ends this sleep */
     while (!signal_pending())
         wq_sleep(&never);
@@ -402,10 +446,10 @@ int32_t sys_rt_sigsuspend_impl(uint32_t set, uint32_t size)
 
 int32_t sys_rt_sigpending_impl(uint32_t set, uint32_t size)
 {
-    struct process *p = proc_current();
+    struct thread *t = thread_current();
     if (size != 8)
         return -EINVAL;
-    uint64_t s = p->sig_pending & p->sig_blocked;
+    uint64_t s = (t->proc->sig_pending | t->sig_pending) & t->sig_blocked;
     return copy_to_user((void *)set, &s, 8);
 }
 

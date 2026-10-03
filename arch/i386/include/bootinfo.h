@@ -32,6 +32,10 @@ struct bootinfo {
     uint32_t initrd_size;           /* its size in bytes (0 = none) */
     uint32_t count;                 /* number of E820 entries */
     struct e820_entry entries[E820_MAX];
+    uint32_t font_phys;             /* the BIOS's 8x16 font, 4 KiB (0 = none) */
 } __attribute__((packed));
+
+_Static_assert(__builtin_offsetof(struct bootinfo, font_phys) == 12 + E820_MAX * 24,
+               "BOOTINFO_FONT in layout.inc");
 
 #endif

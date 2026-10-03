@@ -10,6 +10,7 @@
 #include <keyboard.h>
 #include <kprintf.h>
 #include <mem_test.h>
+#include <random_test.h>
 #include <sched_test.h>
 #include <selftest.h>
 #include <thread_test.h>
@@ -19,6 +20,7 @@
 static int passed, failed;
 
 void pcache_selftest(void);
+void bio_selftest(void);
 void fatvfs_selftest(void);
 void net_selftest(void);
 
@@ -47,8 +49,11 @@ void run_selftests(void)
 
     initrd_selftest();      /* the initramfs arrived intact */
     mem_selftest();         /* first: it checks the heap is back to empty */
+    random_selftest();      /* ChaCha20 against the RFC vector */
+    drm_selftest();         /* display modes, the Bochs VGA, fbdev, fbcon */
     disk_demo();
     bcache_selftest();      /* the block cache, on the test disk */
+    bio_selftest();         /* disk requests that don't wait */
     pcache_selftest();      /* disk file pages: second read from RAM */
     fatvfs_selftest();      /* FAT32 files through the VFS */
     net_selftest();         /* loopback packet path, PCI e1000 */

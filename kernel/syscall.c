@@ -13,9 +13,11 @@
  * a fault into -EFAULT.
  */
 #include <bcache.h>
+#include <futex.h>
 #include <kprintf.h>
 #include <mm.h>
 #include <pcache.h>
+#include <power.h>
 #include <proc.h>
 #include <serial.h>
 #include <signal.h>
@@ -24,6 +26,7 @@
 #include <string.h>
 #include <syscall.h>
 #include <thread.h>
+#include <tty.h>
 #include <uaccess.h>
 #include <vfs.h>
 
@@ -38,27 +41,45 @@ typedef int32_t (*syscall_fn)(uint32_t, uint32_t, uint32_t,
 
 /* --- files ------------------------------------------------------------------ */
 
-/* ssize_t read(int fd, void *buf, size_t count) */
-SYSCALL(sys_read)
+/*
+ * The one door read() and write() go through, for every kind of file.
+ *
+ * Three things happen here so that no filesystem has to remember them:
+ *   - the range is checked, so nothing can name kernel memory;
+ *   - the length is clamped to RW_MAX, because a syscall cannot be preempted
+ *     and the caller must not be able to choose how long it runs;
+ *   - the pages are faulted in, which is the part that is not obvious.
+ *
+ * A copy_to_user can sleep: an untouched page of an mmap'd file sends the
+ * fault to the page cache, which waits for the disk. Any implementation that
+ * reads a shared counter, copies, and then stores the counter has a window
+ * there where a second process sees the same value — that was four real bugs
+ * in the pipe, socket and TCP rings. Doing the faulting here, before the
+ * implementation has looked at anything, leaves the copy unable to sleep, and
+ * makes "a syscall runs to completion" true rather than nearly true.
+ */
+static int32_t rw(uint32_t fd, uint32_t buf, uint32_t len, int writing)
 {
-    struct file *f = fd_get(a1);
+    struct file *f = fd_get(fd);
     if (!f)
         return -EBADF;
-    if (!user_range_ok(a2, a3))
+    if (!user_range_ok(buf, len))
         return -EFAULT;
-    return f->ops->read(f, (void *)a2, a3);
+    if (len > RW_MAX)
+        len = RW_MAX;
+    /* `!writing` because the flag is the kernel's direction: a read() is the
+       kernel writing into the user's buffer. */
+    if (fault_in_user((const void *)buf, len, !writing) < 0)
+        return -EFAULT;
+    return writing ? f->ops->write(f, (const void *)buf, len)
+                   : f->ops->read(f, (void *)buf, len);
 }
 
+/* ssize_t read(int fd, void *buf, size_t count) */
+SYSCALL(sys_read) { return rw(a1, a2, a3, 0); }
+
 /* ssize_t write(int fd, const void *buf, size_t count) */
-SYSCALL(sys_write)
-{
-    struct file *f = fd_get(a1);
-    if (!f)
-        return -EBADF;
-    if (!user_range_ok(a2, a3))
-        return -EFAULT;
-    return f->ops->write(f, (const void *)a2, a3);
-}
+SYSCALL(sys_write) { return rw(a1, a2, a3, 1); }
 
 /* The directory a *at() call's dirfd means: NULL for AT_FDCWD (the
    current directory), else the open directory. 0, or -errno. */
@@ -375,10 +396,35 @@ SYSCALL(sys_getdents64)
     if (!S_ISDIR(dir->mode))
         return -ENOTDIR;
 
+    /* Clamp before the pre-fault, so the caller cannot choose how many pages
+       get touched, and pre-fault so the copies in the loop below do not
+       ordinarily sleep. */
+    if (a3 > RW_MAX)
+        a3 = RW_MAX;
+    if (fault_in_user((void *)a2, a3, 1) < 0)
+        return -EFAULT;
+
+    /*
+     * `next` and `last` are inode pointers held across a copy_to_user, and
+     * that copy can sleep, so both are pinned for as long as they are held.
+     *
+     * Unpinned, a sibling's unlink during the sleep calls inode_free on them
+     * -- detach() frees an unlinked inode the moment its refs reaches 0 --
+     * and a later iteration reads a name pointer and a length out of the
+     * freed node and copies that to user space. `next` is the one that is
+     * easy to miss, and was missed: it is fetched here, before the loop, and
+     * the copies that emit "." and ".." sleep before it is ever used. The
+     * pin on the current entry alone looks sufficient and is not.
+     * user/musl/racetest.c arms a sleep and deletes the directory underneath
+     * this loop, which is how that was found rather than argued about.
+     */
     uint8_t rec[19 + NAME_MAX + 1 + 8] __attribute__((aligned(8)));
     uint32_t written = 0;
+    int32_t rc;
     struct inode *next = vfs_dir_first(f), *last = NULL;
     int ended = 0;
+    if (next)
+        vfs_get(next);
     for (;;) {
         const char *name;
         uint32_t len;
@@ -387,6 +433,7 @@ SYSCALL(sys_getdents64)
             name = ".", len = 1, i = dir;
         } else if (f->pos == 1) {
             name = "..", len = 2;
+            /* dir is pinned by the open file; its parent is pinned by dir. */
             i = (dir->flags & I_UNLINKED) ? dir : dir->parent;
         } else {
             i = next;
@@ -398,8 +445,10 @@ SYSCALL(sys_getdents64)
         }
         uint32_t reclen = (19 + len + 1 + 7) & ~7u;
         if (written + reclen > a3) {
-            if (written == 0)
-                return -EINVAL;         /* buffer too small for one entry */
+            if (written == 0) {
+                rc = -EINVAL;           /* buffer too small for one entry */
+                goto out;
+            }
             break;
         }
         uint64_t ino = i->fs ? i->fs_ino : i->ino, off = f->pos + 1;
@@ -409,23 +458,47 @@ SYSCALL(sys_getdents64)
         rec[18] = dirent_type(i->mode);
         memcpy(rec + 19, name, len);
         memset(rec + 19 + len, 0, reclen - 19 - len);
-        if (copy_to_user((uint8_t *)a2 + written, rec, reclen) < 0)
-            return -EFAULT;
+        if (copy_to_user((uint8_t *)a2 + written, rec, reclen) < 0) {
+            rc = -EFAULT;
+            goto out;
+        }
         written += reclen;
         if (f->pos >= 2) {
-            last = i;
-            next = vfs_dir_after(i);
+            /* Unlinked while we slept: sibling_remove has already taken it
+               out of the list, so a cursor cannot be anchored on it, and its
+               next_sibling leads back into a list it is no longer part of.
+               Stop, keep the cursor we had, and let the caller ask again. */
+            if (i->flags & I_UNLINKED)
+                break;
+            struct inode *after = vfs_dir_after(i);
+            if (after)
+                vfs_get(after);
+            if (last)
+                vfs_put(last);
+            last = i;                   /* next's reference moves to last */
+            next = after;               /* and after's to next */
         }
         f->pos++;
     }
-    /* Remember where we stopped. (Nothing can change the directory during
-       this call: syscalls run with interrupts off.) */
+    /* The anchor must still be in the list: it may have been deleted during a
+       later entry's copy rather than its own. */
+    if (last && (last->flags & I_UNLINKED)) {
+        vfs_put(last);
+        last = NULL;
+    }
+    /* Remember where we stopped. */
+    rc = (int32_t)written;
     if (ended || last) {
         int err = vfs_dir_stop(f, ended ? NULL : last);
         if (err)
-            return err;
+            rc = err;
     }
-    return written;
+out:
+    if (last)
+        vfs_put(last);                  /* only now: the cursor needed it */
+    if (next)
+        vfs_put(next);
+    return rc;
 }
 
 /* int chdir(const char *path) / fchdir(int fd) */
@@ -460,37 +533,36 @@ SYSCALL(sys_fchdir)
 SYSCALL(sys_getcwd)
 {
     char path[PATH_MAX];
-    uint32_t at = PATH_MAX;
-    path[--at] = '\0';
     struct inode *i = proc_current()->cwd;
     if (i->flags & I_UNLINKED)
         return -ENOENT;                 /* our directory was deleted */
-    if (i == vfs_root())
-        path[--at] = '/';
-    for (; i != vfs_root(); i = i->parent) {
-        while (i->covers)
-            i = i->covers;              /* a mounted root: named by its spot */
-        if (i->name_len + 1 > at)
-            return -ENAMETOOLONG;
-        at -= i->name_len;
-        memcpy(path + at, i->name, i->name_len);
-        path[--at] = '/';
-    }
-    uint32_t len = PATH_MAX - at;
-    if (len > a2)
+    int32_t len = vfs_path(i, path, sizeof path);
+    if (len < 0)
+        return len;
+    if ((uint32_t)len + 1 > a2)
         return -ERANGE;
-    if (copy_to_user((void *)a1, path + at, len) < 0)
+    if (copy_to_user((void *)a1, path, len + 1) < 0)
         return -EFAULT;
-    return len;
+    return len + 1;
 }
+
+#ifdef SELFTEST
+/* Arm the n'th copy_to_user/copy_from_user from this thread to yield first,
+   so a test can produce the interleaving the ring-buffer fixes are about.
+   `make test` only — docs/security.md explains why it has to exist. */
+SYSCALL(sys_uaccess_test)
+{
+    uaccess_test_arm((int)a1);
+    return 0;
+}
+#endif
 
 /* ssize_t writev / readv(int fd, const struct iovec *iov, int count):
    several buffers in one call (musl's printf writes this way). Stops at
    the first short transfer, like Linux. */
 static int32_t do_iov(uint32_t fd, uint32_t user_iov, uint32_t count, int writing)
 {
-    struct file *f = fd_get(fd);
-    if (!f)
+    if (!fd_get(fd))
         return -EBADF;
     if (count > 1024)
         return -EINVAL;
@@ -502,10 +574,10 @@ static int32_t do_iov(uint32_t fd, uint32_t user_iov, uint32_t count, int writin
             return total ? total : -EFAULT;
         if (len == 0)
             continue;
-        if (!user_range_ok(base, len))
-            return total ? total : -EFAULT;
-        int32_t n = writing ? f->ops->write(f, (const void *)base, len)
-                            : f->ops->read(f, (void *)base, len);
+        /* One buffer at a time through rw(), so each gets the clamp and the
+           pre-fault. Faulting them all in first would be wrong anyway: a
+           short transfer stops the loop and the rest is never touched. */
+        int32_t n = rw(fd, base, len, writing);
         if (n < 0)
             return total ? total : n;
         total += n;
@@ -531,8 +603,16 @@ static int32_t do_readlink(struct inode *dir, uint32_t user_path, uint32_t buf, 
         return err;
     if (!S_ISLNK(i->mode))
         return -EINVAL;
-    uint32_t n = i->size < size ? i->size : size;
-    if (copy_to_user((void *)buf, i->data, n) < 0)
+    const void *target = i->data;
+    uint32_t len = i->size;
+    if (i->flags & I_PROC_FD) {
+        int32_t r = procfs_readlink(i, path, sizeof path);  /* path is free now */
+        if (r < 0)
+            return r;
+        target = path, len = r;
+    }
+    uint32_t n = len < size ? len : size;
+    if (copy_to_user((void *)buf, target, n) < 0)
         return -EFAULT;
     return n;
 }
@@ -589,6 +669,45 @@ SYSCALL(sys_fsync)
     return err ? err : err2;
 }
 
+/* reboot(magic, magic2, cmd, arg). The two magic numbers guard against a
+   stray call (the second is Linus Torvalds' birthday, in a few spellings).
+   Linux leaves syncing to the caller; we sync anyway, because there is no
+   device shutdown step after it to flush what's in the cache. */
+#define REBOOT_MAGIC1   0xFEE1DEADu
+#define CMD_RESTART     0x01234567u
+#define CMD_RESTART2    0xA1B2C3D4u     /* with a command string: ignored */
+#define CMD_HALT        0xCDEF0123u
+#define CMD_POWER_OFF   0x4321FEDCu
+#define CMD_CAD_ON      0x89ABCDEFu
+#define CMD_CAD_OFF     0u
+SYSCALL(sys_reboot)
+{
+    if (a1 != REBOOT_MAGIC1 ||
+        (a2 != 672274793 && a2 != 85072278 && a2 != 369367448 && a2 != 537993216))
+        return -EINVAL;
+    switch (a3) {
+    case CMD_CAD_ON:  power_set_ctrl_alt_del(1); return 0;
+    case CMD_CAD_OFF: power_set_ctrl_alt_del(0); return 0;
+    case CMD_RESTART:
+    case CMD_RESTART2:
+    case CMD_HALT:
+    case CMD_POWER_OFF:
+        break;
+    default:
+        return -EINVAL;
+    }
+    pcache_sync();
+    bsync();
+    if (a3 == CMD_HALT)
+        power_halt();
+    if (a3 == CMD_POWER_OFF)
+        power_off();
+    power_restart();
+}
+
+/* vhangup(): agetty calls it before it asks for a login name. */
+SYSCALL(sys_vhangup) { tty_hangup(); return 0; }
+
 /* sched_getaffinity(pid, size, mask): one CPU. (musl's sysconf asks.) */
 SYSCALL(sys_getaffinity)
 {
@@ -631,18 +750,31 @@ SYSCALL(sys_kill)           { return sys_kill_impl((int32_t)a1, a2); }
 SYSCALL(sys_rt_sigsuspend)  { return sys_rt_sigsuspend_impl(a1, a2); }
 SYSCALL(sys_rt_sigpending)  { return sys_rt_sigpending_impl(a1, a2); }
 
-/* tkill(tid, sig) / tgkill(tgid, tid, sig): one process per thread here. */
+/* tkill(tid, sig) / tgkill(tgid, tid, sig): a signal for one thread
+   (pthread_kill, raise). */
 SYSCALL(sys_tkill)
 {
-    struct process *p = proc_find(a1);
-    return p ? signal_send(p, a2) : -ESRCH;
+    struct thread *t = thread_by_tid(a1);
+    return t ? signal_send_thread(t, a2) : -ESRCH;
 }
 
 SYSCALL(sys_tgkill)
 {
-    struct process *p = proc_find(a2);
-    return p ? signal_send(p, a3) : -ESRCH;
+    struct thread *t = thread_by_tid(a2);
+    if (!t || t->proc->pid != (int)a1)
+        return -ESRCH;
+    return signal_send_thread(t, a3);
 }
+
+/* gettid(): this thread's id (= getpid() in a process's first thread). */
+SYSCALL(sys_gettid)
+{
+    return thread_current()->tid;
+}
+
+/* futex(uaddr, op, val, timeout, uaddr2, val3): see futex.c. */
+SYSCALL(sys_futex)         { return sys_futex_impl(a1, a2, a3, a4, a5, a6, 0); }
+SYSCALL(sys_futex_time64)  { return sys_futex_impl(a1, a2, a3, a4, a5, a6, 1); }
 
 /* int sched_yield(void): let the next thread run. */
 SYSCALL(sys_sched_yield)
@@ -671,9 +803,15 @@ SYSCALL(sys_getsid)
 
 /* --- processes --------------------------------------------------------------- */
 
-/* void exit(int status) — and exit_group, which ends all threads of a
-   process. With one thread per program, they're the same. */
+/* void exit(int status): ends the calling thread only (musl calls it from
+   pthread_exit); the last thread's exit ends the process. */
 SYSCALL(sys_exit)
+{
+    proc_thread_exit(W_EXITED(a1));             /* never returns */
+}
+
+/* void exit_group(int status): ends every thread (C's exit()). */
+SYSCALL(sys_exit_group)
 {
     proc_exit(W_EXITED(a1));                    /* never returns */
 }
@@ -728,6 +866,8 @@ SYSCALL(sys_mmap2)
         struct file *f = fd_get(a5);
         if (!f)
             return -EBADF;
+        if (f->ops && f->ops->mmap)     /* device memory (/dev/fb0) */
+            return mm_mmap_device(a1, a2, a3, a4, f, a6 * 4096);
         file = f->inode;
     }
     return mm_mmap(a1, a2, a3, a4, file, a6 * 4096);
@@ -745,12 +885,12 @@ SYSCALL(sys_mprotect)
     return mm_mprotect(a1, a2, a3);
 }
 
-/* clone(flags, new_stack, parent_tid *, tls, child_tid *): like fork, on a
-   new stack if one is given (musl's posix_spawn). Threads (CLONE_THREAD)
-   come later. */
+/* clone(flags, new_stack, parent_tid *, tls, child_tid *): a new process
+   like fork, on a new stack if one is given (musl's posix_spawn), or with
+   CLONE_THREAD a new thread in this process (pthread_create). */
 SYSCALL(sys_clone)
 {
-    return proc_clone(a1, a2, a3, a4);
+    return proc_clone(a1, a2, a3, a4, a5);
 }
 
 /* --- the table ---------------------------------------------------------------- */
@@ -764,11 +904,19 @@ static const syscall_fn syscall_table[] = {
     [NR_time]       = sys_time,
     [NR_mknod]      = sys_mknod,
     [NR_chmod]      = sys_chmod,
-    [NR_getuid]     = sys_getid,
-    [NR_getgid]     = sys_getid,
-    [NR_geteuid]    = sys_getid,
-    [NR_getegid]    = sys_getid,
+    [NR_getuid]     = sys_getuid,
+    [NR_getgid]     = sys_getgid,
+    [NR_geteuid]    = sys_geteuid,
+    [NR_getegid]    = sys_getegid,
     [NR_sync]       = sys_sync,
+    [NR_mount]      = sys_mount,
+    [NR_umount2]    = sys_umount2,
+    [NR_sethostname] = sys_sethostname,
+    [NR_reboot]     = sys_reboot,
+    [NR_vhangup]    = sys_vhangup,
+    [NR_flock]      = sys_flock,
+    [NR_getpriority] = sys_getpriority,
+    [NR_setpriority] = sys_setpriority,
     [NR_rename]     = sys_rename,
     [NR_mkdir]      = sys_mkdir,
     [NR_rmdir]      = sys_rmdir,
@@ -792,24 +940,24 @@ static const syscall_fn syscall_table[] = {
     [NR_truncate64] = sys_truncate64,
     [NR_ftruncate64] = sys_ftruncate64,
     [NR_lchown32]   = sys_lchown32,
-    [NR_getuid32]   = sys_getid,
-    [NR_getgid32]   = sys_getid,
-    [NR_geteuid32]  = sys_getid,
-    [NR_getegid32]  = sys_getid,
-    [NR_setreuid32] = sys_setid,
-    [NR_setregid32] = sys_setid,
+    [NR_getuid32]   = sys_getuid,
+    [NR_getgid32]   = sys_getgid,
+    [NR_geteuid32]  = sys_geteuid,
+    [NR_getegid32]  = sys_getegid,
+    [NR_setreuid32] = sys_setreuid,
+    [NR_setregid32] = sys_setregid,
     [NR_getgroups32] = sys_getgroups,
-    [NR_setgroups32] = sys_nop,
+    [NR_setgroups32] = sys_setgroups,
     [NR_fchown32]   = sys_fchown32,
-    [NR_setresuid32] = sys_setid,
-    [NR_getresuid32] = sys_getresid,
-    [NR_setresgid32] = sys_setid,
-    [NR_getresgid32] = sys_getresid,
+    [NR_setresuid32] = sys_setresuid,
+    [NR_getresuid32] = sys_getresuid,
+    [NR_setresgid32] = sys_setresgid,
+    [NR_getresgid32] = sys_getresgid,
     [NR_chown32]    = sys_chown32,
-    [NR_setuid32]   = sys_setid,
-    [NR_setgid32]   = sys_setid,
-    [NR_setfsuid32] = sys_getid,        /* returns the old fs uid: 0 */
-    [NR_setfsgid32] = sys_getid,
+    [NR_setuid32]   = sys_setuid,
+    [NR_setgid32]   = sys_setgid,
+    [NR_setfsuid32] = sys_setfsuid,
+    [NR_setfsgid32] = sys_setfsgid,
     [NR_madvise]    = sys_nop,
     [NR_sched_getaffinity] = sys_getaffinity,
     [NR_set_thread_area] = sys_set_thread_area,
@@ -910,9 +1058,15 @@ static const syscall_fn syscall_table[] = {
     [NR__llseek]    = sys_llseek,
     [NR_vfork]      = sys_fork,
     [NR_mmap2]      = sys_mmap2,
-    [NR_exit_group] = sys_exit,
+    [NR_exit_group] = sys_exit_group,
+    [NR_gettid]     = sys_gettid,
+    [NR_futex]      = sys_futex,
+    [NR_futex_time64] = sys_futex_time64,
     [NR_openat]     = sys_openat,
     [NR_statx]      = sys_statx,
+#ifdef SELFTEST
+    [NR_uaccess_test] = sys_uaccess_test,
+#endif
 };
 
 #define NSYSCALLS (sizeof syscall_table / sizeof syscall_table[0])

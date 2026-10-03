@@ -6,6 +6,7 @@ build/
 .DS_Store
 dist/
 disks/
+__pycache__/
 
 # The live disk is its own repo (myos-live), checked out here.
 /live/

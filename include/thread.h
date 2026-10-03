@@ -30,6 +30,27 @@ struct thread {
     uint32_t esp;                     /* saved stack pointer while paused */
     void *stack;                      /* kmalloc'd stack (NULL for "main") */
     struct process *proc;             /* the process it runs, or NULL */
+    struct thread *proc_next;         /* the next thread of the same process */
+    int tid;                          /* what gettid() says; the first thread's
+                                         tid is its process's pid */
+    uint32_t clear_tid;               /* on exit: write 0 here and futex-wake
+                                         it (pthread_join waits on it) */
+    /* Signals aimed at this thread (tgkill, a fault it caused) and the ones
+       it blocks. Signals for the whole process wait in proc->sig_pending
+       until a thread that doesn't block them takes one. */
+    uint64_t sig_pending, sig_blocked;
+    uint64_t sig_saved;               /* sigsuspend: mask to restore */
+    int sig_restore;
+    /* Non-zero while this thread's or its process's pending set may be
+       non-empty: the one word SIGNAL_CHECK reads on every return to user
+       mode (Linux's TIF_SIGPENDING). Set by whoever makes a signal
+       pending; signal_check() recomputes it. */
+    uint32_t sig_check;
+    /* futex wait: the word it sleeps on (address space + user address).
+       futex_woken says a FUTEX_WAKE ended the sleep (not a signal/timeout). */
+    struct mm *futex_mm;
+    uint32_t futex_addr;
+    uint8_t futex_woken;
     struct mm *mm;                    /* the address space it's using now
                                          (NULL: its process's; a kernel
                                          thread keeps whatever is loaded) */
@@ -94,6 +115,10 @@ uint32_t thread_generation(void);
 
 /* The thread with this name, or NULL. (Dead threads are skipped.) */
 struct thread *thread_find(const char *name);
+
+/* The live user thread with this tid, or NULL (tkill/tgkill; not a hot
+   path: a scan of THREAD_MAX entries). */
+struct thread *thread_by_tid(int tid);
 
 /* --- sleeping and waking (interrupts must be off) --- */
 

@@ -74,6 +74,7 @@ stage2:
     ; --- 4. Tell the kernel where the initramfs is ------------------------------
     mov dword [BOOTINFO + 0], INITRD_LOAD
     mov dword [BOOTINFO + 4], INITRD_BYTES
+    call copy_font
 
     ; --- 5. Switch to protected mode ------------------------------------------
     cli                         ; BIOS interrupt handlers are 16-bit: keep them off
@@ -174,6 +175,30 @@ graphics_on:
 graphics_off:
     mov ax, 0x0003              ; 80x25 text, what the kernel console expects
     int 0x10
+    ret
+
+; copy_font: the video BIOS's 8x16 character shapes, for the kernel's pixel
+; console (drivers/video/fbcon.c) — once the screen is in a graphics mode the
+; card no longer draws text, so the kernel draws the letters itself. int 0x10
+; AX=0x1130 BH=6 returns ES:BP pointing at the font: 256 characters, 16
+; bytes each, one byte per row, bit 7 the leftmost pixel. We copy it to FONT
+; and leave its address in the bootinfo (font_phys).
+copy_font:
+    push ds
+    mov ax, 0x1130
+    mov bh, 6
+    int 0x10
+    mov ax, es
+    mov ds, ax
+    mov si, bp                  ; DS:SI = the BIOS's font
+    xor ax, ax
+    mov es, ax
+    mov di, FONT                ; ES:DI = FONT
+    mov cx, 4096 / 2
+    cld
+    rep movsw
+    pop ds
+    mov dword [BOOTINFO + BOOTINFO_FONT], FONT
     ret
 
 ; hold: ~2 seconds, so the picture is visible. QEMU finishes the disk copy

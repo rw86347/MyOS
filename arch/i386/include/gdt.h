@@ -23,6 +23,10 @@ void tss_set_kernel_stack(uint32_t esp0);
 #define GDT_TLS_ENTRIES 3
 void     gdt_load_tls(const uint64_t tls[GDT_TLS_ENTRIES]);
 uint64_t gdt_tls_descriptor(uint32_t base, uint32_t limit, uint32_t flags);
+
+/* Whether a segment register can be loaded with this selector on the way back
+   to ring 3 without faulting in the kernel first. See gdt.c. */
+int      gdt_user_seg_ok(uint32_t sel);
 #endif
 
 #endif

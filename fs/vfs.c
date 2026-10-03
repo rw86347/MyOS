@@ -50,6 +50,59 @@ struct inode *vfs_child(struct inode *dir, const char *name, uint32_t len)
     return NULL;
 }
 
+/* Built backwards by climbing to the root; a mounted root is named by the
+   directory it covers. Nodes outside the tree get Linux's names: the
+   shared console "/dev/console", pipes and sockets "pipe:[ino]". A deleted
+   file's old directory may be gone, so it gets just its name, as Linux's
+   "(deleted)" form. */
+int vfs_path(struct inode *i, char *buf, uint32_t size)
+{
+    char tmp[PATH_MAX];
+    uint32_t at = PATH_MAX;
+    tmp[--at] = '\0';
+    if (!i->parent || (i->flags & I_UNLINKED)) {
+        const char *pre = "", *post = (i->flags & I_UNLINKED) ? " (deleted)" : "";
+        char num[11];
+        const char *name = i->name;
+        uint32_t n = i->name_len;
+        if (S_ISFIFO(i->mode) || (i->mode & S_IFMT) == S_IFSOCK) {
+            pre = S_ISFIFO(i->mode) ? "pipe:[" : "socket:[", post = "]";
+            uint32_t v = i->ino;
+            name = num + sizeof num;
+            do { *(char *)--name = '0' + v % 10; v /= 10; } while (v);
+            n = num + sizeof num - name;
+        } else if (S_ISCHR(i->mode)) {
+            pre = "/dev/";
+        }
+        uint32_t lp = strlen(pre), lq = strlen(post);
+        if (lp + n + lq + 1 > size)
+            return -ENAMETOOLONG;
+        memcpy(buf, pre, lp);
+        memcpy(buf + lp, name, n);
+        memcpy(buf + lp + n, post, lq + 1);
+        return lp + n + lq;
+    }
+    if (i == root)
+        tmp[--at] = '/';
+    while (i != root) {
+        while (i->covers)
+            i = i->covers;
+        if (i == root || i->parent == i)
+            break;                      /* "/", or a root nobody can reach */
+        if (i->name_len + 1 > at)
+            return -ENAMETOOLONG;
+        at -= i->name_len;
+        memcpy(tmp + at, i->name, i->name_len);
+        tmp[--at] = '/';
+        i = i->parent;
+    }
+    uint32_t len = PATH_MAX - at;
+    if (len > size)
+        return -ENAMETOOLONG;
+    memcpy(buf, tmp + at, len);
+    return len - 1;
+}
+
 /* The sibling list: put c right after entry `after` (NULL: at the front). */
 static void sibling_insert(struct inode *dir, struct inode *after, struct inode *c)
 {
@@ -158,6 +211,16 @@ static int new_node(struct inode *dir, const char *name, uint32_t len, uint32_t 
     }
     i->flags |= I_NAME_OWNED;
     i->atime = i->mtime = i->ctime = time_now();
+    struct process *p = proc_current();   /* NULL: the kernel, root */
+    if (p) {
+        i->uid = p->cred.fsuid;
+        i->gid = p->cred.fsgid;
+    }
+    if (dir->mode & S_ISGID) {          /* a shared group directory */
+        i->gid = dir->gid;
+        if (S_ISDIR(mode))
+            i->mode |= S_ISGID;         /* and so are its subdirectories */
+    }
     i->fs = dir->fs;
     i->mnt = dir->mnt;
     *out = i;
@@ -423,6 +486,31 @@ int vfs_mount_tree(const char *path, struct inode *tree)
     return 0;
 }
 
+int vfs_mount_ram(const char *path, uint32_t mode)
+{
+    struct inode *old;
+    int err = vfs_lookup(path, &old);
+    if (err)
+        return err;
+    if (!S_ISDIR(old->mode))
+        return -ENOTDIR;
+    if (old->mounted || old == root)
+        return -EBUSY;
+    struct inode *r = kmalloc(sizeof *r);   /* a RAM directory in no list */
+    if (!r)
+        return -ENOMEM;
+    memset(r, 0, sizeof *r);
+    r->ino = next_ino++;
+    r->mode = S_IFDIR | (mode & 07777);
+    r->nlink = 2;
+    r->refs = 1;                        /* the mount holds it */
+    r->name = old->name;
+    r->name_len = old->name_len;
+    r->parent = old->parent;
+    cover(old, r);
+    return 0;
+}
+
 /* --- path lookup -------------------------------------------------------- */
 
 /* Walk path[0..len) starting in `dir`. A symbolic link along the way is
@@ -473,7 +561,21 @@ static int walk(struct inode *dir, const char *path, uint32_t len, int follow_la
             return -ENOENT;
         while (next->mounted)
             next = next->mounted;       /* a mount point: go into what's on it */
-        if (S_ISLNK(next->mode) && (!last || follow_last)) {
+        if (next->flags & I_PROC_FD) {
+            /* Following one gives the open file's own inode, not a path
+               looked up again (Linux's "magic" links): O(1), and right
+               even for a deleted file. Pipes and sockets aren't in the
+               tree and can't be opened again this way. */
+            struct file *f = fd_get(next->fs_ino);
+            if (!f || !f->inode)
+                return -ENOENT;         /* the caller has no such fd */
+            if (!last || follow_last) {
+                struct inode *t = f->inode;
+                if (!t->parent && !S_ISCHR(t->mode))
+                    return -ENXIO;
+                next = t;
+            }
+        } else if (S_ISLNK(next->mode) && (!last || follow_last)) {
             if (++*links > MAX_LINKS)
                 return -ELOOP;
             int err = walk(cur, (const char *)next->data, next->size, 1, links, &next);
@@ -624,6 +726,7 @@ struct file *file_new(const struct file_ops *ops, struct inode *i, uint32_t flag
     f->flags = flags;
     f->refs = 1;
     f->priv = NULL;
+    f->flock = 0;
     if (i)
         vfs_get(i);                     /* an open file keeps its inode alive */
     return f;
@@ -655,6 +758,8 @@ int vfs_open_at(struct inode *dir, const char *path, uint32_t flags, uint32_t mo
     int writing = (flags & O_ACCMODE) != O_RDONLY;
     if (S_ISDIR(i->mode) && (writing || (flags & O_TRUNC)))
         return -EISDIR;
+    if (S_ISFIFO(i->mode))
+        return fifo_open(i, flags, out);
     if (!i->ops && !S_ISREG(i->mode) && !S_ISDIR(i->mode))
         return -ENXIO;              /* a device node with no driver */
     if ((flags & O_TRUNC) && writing && S_ISREG(i->mode)) {
@@ -674,6 +779,8 @@ int vfs_open_at(struct inode *dir, const char *path, uint32_t flags, uint32_t mo
 void file_put(struct file *f)
 {
     if (--f->refs == 0) {
+        if (f->flock)
+            flock_release(f);
         if (f->ops->release)
             f->ops->release(f);     /* e.g. a pipe end closing */
         if (f != &console_file) {

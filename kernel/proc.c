@@ -9,6 +9,7 @@
  *   exit    frees everything at once; the parent is woken, not polling.
  */
 #include <errno.h>
+#include <futex.h>
 #include <gdt.h>
 #include <interrupts.h>
 #include <kheap.h>
@@ -87,6 +88,27 @@ void proc_set_cwd(struct process *p, struct inode *dir)
     p->cwd = dir;
 }
 
+/* t becomes one of p's threads, with thread id tid. Interrupts off, and
+   before t first runs (it must know its tid). */
+static void thread_join_proc(struct process *p, struct thread *t, int tid)
+{
+    t->tid = tid;
+    t->proc_next = p->threads;
+    p->threads = t;
+    p->nthreads++;
+}
+
+static void thread_leave_proc(struct process *p, struct thread *t)
+{
+    struct thread **pp = &p->threads;
+    while (*pp && *pp != t)
+        pp = &(*pp)->proc_next;
+    if (*pp)
+        *pp = t->proc_next;
+    t->proc_next = NULL;
+    p->nthreads--;
+}
+
 /* The name a program's thread gets: "/bin/hello" -> "hello". */
 static const char *base_name(const char *path)
 {
@@ -125,7 +147,7 @@ struct process *proc_spawn(const char *path, const char *const argv[],
        a moment (we're a kernel thread, so we can borrow any). */
     struct mm *old = mm_current();
     mm_switch(p->mm);
-    int err = program_load(path, argv, envp, &p->start_eip, &p->start_esp);
+    int err = program_load(path, argv, envp, &p->start_eip, &p->start_esp, &p->cred);
     mm_switch(old);
     if (err) {
         mm_destroy(p->mm);
@@ -135,8 +157,12 @@ struct process *proc_spawn(const char *path, const char *const argv[],
 
     fd_open_console(p);                 /* stdin, stdout, stderr */
     p->kernel_waits = 1;
-    p->thread = thread_create_in(p, base_name(path), start_user, p);
-    if (!p->thread) {
+    flags = irq_save();
+    struct thread *t = thread_create_in(p, base_name(path), start_user, p);
+    if (t)
+        thread_join_proc(p, t, p->pid);
+    irq_restore(flags);
+    if (!t) {
         fd_close_all(p);
         mm_destroy(p->mm);
         reap(p);
@@ -163,14 +189,80 @@ int proc_fork(void)
     return proc_fork_frame(thread_current()->uregs, NULL);
 }
 
-#define CLONE_THREAD        0x00010000
-#define CLONE_SETTLS        0x00080000
-#define CLONE_PARENT_SETTID 0x00100000
+#define CLONE_VM             0x00000100
+#define CLONE_SIGHAND        0x00000800
+#define CLONE_THREAD         0x00010000
+#define CLONE_SETTLS         0x00080000
+#define CLONE_PARENT_SETTID  0x00100000
+#define CLONE_CHILD_CLEARTID 0x00200000
+#define CLONE_CHILD_SETTID   0x01000000
 
-int proc_clone(uint32_t flags, uint32_t new_sp, uint32_t parent_tid, uint32_t tls)
+/* CLONE_SETTLS: the argument is a user_desc, as for set_thread_area.
+   Returns the TLS slot (0..GDT_TLS_ENTRIES-1) and the descriptor, or -1. */
+static int read_tls(uint32_t tls, uint64_t *desc)
+{
+    uint32_t d[4];
+    if (copy_from_user(d, (void *)tls, sizeof d) < 0 ||
+        d[0] < GDT_TLS_FIRST || d[0] >= GDT_TLS_FIRST + GDT_TLS_ENTRIES)
+        return -1;
+    *desc = gdt_tls_descriptor(d[1], d[2], d[3]);
+    return d[0] - GDT_TLS_FIRST;
+}
+
+/* A new thread in this process (pthread_create). It starts by "returning"
+   from clone with EAX = 0 on the stack it was given, where musl has put
+   the function to run. */
+static int clone_thread(uint32_t flags, uint32_t new_sp, uint32_t parent_tid,
+                        uint32_t tls, uint32_t child_tid)
+{
+    if ((flags & (CLONE_VM | CLONE_SIGHAND)) != (CLONE_VM | CLONE_SIGHAND))
+        return -EINVAL;                 /* Linux insists on these too */
+    struct process *p = proc_current();
+    struct thread *me = thread_current();
+    uint64_t desc = 0;
+    int slot = -1;
+    if ((flags & CLONE_SETTLS) && (slot = read_tls(tls, &desc)) < 0)
+        return -EINVAL;
+
+    struct regs frame = *me->uregs;
+    if (new_sp)
+        frame.user_esp = new_sp;
+    uint32_t irq = irq_save();
+    if (p->exiting) {
+        irq_restore(irq);
+        return -EAGAIN;
+    }
+    struct thread *t = thread_fork(p, me->name, &frame);
+    if (!t) {
+        irq_restore(irq);
+        return -EAGAIN;
+    }
+    int tid = next_pid++;               /* tids and pids share one space */
+    thread_join_proc(p, t, tid);
+    if (slot >= 0)
+        t->tls[slot] = desc;
+    if (flags & CLONE_CHILD_CLEARTID)
+        t->clear_tid = child_tid;
+    t->sig_check = p->sig_pending != 0; /* (blocked ones it may take) */
+    irq_restore(irq);
+    /* Same address space, so writing the tid here is the same as the child
+       writing it first thing — but only nearly: interrupts being off does
+       not stop the new thread running, because the copies below can sleep
+       (see fault_in_user in uaccess.h). Both words are written before we
+       return either way, and musl does not read them before clone returns,
+       so the order does not matter here. */
+    if ((flags & CLONE_PARENT_SETTID) && parent_tid)
+        copy_to_user((void *)parent_tid, &tid, sizeof tid);
+    if ((flags & CLONE_CHILD_SETTID) && child_tid)
+        copy_to_user((void *)child_tid, &tid, sizeof tid);
+    return tid;
+}
+
+int proc_clone(uint32_t flags, uint32_t new_sp, uint32_t parent_tid, uint32_t tls,
+               uint32_t child_tid)
 {
     if (flags & CLONE_THREAD)
-        return -ENOSYS;                 /* threads in one process: later */
+        return clone_thread(flags, new_sp, parent_tid, tls, child_tid);
     struct regs frame = *thread_current()->uregs;
     if (new_sp)
         frame.user_esp = new_sp;        /* the child runs on its own stack */
@@ -178,12 +270,12 @@ int proc_clone(uint32_t flags, uint32_t new_sp, uint32_t parent_tid, uint32_t tl
     int pid = proc_fork_frame(&frame, &child);
     if (pid < 0)
         return pid;
-    if (flags & CLONE_SETTLS) {         /* (a user_desc, as set_thread_area) */
-        uint32_t d[4];
-        if (copy_from_user(d, (void *)tls, sizeof d) == 0 &&
-            d[0] >= GDT_TLS_FIRST && d[0] < GDT_TLS_FIRST + GDT_TLS_ENTRIES)
-            child->thread->tls[d[0] - GDT_TLS_FIRST] = gdt_tls_descriptor(d[1], d[2], d[3]);
-    }
+    uint64_t desc;
+    int slot;
+    if ((flags & CLONE_SETTLS) && (slot = read_tls(tls, &desc)) >= 0)
+        child->threads->tls[slot] = desc;
+    if ((flags & CLONE_CHILD_CLEARTID))
+        child->threads->clear_tid = child_tid;
     if ((flags & CLONE_PARENT_SETTID) && parent_tid)
         copy_to_user((void *)parent_tid, &pid, sizeof pid);
     return pid;
@@ -205,6 +297,7 @@ int proc_fork_frame(const struct regs *frame, struct process **child_out)
     child->parent = parent;
     proc_set_cwd(child, parent->cwd);
     child->umask = parent->umask;
+    child->cred = parent->cred;         /* same users and groups */
     child->pgid = parent->pgid;         /* same job, same session */
     child->sid = parent->sid;
     signal_fork(child, parent);
@@ -212,9 +305,15 @@ int proc_fork_frame(const struct regs *frame, struct process **child_out)
     fd_copy_all(child, parent);         /* same open files, shared */
 
     /* The child's thread starts by "returning" from this very syscall,
-       with the parent's registers — except EAX = 0. */
-    child->thread = thread_fork(child, me->name, frame);
-    if (!child->thread) {
+       with the parent's registers — except EAX = 0. Only the calling
+       thread is copied: in the child, the parent's other threads are gone
+       (as on Linux). */
+    uint32_t irq = irq_save();
+    struct thread *t = thread_fork(child, me->name, frame);
+    if (t)
+        thread_join_proc(child, t, child->pid);
+    irq_restore(irq);
+    if (!t) {
         fd_close_all(child);
         mm_destroy(child->mm);
         reap(child);
@@ -265,6 +364,34 @@ static int copy_strings(struct exec_args *a, char **out, int room, uint32_t user
     }
 }
 
+#define EXITING_GROUP 1                 /* exit_group: the process ends */
+#define EXITING_EXEC  2                 /* execve: all threads but one end */
+
+/* Kill every other thread of p and wait until they're gone (execve). They
+   die on their way back to user mode, like on a SIGKILL. Returns 0 if an
+   exit_group got there first (then the whole process must end). */
+static int end_other_threads(struct process *p)
+{
+    struct thread *me = thread_current();
+    uint32_t irq = irq_save();
+    if (p->exiting) {
+        irq_restore(irq);
+        return 0;
+    }
+    p->exiting = EXITING_EXEC;
+    for (struct thread *t = p->threads; t; t = t->proc_next)
+        if (t != me) {
+            t->sig_pending |= SIGBIT(SIGKILL);
+            t->sig_check = 1;
+            thread_wake(t);
+        }
+    while (p->nthreads > 1)
+        wq_sleep(&p->thread_gone);
+    p->exiting = 0;
+    irq_restore(irq);
+    return 1;
+}
+
 int proc_execve(uint32_t user_path, uint32_t user_argv, uint32_t user_envp)
 {
     struct process *p = proc_current();
@@ -301,7 +428,8 @@ int proc_execve(uint32_t user_path, uint32_t user_argv, uint32_t user_envp)
     struct mm *old_mm = p->mm;
     mm_switch(new_mm);
     uint32_t entry, sp;
-    err = program_load(prog, argv, (const char *const *)a->envp, &entry, &sp);
+    struct cred cred = p->cred;
+    err = program_load(prog, argv, (const char *const *)a->envp, &entry, &sp, &cred);
     if (err) {
         mm_switch(old_mm);
         mm_destroy(new_mm);
@@ -309,8 +437,20 @@ int proc_execve(uint32_t user_path, uint32_t user_argv, uint32_t user_envp)
         return err;
     }
 
-    /* 3. Point of no return: the old program is gone. */
+    /* 3. Only the calling thread lives on in the new program. */
+    if (p->nthreads > 1 && !end_other_threads(p)) {
+        mm_switch(old_mm);              /* exit_group won the race: we die */
+        mm_destroy(new_mm);
+        kfree(a);
+        proc_exit(p->status);
+    }
+    struct thread *me = thread_current();
+    me->tid = p->pid;                   /* it now is the main thread */
+    me->clear_tid = 0;
+
+    /* 4. Point of no return: the old program is gone. */
     p->mm = new_mm;
+    p->cred = cred;
     mm_destroy(old_mm);
     for (int fd = 0; fd < PROC_FILES; fd++)
         if (p->cloexec & (1u << fd))
@@ -335,10 +475,9 @@ int proc_execve(uint32_t user_path, uint32_t user_argv, uint32_t user_envp)
 
 /* --- exit and wait ------------------------------------------------------------- */
 
-void proc_exit(int status)
+/* The last thread is gone: the process becomes a zombie with p->status. */
+static void process_end(struct process *p)
 {
-    struct process *p = proc_current();
-    irq_save();
     signal_alarm_cancel(p);
 
     fd_close_all(p);
@@ -364,7 +503,6 @@ void proc_exit(int status)
         }
     }
 
-    p->status = status;
     p->state = PROC_ZOMBIE;
     if (p->parent) {
         wq_wake_all(&p->parent->child_wait);
@@ -374,7 +512,56 @@ void proc_exit(int status)
         wq_wake_all(&kernel_wait);
     else
         reap(p);                        /* an orphan nobody waits for */
+}
+
+/* The calling thread ends; the last one out ends the process. */
+static void __attribute__((noreturn)) thread_leave(struct process *p)
+{
+    struct thread *me = thread_current();
+    /* pthread_join sleeps on the dying thread's tid word until it's 0. */
+    if (me->clear_tid && p->nthreads > 1) {
+        uint32_t zero = 0;
+        if (copy_to_user((void *)me->clear_tid, &zero, sizeof zero) == 0)
+            futex_wake(p->mm, me->clear_tid, 1);
+    }
+    thread_leave_proc(p, me);
+    if (p->nthreads == 0)
+        process_end(p);
+    else
+        wq_wake_all(&p->thread_gone);
     thread_exit();
+}
+
+/* exit_group (and fatal signals): every thread of the process ends. The
+   others are sent a SIGKILL and die on their way back to user mode; the
+   last thread out tears the process down. */
+void proc_exit(int status)
+{
+    struct process *p = proc_current();
+    irq_save();
+    if (!p->exiting) {
+        p->exiting = EXITING_GROUP;
+        p->status = status;
+        struct thread *me = thread_current();
+        for (struct thread *t = p->threads; t; t = t->proc_next)
+            if (t != me) {
+                t->sig_pending |= SIGBIT(SIGKILL);
+                t->sig_check = 1;
+                thread_wake(t);
+            }
+    }
+    thread_leave(p);
+}
+
+/* exit: only the calling thread ends (pthread_exit, or a thread function
+   returning). The last one ends the process with this status. */
+void proc_thread_exit(int status)
+{
+    struct process *p = proc_current();
+    irq_save();
+    if (p->nthreads == 1)
+        proc_exit(status);
+    thread_leave(p);
 }
 
 #define WNOHANG 1
@@ -393,10 +580,18 @@ int proc_wait4(int pid, uint32_t user_status, int options)
                                             any child, for now) */
             have_children = 1;
             if (c->state == PROC_ZOMBIE) {
-                if (user_status && copy_to_user((void *)user_status, &c->status, 4) < 0)
-                    return -EFAULT;
-                int id = c->pid;
+                /* Claim the child before the copy, because the copy can
+                   sleep: a sibling thread (clone(CLONE_THREAD)) waiting on
+                   the same child would otherwise see this zombie too, reap
+                   it, and let a fork reuse the slot — and then our reap
+                   would drop a *live* process's cwd reference and mark its
+                   slot free. Copy from locals so the freed slot is not
+                   read. The status is lost if the copy fails, which is what
+                   Linux does with a bad wait4 pointer as well. */
+                int id = c->pid, status = c->status;
                 reap(c);
+                if (user_status && copy_to_user((void *)user_status, &status, 4) < 0)
+                    return -EFAULT;
                 return id;
             }
         }

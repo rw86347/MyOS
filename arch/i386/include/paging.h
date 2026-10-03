@@ -7,6 +7,7 @@
 #define PTE_PRESENT  0x001
 #define PTE_WRITABLE 0x002
 #define PTE_USER     0x004
+#define PTE_PWT      0x008      /* with PCD: picks the page's memory type (pat.c) */
 #define PTE_PCD      0x010      /* cache disabled: device registers */
 #define PTE_PS       0x080      /* in a directory entry: a 4 MiB page (PSE) */
 #define PTE_GLOBAL   0x100      /* kernel pages: keep in the TLB across CR3 loads */
@@ -20,6 +21,16 @@ void vmm_init(void);
 /* Map one 4 KiB page: virtual `va` -> physical `pa`. Returns 0, or -1 if
    out of memory or `va` is already mapped. */
 int vmm_map(uint32_t va, uint32_t pa, uint32_t flags);
+
+/* Map one 4 MiB page in the kernel half (va and pa 4 MiB aligned): one
+   directory entry, no page table, one TLB entry. Only at boot, before the
+   first process — process directories copy the kernel half when created.
+   Returns 0, or -1 if va is in use. */
+int vmm_map_big(uint32_t va, uint32_t pa, uint32_t flags);
+
+/* The page table flags for a write-combining page (pat.c; uncached on a
+   CPU without PAT). */
+uint32_t pte_write_combining(void);
 
 /* Unmap one page. Returns the physical address it pointed to (0 if none). */
 uint32_t vmm_unmap(uint32_t va);

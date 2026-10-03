@@ -2,10 +2,9 @@
 # MyOS Makefile
 #
 #   make            build build/myos.img (bootable raw disk image)
-#   make run        boot in QEMU: VGA in a window (the text is scaled to fill the
-#                   window — make the window bigger for bigger text), serial
-#                   output in this terminal
-#   make run-full   the same, full screen with the text scaled up to fill it
+#   make run        boot in QEMU: a 1920x1200 pixel console in a window (scaled
+#                   to fit the window), serial output in this terminal
+#   make run-full   the same, full screen
 #                   (leave full screen: Cmd-F, or the View menu)
 #   make run-text   boot in QEMU fully in the terminal (VGA text screen via curses;
 #                   serial goes to build/serial.log). Quit: Esc then 2, type "quit".
@@ -20,6 +19,7 @@
 #   make dist       dist/myos-usb.zip: the boot image + instructions, to write to a
 #                   USB stick or run in an emulator on another computer
 #   make utm        "dist/MyOS read-write.utm": a ready-made UTM virtual machine
+#   make live-root  build/live/rootfs.tar: all the live disk's software
 #   make clean      delete build/
 #
 # Build modes: a normal build contains no test or benchmark code at all.
@@ -76,7 +76,8 @@ LIBS    := -lgcc    # gcc's helper routines (e.g. 64-bit division on i386)
 TEST_SRCS  := kernel/selftest.c kernel/disk_demo.c $(wildcard kernel/*_test.c)
 BENCH_SRCS := kernel/bench.c
 C_SRCS  := $(filter-out $(TEST_SRCS) $(BENCH_SRCS), \
-             $(wildcard arch/i386/*.c kernel/*.c drivers/*.c fs/*.c mm/*.c net/*.c))
+             $(wildcard arch/i386/*.c kernel/*.c drivers/*.c fs/*.c mm/*.c net/*.c \
+                        drivers/gpu/drm/*.c drivers/gpu/drm/tiny/*.c drivers/video/*.c))
 ifeq ($(MODE),test)
   C_SRCS += $(TEST_SRCS)
 endif
@@ -93,8 +94,12 @@ GEN_OBJS := $(BUILD)/gen/slots_conf.o
 # User test programs (user/*.asm and user/*.c -> ELF executables). Test and
 # bench builds put them in the initramfs as /bin/NAME.
 USER_BINS := $(patsubst user/%.asm,$(BUILD)/user/%.elf,$(wildcard user/*.asm)) \
-             $(patsubst user/%.c,$(BUILD)/user/%.elf,$(wildcard user/*.c))
+             $(patsubst user/%.c,$(BUILD)/user/%.elf,$(wildcard user/*.c)) \
+             $(patsubst user/musl/%.c,$(BUILD)/user/musl/%.elf,$(wildcard user/musl/*.c))
 USER_LIB  := $(BUILD)/user/lib/crt0.o $(BUILD)/user/lib/mini.o
+# Alpine Linux packages, unpacked (tools/fetch-alpine.sh; see the initramfs).
+ALPINE := build/ext/alpine
+ALPINE_STAMP := $(ALPINE)/.fetched
 OBJS    := $(BUILD)/arch/i386/entry.o $(ASM_OBJS) $(C_OBJS) $(GEN_OBJS)
 
 IMG     := $(BUILD)/myos.img
@@ -131,7 +136,7 @@ QEMU_FLAGS = -m 64M -cpu pentium3 \
              -drive format=raw,file=$(DATA),index=2,media=disk \
              -netdev user,id=net0 -device e1000,netdev=net0
 
-.PHONY: attacks all dist utm utm-hd hd run-hd test-hd run run-full run-text debug test check-selftests test-shell bench run-bench usb clean fuzz fuzz-build fuzz-replay
+.PHONY: diskattacks verify-disktests verify-tests attacks all dist utm utm-hd hd live-root live-hd utm-live run-live run-hd test-hd run run-full run-text debug test check-selftests test-shell bench run-bench usb clean fuzz fuzz-build fuzz-replay diskfuzz diskfuzz-replay verify-racetests
 
 all: $(IMG) $(USB)
 
@@ -149,6 +154,18 @@ $(BUILD)/user/lib/%.o: user/lib/%.c user/lib/mini.h
 $(BUILD)/user/lib/%.o: user/lib/%.asm
 	@mkdir -p $(dir $@)
 	$(NASM) -f elf32 $< -o $@
+
+# user/musl/NAME.c: linked statically against Alpine's real musl C library
+# (musl-dev, tools/fetch-alpine.sh) — for what the mini libc can't do, like
+# pthreads. (Before the user/%.c rule, which would match these too.)
+MUSL_CFLAGS := -std=c11 -O2 -Wall -Wextra -march=i686 -nostdinc -isystem $(ALPINE)/usr/include
+MUSL_LIB    := $(ALPINE)/usr/lib
+
+$(BUILD)/user/musl/%.elf: user/musl/%.c | $(ALPINE_STAMP)
+	@mkdir -p $(dir $@)
+	$(CC) $(MUSL_CFLAGS) -c $< -o $(BUILD)/user/musl/$*.o
+	$(CC) -nostdlib -static -Wl,-z,noexecstack $(MUSL_LIB)/crt1.o $(MUSL_LIB)/crti.o $(BUILD)/user/musl/$*.o \
+	      -Wl,--start-group $(MUSL_LIB)/libc.a -lgcc -Wl,--end-group $(MUSL_LIB)/crtn.o -o $@
 
 $(BUILD)/user/%.elf: user/%.c $(USER_LIB) user/lib/mini.h
 	@mkdir -p $(dir $@)
@@ -197,9 +214,7 @@ $(BUILD)/kernel.bin: $(BUILD)/kernel.elf
 #   bash     dynamically linked: needs musl's dynamic linker and C library
 #            (/lib/ld-musl-i386.so.1), readline and ncurses (/usr/lib), and
 #            terminal descriptions (/etc/terminfo)
-ALPINE := build/ext/alpine
-ALPINE_STAMP := $(ALPINE)/.fetched
-
+# (ALPINE and ALPINE_STAMP are set further up: the user programs use them.)
 $(ALPINE_STAMP): tools/fetch-alpine.sh
 	tools/fetch-alpine.sh $(ALPINE)
 
@@ -346,6 +361,35 @@ $(HD): $(IMG) tools/mbr-partition.sh
 
 hd: $(HD)
 
+# --- the live disk's software (step 9c-3) ----------------------------------------
+# Every program on the live disk (live/packages.txt: IceWM desktop, logins,
+# AbiWord, gcc/make/python3/adb...), as pinned Alpine packages
+# (live/packages.lock), plus the MyOS source, in one archive:
+# build/live/rootfs.tar. `tools/fetch-live.py --update` re-resolves the list.
+live-root:
+	python3 tools/fetch-live.py
+
+# The live disk: like `make hd`, but myos-root holds the live userland
+# (tools/mklivehd.sh: owners, setuid bits and case-only names kept).
+LIVE_TAR := $(BUILD)/live/rootfs.tar
+LIVE_HD  := $(BUILD)/myos-live.img
+LIVE_MB  := 1536
+$(LIVE_TAR):
+	python3 tools/fetch-live.py
+$(LIVE_HD): $(IMG) $(LIVE_TAR) tools/mklivehd.sh tools/mbr-partition.sh
+	E2FS=$(E2FS) tools/mklivehd.sh $(IMG) $(LIVE_TAR) $@ $(LIVE_MB)
+live-hd: $(LIVE_HD)
+
+# The live disk in UTM, as its own machine (its own UUID).
+UTM_LIVE_VM := dist/MyOS live.utm
+utm-live: $(LIVE_HD)
+	@mkdir -p dist
+	tools/mkutm.sh --installed $(LIVE_HD) "$(UTM_LIVE_VM)" 5C81D2E7-0B4F-4A93-8E6D-71F3A9C2B540
+
+run-live: $(LIVE_HD)
+	$(QEMU) -m 256M -cpu pentium3 -drive format=raw,file=$(LIVE_HD),index=0,media=disk \
+	  $(DISPLAY_OPTS) -serial stdio
+
 run-hd: $(HD) $(USB)
 	$(QEMU) -m 64M -cpu pentium3 -drive format=raw,file=$(HD),index=0,media=disk \
 	  -drive format=raw,file=$(USB),index=1,media=disk $(DISPLAY_OPTS) -serial stdio
@@ -413,8 +457,8 @@ define check-test-disk
 endef
 
 # --- running -----------------------------------------------------------------
-# The PC text screen is 720x400 pixels; zoom-to-fit scales it up to the
-# window (or the whole screen), so the letters grow with it.
+# QEMU's default card is the std VGA, so the Bochs driver switches to
+# 1920x1200; zoom-to-fit scales that (or the text screen before it) to the window.
 DISPLAY_OPTS := -display cocoa,zoom-to-fit=on
 
 run: $(IMG) $(USB) $(DATA)
@@ -423,8 +467,10 @@ run: $(IMG) $(USB) $(DATA)
 run-full: $(IMG) $(USB) $(DATA)
 	$(QEMU) $(QEMU_FLAGS) $(DISPLAY_OPTS),full-screen=on -serial stdio
 
+# curses can only show the text screen: a Cirrus card has no MyOS driver, so
+# the console stays 80x25 text.
 run-text: $(IMG) $(USB) $(DATA)
-	$(QEMU) $(QEMU_FLAGS) -display curses -serial file:$(BUILD)/serial.log
+	$(QEMU) $(QEMU_FLAGS) -vga cirrus -display curses -serial file:$(BUILD)/serial.log
 
 debug: $(IMG) $(USB) $(DATA)
 	$(QEMU) $(QEMU_FLAGS) $(DISPLAY_OPTS) -serial stdio -s -S
@@ -441,6 +487,7 @@ check-selftests: $(IMG) $(USB)
 	@(sleep 8; for k in h i ret; do echo "sendkey $$k"; sleep 0.2; done; \
 	  echo "mouse_move 10 5"; sleep 0.3; echo "mouse_button 1"; sleep 0.3; \
 	  echo "mouse_button 0"; sleep 0.3; \
+	  echo "screendump $(BUILD)/screen.ppm"; sleep 0.5; \
 	  echo "sendkey f10"; sleep 1; echo quit) \
 	  | $(QEMU) $(QEMU_FLAGS) -display none \
 	    -serial file:$(BUILD)/serial.log -monitor stdio >/dev/null
@@ -463,6 +510,9 @@ check-selftests: $(IMG) $(USB)
 	  grep -q "User mode: fpu exited with code 0" $$L || { echo "FAIL: FPU state"; ok=0; }; \
 	  grep -q "systest: all [0-9]* checks passed" $$L || { echo "FAIL: step 8 startup calls"; ok=0; }; \
 	  grep -q "fstest /fst: all [0-9]* checks passed" $$L || { echo "FAIL: step 8i writable files"; ok=0; }; \
+	  grep -q "pthreadtest: all ok" $$L || { echo "FAIL: musl pthreads (clone threads, futex)"; ok=0; }; \
+	  grep -q "racetest: all [0-9]* checks passed" $$L || { echo "FAIL: sleeping copy_to_user races"; ok=0; }; \
+	  grep -q "boottest: all ok" $$L || { echo "FAIL: init/getty syscalls (mount, sethostname, reboot)"; ok=0; }; \
 	  grep -q "pcache: second read comes from RAM" $$L || { echo "FAIL: step 9c-2 page cache"; ok=0; }; \
 	  grep -q "pcache: read-ahead filled the next page" $$L || { echo "FAIL: step 9c-2 read-ahead"; ok=0; }; \
 	  grep -q "fatvfs: HELLO.TXT read through the VFS" $$L || { echo "FAIL: step 9e FAT32 in the VFS"; ok=0; }; \
@@ -481,6 +531,10 @@ check-selftests: $(IMG) $(USB)
 	  grep -q "User mode: hello exited with code 42" $$L || { echo "FAIL: user exit()"; ok=0; }; \
 	  grep -q "peek: killed by CPU exception 14" $$L || { echo "FAIL: user page fault"; ok=0; }; \
 	  grep -q "Kernel read of address 00000000 (page not mapped)" $$L || { echo "FAIL: NULL page fault"; ok=0; }; \
+	  grep -q "drm: bochs 1234:1111, 16 MiB, 1920x1200" $$L || { echo "FAIL: step 11b Bochs VGA driver"; ok=0; }; \
+	  grep -q "fbcon: 120x37" $$L || { echo "FAIL: step 11b pixel console"; ok=0; }; \
+	  grep -q "fbtest: all [0-9]* checks passed" $$L || { echo "FAIL: step 11b /dev/fb0"; ok=0; }; \
+	  python3 tools/check-screen.py $(BUILD)/screen.ppm || { echo "FAIL: step 11b console on the screen"; ok=0; }; \
 	  [ $$ok = 1 ] || { echo "TEST FAILED"; exit 1; }
 	$(call check-test-disk,$(DATA),/persist.txt,written by MyOS)
 	@$(DEBUGFS) -R 'dump /pattern.bin $(BUILD)/pattern.bin' $(DATA) >/dev/null 2>&1; \
@@ -567,7 +621,7 @@ run-bench: $(IMG) $(USB) $(DATA)
 # mutation loop; set FUZZER=libfuzzer where the real one exists.
 FUZZ_CC    ?= clang
 FUZZ_DIR   := build/fuzz
-FUZZ_KSRCS := net/skbuff.c net/ipv4.c net/udp.c net/tcp.c net/dns.c \
+FUZZ_KSRCS := kernel/random.c net/skbuff.c net/ipv4.c net/udp.c net/tcp.c net/dns.c \
               tools/fuzz/stubs.c tools/fuzz/packet.c tools/fuzz/targets.c
 FUZZ_TARGETS := wire ip arp dns tcp
 FUZZ_SAN   := -fsanitize=address,undefined -fno-sanitize-recover=all \
@@ -608,6 +662,83 @@ fuzz-build: $(FUZZ_DIR)/fuzz_net
 # Tests that assert an attack is rejected — the half fuzzing cannot reach,
 # because accepting a forged ARP reply is not a memory error. Same stubs, same
 # sanitizers, different question: not "did it survive" but "did it refuse".
+# --- the disk side: the kernel's real filesystem code against a crafted
+# image, under AddressSanitizer. The source list is almost the whole
+# filesystem stack; only the allocators, the block device and the clock are
+# stubbed (tools/fuzz/diskstubs.c), and the stubs are made more sensitive than
+# the real thing so an overflow is a report rather than a quiet corruption.
+# -Wno-macro-redefined: the kernel's signal.h and the host's both define NSIG.
+DISK_KSRCS := fs/ext2.c fs/bcache.c fs/pcache.c fs/partition.c fs/fat32.c \
+              fs/fatvfs.c fs/vfs.c fs/ramfs.c kernel/blockdev.c \
+              tools/fuzz/diskstubs.c tools/fuzz/disktarget.c \
+              tools/fuzz/diskattacks.c
+DISK_OBJS  := $(patsubst %.c,$(FUZZ_DIR)/disk/%.o,$(DISK_KSRCS))
+DISK_FLAGS := $(FUZZ_WARN) $(FUZZ_SAN) -Wno-macro-redefined \
+              -Itools/fuzz/shim -Iinclude -Itools/fuzz
+
+$(FUZZ_DIR)/disk/%.o: %.c $(wildcard tools/fuzz/*.h) $(wildcard tools/fuzz/shim/*.h)
+	@mkdir -p $(dir $@)
+	$(FUZZ_CC) $(DISK_FLAGS) -c -o $@ $<
+
+# A small, real ext2 image to corrupt: made by mke2fs so the cases start from
+# something the kernel is meant to accept. 4 KiB blocks, which matters more
+# than it looks: bcache gives every buffer a whole page, so with 1 KiB blocks
+# a read 200 bytes past the end of a block is still inside the page and
+# nothing notices. At 4 KiB the block fills the page exactly and the next byte
+# is in the poisoned redzone. Six of the eight cases were silently measuring
+# nothing until this changed.
+$(FUZZ_DIR)/base.ext2:
+	@mkdir -p $(FUZZ_DIR)/baseroot/sub/deep
+	@echo "hello from the base image" > $(FUZZ_DIR)/baseroot/file.txt
+	@awk 'BEGIN{for(i=0;i<500;i++)print "padding line to spill into a second block"}' \
+	    > $(FUZZ_DIR)/baseroot/sub/big.txt
+	@echo deep > $(FUZZ_DIR)/baseroot/sub/deep/leaf.txt
+	@ln -sf file.txt $(FUZZ_DIR)/baseroot/link
+	@ln -sf /a/long/path/that/is/not/there $(FUZZ_DIR)/baseroot/sub/longlink
+	@rm -f $@
+	$(MKE2FS) $(MKE2FS_BASE) -E root_owner=0:0 -L myos-data -b 4096 \
+	    -N 256 -d $(FUZZ_DIR)/baseroot $@ 1024
+
+$(FUZZ_DIR)/diskattacks: $(DISK_OBJS)
+	$(FUZZ_CC) $(FUZZ_SAN) -o $@ $^
+
+diskattacks: $(FUZZ_DIR)/diskattacks $(FUZZ_DIR)/base.ext2
+	@$(FUZZ_DIR)/diskattacks $(FUZZ_DIR)/base.ext2
+
+#   make diskfuzz              mutate the image and mount it, over and over
+#   make diskfuzz DISK_N=1000000   longer
+#
+# The deterministic cases above are one person's list of what a hostile disk
+# might say. This is the part that finds what nobody thought of: take the base
+# image, change a few bytes near something structural, mount it, walk it,
+# write to it. Each run is a fork, because the point is to survive a crash and
+# report it rather than die. Coverage lives in shared memory so the parent can
+# tell a new code path from a repeat and keep the input that found it.
+#
+# It found three bugs in its first minutes that reading the code had missed,
+# two of which only matter on ARM (misaligned halfword access). See
+# docs/security.md.
+DISK_N ?= 100000
+DISK_SEED ?= 1
+diskfuzz: $(FUZZ_DIR)/diskattacks $(FUZZ_DIR)/base.ext2
+	@mkdir -p $(FUZZ_DIR)/crashes tools/fuzz/corpus/disk
+	@$(FUZZ_DIR)/diskattacks --fuzz $(DISK_N) $(DISK_SEED) $(FUZZ_DIR)/base.ext2
+
+# Replay the kept corpus and every saved crash. Fast and deterministic: this
+# is the one to run after touching fs/. Corpus entries are deltas against
+# base.ext2, so the base image has to match -- it is generated, not committed,
+# and the rule above is reproducible.
+diskfuzz-replay: $(FUZZ_DIR)/diskattacks $(FUZZ_DIR)/base.ext2
+	@set -e; n=0; for f in tools/fuzz/corpus/disk/* $(FUZZ_DIR)/crashes/disk-*; do \
+	  [ -f "$$f" ] || continue; \
+	  $(FUZZ_DIR)/diskattacks --replay "$$f" $(FUZZ_DIR)/base.ext2 >/dev/null; \
+	  n=$$((n+1)); \
+	done; echo "DISK REPLAY OK ($$n inputs)"
+
+# Put each ext2 fix back the way it was and check the matching case notices.
+verify-disktests:
+	@tools/fuzz/verify-disktests.sh
+
 ATTACK_SRCS := $(filter-out tools/fuzz/targets.c,$(FUZZ_KSRCS)) tools/fuzz/attacks.c
 ATTACK_OBJS := $(patsubst %.c,$(FUZZ_DIR)/%.o,$(ATTACK_SRCS))
 
@@ -616,6 +747,17 @@ $(FUZZ_DIR)/attacks: $(ATTACK_OBJS)
 
 attacks: $(FUZZ_DIR)/attacks
 	@$(FUZZ_DIR)/attacks
+
+# Does each racetest check fail against the bug it is meant to catch? Boots a
+# test kernel per case, so slower than the host-side ones: about 90 seconds.
+verify-racetests:
+	@tools/fuzz/verify-racetests.sh
+
+# Does each adversarial test actually fail against the bug it is meant to
+# catch? Reintroduces one bug at a time and checks a test notices. A test that
+# passes either way is measuring nothing, which has happened twice here.
+verify-tests:
+	@tools/fuzz/verify-tests.sh
 
 T ?=
 N ?= 200000

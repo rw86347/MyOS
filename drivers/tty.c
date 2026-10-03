@@ -32,7 +32,7 @@
 #endif
 #include <uaccess.h>
 #include <vfs.h>
-#include <vga.h>
+#include <vt.h>
 
 /* struct termios as the Linux kernel has it (36 bytes). */
 #define NCCS 19
@@ -87,6 +87,10 @@ struct termios {
 #define TIOCSWINSZ  0x5414
 #define FIONREAD    0x541B
 #define TIOCNOTTY   0x5422
+#define KDSETMODE   0x4B3A          /* the console: text or graphics */
+#define KDGETMODE   0x4B3B
+#define KD_TEXT     0
+#define KD_GRAPHICS 1
 
 #define LINE_MAX  256               /* the line being edited */
 #define IN_SIZE   2048              /* typed bytes waiting for a reader */
@@ -224,7 +228,19 @@ void tty_input(const char *bytes, int n)
 void tty_attach_keyboard(void)
 {
     keyboard_set_listener(tty_input);
-    vga_set_reply(tty_input);           /* the screen answers via the input */
+    vt_set_reply(tty_input);            /* the screen answers via the input */
+}
+
+/* The console changed size (vt.c): a full-screen program redraws itself
+   when it gets SIGWINCH, as in a terminal window being resized. */
+void tty_set_winsize(int r, int c)
+{
+    if (r == rows && c == cols)
+        return;
+    rows = (uint16_t)r;
+    cols = (uint16_t)c;
+    if (fg_pgrp)
+        signal_send_group(fg_pgrp, SIGWINCH);
 }
 
 int tty_reader_waiting(void)
@@ -277,19 +293,32 @@ int32_t tty_read(struct file *f, void *user_buf, uint32_t n)
             return 0;
         }
     }
+    if (avail > IN_SIZE)
+        avail = IN_SIZE;            /* can't be, but then n below is bounded */
     if (n > avail)
         n = avail;
     uint32_t at = in_tail % IN_SIZE;
     uint32_t first = n < IN_SIZE - at ? n : IN_SIZE - at;
-    if (copy_to_user(user_buf, in + at, first) < 0 ||
-        copy_to_user((char *)user_buf + first, in, n - first) < 0)
-        return -EFAULT;
+    /* Take the bytes before copying them, because the copy can sleep. Every
+       reader of the terminal shares this one ring, so a second one would
+       otherwise measure the same in_tail, hand out the same bytes, and add n
+       again — leaving in_head - in_tail negative, which as an unsigned
+       difference stops clamping n, so the next read copies hundreds of
+       kilobytes from past the end of `in` straight to user space. lines[0]
+       would underflow the same way and `--nlines` at zero turns the memmove
+       into a four-billion-byte one. fs/pipe.c had this shape too.
+       Nothing is rolled back if the copy fails: the line bookkeeping below
+       cannot be undone, and losing a line of typing to a bad pointer is a
+       better outcome than an inconsistent ring. */
     in_tail += n;
     if (tio.c_lflag & ICANON) {
         lines[0] -= n;
         if (lines[0] == 0)
             memmove(lines, lines + 1, --nlines * sizeof lines[0]);
     }
+    if (copy_to_user(user_buf, in + at, first) < 0 ||
+        copy_to_user((char *)user_buf + first, in, n - first) < 0)
+        return -EFAULT;
     return n;
 }
 
@@ -298,6 +327,15 @@ static void flush_input(void)
     in_tail = in_head;
     nlines = 0;
     line_len = 0;
+}
+
+void tty_hangup(void)
+{
+    flush_input();
+    if (fg_pgrp) {
+        signal_send_group(fg_pgrp, SIGHUP);
+        signal_send_group(fg_pgrp, SIGCONT);    /* a stopped job hears it too */
+    }
 }
 
 int32_t tty_ioctl(struct file *f, uint32_t cmd, uint32_t arg)
@@ -360,6 +398,18 @@ int32_t tty_ioctl(struct file *f, uint32_t cmd, uint32_t arg)
     case TIOCSCTTY:
     case TIOCNOTTY:
         return 0;
+    /* A program that draws on the screen itself (an X server, a game on
+       /dev/fb0) switches the console off with KD_GRAPHICS and back on with
+       KD_TEXT, which redraws it. */
+    case KDSETMODE:
+        if (arg != KD_TEXT && arg != KD_GRAPHICS)
+            return -EINVAL;
+        vt_set_graphics(arg == KD_GRAPHICS);
+        return 0;
+    case KDGETMODE: {
+        int mode = vt_graphics() ? KD_GRAPHICS : KD_TEXT;
+        return copy_to_user((void *)arg, &mode, sizeof mode);
+    }
     default:
         return -EINVAL;
     }

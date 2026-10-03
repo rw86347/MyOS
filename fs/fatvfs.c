@@ -17,7 +17,6 @@
 #include <vfs.h>
 
 #define MSDOS_MAGIC 0x4d44
-#define RW_MAX      (256 * 1024)
 
 struct fatmnt {
     struct mount m;

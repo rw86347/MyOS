@@ -19,6 +19,15 @@
  */
 
 /* File types and permission bits (st_mode), as Linux defines them. */
+/* The most one read() or write() transfers, whatever the file. A syscall
+   cannot be preempted, so an uncapped one would hold the CPU for as long as
+   the caller asked — 256 KiB is about 0.1 ms of copying on a Pentium 4, and
+   a short read is something every caller already has to handle.
+   sys_read/sys_write apply it, so no file's ops can be asked for more; the
+   filesystems keep their own copy of the clamp as well, because the ops are
+   also reached from inside the kernel. */
+#define RW_MAX    (256 * 1024)
+
 #define S_IFMT    0170000
 #define S_IFREG   0100000           /* regular file */
 #define S_IFDIR   0040000           /* directory */
@@ -31,6 +40,10 @@
 #define S_ISCHR(m) (((m) & S_IFMT) == S_IFCHR)
 #define S_ISLNK(m) (((m) & S_IFMT) == S_IFLNK)
 #define S_ISFIFO(m) (((m) & S_IFMT) == S_IFIFO)
+#define S_ISUID   04000             /* run as the file's owner */
+#define S_ISGID   02000             /* run as its group; on a directory: new
+                                       entries take the directory's group */
+#define S_IXGRP   00010             /* group may execute */
 
 /* open() flags (Linux i386 values) */
 #define O_ACCMODE   3
@@ -50,8 +63,10 @@
 #define PATH_MAX    256             /* ours; Linux allows 4096 */
 #define FD_MAX      PROC_FILES
 
+struct blockdev;
 struct file;
 struct inode;
+struct vma;
 
 struct file_ops {
     /* Copy up to n bytes to/from USER memory at the file's position.
@@ -61,6 +76,10 @@ struct file_ops {
     void (*release)(struct file *f);        /* last close (may be NULL) */
     int32_t (*ioctl)(struct file *f, uint32_t cmd, uint32_t arg);   /* or NULL */
     uint32_t (*poll)(struct file *f);       /* POLLIN/POLLOUT/... now (NULL: both) */
+    /* Devices whose memory programs can map (/dev/fb0): describe it in vma
+       with vm_iomap_memory (mm.h). vma->start is 0 here, end the length.
+       NULL: mmap gives -ENODEV. */
+    int (*mmap)(struct file *f, struct vma *vma);
 };
 
 /* inode flags */
@@ -69,6 +88,8 @@ struct file_ops {
 #define I_UNLINKED   4              /* removed from the tree; freed at refs == 0 */
 #define I_UNLOADED   8              /* a disk directory whose entries aren't read yet */
 #define I_MOUNTED   16              /* the root of a mounted file system */
+#define I_PROC_FD   32              /* /proc/self/fd/N (fs_ino = N): a link to
+                                       whatever the caller's fd N is open on */
 
 /*
  * A file system on a disk (ext2): what the VFS asks of it. The VFS keeps
@@ -94,6 +115,13 @@ struct fs_ops {
     /* Write those pages (dirty, from the page cache) to the file's blocks.
        Blocks were allocated by the write. NULL: the file system can't. */
     int (*writepages)(struct inode *i, uint32_t index, uint32_t n, const uint32_t *frames);
+    /* For read-ahead that doesn't wait: where pages [index, index + n) are
+       on *dev — page k is sectors [lba[k], lba[k] + secs[k]) (fewer than 8
+       only for the file's last page). Stops at the first page that isn't one
+       piece of disk (a hole, or blocks apart). Returns how many pages.
+       NULL: no read-ahead of this kind. */
+    int (*map_pages)(struct inode *i, uint32_t index, uint32_t n, uint32_t *lba,
+                     uint8_t *secs, struct blockdev **dev);
     int (*statfs)(struct mount *m, uint32_t *bsize, uint32_t *blocks, uint32_t *bfree,
                   uint32_t *files, uint32_t *ffree);
 };
@@ -130,6 +158,7 @@ struct inode {
     uint32_t pc_id;                 /* page cache: its pages' tag (0: none yet) */
     uint32_t ra_next;               /* page cache: a miss here means "read in order" */
     uint16_t ra_win;                /* page cache: last read-ahead, pages */
+    int16_t flock;                  /* flock(): >0 shared holders, -1 exclusive */
     uint32_t pc_ndirty;             /* page cache: dirty pages, all in */
     uint32_t dirty_lo, dirty_hi;    /*   [dirty_lo, dirty_hi] */
     struct inode *dirty_next;       /*   the list of files with dirty pages */
@@ -167,6 +196,7 @@ struct file {
     uint32_t flags;                 /* the open() flags (O_APPEND, O_NONBLOCK...) */
     uint32_t refs;                  /* fds pointing at it */
     void *priv;                     /* pipe: the pipe; directory: its cursor */
+    uint32_t flock;                 /* the flock() it holds: 0, LOCK_SH or LOCK_EX */
 };
 
 /* --- the tree ---------------------------------------------------------- */
@@ -179,6 +209,11 @@ int vfs_lookup(const char *path, struct inode **out);
 int vfs_lookup_nofollow(const char *path, struct inode **out);
 /* ...starting from directory `dir` (NULL: the current directory). */
 int vfs_lookup_at(struct inode *dir, const char *path, int follow, struct inode **out);
+
+/* i's full path, with a NUL, into buf: what getcwd and readlink of
+   /proc/self/fd/N say. Returns the length without the NUL, or
+   -ENAMETOOLONG. */
+int vfs_path(struct inode *i, char *buf, uint32_t size);
 
 /* The entry `name` (len bytes) in directory `dir`, or NULL. O(1). */
 struct inode *vfs_child(struct inode *dir, const char *name, uint32_t len);
@@ -239,6 +274,9 @@ int  vfs_mount(const char *path, struct mount *m, uint32_t root_ino, uint32_t mo
 /* Mount an existing in-memory directory tree on path (/dev onto a disk
    root). */
 int  vfs_mount_tree(const char *path, struct inode *tree);
+/* Mount a new, empty RAM directory on the existing directory at path
+   (mount -t tmpfs). Its files share the RAM file system's pages. */
+int  vfs_mount_ram(const char *path, uint32_t mode);
 int  vfs_mount_count(void);
 struct mount *vfs_mount_at(int index);
 /* Move i to new_dir under a new name, replacing what's there (rename()
@@ -269,9 +307,17 @@ uint32_t time_now(void);                    /* seconds since 1970 (sys_info.c) *
 void initramfs_load(const uint8_t *archive, uint32_t size);   /* initramfs.c */
 void dev_init(void);                            /* dev.c: /dev and its nodes */
 void dev_attach(struct inode *i);               /* give a device node its ops */
+/* A device that appears after boot (/dev/fb0): add its node to /dev. */
+void dev_make_node(const char *name, uint32_t rdev);
 extern const struct file_ops console_ops;
 extern struct file console_file;                /* the shared open console */
 int  pipe_create(struct file **rd, struct file **wr);         /* pipe.c */
+int  fifo_open(struct inode *i, uint32_t flags, struct file **out);  /* a named pipe */
+/* procfs.c: mount -t proc, and readlink of a /proc/self/fd/N link. */
+int  procfs_mount(const char *path);
+int  procfs_readlink(struct inode *link, char *buf, uint32_t size);
+/* flock.c: drop f's flock() (its last fd closed). */
+void flock_release(struct file *f);
 extern struct wait_queue poll_wait;     /* poll.c: woken when a file's state changes */
 
 #endif

@@ -6,7 +6,9 @@
 #include <blockdev.h>
 #include <memlayout.h>
 #include <paging.h>
+#include <interrupts.h>
 #include <stddef.h>
+#include <thread.h>
 
 static struct blockdev devices[BLOCKDEV_MAX];
 static int ndevices;
@@ -121,4 +123,90 @@ int blockdev_flush(struct blockdev *dev)
     while (dev->parent)
         dev = dev->parent;          /* the drive the partition is on */
     return dev->flush ? dev->flush(dev) : 0;
+}
+
+/* --- requests that don't wait ---------------------------------------------- */
+
+/*
+ * Each disk gets a worker thread the first time a request is submitted to
+ * it. The worker runs queued requests one after another through the
+ * driver's ordinary rwv (which sleeps on the interrupt), so the submitter
+ * never waits. Costs one thread switch per request; a driver that can take
+ * several commands at once will later queue them on the hardware itself.
+ */
+static struct {
+    struct bio *head, *tail;
+    struct wait_queue wait;             /* the worker sleeps here */
+    uint8_t started;
+} queue[BLOCKDEV_MAX];
+
+static struct wait_queue bio_done;      /* bio_wait sleeps here */
+
+static void finish(struct bio *b, int status)
+{
+    b->status = (int8_t)status;
+    if (b->done)
+        b->done(b);
+    wq_wake_all(&bio_done);
+}
+
+static void worker(void *arg)
+{
+    int d = (int)(uintptr_t)arg;
+    uint32_t flags = irq_save();
+    for (;;) {
+        while (!queue[d].head)
+            wq_sleep(&queue[d].wait);
+        struct bio *b = queue[d].head;
+        queue[d].head = b->next;
+        if (!queue[d].head)
+            queue[d].tail = NULL;
+        finish(b, rwv(b->dev, b->lba, b->v, b->nv, b->write) < 0 ? -1 : 0);
+    }
+    irq_restore(flags);
+}
+
+int blockdev_submit(struct blockdev *dev, struct bio *b)
+{
+    uint32_t count = 0;
+    for (int k = 0; k < b->nv; k++)
+        count += b->v[k].len / SECTOR_SIZE;
+    if (b->nv < 1 || b->nv > BIO_VEC_MAX || count > BIO_SECTORS || !in_range(dev, b->lba, count))
+        return -1;
+    while (dev->parent) {
+        b->lba += dev->offset;
+        dev = dev->parent;
+    }
+    if (b->write && !dev->write)
+        return -1;
+    int d = dev - devices;
+    b->dev = dev;
+    b->status = BIO_BUSY;
+    b->next = NULL;
+    uint32_t flags = irq_save();
+    if (!queue[d].started) {
+        queue[d].started = 1;
+        if (!thread_create("blk", worker, (void *)(uintptr_t)d)) {
+            queue[d].started = 0;
+            irq_restore(flags);
+            return -1;
+        }
+    }
+    if (queue[d].tail)
+        queue[d].tail->next = b;
+    else
+        queue[d].head = b;
+    queue[d].tail = b;
+    wq_wake_all(&queue[d].wait);
+    irq_restore(flags);
+    return 0;
+}
+
+int bio_wait(struct bio *b)
+{
+    uint32_t flags = irq_save();
+    while (b->status == BIO_BUSY)
+        wq_sleep(&bio_done);
+    irq_restore(flags);
+    return b->status;
 }

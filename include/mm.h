@@ -17,8 +17,15 @@
 #define VM_READ   1
 #define VM_WRITE  2
 #define VM_EXEC   4
+/* Device memory (Linux: VM_PFNMAP): the area maps a fixed physical range
+   (a framebuffer), not RAM pages. Its pages are shared by everyone who maps
+   them — across fork too — and never freed. VM_WC: write-combining. */
+#define VM_PFNMAP 0x100
+#define VM_WC     0x200
+#define VM_MAYWRITE 0x400               /* device opened read-write: mprotect may add write */
 
-#define MM_AREAS  32
+#define MM_AREAS_FIRST  32             /* areas a new address space has room for */
+#define MM_AREAS_MAX  1024              /* it doubles up to this (GTK programs: ~400) */
 
 /* Where things go in a program's memory:
      0x08048000   code and data (from the ELF file), then the heap (brk)
@@ -42,12 +49,15 @@ struct vma {
        the file" (mmap). An ELF segment sets this to where its bytes stop,
        so the BSS past p_filesz is zeros even when the file continues. */
     uint32_t file_end;
+    /* VM_PFNMAP: the physical address of file offset 0 (file_end is then
+       the device's length). */
+    uint32_t phys;
 };
 
 struct mm {
     uint32_t pd;                        /* page directory (physical) */
-    struct vma area[MM_AREAS];          /* sorted by start, no overlaps */
-    int nareas;
+    struct vma *area;                   /* sorted by start, no overlaps */
+    int nareas, cap;                    /* in use, room for */
     uint32_t brk_start, brk;            /* the heap: [brk_start, brk) */
 };
 
@@ -85,6 +95,17 @@ uint32_t mm_brk(uint32_t new_brk);
 int32_t  mm_mmap(uint32_t addr, uint32_t len, uint32_t prot, uint32_t flags,
                  struct inode *file, uint32_t off);
 int32_t  mm_munmap(uint32_t addr, uint32_t len);
+
+/* mmap of a device file whose ops have .mmap (/dev/fb0). The area is
+   always shared: writes reach the device, as with MAP_SHARED. */
+struct file;
+int32_t  mm_mmap_device(uint32_t addr, uint32_t len, uint32_t prot, uint32_t flags,
+                        struct file *f, uint32_t off);
+
+/* For a device's .mmap: make vma map physical [phys, phys + size),
+   starting at the vma's file offset (Linux: vm_iomap_memory). 0, or
+   -EINVAL if the vma reaches past size. */
+int vm_iomap_memory(struct vma *vma, uint32_t phys, uint32_t size);
 int32_t  mm_mprotect(uint32_t addr, uint32_t len, uint32_t prot);
 
 #endif

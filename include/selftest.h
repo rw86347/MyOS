@@ -19,4 +19,7 @@ void initrd_selftest(void);
 /* bcache_test.c */
 void bcache_selftest(void);
 
+/* drm_test.c */
+void drm_selftest(void);
+
 #endif

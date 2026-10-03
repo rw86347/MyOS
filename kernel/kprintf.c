@@ -7,7 +7,7 @@
  *
  * Speed: the text is collected in a small buffer on the stack and handed to
  * the console in one piece (console_write), not one character at a time.
- * Each hand-over costs one interrupt-off section and one VGA cursor move —
+ * Each hand-over costs one interrupt-off section and one cursor move —
  * port I/O is slow on old PCs, so per-character work adds up.
  */
 #include <stdarg.h>
@@ -16,14 +16,14 @@
 #include <kprintf.h>
 #include <serial.h>
 #include <string.h>
-#include <vga.h>
+#include <vt.h>
 
 void console_write(const char *s, size_t n)
 {
     /* Interrupts off for the whole piece: output from two threads (or an
        interrupt) can't get mixed up inside one line. */
     uint32_t flags = irq_save();
-    vga_write_n(s, n);
+    vt_write(s, n);
     serial_write_n(s, n);
     irq_restore(flags);
 }

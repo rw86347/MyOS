@@ -69,4 +69,35 @@ int blockdev_writev(struct blockdev *dev, uint32_t lba, const struct bio_vec *v,
    are merged). The count, or -1 if it is unmapped or needs more than max. */
 int blockdev_map(const void *buf, uint32_t bytes, struct bio_vec *v, int max);
 
+/*
+ * A request that doesn't wait ("bio", like Linux's): blockdev_submit hands
+ * it to the disk and returns at once; the caller goes on (copying the last
+ * read-ahead window to a program, say) while the disk works. When it is
+ * finished, status becomes 0 or -1 and done(b) is called.
+ *
+ * done may run in an interrupt or in the disk's worker thread: it must be
+ * short, must not sleep and must not allocate. The bio, and the pieces v
+ * points at, belong to the disk until then.
+ */
+#define BIO_BUSY 1
+
+struct bio {
+    uint32_t lba;
+    const struct bio_vec *v;
+    int16_t  nv;
+    uint8_t  write;
+    volatile int8_t status;             /* BIO_BUSY, then 0 or -1 */
+    void   (*done)(struct bio *b);      /* may be NULL (bio_wait instead) */
+    void    *priv;                      /* the caller's */
+    struct blockdev *dev;               /* the whole disk (set by submit) */
+    struct bio *next;                   /* the disk's queue */
+};
+
+/* Start the request. 0: it is on its way (done will be called); -1: it was
+   refused (bad range, read-only disk) and done will not be called. */
+int blockdev_submit(struct blockdev *dev, struct bio *b);
+
+/* Sleep until the request is finished; its status. */
+int bio_wait(struct bio *b);
+
 #endif

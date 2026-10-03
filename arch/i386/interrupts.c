@@ -124,8 +124,9 @@ static int user_exception(struct regs *r, uint32_t cr2)
     int sig = exception_signal(r->vector);
     struct process *p = proc_current();
     uint32_t h = p->sig_action[sig - 1].handler;
-    if (h != SIG_DFL && h != SIG_IGN && !(p->sig_blocked & SIGBIT(sig))) {
-        p->sig_pending |= SIGBIT(sig);  /* its handler runs on the way out */
+    if (h != SIG_DFL && h != SIG_IGN && !(t->sig_blocked & SIGBIT(sig))) {
+        t->sig_pending |= SIGBIT(sig);  /* its handler runs on the way out */
+        t->sig_check = 1;
         return 1;
     }
     proc_exit(W_SIGNALED(sig));     /* never returns */

@@ -36,6 +36,11 @@ unsigned tcp_poll(struct tcp_conn *c);
 uint32_t tcp_rx_avail(struct tcp_conn *c);
 int  tcp_error(struct tcp_conn *c, int clear);  /* SO_ERROR */
 int  tcp_connected(struct tcp_conn *c);          /* handshake done */
+
+/* The most one tcp_read or tcp_write can move: the ring is the limit. The
+   socket layer needs it to know how much of a user buffer is worth faulting
+   in before a copy (see fault_in_user in uaccess.h). */
+uint32_t tcp_buf_max(void);
 void tcp_names(struct tcp_conn *c, uint16_t *lport, uint32_t *raddr, uint16_t *rport);
 
 void tcp_shutdown_write(struct tcp_conn *c);     /* send FIN after the data */

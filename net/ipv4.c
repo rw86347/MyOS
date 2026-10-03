@@ -23,6 +23,7 @@
 #include <ipv4.h>
 #include <kprintf.h>
 #include <netdevice.h>
+#include <random.h>
 #include <socket.h>
 #include <string.h>
 #include <tcp.h>
@@ -213,6 +214,23 @@ static int ip_ok(uint32_t ip)
     return ip && ip != 0xFFFFFFFFu && (ip >> 28) != 0xE;
 }
 
+/* Whether an address is a believable *sender*. A packet arrives with whatever
+   source its sender cared to write, and we hand that address to the code that
+   decides where a reply goes (RFC 1122 3.2.1.3 says to discard these). Three
+   of them are worth naming:
+     - a broadcast or multicast source would aim our reply at a whole segment;
+     - 127/8 cannot reach us from a wire, so a frame carrying it is forged;
+     - our own address claimed by someone else is a spoof, and it is also the
+       shape of the old "land" attack: a packet from us, to us.
+   Dropping them here rather than in the echo path covers ICMP, TCP, UDP and
+   raw sockets at once, and keeps an attacker from choosing which per-
+   destination IP-ID counter a reply of ours reveals. */
+static int ip_source_ok(uint32_t ip)
+{
+    return ip_ok(ip) && (ip >> 24) != 127 && ip != OUR_IP &&
+           ip != (OUR_IP | ~OUR_MASK);          /* the subnet broadcast */
+}
+
 static int mac_ok(const uint8_t mac[6])
 {
     if (mac[0] & 1)                     /* multicast or broadcast */
@@ -332,7 +350,7 @@ static int on_arp(struct sk_buff *skb)
     /* Answer a request for our address straight from the MAC on the frame.
        The asker is not recorded: a request claiming to be the gateway is
        the oldest trick there is. */
-    if (oper == ARP_REQUEST && tpa == OUR_IP)
+    if (oper == ARP_REQUEST && tpa == OUR_IP && ip_rate_ok(spa))
         arp_send(ARP_REPLY, a.sha, spa);
 
     /* Learn only from a reply to a question of ours. */
@@ -343,7 +361,35 @@ static int on_arp(struct sk_buff *skb)
     return 0;
 }
 
-static uint16_t ip_id = 1;
+/*
+ * One IP ID counter per destination instead of one for the whole machine.
+ * A single global counter answered a question nobody should be able to ask:
+ * send us two packets, subtract the two ids, and you know exactly how many
+ * packets the machine sent to anyone else in between. That is a traffic
+ * meter on the whole host, and it is what nmap's idle scan is built on.
+ * Per destination, the only count a peer can take is of its own traffic,
+ * which it knows already.
+ *
+ * 64 buckets, chosen by a hash with a secret picked at boot, so an attacker
+ * cannot work out which bucket a victim's address lands in and watch it from
+ * the side. Two destinations that share a bucket share a counter, which costs
+ * nothing but a few skipped ids. The hash is one multiply and a shift because
+ * this runs for every packet sent: asking the CSPRNG here would mean a
+ * ChaCha20 block per packet, and the ids only need to be unguessable from
+ * outside, not independently random.
+ */
+#define IDENTS 64
+static uint32_t idents[IDENTS];
+static uint32_t ident_key;
+
+static uint16_t next_ip_id(uint32_t dst)
+{
+    /* The shift and the table size have to agree, and nothing but this would
+       notice if one of them changed: a wrong shift indexes off the end. */
+    _Static_assert(IDENTS == 1u << 6, "the shift below must match IDENTS");
+    uint32_t h = ((dst ^ ident_key) * 0x9E3779B9u) >> 26;   /* the top 6 bits */
+    return (uint16_t)idents[h]++;
+}
 
 /* The Ethernet and IP headers are written straight into the skb in front
    of the payload: one copy of the payload, no 1500-byte buffer on the stack.
@@ -369,7 +415,7 @@ static struct sk_buff *ip_frame(uint32_t dst, uint8_t proto,
     memset(ip, 0, sizeof *ip);
     ip->ver_ihl = 0x45;
     ip->tot_len = htons((uint16_t)total);
-    ip->id = htons(ip_id++);
+    ip->id = htons(next_ip_id(dst));
     ip->ttl = 64;
     ip->protocol = proto;
     ip->saddr = htonl(OUR_IP);
@@ -440,6 +486,10 @@ static int on_ip(struct sk_buff *skb)
         kfree_skb(skb);
         return 0;
     }
+    if (!ip_source_ok(ntohl(ip.saddr))) {
+        kfree_skb(skb);
+        return 0;
+    }
     /* Addressed to us, and only to us. Nothing here has a use for broadcast
        or multicast yet, and the two things we would do with them are both
        bad: answering a broadcast ping makes this machine a smurf amplifier,
@@ -466,7 +516,10 @@ static int on_ip(struct sk_buff *skb)
         /* Static: net_rx_action has one caller at a time. A bigger echo is
            still passed to raw sockets above, we just do not reflect it. */
         static uint8_t reply[1400];
-        if (ic.type == ICMP_ECHO && body <= sizeof reply) {
+        /* An echo reply goes to whoever the source address says, which an
+           attacker chooses, so this is a reflector and needs a budget. */
+        if (ic.type == ICMP_ECHO && body <= sizeof reply &&
+            ip_rate_ok(ntohl(ip.saddr))) {
             memcpy(reply, skb->data + ihl, body);
             struct icmp_hdr *o = (struct icmp_hdr *)reply;
             o->type = ICMP_ECHO_REPLY;
@@ -488,8 +541,133 @@ static int on_ip(struct sk_buff *skb)
 static struct packet_type arp_pt = { .type = ETH_P_ARP, .func = on_arp };
 static struct packet_type ip_pt = { .type = ETH_P_IP, .func = on_ip };
 
+uint16_t ip_ephemeral_port(int (*used)(uint16_t))
+{
+    /*
+     * RFC 6056. The local port is half of the four-tuple an off-path attacker
+     * has to guess, and a counter from 49152 gave them that half for free
+     * after seeing a single connection. Pure random choice (the RFC's
+     * algorithm 1), not a random start followed by a scan: with a scan,
+     * knowing one port tells you where the next one will be.
+     *
+     * 16384 ports against a couple of dozen sockets, so a collision is about
+     * one in a thousand and 32 tries will not be exhausted in practice. The
+     * scan after it is there so the function is correct rather than merely
+     * very likely. Both loops are bounded: a syscall must not be able to spin.
+     */
+    for (int i = 0; i < 32; i++) {
+        /* 65536 - 49152 is a power of two, so the mask has no modulo bias. */
+        uint16_t p = (uint16_t)(49152 + (random_u32() & 16383));
+        if (!used(p))
+            return p;
+    }
+    uint32_t start = random_u32() & 16383;
+    for (uint32_t i = 0; i < 16384; i++) {
+        uint16_t p = (uint16_t)(49152 + ((start + i) & 16383));
+        if (!used(p))
+            return p;
+    }
+    return 0;
+}
+
+/*
+ * Rate limiting what we send only because something arrived.
+ *
+ * Every one of those is an amplifier: an attacker spoofing a victim's source
+ * address gets us to send the victim a packet for free, and an attacker
+ * measuring our replies gets a clock. A token bucket caps both.
+ *
+ * Three decisions matter more than the numbers.
+ *
+ * The bucket is keyed on **where the reply is going**, not on where the
+ * request appeared to come from — which here are the same address, and that
+ * is the point. The attacker picks that address, so keying on it means the
+ * party being protected is the victim they are aiming at. An attacker who
+ * spoofs a thousand different sources does get a thousand buckets, but each
+ * of those replies goes to a different place, so there is no flood to aim.
+ *
+ * It is **per peer** rather than one counter, because a single global counter
+ * is itself an oracle: an attacker who can watch the limit run out learns
+ * that somebody else is talking to us too, which is precisely the side
+ * channel behind CVE-2016-5696 and SAD DNS.
+ *
+ * And the budget is **jittered**, because a limit that cuts off at exactly N
+ * packets is a clean edge to measure against. With the cutoff moving, the
+ * measurement returns noise instead of an answer.
+ *
+ * Costs: 16 slots of 12 bytes, and on the receive path one hash, one compare
+ * and a subtract. Residual weakness, written down rather than hidden: an
+ * attacker who can spoof source addresses can push a victim out of the table,
+ * and two peers can land in the same slot. Both are better than no limit, and
+ * neither is fixable without per-peer state we cannot afford.
+ */
+#define RL_SLOTS  16
+#define RL_RATE   64                /* packets per second we will answer */
+#define RL_BURST  64                /* and how many of them back to back */
+
+struct rl_slot {
+    uint32_t peer;
+    uint32_t tokens;
+    uint32_t cap;                   /* jittered, 48..64: the moving cutoff */
+    uint32_t last_ms;
+};
+static struct rl_slot rl[RL_SLOTS];
+static uint32_t rl_key;
+static uint32_t rl_bits, rl_bits_left;
+
+/* Four unpredictable bits. The jitter is worthless if it can be predicted,
+   so it comes from the CSPRNG — but a block per packet would be absurd on the
+   receive path, so one 32-bit draw serves eight of these, and a draw happens
+   only when a slot changes hands or its bucket tops out. */
+static uint32_t rl_jitter(void)
+{
+    if (!rl_bits_left) {
+        rl_bits = random_u32();
+        rl_bits_left = 8;
+    }
+    uint32_t v = rl_bits & 15;
+    rl_bits >>= 4;
+    rl_bits_left--;
+    return v;
+}
+
+int ip_rate_ok(uint32_t peer)
+{
+    _Static_assert(RL_SLOTS == 1u << 4, "the shift below must match RL_SLOTS");
+    struct rl_slot *s = &rl[((peer ^ rl_key) * 0x9E3779B9u) >> 28];
+    uint32_t now = timer_ms();
+    if (s->peer != peer) {              /* a new peer takes the slot over */
+        s->peer = peer;
+        s->cap = RL_BURST - rl_jitter();
+        s->tokens = s->cap;
+        s->last_ms = now;
+    } else {
+        uint32_t dt = now - s->last_ms;     /* unsigned: survives the wrap */
+        if (dt > 1000)
+            dt = 1000;                      /* idle long enough is just full */
+        uint32_t gained = dt * RL_RATE / 1000;
+        if (gained) {                       /* under 16 ms: let it accumulate */
+            s->last_ms = now;
+            s->tokens += gained;
+            if (s->tokens >= s->cap) {      /* topped out: move the cutoff */
+                s->cap = RL_BURST - rl_jitter();
+                s->tokens = s->cap;
+            }
+        }
+    }
+    if (!s->tokens)
+        return 0;
+    s->tokens--;
+    return 1;
+}
+
 void ipv4_init(void)
 {
+    /* Unguessable before the first packet: the IP ID counters start at a
+       random value each, and both hash keys are secret. */
+    random_bytes(idents, sizeof idents);
+    ident_key = random_u32();
+    rl_key = random_u32();
     eth = dev_get_by_name("eth0");
     if (!eth)
         return;

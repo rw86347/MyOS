@@ -10,7 +10,9 @@
 #include <errno.h>
 #include <ipv4.h>
 #include <kheap.h>
+#include <random.h>
 #include <string.h>
+#include <timer.h>
 #include <udp.h>
 
 #define UDP_SLOTS 16
@@ -23,7 +25,6 @@ struct udp_slot {
 };
 
 static struct udp_slot slots[UDP_SLOTS];
-static uint16_t next_port = 49152;
 
 static struct udp_slot *find(uint16_t port)
 {
@@ -60,16 +61,14 @@ void udp_unbind(uint16_t port)
         memset(s, 0, sizeof *s);
 }
 
+static int port_used(uint16_t p)
+{
+    return find(p) != 0;
+}
+
 uint16_t udp_free_port(void)
 {
-    for (int tries = 0; tries < 16384; tries++) {
-        uint16_t p = next_port++;
-        if (next_port == 0)
-            next_port = 49152;
-        if (!find(p))
-            return p;
-    }
-    return 0;
+    return ip_ephemeral_port(port_used);
 }
 
 int udp_sendto(uint32_t dst, uint16_t sport, uint16_t dport,

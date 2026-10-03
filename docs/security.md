@@ -257,18 +257,188 @@ rules above.
   being handed another's address. Only reachable from `net_test.c` today, but it is a
   security bug, not merely a race. Fixed with a one-at-a-time guard.
 
+- **Four numbers an attacker could predict, which were all one bug: no randomness.** A TCP
+  initial sequence number, an ephemeral port, a DNS transaction id and an IP ID were each a
+  counter or a function of the clock, and between them they are most of what the RFC 6528,
+  RFC 6056 and Kaminsky attacks need. Fixed by building the generator they were all waiting
+  on — see "The CSPRNG" below — and then:
+
+  - **TCP ISN was `timer_ms() * 64000 + 0x10000000`**, the same number for every connection
+    opened in the same millisecond, from a clock the attacker can read by other means. Now
+    `M + F(four-tuple, secret)` per RFC 6528: `M` is a 4 µs timer so numbers still climb with
+    time the way a peer holding a stale connection expects, and `F` is a keyed hash so the
+    offset is unrelated for every four-tuple. Knowing the sequence space is what lets an
+    off-path attacker inject into or reset a connection blind.
+  - **Ephemeral ports were a counter from 49152** in both `net/tcp.c` and `net/udp.c` — the
+    other half of the four-tuple (RFC 6056). Now chosen at random from 49152..65535 by one
+    shared `ip_ephemeral_port`, deliberately *not* a random start followed by a scan, because
+    with a scan knowing one port tells you where the next will be.
+  - **The DNS transaction id was a counter.** 16 bits, and one subtraction from free after a
+    single observed lookup. That is the arithmetic the Kaminsky attack ran on. Now random.
+  - **IP ID was one counter for the whole machine**, which answered a question nobody should
+    be able to ask: send us two packets, subtract the ids, and you know how many packets the
+    machine sent to everyone else in between. That is a traffic meter on the host and the
+    basis of nmap's idle scan. Now one counter per destination, in 64 buckets chosen by a
+    hash with a boot-time secret, each starting at a random value. The hash is a multiply and
+    a shift rather than a call into the CSPRNG, because this one runs for every packet sent.
+
+  `getrandom()` and `AT_RANDOM` were on the same xorshift. `AT_RANDOM` is what musl builds its
+  stack guard value from, so that was a predictable canary.
+
+- **Nothing we sent in response to a packet was rate limited**: ICMP echo replies, ARP
+  replies, the reset for a connection that does not exist. One inbound packet became one
+  outbound packet with no cap, which makes the machine a reflector — the source address is
+  the attacker's choice, so the reply goes wherever they point it.
+
+  Fixed with a token bucket, 64 packets per second with a burst of 64, in 16 slots. Three
+  things about it matter more than the numbers. It is keyed on **where the reply is going**,
+  so the protected party is the victim being aimed at; an attacker who spoofs a thousand
+  sources gets a thousand buckets but each reply lands somewhere different, so there is no
+  flood to aim. It is **per peer** rather than one counter, because a global counter is itself
+  an oracle — watching it run out tells an attacker that someone else is talking to us, which
+  is the side channel behind CVE-2016-5696 and SAD DNS. And the budget is **jittered**,
+  because a cutoff at exactly N packets is a clean edge to measure; with it moving, the
+  measurement returns noise.
+
+  Residual weaknesses, written down rather than hidden: two peers can land in the same slot,
+  and an attacker who can spoof source addresses can push a victim's slot out of the table.
+  Both are better than no limit and neither is fixable without per-peer state we cannot
+  afford. The normal ACK for in-window data is deliberately *not* limited: that one is
+  required for TCP to work, not a reflector.
+
+- **A raw socket could send any ICMP message type.** That is a weapon aimed at the rest of the
+  network rather than at this machine: an ICMP redirect reroutes a neighbour's traffic, and a
+  forged "fragmentation needed" or "destination unreachable" tears down connections between
+  two other hosts. Linux keeps it behind `CAP_NET_RAW`.
+
+  MyOS has no users, so there is nobody to withhold a capability from — but there is also
+  only one program that wants a raw socket, and `ping` sends exactly one thing. A raw socket
+  may now send an echo request and nothing else, which removes the attack rather than gating
+  it. `-EPERM` otherwise, which is what Linux returns without the capability.
+
+### The CSPRNG
+
+Worth its own section, because everything above depends on it and because the hard part is
+not the cipher.
+
+**The stream is ChaCha20**, the same construction Linux's `/dev/urandom` uses, and it suits
+this machine: 32-bit adds, xors and rotates and nothing else — no tables to miss in the
+cache, no multiplies, and no SSE, which matters because the kernel is built
+`-mgeneral-regs-only` and may not touch the FPU registers at all. It runs **fast key
+erasure**: every block of output also produces the next key and the old one is overwritten,
+so an attacker who reads kernel memory cannot work backwards to bytes already handed out.
+A known-answer test against the RFC 8439 vector runs at every boot in `make test` — a broken
+ChaCha20 still produces output that looks perfectly random, so no statistical check would
+catch a wrong rotation, and only the published answer will.
+
+**The entropy is the hard part, and it is weak.** Both target CPUs predate RDRAND and RDSEED
+by years, so there is no hardware generator to ask: it has to be measured. What is measurable
+is how long things take. A read of port 0x80 is an ISA bus cycle, and the cycle counter says
+how long it really took — a number that is not constant on real hardware, because DRAM
+refresh, bus contention, cache and TLB state and SMIs the operating system never sees all
+move the low bits. We keep the *second* difference, the change in the interval rather than the
+interval, because the interval has a large predictable part and only its variation is
+unpredictable. 512 samples, folded into a rotating pool. Linux does the same thing in
+`try_to_generate_entropy()` when it has nothing better.
+
+Be clear about what that is worth. Each sample is perhaps half a bit to two bits, so the honest
+claim is "probably enough for a 128-bit key on real hardware", not a measured figure. And
+**under QEMU with `-icount` the cycle counter is deterministic, so on the emulator this
+produces the same pool every boot** — the numbers only become real on real hardware, which is
+the machine that matters. The RTC's epoch and the cycle counter are mixed in for uniqueness
+rather than strength, so two machines booting the same image cannot agree. Every block also
+mixes the current cycle counter into its nonce, so timing variation accumulated since boot
+keeps contributing.
+
+Nothing here is on a hot path: every caller wants a few bytes once per connection or once per
+lookup, and the one per-packet value, the IP ID, uses a keyed counter instead. Cost at boot,
+measured: 18 µs of CPU work in QEMU (1093 → 1111 µs to kernel ready). On real hardware expect
+nearer half a millisecond, because an ISA port cycle there is about a microsecond rather than
+QEMU's software handling of one — under 2% of a boot that spends 27 ms waiting for disks.
+
+### Found by auditing the rest of the kernel (2026-10-03)
+
+The network stack had been gone over several times; these came from pointing
+the same method at the filesystem, the syscall layer and the drivers. Two
+threat models: a crafted disk image (a USB stick — `storage_init` auto-mounts
+an ext2 volume labelled `myos-root`/`myos-data` read-write, so plugging it in
+is the whole attack), and a hostile unprivileged program.
+
+**The one that changes how the kernel has to be read: `copy_to_user` and
+`copy_from_user` can sleep.** `arch/i386/interrupts.c` offers every page fault
+to `mm_fault` first, including a ring-0 fault inside `__copy_user`, and for a
+file-backed mapping that goes `mm_fault` → `file_copy_out` → `pcache_read` →
+`wq_sleep` on the disk. ext2 is the root filesystem, so `mmap`ing a file is the
+ordinary case. A syscall is therefore **not** atomic, and "syscalls run with
+interrupts off, so they never race" — true as far as it goes, and relied on in
+`net/netdevice.c` — does not cover a copy to or from user memory. Interrupts
+being off only closes the windows that contain no copy.
+
+Three ring buffers were written against the stronger reading: they computed how
+much room or data there was, copied, and committed `head`/`tail`/`len`
+afterwards. A `fork` shares pipes and sockets, so two processes could both act
+on the same snapshot, both commit, and drive an unsigned difference below zero —
+after which it stops clamping and the next call copies with a length near 2^32:
+
+- `fs/pipe.c` — `head` passes `tail + PIPE_SIZE`, `room` underflows, and the
+  next `write` runs off the end of a one-page buffer with as much
+  attacker-chosen data as it likes. Now the space is claimed before the copy,
+  and a failed copy leaves zeros rather than recycled kernel memory.
+- `net/socket.c` — the datagram was freed by whichever reader finished first
+  while the other kept reading and then freed it again, taking `s->count`
+  below zero, which makes `wait_rx` report data on an empty queue and the next
+  read dereference NULL in ring 0. The datagram is now taken out of the queue
+  before it is copied, so there is one owner; `MSG_PEEK` puts it back.
+- `net/tcp.c` — the same shape on both rings: `tx_len` past `TXBUF` gave an
+  unbounded write into the connection's 16 KiB buffer, `rx_len` below zero gave
+  an unbounded read of kernel heap handed to user space. Both are now clamped
+  as well as committed first, so even a raced count cannot leave the array.
+
+**ext2, against a crafted image.** Seven out-of-bounds accesses, all from
+believing a field on the disk:
+
+- `rec_len` of the `.` entry was used unchecked as the offset of `..` when a
+  directory was renamed into a new parent: a 4-byte write at any offset up to
+  64 KiB past a one-page buffer, with a value also taken from the disk. The
+  cleanest primitive of the set.
+- `name_len` was never checked against `rec_len`, so an entry at the end of a
+  block with `rec_len` 8 and `name_len` 255 read 255 bytes out of the next page
+  and `getdents64` printed them. Three walks shared the bug; all three now go
+  through one `dirent_ok`.
+- `inode_size` was range-checked but not required to be a power of two, so an
+  inode could straddle the end of its block — a disclosure through `stat` and
+  `readlink` on the read side, and a `memset` past the page on the write side.
+- `inodes_per_group`/`blocks_per_group` were only checked non-zero, but one
+  bitmap is one block: a larger value walks `take_bit`/`clear_bit` off the page
+  and sets a bit in whatever follows.
+- A fast symlink holds 60 bytes in `block[]`, but `size` up to `PATH_MAX` was
+  reported, so `readlink` returned up to 196 bytes of unzeroed `kmalloc` heap.
+- `load_symlink`'s failure was ignored, leaving `data` NULL and `size`
+  non-zero; `ls -l` on the directory then dereferenced NULL in ring 0.
+- `blocks_count` of zero divided by zero in the mount message — a `#DE` in
+  ring 0 before userspace exists, so the machine is dead at boot.
+
+**An unprivileged program could halt the machine with one syscall.**
+`rt_sigreturn` restored `gs`/`fs` from the signal frame — which the program
+writes — checking only that the low bits said ring 3. Those registers are
+reloaded by `pop gs` on the way out, which still runs at CPL 0, where the CPU
+requires DPL >= 3; `0x0B` is the kernel code segment with ring-3 bits set, so
+it raises #GP *inside the kernel*, which is fatal. `gdt_user_seg_ok` now checks
+the live descriptor — present, ring 3, not a system segment, readable if it is
+code — which also gets the case of a TLS slot that `set_thread_area` has not
+filled in yet, where a whitelist of indices would still have faulted.
+
+**`/dev/zero` had no `RW_MAX`.** Every real filesystem caps one `read` at 256
+KiB precisely because a syscall cannot be preempted; `read(fd, buf, 0x7fffffff)`
+on `/dev/zero` held the CPU for two million copies and the 1 ms slot with it.
+
+**And one in code written an hour earlier.** `sys_getrandom` looped over the
+whole request with no interruption point, so a gigabyte of valid buffer meant
+millions of ChaCha20 blocks inside one syscall. It now checks for a pending
+signal every 4096 bytes and returns a partial count, which is what
+`getrandom()` promises and what Linux does.
+
 ### Open
-
-Needs the CSPRNG first — these are all one bug, "we have no randomness":
-
-- **TCP ISN is `timer_ms() * 64000 + 0x10000000`.** The RFC 6528 attack verbatim: an off-path
-  attacker who can reach us once predicts the next connection's sequence space and can spoof
-  or reset connections blind. Wants a keyed hash over the four-tuple.
-- **Ephemeral ports are a sequential counter from 49152**, in `net/tcp.c` and `net/udp.c`
-  both. That is the other half of the four-tuple (RFC 6056).
-- **The DNS transaction id is a counter.** With the port now random this is no longer the
-  whole secret, but 16 predictable bits is not a secret either.
-- **IP ID is a global counter**, which leaks how much traffic the machine sends.
 
 Needs design or a feature, not just a fix:
 
@@ -286,14 +456,15 @@ Needs design or a feature, not just a fix:
   on-subnet addresses, evicting a queued TCP segment. TCP retransmits, so the cost is
   latency, and it needs local code execution.
 
-- **Nothing we emit in response to a packet is rate limited**: ICMP echo replies, ARP
-  requests, the RST for an unknown connection, the challenge ACK for a SYN on an established
-  connection, and the ACK `tcp_input` sends for *any* data segment including a duplicate. One
-  inbound packet becomes one outbound packet with no cap. When this is added it must be
-  per-peer and jittered — a single global counter is an oracle (SAD DNS, CVE-2016-5696).
-- **`SOCK_RAW` needs no privilege**, and `raw_icmp_input` hands every ICMP packet to every
-  raw socket, so any program can both forge ICMP from this host and read other programs'
-  ICMP. Linux requires `CAP_NET_RAW`; MyOS has no users or capabilities yet.
+- **`SOCK_RAW` still needs no privilege, and a raw socket still reads every ICMP packet.**
+  Sending is now restricted to echo requests (above), which removes the attack on other
+  hosts. What remains is that any program can open a raw socket at all, and that
+  `raw_icmp_input` hands every ICMP packet to every raw socket that is not connected — so one
+  program can watch another's ping replies and the ICMP errors belonging to its connections.
+  Linux requires `CAP_NET_RAW` for this. **It cannot be fixed here until there are users:**
+  `sys_getid` returns 0 for every id and `setuid` is a stub, so a capability check would be
+  granted to everything and would only look like security. The right place for it is
+  `raw_send_ok` in `net/socket.c` and the `SOCK_RAW` branch of `sys_socket`.
 - **The neighbour cache never re-probes an entry in use.** A host that moves is unreachable
   until its 60 s expiry. Linux re-probes; we should too, once there is a timer hook for it.
 - **`bind()` on a TCP or raw socket silently succeeds and does nothing** (`sys_bind` returns 0
@@ -396,6 +567,16 @@ that they are correct:
 - The fuzzer only ever sends *one* packet per run to `wire`, `ip` and `arp`. Bugs that need a
   particular sequence are only reachable on the `tcp` target today.
 
+The CSPRNG made reproducibility harder and the harness had to be changed for it. The real
+`kernel/random.c` is compiled into the fuzz build — a stand-in would mean the tests were not
+exercising the generator the kernel actually uses — against a cycle counter that counts rather
+than measures, so the stream is the same on every run. But the generator carries its key
+forward, so without re-keying the stream would still depend on how many runs had gone before,
+and the rate limiter now *drops* packets on an unpredictable budget, which would quietly stop
+a saved crash from reproducing. So each run re-keys. That costs about 40% of the throughput
+(167k to 100k runs/s on this Mac) and is worth it: a crash that cannot be replayed is a crash
+that cannot be fixed.
+
 ## Testing that attacks are rejected
 
 `make attacks` is the other half, and the half that matters more. It performs real attacks and
@@ -403,7 +584,7 @@ asserts the behaviour that is supposed to stop them. It shares the stubs and the
 the fuzzer and asks a different question: not "did the stack survive" but "did it refuse".
 
 Every fix in this document should have an entry, and **a fix with no entry here is a fix nobody
-has tested**. 40 checks, about two seconds, so there is no excuse for not running it after
+has tested**. 51 checks, about two seconds, so there is no excuse for not running it after
 touching `net/`:
 
 | area | what is asserted |
@@ -415,6 +596,8 @@ touching `net/`:
 | TCP | an out-of-window reset is ignored (RFC 5961) but an in-window one is accepted; data for an unknown connection draws a reset |
 | TCP windows | a shut window is probed rather than waited on, and the probe is one byte and not the whole queue; a window shut and then gone silent eventually gives up; a window that reopens delivers the data and clears the probe backoff |
 | DNS | a reply is refused if the transaction id, the question, the source address or the source port is wrong; an answer about a different name is refused (RFC 5452) but a foreign record does not hide a real one behind it; a CNAME chain is followed; a CNAME loop and a self-referential compression pointer both terminate and fail; a name differing only in case is accepted |
+| unguessable numbers | sequence numbers of connections opened in the same millisecond are unrelated; local ports and DNS transaction ids and DNS source ports are not counters; a port stays inside the ephemeral range; IP IDs count for one destination but are not one sequence across several |
+| rate limiting | a flood of echoes and a flood at closed ports are both cut off; one peer's flood does not silence another peer; the budget comes back with time |
 
 Half of those are positive controls, deliberately. A test that asserts "no reply was sent"
 passes perfectly when the stack is broken and never replies to anything, so every "this must be
@@ -428,6 +611,14 @@ with the fix reverted and has to fail. That is not a formality. The first versio
 window clears the probe backoff" passed either way: it advanced the clock by one ordinary
 retransmit interval, and the stale deadline the bug leaves behind is a *minute* out, so the
 timer it was trying to provoke never fired. The test was measuring nothing.
+
+`make verify-tests` does that check mechanically. It reintroduces one bug at a time by patching
+the source — the clock-derived ISN, the port counter, the DNS id counter, the machine-wide IP
+ID, each rate limit removed, the rate limit made global — rebuilds, and reports which checks
+noticed. Seven bugs, and each must be caught by its own test and not by a different one. It
+caught a real problem the first time it ran: three cases reported the *wrong* test failing,
+because a patch and a build inside the same second leave `make` thinking the binary is current,
+so the previous case's binary was answering for the next one. It deletes the objects now.
 
 The suite also carries open bugs as **known** entries: the test states the behaviour we want, so
 it reports rather than fails, and the day it starts passing the suite prints `FIXED` and the
@@ -454,7 +645,9 @@ Stated so the list above is not mistaken for a clean bill of health.
   **ext2 and page-cache code reads attacker-controlled bytes** off any disk or USB stick
   plugged in, with the same bug classes and none of this scrutiny; `copy_from_user` /
   `copy_to_user`, the ELF loader, `kmalloc`, signals and the TTY are all unreviewed. A
-  hostile disk image is as real an attacker as a hostile packet.
+  hostile disk image is as real an attacker as a hostile packet. **ext2 now has a harness of
+  its own** (see below) and ten bugs came out of it; FAT32, the ELF loader and the TTY still
+  have nothing.
 - **Two passes found ten bugs, and the second pass found bugs the first missed.** That is the
   useful signal about whether the list is complete: it is not. A third pass would likely find
   more, and the fact that the second pass found the `parse_a` and zero-window issues after the
@@ -477,19 +670,311 @@ Stated so the list above is not mistaken for a clean bill of health.
 - TCP accepts in-order data only (`seq == c->rcv_nxt`) with no out-of-order queue, so there
   is no reassembly buffer to get wrong — the bug class that produced Ripple20.
 
+## Fuzzing a hostile disk image
+
+The section above ends by admitting that the review covered `net/` and not `fs/`, and that
+**a hostile disk image is as real an attacker as a hostile packet**. It is in fact a worse
+one. `storage_init` mounts anything labelled `myos-root` or `myos-data` automatically, and
+mounts it read-write, so plugging in a USB stick is the entire attack. There is no port to
+be closed, no socket to be unbound, and the parser runs before any user exists to be denied.
+
+`make diskattacks` and `make diskfuzz` are the same trick as the network harness, pointed at
+`fs/`: build the real `fs/ext2.c`, `fs/bcache.c`, `fs/pcache.c`, `fs/partition.c` and the VFS
+on the host against `tools/fuzz/diskstubs.c`, under AddressSanitizer and UBSan, hand them a
+block device backed by a byte array, and mount it. The kernel sources are compiled unmodified,
+so a bug found here is a bug in the kernel.
+
+`tools/fuzz/disktarget.c` is what gets run per image: scan partitions, mount, walk every
+directory, read every file, read every symlink, then *write* — create and truncate and unlink,
+make two directories and rename one into the other (which is the path that rewrites `..`),
+symlink — and walk again. 30 deterministic cases in `tools/fuzz/diskattacks.c` corrupt one
+specific field each; `make diskfuzz` then mutates bytes at random, biased towards the
+superblock, the group descriptors, the inode table and the two known directory blocks.
+
+Each case and each run is a **fork**. The point is to survive a crash and name it rather than
+die on the first one, and ASan's report in the child is the parent's evidence. Coverage lives
+in `mmap(MAP_SHARED)` so the parent can tell a new code path from a repeat and keep the input
+that found it; kept inputs are written to `tools/fuzz/corpus/disk/` as **deltas against the
+base image** — an image is 4 MiB, a delta is about a hundred bytes, and `git show` on one
+tells you what it does.
+
+### Making the harness able to see
+
+Most of the work was not writing cases, it was making the harness *capable of noticing*, and
+this is the part worth remembering:
+
+- **The base image must use 4 KiB blocks.** `bcache` gives every buffer a whole page from
+  `pmm_alloc`. With 1 KiB blocks there are 3072 bytes of slack after each block, so a
+  four-byte write just past the end lands in memory that is validly mapped and nothing
+  complains. The image is generated with `mke2fs -b 4096` precisely so that a block *exactly
+  fills* its allocation and the next byte is in a poisoned redzone.
+- **`kmalloc` maps to plain `malloc`, not to a size-class allocator.** A size class rounds
+  100 bytes up to 128 and hides a 20-byte overflow completely.
+- **Fresh `kmalloc` memory is filled with `0xA5`, not zeroed.** This catches the class of bug
+  no sanitizer can see: memory that is validly allocated but never written, handed to user
+  space. The fast-symlink disclosure is found by looking for `0xA5` coming back out, not by
+  any memory error.
+
+### What it found
+
+Six of the first eight cases were measuring nothing — all for the slack-space reason above —
+which `make verify-disktests` caught. That script reintroduces each of the eleven ext2 fixes
+one at a time, rebuilds, and requires that the matching case, and not a different one, fails.
+It is the only reason to believe any of this.
+
+Then the fuzzer found three bugs in its first minutes that two careful readings of the same
+code had missed:
+
+| bug | why reading missed it |
+|---|---|
+| `rec_len` was not required to be a multiple of four, so a walk read a `uint16_t` at an odd address | undefined C, and completely harmless on x86 — but the original Raspberry Pi is a roadmap target, and an unaligned halfword load there is not something to rely on |
+| the `..` fixup in `rename` placed a four-byte **write** at `"."`'s `rec_len` without requiring it to be aligned either | its *bounds* had just been fixed, in this same round. Fixing one of two properties of a value and not noticing the other is not something re-reading the patch reveals; the saved corpus replayed it straight away |
+| `fs->groups` divided by `blocks_per_group` three lines **above** the check for `blocks_per_group == 0` | the check existed, was correct, and was written in the same sitting; nothing in reading the two statements separately reveals the order. A zero divisor is `#DE` in ring 0: the machine is dead at mount, before user space |
+
+The last is the useful one to generalise from. The rule it violates is not "check your
+inputs" — that was done — it is **nothing may be derived from a superblock field before that
+field has been checked**, and that is an ordering property, which is exactly what reading
+code is bad at and what running it is good at. The validation block now sits above every
+derived value, with a comment saying why it has to.
+
+An eighth ext2 bug had already come out of writing the harness: the message that *rejects* an
+out-of-range `log_block_size` printed `1024 << log`, shifting by the very value it had just
+decided was too large.
+
+### Two ways the harness lied, both now closed
+
+Both are worth recording, because they are failures of the thing that checks for failures.
+
+- Piping `make verify-disktests` into `head` killed it with SIGPIPE **before its restore
+  trap ran**, leaving a deliberately reintroduced bug in the tree. Both verify scripts
+  ignore SIGPIPE now.
+- A patch whose target text had moved no longer applied — and `run_case` went on to rebuild
+  the *unmodified* file, watch every case pass, and report `NOT CAUGHT`. A script written to
+  catch tests that measure nothing, measuring nothing. It reports `PATCH DID NOT APPLY` now.
+  It also **deletes the binary on exit**, because the one it used to leave behind was built
+  from the last reintroduced bug, and a fuzz session started afterwards duly "found" it.
+
+### What this still does not cover
+
+- **FAT32 has no target yet.** `fs/fatvfs.c` parses a boot sector, a FAT and directory
+  entries from the same untrusted disk and has had no scrutiny at all. It is the obvious next
+  one, and the harness is already built for it.
+- **The write paths are exercised but barely steered.** Mutations aim at the superblock and
+  the inode table because that is where structure lives; the allocator bitmaps and the
+  indirect-block chain are reached only by luck so far.
+- **No long run yet.** The numbers in this section come from minutes, not hours.
+
+## The copies that sleep, and the audit that followed
+
+This is the most load-bearing thing in the document, so it comes with its own
+section. The claim the kernel was built on is written out in `net/netdevice.c`:
+a syscall is atomic, because interrupts are off for all of it. The `int 0x80`
+gate really is an interrupt gate (`0xEE`, and type `0xE` clears IF) and
+`sysenter` really does clear IF, so the claim looked safe.
+
+**It is false, and it is false in the ordinary case rather than an exotic one.**
+`copy_to_user` and `copy_from_user` can sleep. A fault on a page of an `mmap`'d
+file goes to `mm_fault`, which asks the page cache, which waits for the disk
+and switches to another thread. ext2 is the root filesystem. Nothing unusual
+has to happen.
+
+So the shape below is a bug, and `fork` or `dup` or `clone(CLONE_THREAD)` is
+all an attacker needs to reach it, because each of those gives two processes a
+handle on the same object:
+
+```
+    room = SIZE - len;          /* 1. measure the shared state */
+    n    = min(len_wanted, room);
+    copy_to_user(buf, ring + at, n);    /* 2. ...and sleep in the middle */
+    head += n;                  /* 3. commit, from a stale measurement */
+```
+
+Both callers measure the same `room`, both copy, both commit. The index passes
+the end. `room` is unsigned, so the next call computes a negative number as
+something near four billion, **the clamp stops clamping**, and the call after
+that copies with a length limited only by the buffer the caller asked about.
+That is an out-of-bounds kernel read handed to user space, or an out-of-bounds
+kernel write, depending on direction.
+
+### What was found
+
+Seven sites, in two passes. The first four were found by looking for the shape;
+the last three by a second pass that worked from **shared mutable state**
+instead — enumerate the objects two processes can hold at once, then ask what
+happens if a copy sleeps in the middle. That framing is why the second pass
+found what the first missed, and it is the one to use next time.
+
+| where | consequence |
+|---|---|
+| `fs/pipe.c` `pipe_read`, `pipe_write` | out-of-bounds kernel read to user space; out-of-bounds kernel write |
+| `net/socket.c` `do_recv` | use-after-free of the datagram, double free, and a `count` underflow ending in a NULL dereference in ring 0 |
+| `net/tcp.c` tx and rx rings | same pair, on the connection buffers |
+| `kernel/syscall.c` `sys_getdents64` | **the worst of them.** The loop holds raw `struct inode *` pointers across the copy and takes no reference. `detach()` calls `inode_free` the moment an unlinked inode's `refs` reaches 0, so a sibling's `unlink` during the sleep frees the entry we are iterating. We then read its `name` pointer and `name_len` out of freed memory and `memcpy` that into the user's buffer — an attacker-influenced pointer and length, read from the heap and copied out — and `vfs_dir_stop` writes a cursor into the freed node |
+| `drivers/tty.c` `tty_read` | every reader of the terminal shares one ring, so the same double-consume. Beyond the disclosure, `lines[0]` underflows and `--nlines` at zero turns the `memmove` into a four-billion-byte one |
+| `kernel/proc.c` `proc_wait4` | two threads both see one zombie, both reap it. `reap` clears `cwd` so the second reap is not a double free — but the slot is `PROC_FREE` by then and a `fork` can reuse it, after which the stale reap drops a **live** process's `cwd` reference (an inode refcount underflow, so a use-after-free) and marks its slot free |
+
+### The fix, in two halves, neither sufficient alone
+
+**`fault_in_user()`** (`arch/i386/include/uaccess.h`) touches one byte of every
+page of a user range before any shared state has been read, so the copy that
+follows has nothing left to fault on. Sleeping during it costs nothing because
+nothing has been claimed yet. The write probe is `or byte [addr], 0` — a
+read-modify-write that leaves the byte alone but still takes the *write* fault,
+which is what unshares a copy-on-write page; a plain read would leave it shared
+and the real copy would fault anyway. It is applied in `rw()`, the one door
+`read`, `write`, `readv` and `writev` go through, and in `sys_getdents64` and
+the four socket send/receive syscalls. **+34 cycles on a 4 KiB read**
+(1506 -> 1540, `docs/performance.md`).
+
+**And every site is correct across a sleep anyway**: the ring index is
+committed before the copy and rolled back if the copy fails and nobody else
+claimed meanwhile (`fs/pipe.c`, `net/tcp.c`, `drivers/tty.c`), or the object is
+detached first and requeued if it was only a peek (`net/socket.c`), or the
+zombie is reaped first and the status copied from a local (`kernel/proc.c`), or
+a reference is held across the copy (`sys_getdents64`).
+
+Why both: **`clone(CLONE_THREAD)` is supported now**, so one address space has
+several threads, and a sibling can `munmap` the range and map a file over the
+same address. It can only run while we are asleep, and we do not sleep after
+the pre-fault returns — but the pre-fault itself sleeps, so a thread woken
+while a later page is being probed can pull an earlier page out from under us.
+Pre-faulting removes the sleep that happens with **no attacker present**, which
+is the common case and the one that made pipe and socket reads racy. It is not
+a defence against a deliberate race, and a site whose failure mode is
+memory-unsafe cannot rest on it.
+
+### Three comments that were wrong, and are now right
+
+Worth listing separately, because the comments are what produced the bugs. Each
+of these asserted the atomicity that does not hold:
+
+- `kernel/random.c` — rewritten twice. First to claim a race that could not
+  happen, then to deny one that could. It now records the wrong argument *as*
+  wrong, because it is a tempting argument.
+- `kernel/syscall.c` `sys_getdents64` — "Nothing can change the directory
+  during this call: syscalls run with interrupts off." Now says that interrupts
+  being off is one of two things that make it true, and names the other.
+- `kernel/proc.c` `clone_thread` — "the new thread can't run before this
+  syscall returns (interrupts are off)."
+
+### Checked and found safe
+
+So the list above is not read as "everywhere a copy appears":
+
+- `fs/pcache.c` `copy_out` does `p->readers++` **before** the copy and `--`
+  after, pinning the page across the sleep, and `pcache_reclaim` skips pinned
+  pages. That is the correct pattern, and the file header says so. `irq_save`
+  being held across the sleep is also fine: a resumed thread restores its own
+  interrupt flag, and `cpu_idle` is `sti; hlt; cli`, so it hands back what it
+  was given.
+- `fs/ramfs.c` — `file_truncate` keeps the page table and only clears slots,
+  and `page_at` re-reads `i->pages` every iteration, so a concurrent truncate
+  yields zeros rather than freed memory.
+- Signal delivery and `sigreturn` touch thread-local state only.
+- `f->pos` in the read and write paths of ramfs, ext2 and FAT **can** still be
+  double-used by two threads sharing one `struct file`. The snapshot is taken
+  into a local and the end-of-file guard is applied to that local, so there is
+  no underflow and no out-of-bounds access; the cost is duplicate data, which
+  is a correctness wart rather than a security bug. Left as is.
+
+### Producing the interleaving on purpose
+
+Everything above started as an argument about an interleaving nobody had ever
+made happen, which by the standard this document applies everywhere else is
+not evidence. `make test` now produces it.
+
+`include/uaccess_test.h` and `kernel/uaccess_test.c` let a thread arm the nth
+`copy_to_user` or `copy_from_user` it performs to call `thread_yield()` before
+copying anything. A yield is what a sleep looks like from the other side: the
+sibling runs, sees whatever shared state we left behind, and acts on it. It is
+a yield rather than a real disk wait so the interleaving happens every time
+instead of one time in a thousand, and it is faithful because `wq_sleep` leaves
+the kernel in exactly this state — inside a syscall, interrupts off. A
+test-only syscall (423) does the arming. Both are inside `#ifdef SELFTEST`: a
+normal build has no branch and no symbol.
+
+`user/musl/racetest.c` uses it. Each test asserts a conservation law rather
+than an implementation detail, because the law is what the bug violates and it
+holds however the scheduler orders things:
+
+- eight bytes written to a pipe can be read exactly once, in total;
+- two writers of eight bytes each put sixteen distinct bytes in;
+- one child is reaped by exactly one waiter, and its status survives;
+- every name `getdents64` returns is a name that is really there, and an entry
+  that exists for the whole walk is reported.
+
+`make verify-racetests` puts each of the six fixes back the way it was, one at
+a time, and checks that racetest notices — and names which check noticed. It is
+slower than the host-side verify scripts because every case boots QEMU.
+
+#### An eighth bug, found by the test rather than by reading
+
+The `getdents64` fix above was wrong, and running it said so. It pinned the
+entry it was copying, which is the pointer the code is obviously holding. But
+`next` is fetched from `vfs_dir_first()` *before* the loop, and the copies that
+emit `.` and `..` sleep before it is ever used — so a sibling frees it and the
+first real iteration reads a name pointer and a length out of a recycled inode
+and copies that name to user space. The test printed
+`unexpected entry "\xe9b"`. Both `next` and the cursor anchor are now pinned
+for as long as they are held, with one exit path that releases them.
+
+That is the argument for this kind of test in one bug: two careful readings of
+`sys_getdents64` produced a fix that was still memory-unsafe, and the first run
+of the test caught it.
+
+#### Four ways the test measured nothing, all found by verify-racetests
+
+Every one of these passed while the bug was reintroduced, and would have been
+committed as evidence:
+
+- **the buffer was too small.** At 64 bytes only `.` and `..` fit, so the call
+  returned before the loop touched an entry. 128 bytes holds `.`, `..` and
+  three entries, which is enough for the stale pointer to be used in the same
+  call and small enough that eight entries take several calls.
+- **the sleep always landed in the same place.** One arming always lands on the
+  copy that emits `.`, and two of the three `getdents64` bugs live further in.
+  The test now sweeps the arming position 1..10.
+- **the surviving entry was at the wrong end.** A directory lists in the
+  reverse of creation order, so the first entry reported was the one kept
+  alive — the pointer held across the sleep stayed valid and the missing
+  reference was invisible. The survivor has to be reported *last*.
+- **nothing recycled the freed memory.** Freed memory usually still holds the
+  old name, so a walk reading a dangling pointer reads `"aaa"` back and sees
+  nothing wrong. The sibling now grooms the heap: after deleting, it creates
+  files whose names are its own choosing, so the recycled inode says something
+  the walk could never legitimately return. This is what an exploit does — the
+  point of a use-after-free is to choose what the freed object says — and the
+  test was not an attack path until it did it too.
+- **the deletion order let the bug get away with it.** `sibling_remove` leaves
+  the removed node's own `next_sibling` alone, so a detached node still points
+  at whatever followed it. Deleting in creation order walks the list from tail
+  to head, and by the time each node is removed its `next_sibling` already
+  points at the survivor — every detached node ends up pointing at a *live*
+  entry. Deleting newest-first makes them point at freed memory, which is the
+  case the fix is for. An attacker picks the order; the test should pick the
+  bad one.
+
+### What is still missing
+
+`drivers/tty.c` has no attack-path test. Reading `/dev/console` from a test
+would take the shell's input away from it, so the `tty_read` fix is still only
+an argument. The shape is identical to the pipe's, which is tested, but that is
+an analogy and not a test.
+
 ## Plan
 
 In rough dependency order. Each step should end with something testable, and anything on a
 hot path needs a before/after from `make bench` per the performance rules.
 
-- [ ] **A real CSPRNG first.** Everything else depends on it. ChaCha20 keyed from a boot-time
-      entropy pool (TSC jitter, interrupt timing, the e1000 EEPROM, RDSEED only if CPUID
-      says so — the P4 and Pentium M have neither RDRAND nor RDSEED). Then make `getrandom`
-      actually cryptographic.
+- [x] **A real CSPRNG first.** Everything else depended on it. ChaCha20 with fast key
+      erasure, keyed from boot-time TSC jitter measured against ISA port cycles — the P4 and
+      Pentium M have neither RDRAND nor RDSEED, so it has to be measured. `getrandom` and
+      `AT_RANDOM` now come from it. See "The CSPRNG" above, including what the entropy is
+      honestly worth.
 - [x] **The memory-safety, liveness and reflection bugs above** (see "Fixed").
-- [ ] **Keyed ISN (RFC 6528)**, random ephemeral ports (RFC 6056), random DNS transaction
-      ids, and per-destination IP IDs. All four are waiting on the CSPRNG and nothing else.
-- [ ] **Per-peer rate limits with jitter** on every packet we generate in response to a
+- [x] **Keyed ISN (RFC 6528)**, random ephemeral ports (RFC 6056), random DNS transaction
+      ids, and per-destination IP IDs. All four were waiting on the CSPRNG and nothing else.
+- [x] **Per-peer rate limits with jitter** on every packet we generate in response to a
       received one. No global counters.
 - [x] **A TCP persist timer and zero-window probes**, so a peer cannot stall a connection by
       advertising a zero window (see "Fixed").

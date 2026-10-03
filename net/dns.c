@@ -13,6 +13,7 @@
 #include <interrupts.h>
 #include <ipv4.h>
 #include <netdevice.h>
+#include <random.h>
 #include <string.h>
 #include <timer.h>
 #include <udp.h>
@@ -233,9 +234,11 @@ static int dns_lookup(const char *name, uint32_t *ip)
 {
     uint8_t q[512];
     memset(q, 0, 12);
-    dns_wait_id++;
-    if (dns_wait_id == 0)
-        dns_wait_id = 1;
+    /* The transaction id is 16 bits an off-path spoofer has to guess to
+       land a forged answer. As a counter it was one subtraction away from
+       free once they had seen a single lookup — that is the arithmetic the
+       Kaminsky attack ran on. */
+    dns_wait_id = (uint16_t)random_u32();
     q[0] = (uint8_t)(dns_wait_id >> 8);
     q[1] = (uint8_t)dns_wait_id;
     q[2] = 0x01;                        /* recursion desired */
@@ -257,9 +260,7 @@ static int dns_lookup(const char *name, uint32_t *ip)
 
     /* A fresh ephemeral port per lookup, not a fixed one: a fixed port lets
        any local program bind it and break every lookup the kernel makes,
-       and it hands an off-path spoofer one less thing to guess. The
-       transaction id is still a counter — that needs the CSPRNG, see
-       docs/gaps.md. */
+       and it hands an off-path spoofer one less thing to guess. */
     uint16_t port = udp_free_port();
     if (!port)
         return -EADDRINUSE;

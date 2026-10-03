@@ -17,6 +17,7 @@
 #include <interrupts.h>
 #include <io.h>
 #include <keyboard.h>
+#include <power.h>
 
 #define KBD_DATA   0x60
 #define KBD_STATUS 0x64
@@ -40,12 +41,14 @@ static const char shift_map[128] = {
 #define SC_LSHIFT 0x2A
 #define SC_RSHIFT 0x36
 #define SC_CTRL   0x1D
+#define SC_ALT    0x38
+#define SC_DEL    0x53        /* keypad Del; with 0xE0 first, the Delete key */
 #define SC_CAPS   0x3A
 #define SC_F10    0x44
 #define SC_F11    0x57
 #define SC_F12    0x58
 
-static int shift, ctrl, caps;
+static int shift, ctrl, alt, caps;
 static int extended;            /* the previous byte was the 0xE0 prefix */
 
 /* Once a terminal (tty.c) listens, keys go to it as the bytes a real
@@ -121,6 +124,10 @@ static void keyboard_irq(struct regs *r)
         extended = 0;
         if (sc == SC_CTRL)      /* right Ctrl counts as Ctrl */
             ctrl = !released;
+        else if (sc == SC_ALT)  /* and right Alt as Alt */
+            alt = !released;
+        else if (!released && sc == SC_DEL && ctrl && alt)
+            power_ctrl_alt_del();
         else if (!released && listener && extended_seq(sc))
             send(extended_seq(sc));
         return;
@@ -129,11 +136,13 @@ static void keyboard_irq(struct regs *r)
     switch (sc) {
     case SC_LSHIFT: case SC_RSHIFT: shift = !released; return;
     case SC_CTRL:                   ctrl  = !released; return;
+    case SC_ALT:                    alt   = !released; return;
     }
     if (released)
         return;                 /* we only care about presses */
 
     if (sc == SC_CAPS)  { caps = !caps; return; }
+    if (sc == SC_DEL && ctrl && alt) { power_ctrl_alt_del(); return; }
     if (listener) {
         if (sc == SC_F10) { send("\033[21~"); return; }
         if (sc == SC_F11) { send("\033[23~"); return; }

@@ -21,6 +21,7 @@
 
 #include <dns.h>
 #include <ipv4.h>
+#include <random.h>
 #include <netdevice.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -251,6 +252,19 @@ static int echo_was_answered(uint32_t dst, uint32_t body_n)
            f.b[ETH_HLEN + IP_HLEN + ICMP_TYPE] == ICMP_ECHO_REPLY;
 }
 
+/* The same echo, but arriving with a source address its sender chose. The
+   reply goes wherever that address says, so the source decides the target. */
+static int echo_from_was_answered(uint32_t src)
+{
+    uint8_t pkt[1700];
+    uint32_t n = echo_pkt(pkt, sizeof pkt, ICMP_ECHO, 8);
+    pk_ip_set_src(pkt, src);
+    pk_feed(ETH_P_IP, pkt, n, peer_mac);
+    struct fuzz_frame f;
+    return first_frame(&f, ETH_P_IP, IPPROTO_ICMP) &&
+           f.b[ETH_HLEN + IP_HLEN + ICMP_TYPE] == ICMP_ECHO_REPLY;
+}
+
 static void test_icmp(void)
 {
     printf("ICMP reflection\n");
@@ -276,6 +290,40 @@ static void test_icmp(void)
     reset();
     ok(!echo_was_answered(OTHER_IP, 8), "an echo for another address is not answered",
        "we answered a ping addressed to a different machine");
+
+    /* The destination is checked above, but the *source* is what decides where
+       the reply is sent, and the sender writes it. A reply aimed at a
+       broadcast or multicast address makes this machine a reflector; a reply
+       aimed at a chosen address also lets the sender pick which per-
+       destination IP-ID counter the reply discloses, which is the idle scan
+       the per-destination counters exist to stop. */
+    reset();
+    ok(echo_from_was_answered(PEER_IP), "an echo from a real address is answered",
+       "a ping from an ordinary host was dropped: the source check is too strict");
+
+    reset();
+    ok(!echo_from_was_answered(BCAST), "an echo claiming a broadcast source is dropped",
+       "we reply to the broadcast address if a ping claims to come from it");
+
+    reset();
+    ok(!echo_from_was_answered(SUBNET_BCAST), "an echo claiming the subnet broadcast as its source is dropped",
+       "we reply to the subnet broadcast address if a ping claims to come from it");
+
+    reset();
+    ok(!echo_from_was_answered(MCAST), "an echo claiming a multicast source is dropped",
+       "we reply to a multicast group if a ping claims to come from it");
+
+    reset();
+    ok(!echo_from_was_answered(0), "an echo claiming 0.0.0.0 as its source is dropped",
+       "we reply to 0.0.0.0 if a ping claims to come from it");
+
+    reset();
+    ok(!echo_from_was_answered(0x7F000001u), "an echo claiming a loopback source is dropped",
+       "a frame from the wire claiming 127.0.0.1 was accepted: that address cannot reach us");
+
+    reset();
+    ok(!echo_from_was_answered(OUR_IP), "an echo claiming our own address is dropped",
+       "a packet claiming to come from us was accepted: that is the land attack");
 
     /* The reflection buffer is 1400 bytes and the guard is the only thing
        between a 1460-byte echo and a 60-byte overflow of a static array. */
@@ -653,6 +701,7 @@ struct inject {
 
 static struct inject inj;
 static int inj_done;
+static uint16_t dns_seen_id, dns_seen_port;
 
 static void dns_sink(const uint8_t *ip, uint32_t len)
 {
@@ -663,6 +712,8 @@ static void dns_sink(const uint8_t *ip, uint32_t len)
         return;
     uint16_t our_port = rd16(udp);
     const uint8_t *q = udp + 8;
+    dns_seen_id = rd16(q);          /* what we actually asked with */
+    dns_seen_port = our_port;
     uint32_t qn = len - IP_HLEN - 8;
     if (qn < 12)
         return;
@@ -884,8 +935,226 @@ static void test_dns(void)
        "a self-referential compression pointer was resolved instead of refused");
 }
 
+/* --- values an off-path attacker must not be able to guess ---------------- */
+
+/*
+ * Four numbers used to be counters, and a counter tells an attacker who has
+ * seen one value what the next one will be. That is most of what RFC 6528
+ * (sequence numbers), RFC 6056 (ports) and the Kaminsky attack (DNS ids) need.
+ * The tests below hold the clock still on purpose: the old schemes were all
+ * derived from the clock, so freezing it is what exposes them.
+ */
+
+static uint32_t out_isn;
+static uint16_t out_sport, out_ipid;
+
+static void syn_sink(const uint8_t *ip, uint32_t len)
+{
+    if (len < IP_HLEN + 20 || ip[IP_PROTO] != IPPROTO_TCP)
+        return;
+    out_ipid = (uint16_t)rd16(ip + IP_ID);
+    out_sport = (uint16_t)rd16(ip + IP_HLEN);
+    out_isn = rd32(ip + IP_HLEN + 4);
+}
+
+/* Open a connection far enough to see its SYN on the wire, then drop it. A
+   connection still in SYN_SENT is freed outright, so nothing is left behind. */
+static int peek_at_a_syn(void)
+{
+    out_isn = out_sport = 0;
+    pk_set_ip_sink(syn_sink);
+    struct tcp_conn *c = tcp_open();
+    if (!c)
+        return 0;
+    tcp_connect(c, PEER_IP, PEER_PORT, 1 /* nonblock */);
+    pk_pump();
+    tcp_release(c);
+    drain();
+    pk_set_ip_sink(NULL);
+    return out_isn != 0 || out_sport != 0;
+}
+
+/* An echo request that appears to come from `src`, and the IP ID of the reply.
+   0 if no reply came back. */
+static uint16_t echo_reply_id(uint32_t src)
+{
+    uint8_t pkt[1700];
+    uint32_t n = echo_pkt(pkt, sizeof pkt, ICMP_ECHO, 8);
+    pk_ip_set_src(pkt, src);
+    pk_feed(ETH_P_IP, pkt, n, peer_mac);
+    struct fuzz_frame f;
+    if (!first_frame(&f, ETH_P_IP, IPPROTO_ICMP) ||
+        f.b[ETH_HLEN + IP_HLEN + ICMP_TYPE] != ICMP_ECHO_REPLY)
+        return 0;
+    return (uint16_t)rd16(f.b + ETH_HLEN + IP_ID);
+}
+
+static void test_unpredictable(void)
+{
+    printf("unguessable numbers\n");
+
+    /* The DNS transaction id and source port are the whole secret an off-path
+       spoofer has to guess to land a forged answer before the real server
+       replies. As a counter the id was one subtraction away from free after a
+       single observed lookup, which is the arithmetic the Kaminsky attack
+       ran on. Six lookups, and neither may come out as a run. */
+    reset();
+    uint16_t qid[6], qport[6];
+    int seen = 0;
+    for (int i = 0; i < 6; i++) {
+        uint32_t ip = 0;
+        static const uint8_t ptr_q[2] = { 0xC0, 0x0C };     /* -> the question */
+        uint8_t ans[64];
+        struct inject base = { .src = IPV4_DNS, .sport = 53, .ancount = 1,
+                               .answer = ans,
+                               .answer_n = a_record(ans, ptr_q, 2, GOOD_ADDR) };
+        dns_seen_id = dns_seen_port = 0;
+        resolve_with(base, &ip);
+        if (!dns_seen_id && !dns_seen_port)
+            break;
+        qid[seen] = dns_seen_id;
+        qport[seen] = dns_seen_port;
+        seen++;
+    }
+    int id_counts = seen == 6, port_counts = seen == 6;
+    for (int i = 1; i < seen; i++) {
+        if (qid[i] != (uint16_t)(qid[i - 1] + 1))
+            id_counts = 0;
+        if (qport[i] != (uint16_t)(qport[i - 1] + 1))
+            port_counts = 0;
+    }
+    ok(seen == 6 && !id_counts, "the DNS transaction id is not a counter",
+       "transaction ids came out consecutive, so seeing one lookup tells a spoofer the "
+       "id of the next one and 16 bits of the secret are free (Kaminsky)");
+    ok(seen == 6 && !port_counts, "the DNS source port is not a counter",
+       "DNS source ports came out consecutive, which hands a spoofer the other half of "
+       "what RFC 5452 asks them to guess");
+
+    /* Eight connections without letting the clock move. The old sequence
+       number was timer_ms() * 64000 + 0x10000000, so all eight got the same
+       one; the old port was a counter, so they ran 49152, 49153, 49154. */
+    reset();
+    uint32_t isn[8];
+    uint16_t port[8];
+    int n = 0;
+    for (int i = 0; i < 8; i++) {
+        if (!peek_at_a_syn())
+            break;
+        isn[n] = out_isn;
+        port[n] = out_sport;
+        n++;
+    }
+
+    int isn_repeat = 0;
+    for (int i = 0; i < n; i++)
+        for (int j = i + 1; j < n; j++)
+            if (isn[i] == isn[j])
+                isn_repeat = 1;
+    ok(n == 8 && !isn_repeat,
+       "connections in the same millisecond get unrelated sequence numbers",
+       "two connections opened at the same moment share an initial sequence number, so "
+       "seeing one connection tells an attacker where the next one starts (RFC 6528)");
+
+    int counting = n == 8;
+    for (int i = 1; i < n; i++)
+        if (port[i] != (uint16_t)(port[i - 1] + 1))
+            counting = 0;
+    ok(n == 8 && !counting, "the local port is not a counter",
+       "local ports came out consecutive, which hands an off-path attacker half of the "
+       "four-tuple after a single observation (RFC 6056)");
+
+    int in_range = n == 8;
+    for (int i = 0; i < n; i++)
+        if (port[i] < 49152)
+            in_range = 0;
+    ok(in_range, "the local port stays in the ephemeral range",
+       "a local port landed outside 49152..65535, where it could collide with a service");
+
+    /* The IP ID. Positive control first: it has to be a working counter for
+       the peer it belongs to, or fragment reassembly at the far end breaks. */
+    reset();
+    uint16_t first = echo_reply_id(PEER_IP);
+    uint16_t second = echo_reply_id(PEER_IP);
+    ok(first && second == (uint16_t)(first + 1),
+       "a peer's own IP IDs advance by one",
+       "the IP ID does not count for a single destination, which breaks reassembly");
+
+    /* Eight peers, one echo each. One counter for the whole machine makes
+       those eight ids a single ascending run, and subtracting two of them
+       reads off how much traffic the machine sent to everyone else in
+       between — which is what nmap's idle scan counts. */
+    reset();
+    uint16_t id[8];
+    int got = 0;
+    for (int i = 0; i < 8; i++) {
+        id[got] = echo_reply_id(0x0A000280u + (uint32_t)i * 7u);
+        if (id[got])
+            got++;
+    }
+    int ascending = got == 8;
+    for (int i = 1; i < got; i++)
+        if (id[i] != (uint16_t)(id[i - 1] + 1))
+            ascending = 0;
+    ok(got == 8 && !ascending, "the IP ID is not one counter for the whole machine",
+       "IP IDs to different destinations came out of one ascending sequence, so any peer "
+       "can measure how much traffic this machine sends to everyone else");
+}
+
+/* --- rate limiting ------------------------------------------------------- */
+
+static void test_rate_limit(void)
+{
+    printf("rate limiting\n");
+
+    /* Everything we send only because something arrived is a reflector: the
+       source address is the attacker's choice, so the packet goes wherever
+       they point it. Without a budget, one packet in is one packet out for
+       as long as they care to keep sending. */
+    reset();
+    int answered = 0;
+    for (int i = 0; i < 300; i++)
+        answered += echo_was_answered(OUR_IP, 8);
+    ok(answered > 0 && answered < 300, "a flood of echoes is cut off",
+       "every one of 300 back-to-back pings was answered, so this machine will reflect "
+       "a packet at a spoofed victim for as long as an attacker keeps asking");
+
+    /* And the budget is per peer. A single global counter would stop the
+       flood as well — and would also let the attacker starve everyone else,
+       and let them *detect* everyone else, which is the side channel behind
+       CVE-2016-5696 and SAD DNS. The flooder above is still out of credit. */
+    int others = 0;
+    for (int i = 0; i < 8; i++)
+        others += echo_reply_id(0x0A0002A0u + (uint32_t)i * 11u) != 0;
+    ok(others >= 6, "one peer's flood does not silence the others",
+       "a peer that had sent nothing was refused because somebody else had used up the "
+       "budget, so the limit is global: that starves good traffic and leaks that it exists");
+
+    /* Letting the clock run must give the budget back, or a machine that is
+       pinged hard once stops answering that peer for good. */
+    fuzz_clock_add(2000);
+    ok(echo_was_answered(OUR_IP, 8), "the budget comes back with time",
+       "the rate limit never refills, so one burst silences a peer permanently");
+
+    /* The same budget covers the reset we send for a connection that does not
+       exist, which is a reflector for exactly the same reason. */
+    reset();
+    int resets = 0;
+    for (int i = 0; i < 300; i++) {
+        seg_send(40000 /* nothing is listening */, 0x18, 1000 + (uint32_t)i, 2000,
+                 (const uint8_t *)"x", 1);
+        struct fuzz_frame f;
+        resets += first_frame(&f, ETH_P_IP, IPPROTO_TCP) &&
+                  (f.b[ETH_HLEN + IP_HLEN + 13] & 0x04);
+    }
+    ok(resets > 0 && resets < 300, "a flood at closed ports is cut off",
+       "all 300 segments to a closed port drew a reset, so the reset path is an "
+       "unlimited reflector");
+}
+
 int main(void)
 {
+    random_init();              /* the real ChaCha20 generator, on a fake clock:
+                                   same stream every run, so -replay works */
     ipv4_init();
     fuzz_clock_set(clock_base);
     pk_prime_arp();
@@ -897,6 +1166,8 @@ int main(void)
     test_udp();
     test_tcp();
     test_dns();
+    test_unpredictable();
+    test_rate_limit();
 
     printf("\n%d passed, %d failed", passed, failed);
     if (known_bad)

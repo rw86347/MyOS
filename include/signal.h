@@ -65,12 +65,17 @@ struct k_sigaction {
 
 struct process;
 struct regs;
+struct thread;
 
-/* Mark `sig` pending for p and wake it if it sleeps. sig 0: just check. */
+/* Mark `sig` pending for the whole process p and wake one of its threads
+   that doesn't block it. sig 0: just check. */
 int  signal_send(struct process *p, int sig);
 void signal_send_group(int pgid, int sig);
 
-/* Is a signal waiting for the current process (one it doesn't block)?
+/* The same for one thread (tgkill, a fault it caused). */
+int  signal_send_thread(struct thread *t, int sig);
+
+/* Is a signal waiting for the current thread (one it doesn't block)?
    Sleeping syscalls check this and return -EINTR. */
 int  signal_pending(void);
 
@@ -78,11 +83,11 @@ int  signal_pending(void);
 void signal_check(struct regs *r);
 
 /* The fast path for the above: almost always nothing is pending, and then
-   this costs one load and one compare — on every syscall and interrupt. */
+   this costs one load and one compare — on every syscall and interrupt.
+   (Kernel threads never get sig_check set.) */
 #define SIGNAL_CHECK(r)                                                     \
     do {                                                                    \
-        struct process *p_ = thread_current()->proc;                        \
-        if (p_ && p_->sig_pending)                                          \
+        if (thread_current()->sig_check)                                    \
             signal_check(r);                                                \
     } while (0)
 

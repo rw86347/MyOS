@@ -125,6 +125,30 @@ void gdt_load_tls(const uint64_t tls[GDT_TLS_ENTRIES])
     memcpy(&gdt[GDT_TLS_FIRST], tls, GDT_TLS_ENTRIES * sizeof(uint64_t));
 }
 
+/* Whether `pop fs` / `pop gs` on the way out of the kernel can load this
+   selector without faulting. This needs a look at the descriptor and not just
+   at the selector's low bits, because those pops run at CPL 0: the CPU then
+   requires DPL >= 3, so 0x0B (the kernel code segment with ring-3 bits set)
+   or an index past the end of the table raises #GP *inside the kernel*, which
+   this kernel treats as fatal. Since a program writes its own signal frame,
+   that would be one rt_sigreturn away from halting the machine.
+
+   A thread's TLS entries are only descriptors once set_thread_area has filled
+   them in, so an unset one is absent and correctly refused here; checking the
+   live table rather than a list of indices is what gets that right. */
+int gdt_user_seg_ok(uint32_t sel)
+{
+    uint32_t idx = sel >> 3;
+    if ((sel & 7) != 3 || idx >= sizeof gdt / sizeof gdt[0])
+        return 0;                   /* in the LDT, not ring 3, or off the end */
+    uint8_t a = gdt[idx].access;
+    if ((a & 0xF0) != 0xF0)         /* present, ring 3, and not a system segment */
+        return 0;
+    if ((a & 0x08) && !(a & 0x02))  /* a code segment that cannot be read */
+        return 0;
+    return 1;
+}
+
 /* struct user_desc (the set_thread_area argument) -> a descriptor. */
 uint64_t gdt_tls_descriptor(uint32_t base, uint32_t limit, uint32_t flags)
 {

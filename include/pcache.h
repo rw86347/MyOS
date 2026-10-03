@@ -45,5 +45,6 @@ void pcache_stats(uint32_t *hits, uint32_t *misses);
 /* Frames the cache is holding. The leak check in the self-test counts these
    the same way it counts block-cache frames: they are supposed to stay. */
 uint32_t pcache_pages(void);
+uint32_t pcache_ra_pages(void);        /* pages read ahead without waiting */
 
 #endif

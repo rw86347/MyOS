@@ -12,7 +12,8 @@
 # old PC, the way MyOS expects (values checked against UTM 4.6.4's source):
 #
 #   - i440FX + PIIX chipset ("pc"), Pentium III CPU, 256 MiB, IDE disks
-#   - plain VGA (MyOS writes to the VGA text screen)
+#   - "VGA" display = QEMU's std VGA (Bochs, 1234:1111): MyOS's DRM driver
+#     switches it to 1920x1200 with a pixel console and /dev/fb0
 #   - USB off and the PS/2 controller on: with USB on, UTM gives the machine
 #     a USB keyboard (and with "PS/2" unticked removes the PS/2 controller
 #     altogether) — MyOS only has a PS/2 keyboard driver so far

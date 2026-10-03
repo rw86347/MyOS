@@ -151,6 +151,15 @@ static struct thread *new_thread(struct process *proc, const char *name)
     }
     thread_set_name(t, name);
     t->proc = proc;
+    t->proc_next = NULL;
+    t->tid = 0;
+    t->clear_tid = 0;
+    t->sig_pending = t->sig_blocked = t->sig_saved = 0;
+    t->sig_restore = 0;
+    t->sig_check = 0;
+    t->futex_mm = NULL;
+    t->futex_addr = 0;
+    t->futex_woken = 0;
     t->mm = NULL;                       /* (slots are reused: no stale one) */
     t->uregs = NULL;
     t->wq = NULL;
@@ -222,8 +231,10 @@ struct thread *thread_fork(struct process *proc, const char *name,
     *--sp = 0;                            /* ESI */
     *--sp = 0;                            /* EDI */
 
-    /* The child continues with the parent's TLS and FPU registers too. */
+    /* The child continues with the parent's TLS, signal mask and FPU
+       registers too. */
     memcpy(t->tls, current->tls, sizeof t->tls);
+    t->sig_blocked = current->sig_blocked;
     if (current->uses_fpu) {
         fpu_save(t->fpu_state);
         t->uses_fpu = 1;
@@ -331,6 +342,17 @@ struct thread *thread_find(const char *name)
         struct thread *t = &threads[i];
         if ((t->state == THREAD_READY || t->state == THREAD_BLOCKED) &&
             strcmp(t->name, name) == 0)
+            return t;
+    }
+    return NULL;
+}
+
+struct thread *thread_by_tid(int tid)
+{
+    for (int i = 0; i < THREAD_MAX; i++) {
+        struct thread *t = &threads[i];
+        if (t->proc && t->tid == tid &&
+            (t->state == THREAD_READY || t->state == THREAD_BLOCKED))
             return t;
     }
     return NULL;

@@ -50,4 +50,32 @@ void pcache_selftest(void)
     pcache_stats(&h, &m);
     check(err == 0 && buf[0] == '1' && m > m1,
           "pcache: invalidate drops the cached pages");
+
+    /* The whole file in order, a page at a time: after the first window
+       the next ones are read while we copy (P_RA), and every number is
+       there, in order (1\n2\n...). */
+    pcache_invalidate(ino);
+    uint32_t ra0 = pcache_ra_pages(), expect = 1, cur = 0;
+    int in_order = 1;
+    static uint8_t page[4096];
+    for (uint32_t pos = 0; pos < ino->size && in_order; pos += sizeof page) {
+        uint32_t k = ino->size - pos < sizeof page ? ino->size - pos : sizeof page;
+        if (file_copy_out(ino, pos, page, k) < 0) {
+            in_order = 0;
+            break;
+        }
+        for (uint32_t i = 0; i < k; i++) {
+            if (page[i] == '\n') {
+                in_order &= cur == expect++;
+                cur = 0;
+            } else {
+                cur = cur * 10 + (page[i] - '0');
+            }
+        }
+    }
+    uint32_t ahead = pcache_ra_pages() - ra0;
+    check(in_order && expect == 50001, "pcache: whole file in order, with read-ahead");
+    check(ahead > 0, "pcache: read-ahead ran without waiting");
+    if (in_order && ahead > 0)
+        kprintf("pcache: %lu of %lu pages read ahead without waiting\n", ahead, pages);
 }

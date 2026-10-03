@@ -206,6 +206,26 @@ instructions than Linux 6.1 on every operation and every type.
   `tools/check-pattern.py` checks the same bytes on the disk via debugfs after
   `make test`. `MEM=12M tools/diskbench.sh virtio myos` exercises reclaim.
 
+### 9d-3 part 1: requests that don't wait, read-ahead that runs ahead — done
+
+- `struct bio` + `blockdev_submit(dev, b)` / `bio_wait(b)` (`include/blockdev.h`).
+  `done(b)` may run in a worker thread or (later) an interrupt: short, no sleeping,
+  no allocating. Today every disk gets a worker thread ("blk") on its first submit
+  that runs requests one by one through the driver's ordinary `rwv`. Next step:
+  drivers queue them on the hardware themselves (several in flight).
+- Page cache: P_IO (the disk is still filling the page; pinned by the request) and
+  P_RA (reaching it starts the next window, `readahead()`). Readers that find a P_IO
+  page sleep on `io_wait` (`use()`); a failed read sets the page's id to 0 and the
+  reader falls back to the waiting path. `pcache_get_write` also goes through `use()`
+  so a write never lands in a page the disk is still filling.
+- `fs_ops.map_pages` (ext2: `ext2_map_pages`) tells where whole pages are on disk;
+  read-ahead stops at the first page that isn't one piece. 8 requests at most
+  (`RA_REQS`), static pool, no allocation besides the frames.
+- `ata.c` `wait_drive` spins (`POLL_FIRST`) only if `thread_next_ready()` is NULL.
+- Measuring: `user/streambench.c` (wall clock) via `ICOUNT=0 tools/diskbench.sh`;
+  `BPS=` throttles the disk. QEMU can't show the overlap gain (see performance.md).
+  `kernel/bio_test.c` and the last checks in `pcache_test.c` cover it.
+
 ### 9e FAT32 in the VFS — read only
 
 `fs/fatvfs.c`. The first partition of type 0x0b or 0x0c is mounted at `/mnt`

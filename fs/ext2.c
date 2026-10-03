@@ -104,7 +104,6 @@ struct ext2_dirent {
 #define RO_COMPAT_LARGEFILE 0x0002      /* files over 2 GiB may exist */
 #define INDEX_FL            0x1000      /* a directory with a hash index */
 #define DIRENT_LEN(n)       ((8 + (n) + 3) & ~3u)
-#define RW_MAX              (256 * 1024)    /* per read()/write(), see ramfs.c */
 
 enum { FT_UNKNOWN, FT_REG, FT_DIR, FT_CHR, FT_BLK, FT_FIFO, FT_SOCK, FT_LNK };
 
@@ -179,6 +178,26 @@ static uint32_t group_of(struct ext2 *fs, uint32_t ino) { return (ino - 1) / fs-
 /* Find a 0 among the first n bits of a bitmap, set it, return its index
    (-1: all taken). 32 bits per test. Bit i is bit i%8 of byte i/8 — on a
    little-endian CPU, that's simply bit i%32 of 32-bit word i/32. */
+/* A directory entry as it came off the disk, before we believe any of it.
+   Both lengths are written by whoever made the filesystem. rec_len says where
+   the next entry starts: zero would spin here forever and a large value would
+   walk off the end of the block. name_len says how many bytes of name to
+   copy, and the record has to actually contain them -- an entry at the end of
+   a block with rec_len 8 and name_len 255 otherwise reads 255 bytes out of
+   the next page and hands them to getdents64. A real entry always has
+   rec_len >= 8 + name_len rounded up, so nothing valid is turned away. */
+static int dirent_ok(const struct ext2_dirent *e, uint32_t off, uint32_t bsize)
+{
+    /* rec_len is also where the *next* entry starts, so an odd one leaves the
+       walk reading a uint16_t at an odd address. x86 does not mind and this
+       went unnoticed; ARM is a roadmap target and an unaligned halfword load
+       there is not something to rely on, and it is undefined C either way.
+       The format requires a multiple of four (DIRENT_LEN rounds up to one),
+       so nothing valid is turned away by asking. */
+    return e->rec_len >= 8 && !(e->rec_len & 3) && off + e->rec_len <= bsize &&
+           (uint32_t)e->name_len + 8 <= e->rec_len;
+}
+
 static int take_bit(uint8_t *map, uint32_t n)
 {
     uint32_t *w = (uint32_t *)map;
@@ -529,7 +548,7 @@ static struct buf *find_entry(struct ext2 *fs, struct ext2_inode *ddi, const cha
         *prev = NULL;
         for (uint32_t off = 0; off + 8 <= fs->bsize; ) {
             struct ext2_dirent *e = (struct ext2_dirent *)(b->data + off);
-            if (e->rec_len < 8 || off + e->rec_len > fs->bsize)
+            if (!dirent_ok(e, off, fs->bsize))
                 break;                  /* damaged: skip the rest of the block */
             if (e->inode && e->name_len == len && memcmp(e->name, name, len) == 0) {
                 *out = e;
@@ -607,7 +626,7 @@ static int add_entry(struct ext2 *fs, struct inode *dir, const char *name, uint3
         }
         for (uint32_t off = 0; off + 8 <= fs->bsize; ) {
             struct ext2_dirent *e = (struct ext2_dirent *)(b->data + off);
-            if (e->rec_len < 8 || off + e->rec_len > fs->bsize)
+            if (!dirent_ok(e, off, fs->bsize))
                 break;
             uint32_t used = e->inode ? DIRENT_LEN(e->name_len) : 0;
             if (e->rec_len >= used + need) {
@@ -680,11 +699,17 @@ static const struct file_ops ext2_file_ops;
 static int load_symlink(struct ext2 *fs, struct inode *i, struct ext2_inode *di)
 {
     uint32_t n = min(di->size, PATH_MAX);
+    /* A fast symlink's target lives in the 60 bytes of block[], so that is all
+       there is to read however large size claims to be. Copying less than n
+       and then reporting n left the rest of the buffer -- up to 196 bytes of
+       whatever kmalloc last handed out -- to be returned by readlink(). */
+    if (!has_blocks(di))
+        n = min(n, sizeof di->block);
     char *t = kmalloc(n ? n : 1);
     if (!t)
         return -ENOMEM;
     if (!has_blocks(di)) {
-        memcpy(t, di->block, min(n, sizeof di->block));     /* a "fast" symlink */
+        memcpy(t, di->block, n);                            /* a "fast" symlink */
     } else {
         uint32_t disk;
         struct buf *b = NULL;
@@ -726,7 +751,7 @@ static int ext2_load_dir(struct inode *dir)
         }
         for (uint32_t off = 0; off + 8 <= fs->bsize; ) {
             struct ext2_dirent *e = (struct ext2_dirent *)(b->data + off);
-            if (e->rec_len < 8 || off + e->rec_len > fs->bsize)
+            if (!dirent_ok(e, off, fs->bsize))
                 break;
             off += e->rec_len;
             if (!e->inode || vfs_is_dots(e->name, e->name_len))
@@ -755,8 +780,14 @@ static int ext2_load_dir(struct inode *dir)
                 c->flags |= I_UNLOADED;         /* read when someone looks */
             else if (S_ISREG(c->mode))
                 c->ops = &ext2_file_ops;
-            else if (S_ISLNK(c->mode))
-                load_symlink(fs, c, cdi);
+            else if (S_ISLNK(c->mode)) {
+                /* copy_attrs has already set c->size from the disk. If the
+                   target cannot be read, data stays NULL while size does not,
+                   and the first traversal through the link dereferences NULL
+                   in ring 0. An unreadable link resolves to nothing instead. */
+                if (load_symlink(fs, c, cdi) < 0)
+                    c->size = 0;
+            }
             else if (S_ISCHR(c->mode)) {
                 c->rdev = dev_from_disk(cdi);
                 dev_attach(c);
@@ -950,9 +981,19 @@ static int ext2_rename(struct inode *i, struct inode *new_dir, const char *name,
             struct buf *b = bread(fs->dev, disk, fs->bsize);
             if (b) {
                 struct ext2_dirent *dot = (struct ext2_dirent *)b->data;
-                struct ext2_dirent *dotdot = (struct ext2_dirent *)(b->data + dot->rec_len);
-                dotdot->inode = new_dir->fs_ino;
-                bdirty(b);
+                /* ".." sits at whatever offset "."'s rec_len points to, and
+                   that came off the disk: unchecked it is a 4-byte write
+                   anywhere in the 64 KiB past a one-page buffer. */
+                uint32_t at = dot->rec_len;
+                /* A multiple of four for the same reason as dirent_ok: an
+                   odd rec_len here makes the store below a misaligned 4-byte
+                   write. The bounds check was added first and this was not;
+                   the fuzz corpus found it. */
+                if (at >= DIRENT_LEN(1) && !(at & 3) && at + 8 <= fs->bsize) {
+                    struct ext2_dirent *dotdot = (struct ext2_dirent *)(b->data + at);
+                    dotdot->inode = new_dir->fs_ino;
+                    bdirty(b);
+                }
                 brelse(b);
             }
         }
@@ -1199,6 +1240,45 @@ static int pages_io(struct inode *i, uint32_t index, uint32_t n, const uint32_t 
     return err;
 }
 
+static int ext2_map_pages(struct inode *i, uint32_t index, uint32_t n, uint32_t *lba,
+                          uint8_t *secs, struct blockdev **dev)
+{
+    struct ext2 *fs = fs_of(i);
+    uint32_t flags = lock(fs);
+    struct ext2_inode *di;
+    struct buf *ib = get_inode(fs, i->fs_ino, &di);
+    uint32_t spb = fs->bsize / SECTOR_SIZE, per = PAGE_SIZE / fs->bsize;
+    uint32_t map[64], mbase = 0, mlen = 0;  /* file blocks [mbase, mbase+mlen) */
+    uint32_t p = 0;
+    for (; ib && p < n; p++) {
+        uint32_t start = (index + p) * PAGE_SIZE, first = 0, b = 0;
+        for (; b < per && start + b * fs->bsize < i->size; b++) {
+            uint32_t fb = start / fs->bsize + b;
+            if (fb - mbase >= mlen) {
+                int got = bmap_run(fs, di, fb, 64, map);
+                if (got <= 0)
+                    break;
+                mbase = fb;
+                mlen = got;
+            }
+            uint32_t disk = map[fb - mbase];
+            if (!disk || (b && disk != first + b))
+                break;                  /* a hole, or not next to the last block */
+            if (!b)
+                first = disk;
+        }
+        if (!b || (b < per && start + b * fs->bsize < i->size))
+            break;                      /* this page isn't one piece */
+        lba[p] = first * spb;
+        secs[p] = (uint8_t)(b * spb);
+    }
+    *dev = fs->dev;
+    if (ib)
+        brelse(ib);
+    unlock(fs, flags);
+    return p;
+}
+
 static int ext2_readpages(struct inode *i, uint32_t index, uint32_t n, const uint32_t *frames)
 {
     return pages_io(i, index, n, frames, 0);
@@ -1320,6 +1400,7 @@ static const struct fs_ops ext2_ops = {
     .truncate = ext2_truncate,
     .readpages   = ext2_readpages,
     .writepages  = ext2_writepages,
+    .map_pages   = ext2_map_pages,
     .statfs = ext2_statfs,
 };
 
@@ -1350,8 +1431,12 @@ int ext2_mount(struct blockdev *dev, const char *path)
     uint32_t incompat = s->rev_level ? s->feature_incompat : 0;
     uint32_t ro_compat = s->rev_level ? s->feature_ro_compat : 0;
     if (s->log_block_size > 2 || (incompat & ~INCOMPAT_FILETYPE)) {
-        kprintf("ext2: %s uses features we can't read (incompat %lx, %lu-byte blocks)\n",
-                dev->name, incompat, (uint32_t)1024 << s->log_block_size);
+        /* The log is printed, not 1024 << log: this is the path taken when
+           that value is out of range, and shifting by 32 or more is
+           undefined — on x86 only the low five bits count, so the message
+           would have reported a block size the disk never claimed. */
+        kprintf("ext2: %s uses features we can't read (incompat %lx, log block size %lu)\n",
+                dev->name, incompat, (uint32_t)s->log_block_size);
         return -EINVAL;
     }
     struct ext2 *fs = kmalloc(sizeof *fs);
@@ -1370,12 +1455,26 @@ int ext2_mount(struct blockdev *dev, const char *path)
     fs->first_ino = s->rev_level ? s->first_ino : 11;
     fs->filetype = (incompat & INCOMPAT_FILETYPE) != 0;
     fs->readonly = (ro_compat & ~(RO_COMPAT_SPARSE | RO_COMPAT_LARGEFILE)) != 0;
-    fs->groups = (fs->blocks - fs->first_data + fs->bpg - 1) / fs->bpg;
-    fs->gd_block = fs->first_data + 1;
-    if (fs->isize < 128 || fs->isize > fs->bsize || !fs->ipg || !fs->bpg) {
+    /* Every field above is a superblock field, so a crafted image chooses it,
+       and nothing may be *derived* from one before it has been checked.
+       Each check stops a specific out-of-bounds access further on:
+         - isize must be a power of two, or an inode straddles the end of its
+           block and we read and memset past the buffer (the format requires
+           this; only the range was checked before);
+         - one bitmap is one block, so a group cannot hold more inodes or
+           blocks than that block has bits, or take_bit/clear_bit scan and
+           write past the page;
+         - blocks_per_group of zero divides by zero in fs->groups below, and
+           blocks_count of zero in the mount message; anything under
+           first_data_block underflows fs->groups. */
+    if (fs->isize < 128 || fs->isize > fs->bsize || (fs->isize & (fs->isize - 1)) ||
+        !fs->ipg || !fs->bpg || fs->ipg > fs->bsize * 8 || fs->bpg > fs->bsize * 8 ||
+        fs->first_data > 1 || fs->blocks <= fs->first_data || !fs->inodes) {
         kfree(fs);
         return -EINVAL;
     }
+    fs->groups = (fs->blocks - fs->first_data + fs->bpg - 1) / fs->bpg;
+    fs->gd_block = fs->first_data + 1;
 
     /* From now on the superblock lives in the cache, as part of the block
        it's in (block 1 with 1 KiB blocks, else byte 1024 of block 0). */

@@ -35,6 +35,13 @@ static inline int copy_to_user(void *user_dst, const void *src, uint32_t n)
     return 0;
 }
 
+/* Nothing is paged out on the host, so there is nothing to fault in. */
+static inline int fault_in_user(const void *user, uint32_t n, int write)
+{
+    (void)user; (void)n; (void)write;
+    return 0;
+}
+
 static inline int get_user32(uint32_t *dst, uint32_t user_addr)
 {
     (void)dst; (void)user_addr;

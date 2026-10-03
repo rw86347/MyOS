@@ -134,6 +134,22 @@ left alone. Storage drivers (IDE, AHCI, later NVMe) stay in the kernel: one sysc
 read, no extra context switches; the user-space driver ring is for shim drivers (NICs,
 WiFi, USB host).
 
+Decided (2026-10-03): **display drivers have Linux's DRM/KMS shape.** A display
+driver fills in the same structs and callbacks a Linux one does (`drm_driver`,
+`drm_connector` with `get_modes`, `drm_simple_display_pipe_funcs` with `mode_valid` /
+`enable` / `disable` / `update`), and the headers sit at Linux's paths (`include/drm/`,
+`include/linux/fb.h`, `include/linux/io.h`), so a ported driver's `#include` lines work.
+Only the subset one screen needs exists: one CRTC, one plane, one connector; the
+states live in the pipe instead of being allocated per commit; mode lists are fixed
+tables. More of DRM gets added when a ported driver needs it. Programs get `/dev/fb0`
+through fbdev emulation (Linux's `drm_fbdev_generic`), with Linux's ioctl numbers and
+struct layouts — what the X server's fbdev driver uses. `/dev/dri/card0` (KMS ioctls,
+GEM buffers) comes later, with a driver that has real acceleration to offer.
+The first driver, for the Bochs/QEMU std VGA (UTM's "VGA" display), is original code
+written from QEMU's documentation, for the same licence reason as the e1000.
+The console is a backend of `drivers/vt.c`, like Linux's fbcon: it keeps its text in
+RAM and never reads video memory back.
+
 Open questions:
 - Block drivers in user space need a fast path: kernel and driver share a request ring and the
   data buffers (no copying), and an IRQ wakes the driver. Can a disk driver own one of the

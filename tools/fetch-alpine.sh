@@ -15,6 +15,7 @@ PACKAGES="
 busybox-static          1.36.1-r31           7b099399505c480d16889f774bb3220b71e000bab70450b5ae904476368ee754
 bash                    5.2.26-r0            88cf60707bb8667e71b57910917304542d9e64c1db9c7f427895faa9e7d51628
 musl                    1.2.5-r3             7e56fb578429d6c493c3cc07a7390635a5d76dcc6e38c74fbec9279b2d68ab63
+musl-dev                1.2.5-r3             307e33b04095707f39b8c2ec9224e66c11acd5510651e09a6e199ae364c68cd5
 readline                8.2.10-r0            7ee65ca278c8a76dae3dcf9d253cd02b28958b20a1e44f60d358413820a82d2c
 libncursesw             6.4_p20240420-r2     0d495180e37c6ac07a6c51be17e91464719857c8975c15091078d5c3b8495650
 ncurses-terminfo-base   6.4_p20240420-r2     ba1c61cde706f90e4f45f9dc5feec39697808639553ead231fe9c9afdba48642

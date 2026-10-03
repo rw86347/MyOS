@@ -20,6 +20,7 @@
 #include <errno.h>
 #include <kheap.h>
 #include <kprintf.h>
+#include <linux/fb.h>
 #include <paging.h>
 #include <pmm.h>
 #include <sched.h>
@@ -44,7 +45,7 @@ static int run(const char *path, const char *const argv[])
         kprintf("User mode: %s failed to load\n", path);
         return -1;
     }
-    const char *name = p->thread->name;
+    const char *name = p->threads->name;
     int status = proc_wait_kernel(p);
     int code = W_IFEXITED(status) ? W_EXITSTATUS(status) : 128 + W_TERMSIG(status);
     kprintf("User mode: %s exited with code %d\n", name, code);
@@ -180,8 +181,25 @@ void user_selftest(void)
     static const char *const fs_disk_args[] = { "fstest", "/data/fst", NULL };
     check(run("/bin/fstest", fs_disk_args) == 0,
           "user: all of fstest again, on the ext2 disk (step 9b)");
+    static const char *const pthread_args[] = { "pthreadtest", NULL };
+    check(run("/bin/pthreadtest", pthread_args) == 0,
+          "user: musl pthreads: mutex, condvar, TLS, join, signals, exit/exec (threads)");
+    /* Deliberately interleaves two threads inside a copy_to_user, which is
+       the one thing seven of this round's bugs needed and no test produced
+       (docs/security.md). Test builds only: it needs the arming syscall. */
+    static const char *const race_args[] = { "racetest", NULL };
+    check(run("/bin/racetest", race_args) == 0,
+          "user: a copy to user space that sleeps cannot be raced (pipe, wait4, readdir)");
+    static const char *const boot_args[] = { "boottest", NULL };
+    check(run("/bin/boottest", boot_args) == 0,
+          "user: init's calls: sethostname, mount tmpfs, umount2, vhangup, reboot switches");
     check(run_tty_test() == 0,
           "user: terminal: line editing, EOF, raw mode, Ctrl-C (step 8)");
+    if (fb_get(0)) {                    /* only with a display card (QEMU's std VGA) */
+        static const char *const fb_args[] = { "fbtest", NULL };
+        check(run("/bin/fbtest", fb_args) == 0,
+              "user: /dev/fb0: screen info, mmap, fork, pan, mode change, KD_GRAPHICS (step 11b)");
+    }
     check(run_fpu_test() == 0, "user: FPU/SSE registers survive thread switches");
     sched_set_preempt(0);
     test_bad_elf();

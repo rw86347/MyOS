@@ -84,12 +84,12 @@ SYSCALL_DEF(sys_mkdir)   { return do_mkdir(AT_FDCWD, a1, a2); }
 SYSCALL_DEF(sys_mkdirat) { return do_mkdir(a1, a2, a3); }
 
 /* int mknod(path, mode, dev) / mknodat(dirfd, path, mode, dev): an empty
-   file, or a device node (`mknod /dev/null c 1 3`). Named pipes and
-   block devices come later (docs/gaps.md). */
+   file, a named pipe (mkfifo), or a device node (`mknod /dev/null c 1 3`).
+   Block devices come later (docs/gaps.md). */
 static int32_t do_mknod(uint32_t dirfd, uint32_t user_path, uint32_t mode, uint32_t dev)
 {
     uint32_t type = mode & S_IFMT ? mode & S_IFMT : S_IFREG;
-    if (type != S_IFREG && type != S_IFCHR)
+    if (type != S_IFREG && type != S_IFCHR && type != S_IFIFO)
         return -EPERM;
     char path[PATH_MAX];
     struct inode *dir, *i;
@@ -397,4 +397,106 @@ SYSCALL_DEF(sys_fstatfs64)
 {
     struct file *f = fd_get(a1);
     return f ? fill_statfs(f->inode, a2, a3) : -EBADF;
+}
+
+/* --- mount, umount ------------------------------------------------------------ */
+
+/*
+ * The kernel mounts the disks itself at boot (by label, main.c). What a
+ * program can mount is a tmpfs (a fresh RAM directory, for /run and /tmp)
+ * or proc (fs/procfs.c). There are no block device files yet, so
+ * "mount /dev/sda1 /mnt" can't name a disk, and no sysfs: that fails the
+ * way Linux fails for a file system type it wasn't built with. Boot
+ * scripts expect that and go on.
+ */
+#define MS_RDONLY   1
+#define MS_REMOUNT  32
+#define MS_BIND     4096
+#define MS_MOVE     8192
+#define MS_MGC_MSK  0xFFFF0000u         /* old programs put a magic number here */
+#define MS_MGC_VAL  0xC0ED0000u
+
+/* Is i the top of a mounted file system (or "/")? */
+static int is_mount_root(struct inode *i)
+{
+    return i->covers || i == vfs_root();
+}
+
+/* The "mode=1777" option of a tmpfs, from the comma-separated data
+   string; Linux's default when it's missing. */
+static uint32_t tmpfs_mode(uint32_t user_data)
+{
+    char opt[128];
+    uint32_t mode = 01777;
+    if (!user_data || strncpy_from_user(opt, (const char *)user_data, sizeof opt) < 0)
+        return mode;
+    for (char *p = opt; *p; ) {
+        if (p[0] == 'm' && p[1] == 'o' && p[2] == 'd' && p[3] == 'e' && p[4] == '=') {
+            mode = 0;
+            for (p += 5; *p >= '0' && *p <= '7'; p++)
+                mode = mode * 8 + (uint32_t)(*p - '0');
+            return mode & 07777;
+        }
+        while (*p && *p != ',')
+            p++;
+        if (*p)
+            p++;
+    }
+    return mode;
+}
+
+/* mount(source, target, fstype, flags, data) */
+SYSCALL_DEF(sys_mount)
+{
+    char target[PATH_MAX], type[16];
+    struct inode *i;
+    uint32_t flags = a4;
+    if ((flags & MS_MGC_MSK) == MS_MGC_VAL)
+        flags &= ~MS_MGC_MSK;
+    int err = get_path(target, a2);
+    if (err)
+        return err;
+
+    if (flags & (MS_BIND | MS_MOVE))
+        return -EINVAL;
+    if (flags & MS_REMOUNT) {
+        err = vfs_lookup(target, &i);
+        if (err)
+            return err;
+        if (!is_mount_root(i))
+            return -EINVAL;
+        /* nosuid, noexec, ...: nothing checks them yet (no setuid files,
+           everyone is root). Read-only needs the file system's help: no. */
+        return (flags & MS_RDONLY) ? -EBUSY : 0;
+    }
+
+    long n = strncpy_from_user(type, (const char *)a3, sizeof type);
+    if (n == -EFAULT)
+        return -EFAULT;
+    if (n < 0)
+        return -ENODEV;                 /* too long to be a type we know */
+    if (strcmp(type, "tmpfs") == 0)
+        return vfs_mount_ram(target, tmpfs_mode(a5));
+    if (strcmp(type, "proc") == 0)
+        return procfs_mount(target);
+    if (strcmp(type, "ext2") == 0 || strcmp(type, "vfat") == 0)
+        return -ENOTBLK;                /* no block device files to name */
+    return -ENODEV;
+}
+
+/* umount2(target, flags). Taking a file system off the tree needs to know
+   that nothing in it is open or anyone's cwd; the VFS doesn't count that
+   yet, so every mount stays busy. */
+SYSCALL_DEF(sys_umount2)
+{
+    char target[PATH_MAX];
+    struct inode *i;
+    if (a2 & ~0xFu)
+        return -EINVAL;
+    int err = get_path(target, a1);
+    if (!err)
+        err = vfs_lookup(target, &i);
+    if (err)
+        return err;
+    return is_mount_root(i) ? -EBUSY : -EINVAL;
 }

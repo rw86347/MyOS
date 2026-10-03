@@ -32,6 +32,7 @@
 #include <kheap.h>
 #include <memlayout.h>
 #include <mm.h>
+#include <random.h>
 #include <string.h>
 #include <sysenter.h>
 #include <timer.h>
@@ -67,18 +68,26 @@ static uint32_t count(const char *const v[])
     return n;
 }
 
-/* Copy n strings onto the stack (growing down), and their addresses
-   into addr[]. */
-static uint32_t push_strings(uint32_t sp, const char *const v[], uint32_t n,
-                             uint32_t *addr)
+static uint32_t strings_size(const char *const v[], uint32_t n)
+{
+    uint32_t size = 0;
+    for (uint32_t i = 0; i < n; i++)
+        size += strlen(v[i]) + 1;
+    return size;
+}
+
+/* Copy n strings to `at` and up, one after another, and their addresses
+   into addr[]. Returns where the next one would go. */
+static uint32_t put_strings(uint32_t at, const char *const v[], uint32_t n,
+                            uint32_t *addr)
 {
     for (uint32_t i = 0; i < n; i++) {
         uint32_t len = strlen(v[i]) + 1;
-        sp -= len;
-        memcpy((void *)sp, v[i], len);
-        addr[i] = sp;
+        memcpy((void *)at, v[i], len);
+        addr[i] = at;
+        at += len;
     }
-    return sp;
+    return at;
 }
 
 /* Build the start-up stack described at the top; returns the initial ESP.
@@ -86,16 +95,17 @@ static uint32_t push_strings(uint32_t sp, const char *const v[], uint32_t n,
    appear on first touch (demand paging), like the program's own would. */
 static uint32_t build_stack(const char *const argv[], const char *const envp[],
                             const struct elf_info *info, uint32_t sysinfo,
-                            uint32_t interp_base)
+                            uint32_t interp_base, const struct cred *c)
 {
     uint32_t argc = count(argv), envc = count(envp);
     uint32_t sp = USER_STACK_TOP;
 
-    /* 1. 16 "random" bytes for AT_RANDOM (not really random yet: there's no
-       entropy source). The strings go below them, the table below those. */
-    uint32_t seed = timer_ms() * 2654435761u, rnd[4];
-    for (int i = 0; i < 4; i++)
-        rnd[i] = seed = seed * 1103515245 + 12345;
+    /* 1. 16 random bytes for AT_RANDOM. musl uses these to pick its stack
+       guard value and to seed its hash tables, so a predictable 16 bytes
+       hands an attacker the stack canary. The strings go below them, the
+       table below those. */
+    uint32_t rnd[4];
+    random_bytes(rnd, sizeof rnd);
     sp -= sizeof rnd;
     memcpy((void *)sp, rnd, sizeof rnd);
     uint32_t random_addr = sp;
@@ -107,8 +117,10 @@ static uint32_t build_stack(const char *const argv[], const char *const envp[],
         AT_PAGESZ, PAGE_SIZE,
         AT_BASE,   interp_base,         /* where the dynamic linker is (0: none) */
         AT_ENTRY,  info->entry,
-        AT_UID, 0, AT_EUID, 0, AT_GID, 0, AT_EGID, 0,   /* we're all root */
-        AT_SECURE, 0,
+        AT_UID, c->uid, AT_EUID, c->euid, AT_GID, c->gid, AT_EGID, c->egid,
+        /* A setuid program: its C library must not trust the environment
+           (LD_PRELOAD, LD_LIBRARY_PATH) of the user who started it. */
+        AT_SECURE, c->uid != c->euid || c->gid != c->egid,
         AT_RANDOM, random_addr,
         sysinfo ? AT_SYSINFO : AT_IGNORE, sysinfo,
         AT_NULL,   0,
@@ -120,12 +132,17 @@ static uint32_t build_stack(const char *const argv[], const char *const envp[],
     uint32_t words = 1 + argc + 1 + envc + 1 + sizeof auxv / 4;
     uint32_t *table = (uint32_t *)((sp - ARG_SPACE - words * 4) & ~0xFu);
 
+    /* The strings in Linux's order: argv[0] lowest, then the rest of argv,
+       then the environment, all in one run. Programs that rewrite their
+       name for `ps` (util-linux's login, sendmail) treat argv[0] through
+       the end of the last environment string as one buffer to overwrite. */
     uint32_t *p = table;
     *p++ = argc;
-    sp = push_strings(sp, argv, argc, p);
+    uint32_t at = sp - strings_size(argv, argc) - strings_size(envp, envc);
+    at = put_strings(at, argv, argc, p);
     p += argc;
     *p++ = 0;                           /* end of argv */
-    push_strings(sp, envp, envc, p);
+    put_strings(at, envp, envc, p);
     p += envc;
     *p++ = 0;                           /* end of envp */
     memcpy(p, auxv, sizeof auxv);
@@ -165,10 +182,12 @@ static int script_interp(struct inode *ino, char *head, char *interp, char *arg)
 }
 
 static int load_elf(struct inode *ino, const char *const argv[],
-                    const char *const envp[], uint32_t *entry, uint32_t *sp);
+                    const char *const envp[], uint32_t *entry, uint32_t *sp,
+                    struct cred *cred);
 
 int program_load(const char *path, const char *const argv[],
-                 const char *const envp[], uint32_t *entry, uint32_t *sp)
+                 const char *const envp[], uint32_t *entry, uint32_t *sp,
+                 struct cred *cred)
 {
     /* A program from the initramfs is already in memory: the loader
        reads it right where it is (no copy). */
@@ -202,16 +221,17 @@ int program_load(const char *path, const char *const argv[],
         if (!err && (!S_ISREG(interp->mode) || (interp->ops && !interp->fs)))
             err = -EACCES;
         if (!err)                       /* (one level: no #! interpreters) */
-            err = load_elf(interp, s->argv, envp, entry, sp);
+            err = load_elf(interp, s->argv, envp, entry, sp, cred);
         kfree(s);
         return err;
     }
     kfree(s);
-    return load_elf(ino, argv, envp, entry, sp);
+    return load_elf(ino, argv, envp, entry, sp, cred);
 }
 
 static int load_elf(struct inode *ino, const char *const argv[],
-                    const char *const envp[], uint32_t *entry, uint32_t *sp)
+                    const char *const envp[], uint32_t *entry, uint32_t *sp,
+                    struct cred *cred)
 {
     int err;
 
@@ -251,8 +271,18 @@ static int load_elf(struct inode *ino, const char *const argv[],
     if (err)
         return err;
 
+    /* A setuid / setgid file runs as its owner / group. (Setgid without
+       group execute permission means something else, so it's skipped, as
+       in Linux.) The saved ids always take the effective ones. */
+    if (ino->mode & S_ISUID)
+        cred->euid = ino->uid;
+    if ((ino->mode & (S_ISGID | S_IXGRP)) == (S_ISGID | S_IXGRP))
+        cred->egid = ino->gid;
+    cred->suid = cred->fsuid = cred->euid;
+    cred->sgid = cred->fsgid = cred->egid;
+
     uint32_t sysinfo = vsyscall_map();  /* 0: CPU has no sysenter */
     *entry = start;
-    *sp = build_stack(argv, envp, &info, sysinfo, interp_base);
+    *sp = build_stack(argv, envp, &info, sysinfo, interp_base, cred);
     return 0;
 }

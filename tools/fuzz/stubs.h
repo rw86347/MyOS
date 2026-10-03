@@ -30,6 +30,7 @@ struct net_device *fuzz_dev(void);
    reached without a run taking a real second. */
 void fuzz_clock_set(uint32_t t);
 void fuzz_clock_add(uint32_t d);
+void fuzz_cycles_reset(void);       /* and the fake cycle counter */
 
 /* Called from net_sleep and net_rx_action: a target's chance to answer the
    packet the stack just sent. NULL to disable. */

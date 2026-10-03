@@ -29,6 +29,7 @@
 
 #include <dns.h>
 #include <ipv4.h>
+#include <random.h>
 #include <netdevice.h>
 #include <skbuff.h>
 #include <stdint.h>
@@ -355,6 +356,8 @@ const struct fuzz_target *fuzz_targets(unsigned *n)
 
 void fuzz_init(void)
 {
+    random_init();              /* the real ChaCha20 generator, on a fake clock:
+                                   same stream every run, so -replay works */
     ipv4_init();                /* registers on_arp and on_ip through dev_add_pack */
     fuzz_clock_set(1000);
     pk_prime_arp();
@@ -367,11 +370,19 @@ void fuzz_run(const struct fuzz_target *t, const unsigned char *data, size_t len
      * run 200000 cannot be replayed on its own. So the clock is wound back to
      * the same value and the neighbours are re-resolved before each run.
      *
-     * It is not perfect: the ARP pending queue and the neighbour table are
-     * global and a run can leave a mark on them. If a saved crash does not
-     * reproduce under -replay, that is the reason, and the input needs to be
-     * run after the one before it.
+     * The generator is re-keyed too. It is the real ChaCha20 one, and its
+     * nonce carries the cycle counter, so without this the stream would
+     * depend on how many runs had gone before — and the rate limiter now
+     * *drops* packets on an unpredictable budget, which would quietly stop a
+     * crash from reproducing.
+     *
+     * It is still not perfect: the ARP pending queue and the neighbour table
+     * are global and a run can leave a mark on them. If a saved crash does
+     * not reproduce under -replay, that is the reason, and the input needs to
+     * be run after the one before it.
      */
+    fuzz_cycles_reset();
+    random_init();
     fuzz_clock_set(1000);
     fuzz_sent_reset();
     fuzz_set_inject(NULL);
