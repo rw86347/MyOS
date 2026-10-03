@@ -113,8 +113,10 @@ when it's fixed. File references point at the comment that mentions the gap.
   `fsync` writes the whole cache. (`fs/bcache.c`)
 - **LBA28 only**: disks up to 128 GiB. LBA48 is a small addition. (`drivers/ata.c`)
 - **MBR partitions only**: no extended/logical partitions, no GPT. (`fs/partition.c`)
-- **FAT32 is read-only.** (`fs/fat32.c`)
-- **FAT32 long names are ASCII only**; other characters become `?`. (`fs/fat32.c`)
+- **FAT32 is read-only, and it is in the VFS.** The first FAT32 partition is mounted
+  at /mnt (`fs/fatvfs.c`). Creating or writing a file returns EROFS. `statfs` reports
+  no free clusters yet. Long names are ASCII only; other characters become `?`
+  (`fs/fat32.c`).
 - **Block devices live in a fixed-size array.** The comment says "no kmalloc yet" — we have
   kmalloc now. (`kernel/blockdev.c`)
 - **Root on disk (9c)**: on an installed disk (`make hd`) the whole tree is on ext2. On
@@ -123,13 +125,14 @@ when it's fixed. File references point at the comment that mentions the gap.
   (and the initramfs's 3 MiB) stays in memory unused; an installed disk still loads the
   full initramfs at boot. Files that mke2fs copied from the Mac belong to uid 501 (the
   Mac user), not root. No `mount`/`umount` calls; mounts can't be undone. Only the first
-  `myos-root` counts. Programs on disk are copied whole at exec (page cache: 9c-2).
+  `myos-root` counts. A program is mapped from its file and paged in on touch
+  (the page cache, 9c-2); it is no longer copied whole at exec.
 - **The disk driver spins up to 2048 status reads** before sleeping on the interrupt (fast
   in QEMU, where waking a halted CPU is slow); on real hardware that's up to ~2 ms of CPU
   per seek. (`drivers/ata.c`, `POLL_FIRST`)
 - **ext2** (`fs/ext2.c`): the first ext2 file system found (a type-0x83 partition or a
   whole disk without a partition table) is mounted at /data; no `mount`/`umount` calls
-  yet, no FAT32 in the VFS. No journal: switching off mid-change can leave the disk
+  yet. No journal: switching off mid-change can leave the disk
   inconsistent (e2fsck repairs it); the superblock stays "not cleanly unmounted" since
   nothing unmounts. Refused: ext4 extents, 64-bit, flex_bg; mounted read-only: disks with
   checksums or other features we can't keep up to date. A directory we change loses its

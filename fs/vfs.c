@@ -4,13 +4,14 @@
  * Speed (rule 1 in CLAUDE.md): looking up a path costs one hash-table probe
  * per component ("/data/numbers.txt" = 2 probes), however many files there
  * are. The table is keyed on (directory, name), like Linux's dentry cache.
- * File data is never copied into a cache: read() copies straight from where
- * the file system keeps it (for the initramfs: the archive in RAM) into the
- * program's buffer.
+ * Disk file pages sit in the page cache (pcache.c). read() of an ext2 file
+ * still copies from the block cache; exec and mmap fault through the page
+ * cache, so a program is not copied whole at start.
  */
 #include <errno.h>
 #include <kheap.h>
 #include <kprintf.h>
+#include <pcache.h>
 #include <proc.h>
 #include <string.h>
 #include <uaccess.h>
@@ -111,6 +112,7 @@ struct inode *vfs_add(struct inode *dir, const char *name, uint32_t len, uint32_
 
 static void inode_free(struct inode *i)
 {
+    pcache_invalidate(i);
     if (i->fs && i->fs->evict)
         i->fs->evict(i);                /* on the disk: its blocks, its inode */
     file_free(i);                       /* its pages (ramfs.c) */

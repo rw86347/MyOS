@@ -18,6 +18,9 @@
 
 static int passed, failed;
 
+void pcache_selftest(void);
+void fatvfs_selftest(void);
+
 void check(int ok, const char *what)
 {
     if (ok) {
@@ -45,6 +48,8 @@ void run_selftests(void)
     mem_selftest();         /* first: it checks the heap is back to empty */
     disk_demo();
     bcache_selftest();      /* the block cache, on the test disk */
+    pcache_selftest();      /* disk file pages: second read from RAM */
+    fatvfs_selftest();      /* FAT32 files through the VFS */
     thread_selftest();      /* kernel threads + context switch */
     user_selftest();        /* ring 3 programs, syscalls, ELF, FPU */
     sched_selftest();       /* starts the 20 x 1 ms slot scheduler */

@@ -23,14 +23,31 @@
 # The UUIDs are fixed, so a rebuilt VM is the same VM to UTM. Running this
 # again on an existing VM replaces the boot disk and the settings but KEEPS
 # the data disk (your files) and UTM's own files.
+#
+#   tools/mkutm.sh --installed build/myos-hd.img "out.utm"
+#
+# makes a different VM: ONE disk with the whole system on it (boot area +
+# ext2 myos-root, `make hd`) — an installed MyOS, where everything you
+# change survives a restart. That disk holds your files, so it's made only
+# once: running this again keeps it (delete it for a fresh one).
 set -e
+installed=0
+if [ "$1" = --installed ]; then
+    installed=1
+    shift
+fi
 img=$1
 out=$2
-[ -f "$img" ] && [ -n "$out" ] || { echo "usage: $0 disk.img out.utm" >&2; exit 1; }
+[ -f "$img" ] && [ -n "$out" ] || { echo "usage: $0 [--installed] disk.img out.utm" >&2; exit 1; }
 MKE2FS=${MKE2FS:-/opt/homebrew/opt/e2fsprogs/sbin/mke2fs}
 
-VM_UUID=${3:-4ED3E77A-4A46-4ABB-AA03-07F9108A6B16}
-DISK_UUID=BD3A2E96-4AD2-421D-8562-3C6563FD797D
+if [ $installed = 1 ]; then
+    VM_UUID=${3:-9B2C4E61-7D3A-4F58-A1E6-2C8D5B0F7A93}
+    DISK_UUID=3E7A9C15-52B4-4D0E-8F61-A7C2D9E04B38
+else
+    VM_UUID=${3:-4ED3E77A-4A46-4ABB-AA03-07F9108A6B16}
+    DISK_UUID=BD3A2E96-4AD2-421D-8562-3C6563FD797D
+fi
 DATA_UUID=6A1F0C52-8E3B-4C1D-9F27-5B0D3E8A7C41
 name=$(basename "$out" .utm)
 
@@ -38,9 +55,30 @@ mkdir -p "$out/Data"
 # qcow2: UTM lets QEMU guess the disk format, and qcow2 is never guessed wrong.
 # Written under another name, then renamed over the old one: a VM that is
 # running keeps the disk it opened, and its next start gets the new one.
-qemu-img convert -q -f raw -O qcow2 "$img" "$out/Data/$DISK_UUID.qcow2.new"
-mv -f "$out/Data/$DISK_UUID.qcow2.new" "$out/Data/$DISK_UUID.qcow2"
-if [ ! -f "$out/Data/$DATA_UUID.qcow2" ]; then
+if [ $installed = 1 ] && [ -f "$out/Data/$DISK_UUID.qcow2" ]; then
+    echo "Kept the system disk in $out (your files); delete it for a fresh one"
+else
+    qemu-img convert -q -f raw -O qcow2 "$img" "$out/Data/$DISK_UUID.qcow2.new"
+    mv -f "$out/Data/$DISK_UUID.qcow2.new" "$out/Data/$DISK_UUID.qcow2"
+fi
+DATA_DRIVE=
+if [ $installed = 0 ]; then
+    DATA_DRIVE="		<dict>
+			<key>Identifier</key>
+			<string>$DATA_UUID</string>
+			<key>ImageName</key>
+			<string>$DATA_UUID.qcow2</string>
+			<key>ImageType</key>
+			<string>Disk</string>
+			<key>Interface</key>
+			<string>IDE</string>
+			<key>InterfaceVersion</key>
+			<integer>1</integer>
+			<key>ReadOnly</key>
+			<false/>
+		</dict>"
+fi
+if [ $installed = 0 ] && [ ! -f "$out/Data/$DATA_UUID.qcow2" ]; then
     tmp=$(mktemp -t myos-data)
     "$MKE2FS" -q -t ext2 -O none,filetype,sparse_super -E root_owner=0:0 \
         -L myos-data -b 4096 -F "$tmp" 256M
@@ -89,20 +127,7 @@ cat > "$out/config.plist" <<EOF
 			<key>ReadOnly</key>
 			<false/>
 		</dict>
-		<dict>
-			<key>Identifier</key>
-			<string>$DATA_UUID</string>
-			<key>ImageName</key>
-			<string>$DATA_UUID.qcow2</string>
-			<key>ImageType</key>
-			<string>Disk</string>
-			<key>Interface</key>
-			<string>IDE</string>
-			<key>InterfaceVersion</key>
-			<integer>1</integer>
-			<key>ReadOnly</key>
-			<false/>
-		</dict>
+$DATA_DRIVE
 	</array>
 	<key>Information</key>
 	<dict>

@@ -366,7 +366,7 @@ static int32_t fill_statfs(struct inode *i, uint32_t size, uint32_t user_buf)
         int err = i->mnt->ops->statfs(i->mnt, &bsize, &blocks, &bfree, &files, &ffree);
         if (err)
             return err;
-        st.f_type = EXT2_MAGIC;
+        st.f_type = i->mnt->magic ? i->mnt->magic : EXT2_MAGIC;
         st.f_bsize = st.f_frsize = bsize;
         st.f_blocks = blocks;
         st.f_bfree = st.f_bavail = bfree;

@@ -16,6 +16,7 @@
 #include <blockdev.h>
 #include <cpu.h>
 #include <ext2.h>
+#include <fat32.h>
 #include <string.h>
 #include <cycles.h>
 #include <fpu.h>
@@ -160,6 +161,16 @@ static void storage_init(void)
         mount_root(rootdev);
     if (datadev)
         ext2_mount(datadev, "/data");
+
+    /* The first FAT32 partition (the test stick, a USB disk) at /mnt.
+       Read-only until FAT writing exists (step 9e). */
+    for (int i = 0; i < blockdev_count(); i++) {
+        struct blockdev *d = blockdev_get(i);
+        if (!d->parent || (partition_type(d) != 0x0c && partition_type(d) != 0x0b))
+            continue;
+        if (fat_vfs_mount(d, "/mnt") == 0)
+            break;
+    }
 }
 
 void kernel_main(void)

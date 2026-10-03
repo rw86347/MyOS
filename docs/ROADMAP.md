@@ -61,12 +61,17 @@ Mark a step `[x]` only when its "Done when" check works.
     myos-root as "/" (live disks without one run from the initramfs, as before), puts
     /dev on it, and mounts myos-data at /data. `make hd` / `run-hd` / `test-hd` (two
     boots; e2fsck on the root partition). Everything survives a restart.
-  - [ ] 9c-2: a page cache: programs and libraries run from disk without copying whole
-    files (CPU work to a prompt: 3.3 ms from RAM, 18.7 ms from disk), read-ahead.
+  - [x] 9c-2: a page cache: programs and libraries run from disk without copying whole
+    files. The entry page is faulted in at exec; the rest, and one page of
+    read-ahead, on first touch. `make bench` (RAM root): /init + bash CPU work
+    6144 µs → 1204 µs. The 18.7 ms disk-root figure is from before this and was
+    not re-measured.
   - [ ] 9c-3: the live disk's installer (partition, mke2fs, copy, boot area), raw block
     devices (/dev/hda...), and the UTM VM on the installed layout.
   - [ ] 9d: PCI scan + bus-master DMA (PIIX/ICH); AHCI (SATA disks).
   - [ ] 9e: FAT32 in the VFS: read, then write (USB sticks, swapping files with a Mac/PC).
+    Read is in: the first FAT32 partition is mounted at /mnt (read-only). Write,
+    which has to allocate clusters and update the FAT, is still open.
   - Later: ext4 read, exFAT, ext4 write (needs a journal). USB disks need a USB host
     controller first (UHCI/EHCI on old PCs, xHCI on the Pocket 4). NTFS is out of scope.
 
@@ -75,6 +80,8 @@ Mark a step `[x]` only when its "Done when" check works.
   2026-10-02, `docs/DESIGN.md`): first `e1000` (QEMU's card, no firmware), then `e100`,
   `8139too`, `r8169` for old PCs. TCP/IP (lwIP or our own) and the socket syscalls.
   Done when: `ping`, `wget` and BusyBox `udhcpc` work in QEMU.
+  The stack above the driver follows Linux's shape (`sk_buff`, sockets, the same
+  driver callbacks). Decided 2026-10-03, `docs/DESIGN.md`. Not lwIP.
 - [ ] **11. Fuller Linux ABI** — `mmap`, `brk`, dynamic linking (`ld.so`), more syscalls as programs need them.
   Done when: ordinary dynamically linked GNU programs run.
   - [x] Pulled forward (2026-10-02): dynamic linking — the kernel loads a program's

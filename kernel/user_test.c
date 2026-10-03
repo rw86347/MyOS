@@ -15,6 +15,7 @@
  * until the program's thread is dead.
  */
 #include <bcache.h>
+#include <pcache.h>
 #include <elf.h>
 #include <errno.h>
 #include <kheap.h>
@@ -145,7 +146,7 @@ void user_selftest(void)
     static const char *const no_args[] = { NULL };
     static const char *const args[] = { "args", "one", "two", NULL };
     uint32_t free_before = pmm_free_count(), heap_before = kheap_pages();
-    uint32_t cache_before = bcache_pages();
+    uint32_t cache_before = bcache_pages(), pc_before = pcache_pages();
     sched_set_preempt(1);               /* programs share the CPU, as for real */
 
     static const char *const files_args[] = { "files", NULL };
@@ -187,9 +188,9 @@ void user_selftest(void)
 
     check(vmm_translate(0x08048000) == 0, "user: program memory unmapped");
     /* Every page comes back — exactly. The only pages allowed to stay
-       missing are the ones the kernel heap took to grow, and the block
-       cache's (both keep them). */
+       missing are the ones the kernel heap took to grow, and the two
+       caches (both keep them). */
     check(pmm_free_count() + (kheap_pages() - heap_before) +
-          (bcache_pages() - cache_before) == free_before,
+          (bcache_pages() - cache_before) + (pcache_pages() - pc_before) == free_before,
           "user: every program page freed (none leaked)");
 }

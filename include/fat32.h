@@ -56,4 +56,7 @@ int fat32_lookup(struct fat32_fs *fs, const char *path, struct fat32_dirent *out
 int fat32_read(struct fat32_fs *fs, const struct fat32_dirent *file,
                uint32_t offset, void *buf, uint32_t len);
 
+/* Mount a FAT32 partition into the VFS at `path` (read-only). 0 or -errno. */
+int fat_vfs_mount(struct blockdev *dev, const char *path);
+
 #endif

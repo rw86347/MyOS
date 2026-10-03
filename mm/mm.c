@@ -108,27 +108,30 @@ static int overlaps(struct mm *mm, uint32_t start, uint32_t end)
 
 int mm_add(struct mm *mm, uint32_t start, uint32_t end, uint32_t flags)
 {
-    return mm_add_file(mm, start, end, flags, NULL, 0);
+    return mm_add_file(mm, start, end, flags, NULL, 0, 0);
 }
 
 int mm_add_file(struct mm *mm, uint32_t start, uint32_t end, uint32_t flags,
-                struct inode *file, uint32_t file_off)
+                struct inode *file, uint32_t file_off, uint32_t file_end)
 {
     if (start >= end || end > KERNEL_VBASE || overlaps(mm, start, end))
         return -EINVAL;
 
     /* Grow a neighbour instead of adding an area, if it touches and has the
-       same flags (the heap growing with brk does this all the time).
-       File areas stay separate. */
-    for (int i = 0; i < mm->nareas && !file; i++) {
+       same flags (the heap growing with brk does this all the time). A file
+       area grows only when the next page is the next bytes of the same file
+       with the same end-of-data, so one ELF segment is one area. */
+    for (int i = 0; i < mm->nareas; i++) {
         struct vma *v = &mm->area[i];
-        if (v->flags != flags || v->file)
+        if (v->flags != flags || v->file != file || v->file_end != file_end)
+            continue;
+        if (file && v->file_off + (v->end - v->start) != file_off)
             continue;
         if (v->end == start && (i + 1 == mm->nareas || mm->area[i + 1].start >= end)) {
             v->end = end;
             return 0;
         }
-        if (v->start == end) {
+        if (!file && v->start == end) {
             v->start = start;
             return 0;
         }
@@ -141,7 +144,7 @@ int mm_add_file(struct mm *mm, uint32_t start, uint32_t end, uint32_t flags,
         mm->area[i] = mm->area[i - 1];
         i--;
     }
-    mm->area[i] = (struct vma){ start, end, flags, file, file_off };
+    mm->area[i] = (struct vma){ start, end, flags, file, file_off, file_end };
     mm->nareas++;
     if (file)
         vfs_get(file);      /* a mapped file stays readable, even if deleted */
@@ -160,7 +163,8 @@ int mm_remove(struct mm *mm, uint32_t start, uint32_t end)
             memmove(&mm->area[i + 2], &mm->area[i + 1],
                     (mm->nareas - i - 1) * sizeof *v);
             mm->area[i + 1] = (struct vma){ end, v->end, v->flags, v->file,
-                                            v->file_off + (end - v->start) };
+                                            v->file_off + (end - v->start),
+                                            v->file_end };
             if (v->file)
                 vfs_get(v->file);
             v->end = start;
@@ -212,9 +216,17 @@ int mm_fault(uint32_t va, uint32_t err)
     uint32_t page = PAGE_DOWN(va), n = 0;
     if (v->file) {
         uint32_t off = v->file_off + (page - v->start);
-        if (off < v->file->size)
-            n = v->file->size - off < PAGE_SIZE ? v->file->size - off : PAGE_SIZE;
-        file_copy_out(v->file, off, P2V(frame), n);
+        /* ~0: mmap of the whole file. An ELF segment stops at file_end so
+           the bytes after p_filesz (the BSS) stay zero. */
+        uint32_t limit = v->file_end == ~0u ? v->file->size : v->file_end;
+        if (limit > v->file->size)
+            limit = v->file->size;
+        if (off < limit)
+            n = limit - off < PAGE_SIZE ? limit - off : PAGE_SIZE;
+        if (n && file_copy_out(v->file, off, P2V(frame), n) < 0) {
+            pmm_free(frame);
+            return -1;
+        }
     }
     memset((uint8_t *)P2V(frame) + n, 0, PAGE_SIZE - n);
     uint32_t flags = PTE_USER | (v->flags & VM_WRITE ? PTE_WRITABLE : 0);
@@ -294,7 +306,7 @@ int32_t mm_mmap(uint32_t addr, uint32_t len, uint32_t prot, uint32_t flags,
         if (!addr)
             return -ENOMEM;
     }
-    int err = mm_add_file(current_mm, addr, addr + len, vflags, file, off);
+    int err = mm_add_file(current_mm, addr, addr + len, vflags, file, off, ~0u);
     return err ? err : (int32_t)addr;
 }
 

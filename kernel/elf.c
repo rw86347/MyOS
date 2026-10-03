@@ -201,3 +201,136 @@ int elf_load(const void *image, uint32_t size, uint32_t dyn_base, struct elf_inf
     info->brk_start = add_areas(ph, eh->e_phnum);
     return 0;
 }
+
+/* The furthest file offset that still holds real bytes of any segment
+   covering this page. Past that, the page is BSS: zeros. */
+static uint32_t page_limit(const struct elf32_phdr *ph, int n, uint32_t page)
+{
+    uint32_t limit = 0;
+    for (int i = 0; i < n; i++) {
+        if (ph[i].p_type != PT_LOAD || !ph[i].p_memsz)
+            continue;
+        if (ph[i].p_vaddr >= page + PAGE_SIZE ||
+            ph[i].p_vaddr + ph[i].p_memsz <= page)
+            continue;
+        uint32_t fe = ph[i].p_offset + ph[i].p_filesz;
+        if (fe > limit)
+            limit = fe;
+    }
+    return limit;
+}
+
+int elf_map(struct inode *ino, uint32_t dyn_base, struct elf_info *info,
+            char *interp, uint32_t interp_cap)
+{
+    struct elf32_ehdr eh;
+    if (!ino || ino->size < sizeof eh ||
+        file_copy_out(ino, 0, &eh, sizeof eh) < 0)
+        return -ENOEXEC;
+
+    if (memcmp(eh.e_ident, "\x7f" "ELF", 4) != 0 ||
+        eh.e_ident[4] != ELFCLASS32 ||
+        eh.e_ident[5] != ELFDATA2LSB ||
+        (eh.e_type != ET_EXEC && eh.e_type != ET_DYN) ||
+        eh.e_machine != EM_386 ||
+        eh.e_phentsize != sizeof(struct elf32_phdr) ||
+        eh.e_phnum == 0 || eh.e_phnum > ELF_MAX_PHDRS ||
+        eh.e_phoff > ino->size ||
+        eh.e_phnum * sizeof(struct elf32_phdr) > ino->size - eh.e_phoff)
+        return -ENOEXEC;
+
+    struct elf32_phdr ph[ELF_MAX_PHDRS];
+    if (file_copy_out(ino, eh.e_phoff, ph, eh.e_phnum * sizeof ph[0]) < 0)
+        return -EIO;
+
+    info->interp = NULL;
+    for (int i = 0; i < eh.e_phnum; i++) {
+        if (ph[i].p_type != PT_INTERP)
+            continue;
+        if (ph[i].p_offset > ino->size || ph[i].p_filesz > ino->size - ph[i].p_offset ||
+            ph[i].p_filesz < 2 || ph[i].p_filesz > interp_cap ||
+            ph[i].p_filesz > PATH_MAX)
+            return -ENOEXEC;
+        if (file_copy_out(ino, ph[i].p_offset, interp, ph[i].p_filesz) < 0)
+            return -EIO;
+        if (interp[ph[i].p_filesz - 1] != '\0')
+            return -ENOEXEC;
+        info->interp = interp;
+    }
+
+    uint32_t bias = 0;
+    if (eh.e_type == ET_DYN) {
+        uint32_t lowest = 0xFFFFFFFF, highest = 0;
+        for (int i = 0; i < eh.e_phnum; i++) {
+            if (ph[i].p_type != PT_LOAD)
+                continue;
+            if (ph[i].p_vaddr < lowest)
+                lowest = ph[i].p_vaddr;
+            if (ph[i].p_vaddr + ph[i].p_memsz > highest)
+                highest = ph[i].p_vaddr + ph[i].p_memsz;
+        }
+        lowest &= ~0xFFFu;
+        if (highest <= lowest)
+            return -ENOEXEC;
+        if (dyn_base == ELF_BASE_ANY) {
+            dyn_base = mm_find_gap(mm_current(), ((highest - lowest) + 0xFFF) & ~0xFFFu);
+            if (!dyn_base)
+                return -ENOMEM;
+        }
+        bias = dyn_base - lowest;
+        for (int i = 0; i < eh.e_phnum; i++)
+            ph[i].p_vaddr += bias;
+    }
+    info->base = bias;
+    info->entry = eh.e_entry + bias;
+    info->phnum = eh.e_phnum;
+    info->phdr = 0;
+
+    uint32_t top = 0;
+    for (int i = 0; i < eh.e_phnum; i++) {
+        struct elf32_phdr *p = &ph[i];
+        if (p->p_type == PT_PHDR)
+            info->phdr = p->p_vaddr;
+        if (p->p_type != PT_LOAD || p->p_memsz == 0)
+            continue;
+
+        uint32_t end = p->p_vaddr + p->p_memsz;
+        if (p->p_filesz > p->p_memsz ||
+            p->p_offset > ino->size || p->p_filesz > ino->size - p->p_offset ||
+            (p->p_vaddr & 0xFFF) != (p->p_offset & 0xFFF) ||
+            p->p_vaddr < PAGE_SIZE ||
+            end < p->p_vaddr || end > KERNEL_VBASE)
+            return -ENOEXEC;
+
+        uint32_t map_start = p->p_vaddr & ~0xFFFu;
+        uint32_t map_end = (end + 0xFFF) & ~0xFFFu;
+        uint32_t file_off0 = p->p_offset - (p->p_vaddr - map_start);
+        for (uint32_t page = map_start; ; page += PAGE_SIZE) {
+            uint32_t flags = VM_READ;
+            if (page_has(ph, eh.e_phnum, page, PF_W))
+                flags |= VM_WRITE;
+            if (page_has(ph, eh.e_phnum, page, PF_X))
+                flags |= VM_EXEC;
+            int err = mm_add_file(mm_current(), page, page + PAGE_SIZE, flags, ino,
+                                  file_off0 + (page - map_start),
+                                  page_limit(ph, eh.e_phnum, page));
+            if (err && err != -EINVAL)
+                return err;             /* -EINVAL: an earlier segment has it */
+            if (!info->phdr && p->p_offset == 0 && eh.e_phoff < p->p_filesz &&
+                page == map_start)
+                info->phdr = p->p_vaddr + eh.e_phoff;
+            if (page + PAGE_SIZE == map_end)
+                break;
+        }
+        if (map_end > top)
+            top = map_end;
+    }
+
+    if (info->entry < PAGE_SIZE || info->entry >= KERNEL_VBASE)
+        return -ENOEXEC;
+    /* The rest of the file waits until the program touches it. */
+    if (mm_fault(info->entry, 0) < 0 || !vmm_translate(info->entry))
+        return -ENOEXEC;
+    info->brk_start = top;
+    return 0;
+}

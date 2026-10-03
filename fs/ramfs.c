@@ -18,6 +18,7 @@
  * never runs long with interrupts off (programs loop on short counts).
  */
 #include <errno.h>
+#include <pcache.h>
 #include <kheap.h>
 #include <memlayout.h>
 #include <pmm.h>
@@ -71,7 +72,7 @@ static const uint8_t *page_at(struct inode *i, uint32_t pos)
 int file_copy_out(struct inode *i, uint32_t pos, void *kbuf, uint32_t n)
 {
     if (i->fs)
-        return i->fs->read_kernel(i, pos, kbuf, n);     /* on a disk */
+        return pcache_read(i, pos, kbuf, n);    /* disk: shared page cache */
     if (!i->pages) {                    /* the archive is contiguous */
         memcpy(kbuf, i->data + pos, n);
         return 0;

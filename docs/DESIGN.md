@@ -109,7 +109,11 @@ WiFi and USB host) drivers are unmodified Linux v7.2 source compiled against the
 `e1000` first (QEMU's card; no firmware, no `phylib`), then `e100`, `8139too`, `r8169`. The
 shim provides `net_device`, `sk_buff`, NAPI, PCI/DMA/IRQ, timers, workqueues and locks —
 a few thousand lines before the first driver runs, after which each new driver is cheap.
-Only the drivers come from Linux: the TCP/IP stack above `net_device` is lwIP or ours.
+
+Decided (2026-10-03): the stack above that boundary follows Linux's shape too
+(`sk_buff` ownership, the socket layer, the same driver callbacks), so a ported
+driver is not glued onto a foreign stack. This is step 10. Step 9 does not
+bring the network up. The earlier "lwIP or ours" choice is closed.
 Licence note: those drivers are GPLv2, so a MyOS image that includes them is effectively
 GPLv2 too; MyOS has no licence file yet — pick one before step 10.
 

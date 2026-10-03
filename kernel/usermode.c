@@ -164,23 +164,6 @@ static int script_interp(struct inode *ino, char *head, char *interp, char *arg)
     return interp[0] != '\0';
 }
 
-/* A program file's bytes in one piece, for the ELF loader. A file from
-   the initramfs already is (no copy); one written since then is spread
-   over pages, and one on a disk is in disk blocks, so those are copied
-   into a temporary buffer (*tmp: kfree it). */
-static const uint8_t *file_bytes(struct inode *ino, uint8_t **tmp)
-{
-    *tmp = NULL;
-    if (!ino->pages && !ino->fs && ino->data)
-        return ino->data;
-    *tmp = kmalloc(ino->size ? ino->size : 1);
-    if (*tmp && file_copy_out(ino, 0, *tmp, ino->size) < 0) {
-        kfree(*tmp);
-        *tmp = NULL;
-    }
-    return *tmp;
-}
-
 static int load_elf(struct inode *ino, const char *const argv[],
                     const char *const envp[], uint32_t *entry, uint32_t *sp);
 
@@ -232,13 +215,11 @@ static int load_elf(struct inode *ino, const char *const argv[],
 {
     int err;
 
+    /* Map the file. Pages are read when the program touches them (and the
+       next page is read ahead), so a binary on disk is not copied whole. */
     struct elf_info info;
-    uint8_t *tmp;
-    const uint8_t *bytes = file_bytes(ino, &tmp);
-    if (!bytes)
-        return -ENOMEM;
-    err = elf_load(bytes, ino->size, ELF_DYN_BASE, &info);
-    kfree(tmp);
+    char interp[PATH_MAX];
+    err = elf_map(ino, ELF_DYN_BASE, &info, interp, sizeof interp);
     if (err)
         return err;
 
@@ -258,11 +239,7 @@ static int load_elf(struct inode *ino, const char *const argv[],
         if (!S_ISREG(ld->mode) || (ld->ops && !ld->fs))
             return -EACCES;
         struct elf_info linfo;
-        bytes = file_bytes(ld, &tmp);
-        if (!bytes)
-            return -ENOMEM;
-        err = elf_load(bytes, ld->size, ELF_BASE_ANY, &linfo);
-        kfree(tmp);
+        err = elf_map(ld, ELF_BASE_ANY, &linfo, interp, sizeof interp);
         if (err)
             return err;
         if (linfo.interp)

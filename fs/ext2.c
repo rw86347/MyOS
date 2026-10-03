@@ -44,6 +44,7 @@
 #include <interrupts.h>
 #include <kheap.h>
 #include <kprintf.h>
+#include <pcache.h>
 #include <string.h>
 #include <thread.h>
 #include <uaccess.h>
@@ -972,6 +973,7 @@ static int ext2_truncate(struct inode *i, uint32_t size)
     if (fs->readonly)
         return -EROFS;
     uint32_t flags = lock(fs);
+    pcache_invalidate(i);               /* cached pages would keep the old bytes */
     struct ext2_inode *di;
     struct buf *ib = get_inode(fs, i->fs_ino, &di);
     if (!ib) {
@@ -1116,6 +1118,7 @@ static int32_t ext2_write(struct file *f, const void *user_buf, uint32_t n)
     if (prefault(user_buf, n) < 0)
         return -EFAULT;
     uint32_t flags = lock(fs);
+    pcache_invalidate(i);               /* the next read fills from the new bytes */
     if (f->flags & O_APPEND)
         f->pos = i->size;               /* every write goes to the end */
     uint32_t pos = f->pos;

@@ -38,6 +38,10 @@ struct vma {
     uint32_t flags;                     /* VM_READ / VM_WRITE / VM_EXEC */
     struct inode *file;                 /* mmap'd file (NULL: zero-filled) */
     uint32_t file_off;                  /* file offset of `start` */
+    /* Exclusive file offset of real bytes. ~0 means "through the end of
+       the file" (mmap). An ELF segment sets this to where its bytes stop,
+       so the BSS past p_filesz is zeros even when the file continues. */
+    uint32_t file_end;
 };
 
 struct mm {
@@ -60,9 +64,11 @@ void mm_switch(struct mm *mm);          /* load its page directory */
 /* Add an area (demand-zero pages). 0, or -errno (overlap, too many). */
 int mm_add(struct mm *mm, uint32_t start, uint32_t end, uint32_t flags);
 
-/* Add an area whose pages come from a file (copied in on first touch). */
+/* Add an area whose pages come from a file (copied in on first touch).
+   file_end is the exclusive file offset of real bytes, or ~0u for the
+   whole file. */
 int mm_add_file(struct mm *mm, uint32_t start, uint32_t end, uint32_t flags,
-                struct inode *file, uint32_t file_off);
+                struct inode *file, uint32_t file_off, uint32_t file_end);
 
 /* The lowest free stretch of len bytes from MMAP_BASE up, or 0. */
 uint32_t mm_find_gap(struct mm *mm, uint32_t len);

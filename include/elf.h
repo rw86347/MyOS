@@ -82,4 +82,13 @@ struct elf_info {
 #define ELF_BASE_ANY 0
 int elf_load(const void *image, uint32_t size, uint32_t dyn_base, struct elf_info *info);
 
+struct inode;
+
+/* Map `ino` into the current address space and fault in only the entry
+   page. The rest is filled on first touch (and the next page is read
+   ahead). `interp`, when the file names a dynamic linker, receives that
+   path; info->interp then points at `interp`. */
+int elf_map(struct inode *ino, uint32_t dyn_base, struct elf_info *info,
+            char *interp, uint32_t interp_cap);
+
 #endif

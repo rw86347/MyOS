@@ -257,3 +257,18 @@ Short dated notes after each work session: what was done, what broke, what was l
   QEMU from root to prompt: a bigger block cache (an eighth of RAM, up to 8 MiB) gave
   2.1 s, and a short spin before sleeping on the disk interrupt 0.3 s (QEMU takes ~2.5 ms
   to wake a halted CPU). Thread switch 94 -> 97 cycles.
+- 2026-10-03: Step 9c-2, and the read half of 9e. Grok, while Claude was out of tokens;
+  notes in docs/for-claude.md. Page cache (`fs/pcache.c`, 128 direct-mapped pages):
+  exec maps the ELF and faults pages in, with one page of read-ahead, instead of
+  copying the whole file. A write drops that file's cached pages. `make test`
+  (`pcache_selftest`) and `make test-shell` pass. `make bench`: /init + bash CPU work
+  6144 -> 1204 µs; exec of the tiny `true` is 33779 cycles (was 33631). FAT32 is now
+  a VFS mount at /mnt, read-only (`fs/fatvfs.c`); `fatvfs_selftest` reads HELLO.TXT,
+  a long name, a nested file, and the 64 KiB pattern, and checks that create returns
+  EROFS. Writing FAT, the installer (9c-3), and DMA/AHCI (9d) are still open.
+  Networking was not started: it is step 10, and the stack should follow Linux's
+  driver boundary (DESIGN.md, 2026-10-03).
+- 2026-10-03: `make utm-hd` (tools/mkutm.sh --installed): a second UTM VM, "MyOS
+  installed", with ONE disk holding the whole system (make hd); its disk keeps your
+  files, so a rebuild leaves it alone. Tested UTM-style (i440FX, qcow2 on IDE, 256 MiB):
+  a file in /root and bash's history (after `exit`) survive a restart.

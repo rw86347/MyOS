@@ -130,7 +130,7 @@ QEMU_FLAGS = -m 64M -cpu pentium3 \
              -drive format=raw,file=$(USB),index=1,media=disk \
              -drive format=raw,file=$(DATA),index=2,media=disk
 
-.PHONY: all dist utm hd run-hd test-hd run run-full run-text debug test check-selftests test-shell bench run-bench usb clean
+.PHONY: all dist utm utm-hd hd run-hd test-hd run run-full run-text debug test check-selftests test-shell bench run-bench usb clean
 
 all: $(IMG) $(USB)
 
@@ -311,6 +311,13 @@ utm: $(IMG)
 	@mkdir -p dist
 	tools/mkutm.sh $(IMG) "$(UTM_VM)"
 
+# An installed MyOS in UTM: one disk with the whole system (make hd). Its
+# disk holds your files, so rebuilding keeps it.
+UTM_HD_VM := dist/MyOS installed.utm
+utm-hd: $(HD)
+	@mkdir -p dist
+	tools/mkutm.sh --installed $(HD) "$(UTM_HD_VM)"
+
 # --- FAT32 test disk ---------------------------------------------------------
 $(USB): tools/mkusb.sh
 	tools/mkusb.sh $@
@@ -455,6 +462,9 @@ check-selftests: $(IMG) $(USB)
 	  grep -q "User mode: fpu exited with code 0" $$L || { echo "FAIL: FPU state"; ok=0; }; \
 	  grep -q "systest: all [0-9]* checks passed" $$L || { echo "FAIL: step 8 startup calls"; ok=0; }; \
 	  grep -q "fstest /fst: all [0-9]* checks passed" $$L || { echo "FAIL: step 8i writable files"; ok=0; }; \
+	  grep -q "pcache: second read comes from RAM" $$L || { echo "FAIL: step 9c-2 page cache"; ok=0; }; \
+	  grep -q "pcache: read-ahead filled the next page" $$L || { echo "FAIL: step 9c-2 read-ahead"; ok=0; }; \
+	  grep -q "fatvfs: HELLO.TXT read through the VFS" $$L || { echo "FAIL: step 9e FAT32 in the VFS"; ok=0; }; \
 	  grep -q "ext2test: all [0-9]* checks passed" $$L || { echo "FAIL: step 9b ext2 (Linux-made files)"; ok=0; }; \
 	  grep -q "fstest /data/fst: all [0-9]* checks passed" $$L || { echo "FAIL: step 9b ext2 (fstest)"; ok=0; }; \
 	  grep -q "sigtest: all [0-9]* checks passed" $$L || { echo "FAIL: step 8 signals"; ok=0; }; \

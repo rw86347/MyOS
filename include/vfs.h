@@ -96,6 +96,7 @@ struct mount {
     void *priv;                     /* the file system's own state */
     struct inode *root;             /* where it appears in the tree */
     const char *type;               /* "ext2" (for /proc/mounts, df) */
+    uint32_t magic;                 /* statfs f_type; 0 means ext2 */
     uint32_t dev_minor;             /* st_dev: 0:1 is the RAM file system */
 };
 

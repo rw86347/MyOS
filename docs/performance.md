@@ -30,14 +30,14 @@ QEMU, instruction-count mode (lower is better):
 | benchmark                         | baseline | now    | change                     |
 |-----------------------------------|---------:|-------:|----------------------------|
 | boot: kernel ready, 64 MiB (µs)   |   11 608 |    763 | CPU work; 119 before BusyBox + bash (~330 initramfs entries, ~1.7 µs each); 9b: +36 finding disks, mounting /data |
-| boot: bash prompt, 64 MiB (µs)    |        — |  6 907 | CPU work: kernel ready + 6 144 for /init, ld-musl, bash's libraries, /etc/profile |
+| boot: bash prompt, 64 MiB (µs)    |        — |  2 024 | CPU work. Was 6 907 (kernel + 6 144 for /init and bash). 9c-2 maps the files and faults pages in, so that part is 1 204 µs |
 | boot: kernel ready, 512 MiB (µs)  |        — |    181 | was 4 181 before the bitmap fix (23×) |
 | memcpy 4 KiB                      |   12 315 |  1 053 | 11.7× (`rep movsd`)        |
 | memset 4 KiB                      |   10 266 |  1 049 | 9.8× (`rep stosd`)         |
 | kmalloc+kfree 64 B                |      109 |     67 | 1.6× (size classes); +4 for the double-free mark (step 9) |
 | … with 1000 objects live          |   15 105 |     63 | 240×, and now constant     |
 | thread switch                     |      188 |     94 | 2× (run queue, step 8)     |
-| exec + exit (ELF `true`)          |  218 177 | 33 631 | 6.5× (memset, demand paging); 8i: +437, x-bit check, inode refs |
+| exec + exit (ELF `true`)          |  218 177 | 33 779 | 6.5× (memset, demand paging); 9c-2: +148, the entry page is faulted instead of a whole-file copy (a tiny file, so no win here) |
 | null syscall, `int 0x80`          |      115 |    128 | +11: registers saved for fork, signal check |
 | null syscall, `sysenter`          |        — |    158 | see note                   |
 | fork + exit + wait                |        — | 51 403 | step 8 (copy-on-write); 8i: +187, cwd and mapping refs |
@@ -73,8 +73,11 @@ reads) before sleeping on the disk's interrupt. QEMU needs ~2.5 ms to wake a hal
 virtual CPU, so every interrupt wait cost that; data is ready within microseconds there.
 On a real disk the spin costs up to ~2 ms of CPU per seek before sleeping — measure on
 hardware; DMA (9d: one interrupt per 64 KiB) makes it mostly moot. CPU work to a prompt
-(make bench, instruction count): 3.3 ms from RAM vs 18.7 ms from the disk — exec copies
-whole files and every page is found through the block map: the page cache (9c-2).
+(make bench, instruction count), before the page cache: 3.3 ms from RAM vs 18.7 ms from
+the disk, because exec copied whole files. After 9c-2, on a RAM root, /init + bash is
+1 204 µs of CPU (the table's bash-prompt row). The disk-root number has not been
+re-measured; bash's pages still come off the disk on first touch, one page at a time,
+with the next page read ahead.
 
 **Note on disk numbers:** QEMU's "disk" answers at once in host time, but while our CPU
 sleeps waiting for it, instruction-count mode jumps the virtual clock ahead by however long
