@@ -84,6 +84,81 @@ static int skip_name(const uint8_t *p, uint32_t len, uint32_t off)
     return -1;
 }
 
+#define NAME_MAX  255               /* RFC 1035: the longest name on the wire */
+#define CNAME_MAX 8                 /* how far a chain of CNAMEs is followed */
+
+/*
+ * Expand the name at `off` into out[], lowercased, so that two names can be
+ * compared as plain bytes. Returns its length, or -1.
+ *
+ * This is the only place a compression pointer is followed rather than
+ * stepped over, and following them is exactly how CVE-2020-24338 hung a
+ * stack forever: a name that pointed at itself. It is safe here because a
+ * pointer must land strictly further back than the last one did. The targets
+ * strictly decrease, so a cycle cannot be built at all, and `hops` caps the
+ * work so the cost is bounded rather than quadratic in the message length.
+ *
+ * Lowercasing is not cosmetic: a name is case-insensitive on the wire
+ * (RFC 4343), so a server may answer EXAMPLE.com for example.com and a
+ * byte compare would reject a perfectly good reply.
+ */
+static int name_expand(const uint8_t *p, uint32_t len, uint32_t off,
+                       uint8_t *out, uint32_t cap)
+{
+    uint32_t n = 0, limit = off;
+    int hops = 0;
+    while (off < len) {
+        uint8_t l = p[off];
+        if ((l & 0xC0) == 0xC0) {               /* a pointer */
+            if (off + 1 >= len || ++hops > 8)
+                return -1;
+            uint32_t to = (uint32_t)(l & 0x3F) << 8 | p[off + 1];
+            if (to >= limit)                    /* not strictly backwards */
+                return -1;
+            limit = to;
+            off = to;
+            continue;
+        }
+        if (l & 0xC0)                           /* reserved label type */
+            return -1;
+        if (l == 0)
+            return (int)n;                      /* the root: the name ends */
+        if (off + 1 + l >= len || n + 1 + l > cap)
+            return -1;
+        out[n++] = l;
+        for (uint8_t i = 0; i < l; i++) {
+            uint8_t c = p[off + 1 + i];
+            if (c >= 'A' && c <= 'Z')
+                c = (uint8_t)(c + 32);
+            out[n++] = c;
+        }
+        off += 1 + l;
+    }
+    return -1;                                  /* ran off the end */
+}
+
+/*
+ * Two buffers for names being compared, static rather than 512 more bytes of
+ * kernel stack. Safe because dns_resolve lets one lookup run at a time
+ * (dns_busy), which is the same thing that protects dns_pkt and dns_q.
+ */
+static uint8_t want_name[NAME_MAX + 1];     /* the name we are chasing */
+static uint8_t rr_name[NAME_MAX + 1];       /* the name a record is about */
+
+/*
+ * The address for the name we asked about.
+ *
+ * The rule that matters is RFC 5452 §5: an answer is only an answer if it is
+ * *about* the name in the question. Without that check a reply which passes
+ * the transaction id, the port and the question section can still carry an
+ * address for some entirely different name, and we would use it — which is
+ * the hole the Kaminsky attack went through.
+ *
+ * A CNAME makes it awkward, because then the A record is about the end of
+ * the chain and not about the question at all. So the chain is walked: a
+ * record counts if its owner is the question, or the target of a CNAME that
+ * already counted. Records about anything else are skipped, not trusted.
+ */
 static int parse_a(const uint8_t *p, uint32_t len, uint32_t *ip)
 {
     if (len < 12)
@@ -96,32 +171,62 @@ static int parse_a(const uint8_t *p, uint32_t len, uint32_t *ip)
     uint32_t an = (uint32_t)((p[6] << 8) | p[7]);
     if (qd > 4 || an > 16)
         return -1;
-    uint32_t off = 12;
+    uint32_t first = 12;
     for (uint32_t i = 0; i < qd; i++) {
-        int next = skip_name(p, len, off);
+        int next = skip_name(p, len, first);
         if (next < 0 || (uint32_t)next + 4 > len)
             return -1;
-        off = (uint32_t)next + 4;       /* type and class */
+        first = (uint32_t)next + 4;     /* type and class */
     }
-    for (uint32_t i = 0; i < an; i++) {
-        int next = skip_name(p, len, off);
-        if (next < 0 || (uint32_t)next + 10 > len)
-            return -1;
-        off = (uint32_t)next;
-        uint16_t type = (uint16_t)((p[off] << 8) | p[off + 1]);
-        uint16_t class = (uint16_t)((p[off + 2] << 8) | p[off + 3]);
-        uint16_t rdlen = (uint16_t)((p[off + 8] << 8) | p[off + 9]);
-        off += 10;
-        if (off + rdlen > len)
-            return -1;
-        if (type == 1 && class == 1 && rdlen == 4) {
-            *ip = ((uint32_t)p[off] << 24) | ((uint32_t)p[off + 1] << 16) |
-                  ((uint32_t)p[off + 2] << 8) | p[off + 3];
-            return 0;
+
+    /* Start from the question we sent. It is held uncompressed, name first,
+       so the name is everything but the trailing type and class. */
+    if (dns_qlen < 5)
+        return -1;
+    int want_n = name_expand(dns_q, dns_qlen - 4, 0, want_name, sizeof want_name);
+    if (want_n <= 0)
+        return -1;
+
+    for (int chain = 0; chain < CNAME_MAX; chain++) {
+        uint32_t off = first;
+        int chased = 0;
+        for (uint32_t i = 0; i < an; i++) {
+            uint32_t at = off;                  /* where the owner name is */
+            int next = skip_name(p, len, off);
+            if (next < 0 || (uint32_t)next + 10 > len)
+                return -1;
+            off = (uint32_t)next;
+            uint16_t type  = (uint16_t)((p[off] << 8) | p[off + 1]);
+            uint16_t class = (uint16_t)((p[off + 2] << 8) | p[off + 3]);
+            uint16_t rdlen = (uint16_t)((p[off + 8] << 8) | p[off + 9]);
+            off += 10;
+            if (off + rdlen > len)
+                return -1;
+            uint32_t rdata = off;
+            off += rdlen;
+            if (class != 1)                     /* IN only */
+                continue;
+            int rr_n = name_expand(p, len, at, rr_name, sizeof rr_name);
+            if (rr_n != want_n || memcmp(rr_name, want_name, (uint32_t)want_n) != 0)
+                continue;                       /* about some other name */
+            if (type == 1 && rdlen == 4) {
+                *ip = ((uint32_t)p[rdata] << 24) | ((uint32_t)p[rdata + 1] << 16) |
+                      ((uint32_t)p[rdata + 2] << 8) | p[rdata + 3];
+                return 0;
+            }
+            if (type == 5) {                    /* CNAME: the name moved */
+                int t = name_expand(p, len, rdata, want_name, sizeof want_name);
+                if (t <= 0)
+                    return -1;
+                want_n = t;
+                chased = 1;
+                break;                          /* rescan for the new name */
+            }
         }
-        off += rdlen;
+        if (!chased)
+            return -1;                          /* no answer, nothing to follow */
     }
-    return -1;
+    return -1;                                  /* the chain went on too long */
 }
 
 static int dns_lookup(const char *name, uint32_t *ip)

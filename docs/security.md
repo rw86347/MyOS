@@ -198,8 +198,59 @@ rules above.
   removes one fixed quantity an off-path spoofer would otherwise not have to guess.
 - **A DNS reply's question section was never matched against the question asked.** Fixed:
   `qdcount` must be 1 and the question section must byte-compare equal to what we sent
-  (servers echo it verbatim). Note this checks the *question*, not the answer records — see
-  `parse_a` under "Open", which is a separate and still-missing check.
+  (servers echo it verbatim).
+- **`parse_a` did not check which name an answer was about.** It stepped over each record's
+  owner name and took the first `A`/`IN`/4-byte record it found, whatever that record was
+  actually about — so a reply that passed the id, port, source-address and question checks
+  could still carry an address for an unrelated name. This is the response-matching rule of
+  RFC 5452 §5, the check the Kaminsky attack worked by evading.
+
+  Fixed, and it needed more than a byte compare. Requiring the owner name to equal the
+  question **breaks every CNAME**, because there the `A` record is about the end of the chain
+  and not about the question at all. So `parse_a` now walks the chain: a record counts if its
+  owner is the question, or the target of a CNAME that already counted, up to `CNAME_MAX`
+  hops. Records about anything else are skipped rather than trusted, and skipped rather than
+  treated as the end of the list — a forged record first in the section must not hide a real
+  answer behind it.
+
+  Comparing names means resolving compression, and `name_expand` is the one place a pointer is
+  followed rather than stepped over. Following them is exactly how CVE-2020-24338 hung a stack
+  forever. It is safe here because **a pointer must land strictly further back than the last
+  one did**: the targets strictly decrease, so a cycle cannot be built at all, and a hop limit
+  keeps the cost linear instead of quadratic in the message length. Names are lowercased
+  first, because a name ignores case on the wire (RFC 4343) and a server may well answer
+  `EXAMPLE.com` — rejecting that would have broken real lookups while looking like security.
+- **A peer that advertised a zero window stalled the connection forever.** `output()` computes
+  `limit = min(snd_wnd, 4 * mss)`; with `snd_wnd == 0` the loop never ran, so `arm()` was never
+  reached, so `rto_at` stayed 0 and **no timer was left running at all**. The data sat in the
+  send ring, `tcp_write` had already told the caller it was accepted, and nothing would ever
+  happen again — not a retransmit, not a timeout. A blocking `tcp_write` or `tcp_flush` waited
+  in `nap()` for good. Reachable from the SYN-ACK onward, by a peer that need only set two
+  bytes to zero.
+
+  This one needed a missing feature rather than a corrected check, and the feature is the
+  persist timer of RFC 1122 §4.2.2.17. `output()` now lets **one byte** past a shut window.
+  The peer must drop a byte that is past its window but must answer with its current window,
+  which is both how the window reopening is noticed when the update announcing it was lost,
+  and how we learn the peer is still alive. Because that byte counts as sent, the ordinary
+  retransmit timer repeats it, and that repetition *is* the persist timer — no second timer,
+  no new state in `struct tcp_conn`.
+
+  Two things do not fall out for free. A shut window is **not** a lost packet: the peer is
+  alive and its application has stopped reading, which can legitimately last minutes, so
+  probing gets a longer leash (`PROBES`) and backs off further (`PERSIST_MAX`) than
+  retransmission does — about four minutes rather than twenty seconds. And a window that
+  reopens must **clear** that backoff, because `take_ack` deliberately ignores an ack that
+  acknowledges nothing new, which is exactly what a pure window update is. Without that,
+  probes stayed charged against the connection and the next timer killed a connection that
+  had just become healthy, after a minute of crawling. That second half is a bug the fix
+  introduces if written carelessly, so `make attacks` tests it separately.
+
+  Deliberate deviation: RFC 1122 says to keep a connection open for as long as the peer
+  answers probes. MyOS gives up after `PROBES`. Code that never gives up is a hang, and a hang
+  is what the attacker wanted — see `docs/gaps.md`. A connection whose socket has been
+  released is capped much tighter, at `ORPHAN_MS` (10 s) by `end_at`, so the longer leash
+  cannot be used to hold a connection slot after the application is done with it.
 - **Concurrent DNS lookups could swap answers.** `dns_got`, `dns_pkt`, `dns_wait_id` and
   `dns_len` are one shared set of globals, and `udp_bind` accepts a second bind with the same
   `ctx` (both `NULL`), so two callers would have silently crossed — resolving one name and
@@ -221,19 +272,6 @@ Needs the CSPRNG first — these are all one bug, "we have no randomness":
 
 Needs design or a feature, not just a fix:
 
-- **`parse_a` does not check which name an answer belongs to.** It steps over each record's
-  owner name with `skip_name` and takes the first `A`/`IN`/4-byte record it finds, whatever
-  that record is actually about. So a response that passes the id, port, source-address and
-  question checks can still carry an address for an unrelated name and we will use it. This
-  is the response-matching rule of RFC 5452 §5 — the "bailiwick" check that the Kaminsky
-  attack worked by evading. The practical attacker today is the configured resolver itself
-  or someone who can spoof it, not a blind off-path one, but the check is missing.
-  Not fixed yet on purpose: the naive version (require the owner name to equal the question)
-  **breaks every CNAME**, because in a CNAME response the `A` record's owner is the chain's
-  target, not the name asked about. Doing it right means accepting an owner that is either
-  the question or the target of a CNAME already accepted in the same response, comparing
-  compression pointers by value rather than following them (rule 5). That is a resolver
-  change and wants its own step.
 - **A forged reply can still win a race on a *solicited* ARP request.** The cache now only
   learns from a reply to a request of ours, which removes unsolicited poisoning entirely, and
   once an entry exists further replies are ignored until it expires. But in the window after
@@ -253,11 +291,6 @@ Needs design or a feature, not just a fix:
   connection, and the ACK `tcp_input` sends for *any* data segment including a duplicate. One
   inbound packet becomes one outbound packet with no cap. When this is added it must be
   per-peer and jittered — a single global counter is an oracle (SAD DNS, CVE-2016-5696).
-- **A peer that advertises a zero window stalls the connection forever.** `output()` computes
-  `limit = min(snd_wnd, 4 * mss)`; with `snd_wnd == 0` the loop never runs, `arm()` is never
-  called, so `rto_at` stays 0 and no timer fires. The data sits in the send ring and
-  `tcp_write` has already told the caller it was accepted. Reachable from the SYN-ACK onward.
-  Needs a persist timer and zero-window probes.
 - **`SOCK_RAW` needs no privilege**, and `raw_icmp_input` hands every ICMP packet to every
   raw socket, so any program can both forge ICMP from this host and read other programs'
   ICMP. Linux requires `CAP_NET_RAW`; MyOS has no users or capabilities yet.
@@ -266,23 +299,156 @@ Needs design or a feature, not just a fix:
 - **`bind()` on a TCP or raw socket silently succeeds and does nothing** (`sys_bind` returns 0
   for anything that is not `SOCK_DGRAM`), so a program that binds a source port does not get
   it. `setsockopt` likewise accepts and ignores everything.
-- **The parsers have never been fuzzed**, and no Spectre v1 barriers or retpolines exist on
-  either target CPU.
+- No Spectre v1 barriers or retpolines exist on either target CPU.
+
+## Fuzzing the parsers
+
+`tools/fuzz/` builds the five `net/` sources with the **host** compiler and links them against
+`tools/fuzz/stubs.c` instead of the rest of the kernel. The point is AddressSanitizer: on the
+host a one-byte overrun in a parser is an immediate, located failure, where on real hardware
+or under QEMU it is silent corruption that boots fine. The kernel sources are compiled
+unmodified — only `interrupts.h` and `uaccess.h` are replaced, because they are inline i386
+assembly — so anything the fuzzer finds is a bug in the kernel and not in a rewritten copy of
+it.
+
+    make attacks           assert that attacks are rejected (run this after touching net/)
+    make fuzz              fuzz all five targets
+    make fuzz T=dns N=1e7  one target, longer
+    make fuzz-replay       re-run every saved input
+    make fuzz-coverage     what the fuzzing actually reached, as source lines
+
+Apple's clang ships the sanitizer runtimes but not libFuzzer, so `tools/fuzz/driver.c` is the
+mutation loop: a corpus, a mutator that knows lengths on the wire are big-endian, and
+`-fsanitize-coverage=trace-pc-guard` for feedback. An input that reaches an edge no earlier
+input did is kept. Build with `FUZZER=libfuzzer` to use the real one where it exists; the
+targets are plain `LLVMFuzzerTestOneInput` either way.
+
+Three things make it find bugs rather than merely run: the sanitizers turn an overrun into an
+abort, a death callback saves the input that did it, and an alarm fires if one single input
+takes 30 seconds — because a parser that never returns is a bug too. That last one is aimed
+squarely at CVE-2020-24338, a DNS name that pointed at itself.
+
+### Getting past the gates
+
+The hard part is not generating bytes, it is reaching the code. A random 40-byte string fails
+the IPv4 header checksum essentially always, so a naive fuzzer watches `on_ip` drop packets at
+line four forever. Each target therefore repairs the fields that are pure bookkeeping and
+leaves alone everything an attacker controls:
+
+| target | what it drives | what the harness repairs |
+|---|---|---|
+| `wire` | `on_ip`, raw | nothing — the drop paths and length checks |
+| `ip`   | ICMP echo, dispatch into UDP and TCP | version, header length, our address, checksums |
+| `arp`  | `on_arp`, with a request outstanding so `remember` is reachable | nothing |
+| `dns`  | a reply to a lookup the stack is really waiting for | transaction id, question section |
+| `tcp`  | a sequence of segments against a live connection | ports, checksum, optionally seq/ack |
+
+The `dns` and `tcp` targets are the interesting ones. Both let the stack send first, read the
+transaction id or sequence number it chose out of the frame, and put it in the reply — so the
+bytes reach `parse_a` and the TCP state machine instead of being rejected at the door. For TCP
+that models an attacker who can see our traffic, which is normally much stronger than an
+off-path one; here the ISN is `timer_ms() * 64000` plus a constant, so an off-path attacker can
+work it out anyway. It is the threat model, not a generous assumption.
+
+Each repair is a check no longer being tested, which is why `wire` exists and repairs nothing.
+
+### Result
+
+145 million runs across the five targets: **no crash, no sanitizer report, no hang.** What
+makes that worth saying is the coverage it came with, from `make fuzz-coverage`:
+
+| function | lines | branches |
+|---|---|---|
+| `on_arp` | 100% | 100% |
+| `udp_input` | 100% | 92.9% |
+| `skip_name` | 100% | 85.7% |
+| `on_ip` | 98.3% | 97.2% |
+| `name_expand` | 96.9% | 87.5% |
+| `parse_a` | 93.8% | 87.0% |
+| `encode_name` | 89.5% | 70.0% |
+| `tcp_input` | 85.9% | 83.3% |
+
+By file: `net/dns.c` 90.6%, `net/udp.c` 84.5%, `net/ipv4.c` 84.3%, `net/tcp.c` 59.2%. The TCP
+number is low because most of that file is the send path — `tcp_write`, `tcp_read`, the
+retransmit queue — which a received packet does not reach; the part that parses what arrives is
+covered at 85.9%.
+
+Coverage stopped moving early: the first 25 million runs reached every line the next 100 million
+did. That is the signal to stop adding runs and start adding reach — the way to find more is a
+target that drives code these five do not, not a longer campaign on the same five. `remember`
+at 63.6% is the clearest example, because the lines being missed are the cache's LRU eviction,
+which needs more neighbours in play than any target creates.
+
+So "the parsers have been fuzzed" is now a true statement about `on_ip`, `on_arp`, `udp_input`,
+`parse_a` and `skip_name`, and a mostly-true one about `tcp_input`. It is **not** a statement
+that they are correct:
+
+- Coverage is not correctness. A line can execute and still be wrong, and nothing here checks
+  that the stack produced the *right* answer — only that it did not crash, hang, or corrupt
+  memory. The `parse_a` flaw is the proof: the `dns/foreign-a` seed made the resolver return an
+  address from an answer about `evil.example` when it had asked about `example.com`, and every
+  one of 125 million runs passed, because accepting the wrong address is not a memory error.
+  It took `make attacks` to catch it.
+- `irq_save`/`irq_restore` are nothing on the host, so a bug that needs an interrupt to land
+  between two instructions is invisible here. Races remain a reading problem.
+- The ARP pending queue and the neighbour table are global and a run can leave a mark on the
+  next one, so a saved crash might not reproduce under `-replay` on its own.
+- The fuzzer only ever sends *one* packet per run to `wire`, `ip` and `arp`. Bugs that need a
+  particular sequence are only reachable on the `tcp` target today.
+
+## Testing that attacks are rejected
+
+`make attacks` is the other half, and the half that matters more. It performs real attacks and
+asserts the behaviour that is supposed to stop them. It shares the stubs and the sanitizers with
+the fuzzer and asks a different question: not "did the stack survive" but "did it refuse".
+
+Every fix in this document should have an entry, and **a fix with no entry here is a fix nobody
+has tested**. 40 checks, about two seconds, so there is no excuse for not running it after
+touching `net/`:
+
+| area | what is asserted |
+|---|---|
+| ARP | an unsolicited reply cannot overwrite the gateway's entry, or create one; a reply with a multicast or all-zero sender MAC is refused; a request for our address is answered but teaches the cache nothing; a request for someone else's address is ignored |
+| ICMP | an echo to broadcast, subnet broadcast, multicast or another host draws no reply (no smurf amplifier); an echo too big for the 1400-byte reply buffer is not reflected; a fragment is dropped |
+| our ping | an echo reply from a host we did not ping does not satisfy the ping |
+| UDP | a datagram to an unbound port or to port 0 draws no reply (no reflector) |
+| TCP | an out-of-window reset is ignored (RFC 5961) but an in-window one is accepted; data for an unknown connection draws a reset |
+| TCP windows | a shut window is probed rather than waited on, and the probe is one byte and not the whole queue; a window shut and then gone silent eventually gives up; a window that reopens delivers the data and clears the probe backoff |
+| DNS | a reply is refused if the transaction id, the question, the source address or the source port is wrong; an answer about a different name is refused (RFC 5452) but a foreign record does not hide a real one behind it; a CNAME chain is followed; a CNAME loop and a self-referential compression pointer both terminate and fail; a name differing only in case is accepted |
+
+Half of those are positive controls, deliberately. A test that asserts "no reply was sent"
+passes perfectly when the stack is broken and never replies to anything, so every "this must be
+ignored" has a "this must work" beside it: ping to our address *is* answered, a 1300-byte echo
+*is* reflected, a legitimate reset *does* close the connection, a well-formed DNS reply *does*
+resolve. Writing them caught two bugs in the tests themselves, both the same mistake — draining
+the send queue before looking at it, which made "nothing was sent" trivially true.
+
+The other way a test lies is by passing against the broken code, so each new check is run once
+with the fix reverted and has to fail. That is not a formality. The first version of "a reopened
+window clears the probe backoff" passed either way: it advanced the clock by one ordinary
+retransmit interval, and the stale deadline the bug leaves behind is a *minute* out, so the
+timer it was trying to provoke never fired. The test was measuring nothing.
+
+The suite also carries open bugs as **known** entries: the test states the behaviour we want, so
+it reports rather than fails, and the day it starts passing the suite prints `FIXED` and the
+entry gets promoted to a real check. That is how an open bug in this document stays visible
+instead of being forgotten — and it worked: `parse_a` was entered that way, and the suite
+announced the fix on the run after it landed. There are no `known` entries left today.
 
 ### What this review does not cover
 
 Stated so the list above is not mistaken for a clean bill of health.
 
-- **It was reading, not testing.** Reading finds missing bounds checks, trusted lengths and
-  predictable values reasonably well. It finds state-machine bugs — a sequence of legal-looking
-  packets that drives TCP somewhere it should not go — badly. Those are what fuzzing and a
-  state-space check find, and neither has been run.
-- **The fixes are verified only against the happy path.** `make test` proves ping, DNS and
-  TCP still work; no test sends a forged ARP reply, a broadcast echo, a zero-window SYN-ACK,
-  a truncated DNS name, or a short frame to check the padding. Every fix here is believed
-  correct and unproven. Attack-path self-tests are cheap to add — the loopback device and
-  `netif_rx` can inject a crafted frame directly — and should come before any claim that a
-  class of bug is closed.
+- **The review itself was reading, not testing.** Reading finds missing bounds checks, trusted
+  lengths and predictable values reasonably well. It finds state-machine bugs — a sequence of
+  legal-looking packets that drives TCP somewhere it should not go — badly. Fuzzing now covers
+  the memory-safety half of that (see below); the half that asks whether the stack produced the
+  *correct* answer is still unchecked.
+- **One fix is still unverified: the Ethernet padding.** `make attacks` now covers the rest
+  (see below), but `drivers/e1000.c` is not in that build — it needs PCI, MMIO and interrupts —
+  so nothing checks that a frame shorter than 60 bytes is padded with zeros rather than with
+  whatever the previous packet left in the transmit buffer. Doing it properly means capturing
+  the wire, which QEMU will do with `-object filter-dump`.
 - **Only `net/`, `drivers/e1000.c`, `drivers/pci.c` and the socket layer were reviewed.**
   The network stack is not the only place the kernel parses input it does not control. The
   **ext2 and page-cache code reads attacker-controlled bytes** off any disk or USB stick
@@ -325,14 +491,12 @@ hot path needs a before/after from `make bench` per the performance rules.
       ids, and per-destination IP IDs. All four are waiting on the CSPRNG and nothing else.
 - [ ] **Per-peer rate limits with jitter** on every packet we generate in response to a
       received one. No global counters.
-- [ ] **A TCP persist timer and zero-window probes**, so a peer cannot stall a connection by
-      advertising a zero window.
-- [ ] **Fuzz the parsers.** Build `on_ip`, `udp_input`, `tcp_input`, `parse_a` and the option
-      parsers as a host-side harness and run them under AFL++ or libFuzzer with ASan and
-      UBSan. These are pure `(pointer, len)` functions, which makes this cheap — the hardest
-      part of fuzzing a kernel is already done by how this code is written. A corpus of the
-      AMNESIA:33 and Ripple20 shapes (zero-length segments, lengths past the end, bogus
-      option lengths, truncated DNS names) belongs in the repo.
+- [x] **A TCP persist timer and zero-window probes**, so a peer cannot stall a connection by
+      advertising a zero window (see "Fixed").
+- [x] **Fuzz the parsers** — done, see "Fuzzing the parsers" above. `on_ip`, `udp_input`,
+      `tcp_input` and `parse_a` are pure `(pointer, len)` functions, which made it cheap: the
+      hardest part of fuzzing a kernel was already done by how this code is written. The
+      AMNESIA:33 and Ripple20 shapes are in the seed corpus.
 - [ ] **Compiler and ABI hardening**, measured: `-fstack-protector-strong` (the Linux
       self-protection project's recommendation; about 20% of functions instrumented),
       `-fstack-clash-protection`, and `-fsanitize=bounds` with `-fsanitize-undefined-trap-on-error`

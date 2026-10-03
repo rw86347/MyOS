@@ -131,7 +131,7 @@ QEMU_FLAGS = -m 64M -cpu pentium3 \
              -drive format=raw,file=$(DATA),index=2,media=disk \
              -netdev user,id=net0 -device e1000,netdev=net0
 
-.PHONY: all dist utm utm-hd hd run-hd test-hd run run-full run-text debug test check-selftests test-shell bench run-bench usb clean fuzz fuzz-build fuzz-replay
+.PHONY: attacks all dist utm utm-hd hd run-hd test-hd run run-full run-text debug test check-selftests test-shell bench run-bench usb clean fuzz fuzz-build fuzz-replay
 
 all: $(IMG) $(USB)
 
@@ -568,7 +568,7 @@ run-bench: $(IMG) $(USB) $(DATA)
 FUZZ_CC    ?= clang
 FUZZ_DIR   := build/fuzz
 FUZZ_KSRCS := net/skbuff.c net/ipv4.c net/udp.c net/tcp.c net/dns.c \
-              tools/fuzz/stubs.c tools/fuzz/targets.c
+              tools/fuzz/stubs.c tools/fuzz/packet.c tools/fuzz/targets.c
 FUZZ_TARGETS := wire ip arp dns tcp
 FUZZ_SAN   := -fsanitize=address,undefined -fno-sanitize-recover=all \
               -fsanitize-coverage=trace-pc-guard
@@ -605,12 +605,25 @@ $(FUZZ_DIR)/fuzz_net: $(FUZZ_OBJS)
 
 fuzz-build: $(FUZZ_DIR)/fuzz_net
 
+# Tests that assert an attack is rejected — the half fuzzing cannot reach,
+# because accepting a forged ARP reply is not a memory error. Same stubs, same
+# sanitizers, different question: not "did it survive" but "did it refuse".
+ATTACK_SRCS := $(filter-out tools/fuzz/targets.c,$(FUZZ_KSRCS)) tools/fuzz/attacks.c
+ATTACK_OBJS := $(patsubst %.c,$(FUZZ_DIR)/%.o,$(ATTACK_SRCS))
+
+$(FUZZ_DIR)/attacks: $(ATTACK_OBJS)
+	$(FUZZ_CC) $(FUZZ_SAN) -o $@ $^
+
+attacks: $(FUZZ_DIR)/attacks
+	@$(FUZZ_DIR)/attacks
+
 T ?=
 N ?= 200000
 fuzz: $(FUZZ_DIR)/fuzz_net tools/fuzz/seeds
 	@set -e; for t in $(if $(T),$(T),$(FUZZ_TARGETS)); do \
 	  $(FUZZ_DIR)/fuzz_net $$t -runs=$(N) -seed=1 \
-	    -corpus=tools/fuzz/seeds/$$t -out=$(FUZZ_DIR); \
+	    -corpus=tools/fuzz/seeds/$$t -corpus=tools/fuzz/corpus/$$t \
+	    -out=$(FUZZ_DIR); \
 	done
 	@if ls $(FUZZ_DIR)/crashes/* >/dev/null 2>&1; then \
 	  echo "FUZZ FOUND SOMETHING: $(FUZZ_DIR)/crashes/"; ls -1 $(FUZZ_DIR)/crashes/; exit 1; \
@@ -630,13 +643,13 @@ $(FUZZ_DIR)/fuzz_cov: $(FUZZ_KSRCS) tools/fuzz/driver.c $(wildcard tools/fuzz/*.
 	done
 	$(FUZZ_CC) $(FUZZ_COVFLAGS) -Itools/fuzz -c -o $(FUZZ_DIR)/cov-driver.o tools/fuzz/driver.c
 	$(FUZZ_CC) $(FUZZ_COVFLAGS) -o $@ $(FUZZ_DIR)/cov-net_*.o \
-	  $(FUZZ_DIR)/cov-tools_fuzz_stubs.o $(FUZZ_DIR)/cov-tools_fuzz_targets.o \
-	  $(FUZZ_DIR)/cov-driver.o
+	  $(FUZZ_DIR)/cov-tools_fuzz_*.o $(FUZZ_DIR)/cov-driver.o
 
 fuzz-coverage: $(FUZZ_DIR)/fuzz_cov
 	@rm -rf $(FUZZ_DIR)/prof && mkdir -p $(FUZZ_DIR)/prof
 	@for t in $(FUZZ_TARGETS); do \
-	  files=$$(ls tools/fuzz/seeds/$$t/* $(FUZZ_DIR)/corpus-$$t/* 2>/dev/null || true); \
+	  files=$$(ls tools/fuzz/seeds/$$t/* tools/fuzz/corpus/$$t/* \
+	              $(FUZZ_DIR)/corpus-$$t/* 2>/dev/null || true); \
 	  [ -z "$$files" ] && continue; \
 	  LLVM_PROFILE_FILE=$(FUZZ_DIR)/prof/$$t.profraw \
 	    $(FUZZ_DIR)/fuzz_cov $$t -replay $$files >/dev/null 2>&1 || true; \
@@ -644,19 +657,19 @@ fuzz-coverage: $(FUZZ_DIR)/fuzz_cov
 	@xcrun llvm-profdata merge -sparse $(FUZZ_DIR)/prof/*.profraw -o $(FUZZ_DIR)/prof/all.profdata
 	@xcrun llvm-cov report $(FUZZ_DIR)/fuzz_cov \
 	  -instr-profile=$(FUZZ_DIR)/prof/all.profdata $(FUZZ_KSRCS) \
-	  | sed -n '1,3p;/^net\//p;/^TOTAL/p'
+	  | sed -n '1,2p;/^net\//p;/^TOTAL/p'
 	@echo ""
 	@echo "per-function, the parsers:"
 	@xcrun llvm-cov report $(FUZZ_DIR)/fuzz_cov -show-functions \
 	  -instr-profile=$(FUZZ_DIR)/prof/all.profdata net/dns.c net/ipv4.c net/tcp.c net/udp.c \
-	  | awk 'NR<=2 || /parse_a|skip_name|on_ip|on_arp|udp_input|tcp_input|encode_name|remember|lookup/'
+	  | awk 'NR<=2 || /parse_a|skip_name|name_expand|on_ip|on_arp|udp_input|tcp_input|encode_name|remember|lookup/'
 
 # Replay everything already saved: fast, deterministic, and the thing to run
 # after touching net/ — a fixed bug must stay fixed.
 fuzz-replay: $(FUZZ_DIR)/fuzz_net
 	@set -e; for t in $(FUZZ_TARGETS); do \
-	  files=$$(ls tools/fuzz/seeds/$$t/* $(FUZZ_DIR)/corpus-$$t/* \
-	              $(FUZZ_DIR)/crashes/*-$$t-* 2>/dev/null || true); \
+	  files=$$(ls tools/fuzz/seeds/$$t/* tools/fuzz/corpus/$$t/* \
+	              $(FUZZ_DIR)/corpus-$$t/* $(FUZZ_DIR)/crashes/*-$$t-* 2>/dev/null || true); \
 	  if [ -n "$$files" ]; then \
 	    echo "--- $$t"; $(FUZZ_DIR)/fuzz_net $$t -replay $$files >/dev/null; \
 	  fi; \

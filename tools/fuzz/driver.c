@@ -389,7 +389,8 @@ int main(int argc, char **argv)
     }
 
     unsigned long long runs = 200000;
-    const char *corpus_dir = NULL;
+    const char *corpus_dirs[8];
+    unsigned corpus_dirs_n = 0;
     int replay = 0, replay_first = 0;
 
     for (int i = 2; i < argc; i++) {
@@ -397,8 +398,10 @@ int main(int argc, char **argv)
             runs = strtoull(argv[i] + 6, NULL, 10);
         else if (strncmp(argv[i], "-seed=", 6) == 0)
             rng_state = strtoull(argv[i] + 6, NULL, 10) | 1;
-        else if (strncmp(argv[i], "-corpus=", 8) == 0)
-            corpus_dir = argv[i] + 8;
+        else if (strncmp(argv[i], "-corpus=", 8) == 0) {
+            if (corpus_dirs_n < sizeof corpus_dirs / sizeof corpus_dirs[0])
+                corpus_dirs[corpus_dirs_n++] = argv[i] + 8;
+        }
         else if (strncmp(argv[i], "-out=", 5) == 0)
             out_dir = argv[i] + 5;
         else if (strcmp(argv[i], "-replay") == 0) {
@@ -439,8 +442,8 @@ int main(int argc, char **argv)
         return 0;
     }
 
-    if (corpus_dir)
-        load_dir(corpus_dir);
+    for (unsigned i = 0; i < corpus_dirs_n; i++)
+        load_dir(corpus_dirs[i]);
     if (!corpus_n) {
         static const uint8_t empty[64] = { 0 };
         corpus_add(empty, sizeof empty);

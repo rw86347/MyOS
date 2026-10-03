@@ -60,6 +60,8 @@
 #define RTO_MIN      250
 #define RTO_MAX      4000
 #define RETRIES      8
+#define PERSIST_MAX  60000          /* a shut window backs off this far */
+#define PROBES       10             /* probes at a shut window before giving up */
 #define TIME_WAIT_MS 2000
 #define ORPHAN_MS    10000          /* a closed socket's FIN gets this long */
 
@@ -161,6 +163,17 @@ static void output(struct tcp_conn *c)
     if (c->state != ST_EST && c->state != ST_CLOSE_WAIT)
         return;
     uint32_t limit = c->snd_wnd < TCP_INFLIGHT * c->mss ? c->snd_wnd : TCP_INFLIGHT * c->mss;
+    /*
+     * A shut window would otherwise stop the connection dead: nothing can be
+     * sent, so arm() below is never reached, so no timer runs and nothing ever
+     * tries again. One byte is allowed past the window to probe it (RFC 1122
+     * 4.2.2.17). The peer drops that byte and answers with its current window,
+     * which is how we learn the window reopened even if the update saying so
+     * was lost. Once the byte is on the wire the retransmit timer repeats it,
+     * and that repetition is the persist timer.
+     */
+    if (!limit && !c->tx_sent && c->tx_len)
+        limit = 1;
     while (c->tx_sent < c->tx_len && c->tx_sent < limit) {
         uint32_t n = c->tx_len - c->tx_sent;
         if (n > c->mss)
@@ -180,6 +193,11 @@ static void output(struct tcp_conn *c)
         c->state = c->state == ST_EST ? ST_FIN_WAIT1 : ST_LAST_ACK;
         arm(c);
     }
+    /* Anything left waiting needs a timer behind it, even when not one byte
+       made it out: the probe above can fail too (the card's ring was full),
+       and a send with no timer is a connection that stops here for good. */
+    if (c->tx_sent < c->tx_len || (c->fin_queued && !c->fin_sent))
+        arm(c);
 }
 
 /* Answer a segment for no connection of ours. */
@@ -566,8 +584,20 @@ void tcp_input(uint32_t src, uint32_t dst, const uint8_t *pkt, uint32_t len)
     }
     if (!(flags & FL_ACK))
         return;
+    int was_shut = !c->snd_wnd;
     take_ack(c, ack);
     c->snd_wnd = wnd;
+    /* A window that reopens is a sign of life even when the ack acknowledges
+       nothing new (take_ack ignores those). The backoff and probe count that
+       were covering a shut window must not be charged against the data that
+       can now flow, or the next timer would kill a healthy connection. */
+    if (was_shut && wnd) {
+        c->retries = 0;
+        c->rto = RTO_MIN;
+        c->rto_at = 0;
+        if (c->snd_una != c->snd_nxt)
+            arm(c);
+    }
     if (c->state == ST_CLOSED) {    /* LAST_ACK done */
         if (c->orphan)
             conn_free(c);
@@ -635,7 +665,16 @@ uint32_t tcp_timers(uint32_t now)
             continue;
         }
         if (due(c->rto_at, now)) {
-            if (++c->retries > RETRIES) {
+            /*
+             * A shut window is not a lost packet. The peer is alive and its
+             * application has stopped reading, which can legitimately last
+             * minutes, so probes get a longer leash and back off further than
+             * retransmits do. Bounded all the same: RFC 1122 says to keep
+             * probing for as long as the peer answers, but code that never
+             * gives up is a hang, and a hang is what the attacker wanted.
+             */
+            int probing = !c->snd_wnd && c->tx_sent && c->state != ST_SYN_SENT;
+            if (++c->retries > (probing ? PROBES : RETRIES)) {
                 fail(c, -ETIMEDOUT);
                 if (c->orphan) {
                     conn_free(c);
@@ -649,7 +688,8 @@ uint32_t tcp_timers(uint32_t now)
                          c->tx_sent < c->mss ? c->tx_sent : c->mss);
                 else if (c->fin_sent)
                     emit(c, FL_FIN | FL_ACK, c->snd_nxt - 1, 0, 0);
-                c->rto = c->rto * 2 > RTO_MAX ? RTO_MAX : c->rto * 2;
+                uint32_t cap = probing ? PERSIST_MAX : RTO_MAX;
+                c->rto = c->rto * 2 > cap ? cap : c->rto * 2;
                 c->rto_at = (now + c->rto) | 1;
             }
         }

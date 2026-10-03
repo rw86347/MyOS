@@ -39,141 +39,31 @@
 #include <timer.h>
 #include <udp.h>
 
+#include "packet.h"
 #include "stubs.h"
 #include "targets.h"
 
-/* Offsets, rather than structs copied out of net/ipv4.c: these are wire
-   formats fixed by RFC 791/792/768/793, and a private copy of a struct
-   would be one more thing that can disagree with the kernel's. */
-#define IP_VER_IHL  0
-#define IP_TOT_LEN  2
-#define IP_FRAG     6
-#define IP_PROTO    9
-#define IP_CHECK   10
-#define IP_SADDR   12
-#define IP_DADDR   16
-#define IP_HLEN    20
+/* --- the reply pump -----------------------------------------------------
+   Called from net_sleep and net_rx_action, i.e. exactly where the stack
+   waits for something. pk_pump drains what was sent and answers any ARP;
+   on_ip_frame is where a target gets to answer an IP frame. */
 
-#define ETH_SRC     6
-#define ETH_TYPE   12
+static void pump(void) { pk_pump(); }
 
 /* Longer than net/tcp.c's ORPHAN_MS and TIME_WAIT_MS, so a released
    connection is certainly due to be reaped. */
 #define ORPHAN_SLACK_MS 30000
 
-#define PEER_IP   0x0A000202u       /* 10.0.2.2, the gateway: on our subnet */
-#define PEER_PORT 80
-
-static const uint8_t peer_mac[6] = { 0x52, 0x55, 0x0A, 0x00, 0x02, 0x02 };
-
-static void wr16(uint8_t *p, uint16_t v) { p[0] = (uint8_t)(v >> 8); p[1] = (uint8_t)v; }
-static void wr32(uint8_t *p, uint32_t v)
+static void set_ip_sink(void (*fn)(const uint8_t *, uint32_t))
 {
-    p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16);
-    p[2] = (uint8_t)(v >> 8);  p[3] = (uint8_t)v;
-}
-static uint16_t rd16(const uint8_t *p) { return (uint16_t)((p[0] << 8) | p[1]); }
-static uint32_t rd32(const uint8_t *p)
-{
-    return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
-           ((uint32_t)p[2] << 8) | p[3];
-}
-
-/* The kernel's own checksum, reused so the harness cannot disagree with it:
-   ip_csum_finish(ip_csum_add(0, ...)) is exactly what net/ipv4.c does. */
-static uint16_t csum(const void *d, uint32_t n)
-{
-    return ip_csum_finish(ip_csum_add(0, d, n));
-}
-
-/* --- handing a frame to the stack ----------------------------------------
-   Built to look like what eth_type_trans leaves behind: the Ethernet header
-   already pulled, skb->protocol set, the sender's MAC saved in eth_src. The
-   handler takes ownership and frees it. */
-static void feed(uint16_t type, const uint8_t *b, uint32_t n, const uint8_t mac[6])
-{
-    int (*fn)(struct sk_buff *) = fuzz_handler(type);
-    if (!fn)
-        return;
-    struct sk_buff *skb = alloc_skb(n + 64);
-    if (!skb)
-        return;
-    skb_reserve(skb, 16);
-    unsigned char *p = skb_put(skb, n);
-    if (!p) {
-        kfree_skb(skb);
-        return;
-    }
-    if (n)
-        memcpy(p, b, n);
-    skb->protocol = htons(type);
-    skb->dev = fuzz_dev();
-    memcpy(skb->eth_src, mac, 6);
-    fn(skb);
-}
-
-/* --- ARP ------------------------------------------------------------------ */
-
-static void arp_build(uint8_t out[28], uint16_t oper, const uint8_t sha[6],
-                      uint32_t spa, uint32_t tpa)
-{
-    wr16(out, 1);                   /* Ethernet */
-    wr16(out + 2, 0x0800);          /* IPv4 */
-    out[4] = 6;
-    out[5] = 4;
-    wr16(out + 6, oper);
-    memcpy(out + 8, sha, 6);
-    wr32(out + 14, spa);
-    memset(out + 18, 0, 6);
-    wr32(out + 24, tpa);
-}
-
-/* Answer an ARP request the stack sent. Without this nothing addressed to a
-   neighbour ever leaves: ip_send queues the frame and waits for a reply, so
-   the DNS query and the TCP SYN would sit in the pending queue and the
-   target would never see them. */
-static void arp_answer(const uint8_t *arp)
-{
-    uint32_t want = rd32(arp + 24);         /* tpa: who they are asking about */
-    uint8_t reply[28];
-    arp_build(reply, 2 /* reply */, peer_mac, want, 0x0A00020Fu /* IPV4_ADDR */);
-    feed(ETH_P_ARP, reply, sizeof reply, peer_mac);
-}
-
-/* --- the reply pump ------------------------------------------------------
-   Called from net_sleep and net_rx_action, i.e. exactly where the stack
-   waits for something. Drains everything it sent and answers it. ARP
-   replies flush frames that were waiting, so this loops until quiet. */
-
-static void (*on_ip_frame)(const uint8_t *ip, uint32_t len);
-
-static void pump(void)
-{
-    for (int pass = 0; pass < 8; pass++) {
-        struct fuzz_frame f;
-        int any = 0;
-        while (fuzz_take(&f)) {
-            any = 1;
-            if (f.len < ETH_HLEN)
-                continue;
-            uint16_t type = rd16(f.b + ETH_TYPE);
-            const uint8_t *body = f.b + ETH_HLEN;
-            uint32_t blen = f.len - ETH_HLEN;
-            if (type == ETH_P_ARP && blen >= 28 && rd16(body + 6) == 1)
-                arp_answer(body);
-            else if (type == ETH_P_IP && blen >= IP_HLEN && on_ip_frame)
-                on_ip_frame(body, blen);
-        }
-        if (!any)
-            break;
-    }
+    pk_set_ip_sink(fn);
 }
 
 /* --- target: wire -------------------------------------------------------- */
 
 static void t_wire(const uint8_t *d, size_t n)
 {
-    feed(ETH_P_IP, d, (uint32_t)n, peer_mac);
+    pk_feed(ETH_P_IP, d, (uint32_t)n, peer_mac);
 }
 
 /* --- target: ip ----------------------------------------------------------
@@ -197,7 +87,7 @@ static void t_ip(const uint8_t *d, size_t n)
     wr32(pkt + IP_SADDR, PEER_IP);
     wr32(pkt + IP_DADDR, 0x0A00020Fu);          /* IPV4_ADDR: only ours is taken */
     wr16(pkt + IP_CHECK, 0);
-    wr16(pkt + IP_CHECK, csum(pkt, IP_HLEN));
+    wr16(pkt + IP_CHECK, pk_csum(pkt, IP_HLEN));
 
     uint8_t  proto = pkt[IP_PROTO];
     uint8_t *seg   = pkt + IP_HLEN;
@@ -205,7 +95,7 @@ static void t_ip(const uint8_t *d, size_t n)
 
     if (proto == IPPROTO_ICMP && slen >= 4) {
         wr16(seg + 2, 0);
-        wr16(seg + 2, csum(seg, slen));
+        wr16(seg + 2, pk_csum(seg, slen));
     } else if (proto == IPPROTO_TCP && slen >= 20) {
         wr16(seg + 16, 0);
         wr16(seg + 16, ip_transport_csum(PEER_IP, 0x0A00020Fu, IPPROTO_TCP, seg, slen));
@@ -213,7 +103,7 @@ static void t_ip(const uint8_t *d, size_t n)
         wr16(seg + 6, 0);           /* UDP may leave it zero; udp_input allows it */
     }
 
-    feed(ETH_P_IP, pkt, (uint32_t)n, peer_mac);
+    pk_feed(ETH_P_IP, pkt, (uint32_t)n, peer_mac);
 }
 
 /* --- target: arp --------------------------------------------------------- */
@@ -235,7 +125,7 @@ static void t_arp(const uint8_t *d, size_t n)
     while (fuzz_take(&f))
         ;                           /* drop the request we just made */
 
-    feed(ETH_P_ARP, d, (uint32_t)n, peer_mac);
+    pk_feed(ETH_P_ARP, d, (uint32_t)n, peer_mac);
 
     while (fuzz_take(&f))
         ;
@@ -317,7 +207,7 @@ static void t_dns(const uint8_t *d, size_t n)
     dns_in = d;
     dns_in_n = n;
     dns_answered = 0;
-    on_ip_frame = dns_reply;
+    set_ip_sink(dns_reply);
     fuzz_set_inject(pump);
 
     uint32_t ip = 0;
@@ -327,7 +217,7 @@ static void t_dns(const uint8_t *d, size_t n)
                 ip >> 24, (ip >> 16) & 0xFF, (ip >> 8) & 0xFF, ip & 0xFF);
 
     fuzz_set_inject(NULL);
-    on_ip_frame = NULL;
+    set_ip_sink(NULL);
 }
 
 /* --- target: tcp --------------------------------------------------------
@@ -380,7 +270,7 @@ static void t_tcp(const uint8_t *d, size_t n)
     }
 
     our_seq = our_len = their_seq = 0;
-    on_ip_frame = tcp_record;
+    set_ip_sink(tcp_record);
     fuzz_set_inject(pump);
     tcp_connect(c, PEER_IP, PEER_PORT, 1 /* nonblock */);
     /* A non-blocking connect returns the moment the SYN is handed to
@@ -463,32 +353,11 @@ const struct fuzz_target *fuzz_targets(unsigned *n)
     return table;
 }
 
-/*
- * Resolve the neighbours the targets talk to. ip_send is non-blocking: it
- * parks the frame and sends an ARP request, and the frame only leaves when
- * the reply arrives. A run that has to do that first spends its one packet
- * on ARP and never reaches the code being tested, so this runs before every
- * run. It is idempotent — with the entry already cached, ip_send just
- * transmits and the pump throws the frame away.
- */
-static void prime_arp(void)
-{
-    static const uint8_t pad[8] = { 0 };
-    void (*save)(const uint8_t *, uint32_t) = on_ip_frame;
-    on_ip_frame = NULL;
-    ip_send(PEER_IP, IPPROTO_UDP, pad, sizeof pad);
-    pump();
-    ip_send(IPV4_DNS, IPPROTO_UDP, pad, sizeof pad);
-    pump();
-    fuzz_sent_reset();
-    on_ip_frame = save;
-}
-
 void fuzz_init(void)
 {
     ipv4_init();                /* registers on_arp and on_ip through dev_add_pack */
     fuzz_clock_set(1000);
-    prime_arp();
+    pk_prime_arp();
 }
 
 void fuzz_run(const struct fuzz_target *t, const unsigned char *data, size_t len)
@@ -506,13 +375,13 @@ void fuzz_run(const struct fuzz_target *t, const unsigned char *data, size_t len
     fuzz_clock_set(1000);
     fuzz_sent_reset();
     fuzz_set_inject(NULL);
-    on_ip_frame = NULL;
-    prime_arp();
+    set_ip_sink(NULL);
+    pk_prime_arp();
 
     t->fn(data, len);
 
     fuzz_set_inject(NULL);
-    on_ip_frame = NULL;
+    set_ip_sink(NULL);
 }
 
 /*

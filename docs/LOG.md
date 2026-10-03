@@ -385,6 +385,90 @@ Short dated notes after each work session: what was done, what broke, what was l
   operation and disk type (table in `docs/performance.md`). `make test` 99 passed,
   `make test-shell` OK (e2fsck clean), `tools/test-disks.sh` OK on all three new
   drivers. QEMU only; real-disk timing still to measure.
+- 2026-10-03: Fuzzing harness for the packet parsers, Cursor. `tools/fuzz/` builds
+  the five net sources with the host clang and links them against stub versions
+  of the 20 kernel symbols they reference (`i686-elf-nm -u` named them), so they
+  run under AddressSanitizer: a one-byte overrun becomes a located abort instead
+  of silent corruption that boots fine. Only `interrupts.h` and `uaccess.h` are
+  replaced — they are inline i386 assembly — so the net code is compiled
+  unmodified and anything found is a real bug. Apple's clang has the sanitizer
+  runtimes but no libFuzzer, so `driver.c` is the mutation loop:
+  `-fsanitize-coverage=trace-pc-guard` for feedback, a mutator that knows wire
+  lengths are big-endian, a death callback to save the input that killed it, and
+  an alarm so a parser that never returns counts as a failure too.
+  Five targets: `wire` (raw bytes to on_ip), `ip` (header repaired, body hostile),
+  `arp` (with a request outstanding so `remember` is reachable), `dns` and `tcp`.
+  The last two let the stack send first, read the transaction id or sequence
+  number out of the frame, and put it in the reply, so the bytes reach `parse_a`
+  and the TCP state machine instead of being rejected at the door. 85 seeds shaped
+  after the CVEs in `docs/security.md` — Ripple20 length lies, AMNESIA:33 pointer
+  loops, SACK-panic tiny MSS, options with a zero length byte.
+  Result: 25M runs, no crash, no sanitizer report, no hang, with `make
+  fuzz-coverage` showing 100% of `on_arp`/`udp_input`/`skip_name`, 98% of `on_ip`,
+  95% of `parse_a`, 86% of `tcp_input`. Two harness bugs of my own on the way:
+  `pump()` was eating the SYN before the target could read its sequence number
+  (so TCP never left SYN_SENT and `synack` covered no more than a blind reset),
+  and I called `tcp_timers(0)` where the kernel calls `tcp_timers(timer_ms())`,
+  so nothing was ever reaped and the 16-connection table ran dry after 16 runs —
+  which the harness reported as a leak. Checked before believing it; neither was
+  a kernel bug. The harness also demonstrates the open `parse_a` flaw: the
+  `dns/foreign-a` seed makes the resolver return an address taken from an answer
+  about `evil.example` when it asked about `example.com`, and the run passes,
+  because accepting the wrong address is not a memory error.
+  Ran it out to 125M runs total: still no crash. Coverage stopped moving after the
+  first 25M, so the next 100M bought nothing — the way to find more is a target
+  that reaches code these five do not, not a longer campaign. `remember` at 63.6%
+  is the clearest hole: the missed lines are the ARP cache's LRU eviction, which
+  needs more neighbours in play than any target creates.
+- 2026-10-03: `make attacks` — tests that assert an attack is rejected, Cursor.
+  The fuzzer proves 125M malformed packets do not corrupt memory; it cannot tell
+  whether the stack did the right thing, because accepting a forged ARP reply or
+  answering a broadcast ping is not a memory error and no sanitizer complains.
+  So `tools/fuzz/attacks.c` performs the attacks and checks the behaviour that
+  stops them: 30 checks, ~2 seconds. Extracted the packet builders and the reply
+  pump out of targets.c into `tools/fuzz/packet.c` so the fuzzer and the tests
+  share them.
+  Half the checks are positive controls on purpose — "no reply was sent" passes
+  perfectly when the stack is broken and never replies to anything, so every
+  "must be ignored" has a "must work" beside it. That caught two bugs in my own
+  tests, both the same mistake: `pk_pump()` drains the send queue, so a test that
+  looked for a reply after pumping found nothing and declared the stack silent.
+  Same class of mistake as the SYN-draining bug in the fuzz harness yesterday.
+  Result: 30 passed, 0 failed, 1 known bug open. The known one is `parse_a`
+  accepting an A record about `evil.io` when we asked about `example.com`; it is
+  recorded with `known()` rather than `ok()`, so it reports without failing the
+  build and prints `FIXED` the day it starts passing. Still untested: the e1000
+  short-frame padding, because that driver needs PCI and MMIO and is not in this
+  build — it wants a wire capture via `qemu -object filter-dump`.
+- 2026-10-03: RFC 5452 response matching in `parse_a`, Cursor. The last known bug
+  from the security review: the parser took the first A record in the answer
+  section whatever name it was about, so a reply that passed the transaction id,
+  the port, the source address and the question could still carry an address for
+  something else. That is the check the Kaminsky attack evaded.
+  The reason it was not a one-liner: requiring the owner name to equal the
+  question breaks every CNAME, because there the A record is about the end of the
+  chain, not the question. So `parse_a` walks the chain — a record counts if its
+  owner is the question or the target of a CNAME that already counted, up to
+  CNAME_MAX hops — and skips records about other names rather than stopping at
+  them, so a forged record placed first cannot hide the real answer behind it.
+  Comparing names means resolving compression, so `name_expand` is now the one
+  place a pointer is followed instead of stepped over. Following pointers is how
+  CVE-2020-24338 hung a stack forever; this is safe because a pointer must land
+  strictly further back than the last one did, so the targets strictly decrease
+  and a cycle is unbuildable, with a hop limit keeping the cost linear. Names are
+  lowercased first: a name ignores case on the wire (RFC 4343) and a server may
+  answer EXAMPLE.com, so a byte compare would have rejected good replies while
+  looking like security.
+  `make attacks` printed `FIXED` on the next run, which is what the `known()`
+  mechanism is for. Promoted it to a real check and added five more around it:
+  a foreign record is skipped rather than fatal, a CNAME chain is followed, a
+  CNAME loop terminates, a self-referential pointer is refused, and a reply
+  differing only in case is accepted. 36 passed, 0 failed, no known bugs left.
+  Verified beyond the tests: `make test` still reports 99 passed / TEST OK with
+  a real lookup, `net: dns example.com is 172.66.147.243`, and the HTTP fetch
+  over TCP still works. Re-fuzzed the dns target since `name_expand` is new code
+  doing the dangerous operation: coverage went from 230 to 256 edges and 20M runs
+  found nothing.
 
 ## 2026-10-03 — 9d-2: writes through the page cache, a cache as big as free RAM
 - Writes now copy into the file's pages in the page cache and mark them dirty;
@@ -404,3 +488,45 @@ Short dated notes after each work session: what was done, what broke, what was l
   `docs/performance.md` ("Cache sizing").
 - New test: `ext2test` writes a 300 000-byte pattern in odd pieces, overwrites,
   truncates, leaves a gap; the Makefile checks the bytes on the disk with debugfs.
+
+- 2026-10-03: TCP persist timer — a zero window no longer stalls forever, Cursor.
+  Rodger asked for the one bug from the review that needed a feature rather than a
+  corrected check. `output()` computes `limit = min(snd_wnd, 4 * mss)`, so with the
+  peer advertising a window of 0 the send loop never ran — and the `arm()` call that
+  starts the retransmit timer lives *inside* that loop. So `rto_at` stayed 0, which
+  means "timer off", and nothing would ever happen on that connection again: no
+  retransmit, no timeout, no error. `tcp_write` had already told the caller the data
+  was accepted and a blocking write waited in `nap()` for good. Two bytes set to
+  zero by the peer, reachable from the SYN-ACK onward.
+  The fix is RFC 1122 4.2.2.17: let **one byte** past a shut window. The peer has to
+  drop a byte that is past its window but has to answer with its current window,
+  which is both how a lost window update is recovered from and how we learn the peer
+  is alive. Because that byte counts as sent, the ordinary retransmit timer repeats
+  it — the repetition *is* the persist timer, so no second timer and no new field in
+  `struct tcp_conn`. Same change also arms a timer when the probe itself fails to go
+  out because the card's ring was full, which was a second way to the same dead end;
+  the comment there had always claimed "the timer resends", and there was no timer.
+  Two things did not fall out for free. A shut window is not a lost packet — the peer
+  is alive and its application has stopped reading, which can legitimately last
+  minutes — so probing gets a longer leash and backs off to 60 s rather than 4 s:
+  four minutes to give up instead of twenty seconds. Bounded all the same, which
+  deviates from the RFC's "stay open as long as the peer answers" on purpose, because
+  something that never gives up is a hang and a hang is what the attacker wanted.
+  Linux does the same with `tcp_retries2`. An orphaned connection is still capped at
+  `ORPHAN_MS` (10 s) by `end_at`, so the longer leash cannot hold a connection slot
+  after the application is done.
+  And a window that reopens has to *clear* that backoff. `take_ack` deliberately
+  ignores an ack that acknowledges nothing new, which is exactly what a pure window
+  update is — so without an explicit reset the probes stayed charged against the
+  connection, recovery crawled on a minute-old deadline, and the next timer killed a
+  connection that had just become healthy. That is a bug the fix introduces if
+  written carelessly, so it gets its own check.
+  Four new checks in `make attacks` (40 passed, 0 failed), and each was run against
+  the reverted code to confirm it fails there. Worth doing: the first version of the
+  backoff check passed either way, because it advanced the clock by one ordinary
+  retransmit interval while the stale deadline the bug leaves behind is a minute out,
+  so the timer it meant to provoke never fired and the test measured nothing.
+  Re-fuzzed: 3M runs on the tcp target and 2M on each of the other four, no crashes,
+  and the tcp target found 3 new inputs — the probe path is new reachable code.
+  `make test` still reports 99 passed / DISK OK / TEST OK with a real DNS lookup and
+  a real HTTP fetch over TCP. Kernel 160404 bytes.

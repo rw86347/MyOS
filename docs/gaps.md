@@ -225,16 +225,18 @@ when it's fixed. File references point at the comment that mentions the gap.
   - No IPv6, at any layer: no Ethertype 0x86DD, no extension headers, no ICMPv6, no
     neighbour discovery, no `AF_INET6` (`socket()` says EAFNOSUPPORT). Not a gap we
     are in a hurry to close — see `docs/security.md`.
-  - `parse_a` takes the first A record in a DNS answer without checking which name
-    it belongs to (RFC 5452 response matching). The question section is checked, the
-    answer records aren't. Fixing it naively breaks CNAMEs, because there the A
-    record's owner is the chain target — see `docs/security.md`.
   - A forged ARP reply can still win the race on a request we did send (unsolicited
     ones are now ignored entirely). Not fixable on a shared segment.
   - `ip_send` checks the next hop, not the destination, so we will still *send* to a
     broadcast address even though we no longer receive one.
-  - Nothing in `net/` has been fuzzed, and no test attacks the stack: the fixes are
-    verified only against the happy path (`make test` ping/DNS/TCP).
+  - The Ethernet padding fix is untested: `drivers/e1000.c` needs PCI and MMIO so it
+    is not in the `make attacks` build, and nothing checks that a frame under 60
+    bytes is padded with zeros rather than the previous packet's bytes. Needs a wire
+    capture (`qemu -object filter-dump`).
+  - `make fuzz` covers `on_ip`, `on_arp`, `udp_input`, `parse_a` and `skip_name` well
+    (94–100% of lines) and `tcp_input` at 86%. It sends one packet per run except on
+    the `tcp` target, so bugs needing a particular sequence of packets are mostly
+    out of reach. Host `irq_save` is a no-op, so interrupt races are invisible to it.
   - TCP initial sequence number is `timer_ms()` + a constant: guessable, so a
     connection can be hijacked or reset blind. Linux: keyed hash (RFC 6528).
   - Ephemeral UDP ports are handed out in order from 49152, and the kernel's own
@@ -248,14 +250,23 @@ when it's fixed. File references point at the comment that mentions the gap.
     is under 1% of the UDP path in instruction count (docs/performance.md); on a
     real P4 it is more and must be measured.
   - The parsers check lengths and checksums but have never been fuzzed.
-- **TCP zero window stalls forever.** `output()` sends nothing when the peer advertises a
-  window of 0, and because no segment goes out the retransmit timer is never armed, so
-  the data sits in the send ring and nothing wakes it. `tcp_write` has already told the
-  caller it was accepted. Needs a persist timer and zero-window probes.
+- **Zero-window probing gives up, where RFC 1122 says not to.** §4.2.2.17 says a connection
+  must stay open for as long as the peer keeps answering probes, even if its window never
+  reopens. MyOS probes a shut window with one byte, backing off to 60 s, and then fails the
+  connection with `ETIMEDOUT` after `PROBES` tries — about four minutes. Deliberate: code
+  that never gives up is a hang, and the worst case has to be bounded. Linux does the same
+  thing for the same reason (`tcp_retries2`), just with a longer limit. The probing itself
+  is not a shortcut — it is implemented and tested, see `docs/security.md`.
+- **A shut window still has no separate timer or counter.** The probe byte counts as sent, so
+  the ordinary retransmit timer repeats it and `retries` counts both probes and retransmits;
+  the two are told apart by whether `snd_wnd` is zero. Smaller and one timer fewer, but it
+  means a connection that alternates between a shut window and real loss shares one counter
+  between the two.
 - **TCP** (step 10e): client side only, no listen/accept. No congestion control
   (no slow start): at most 4 segments in flight, a fixed limit, not a response to
   loss. No out-of-order queue, SACK, window scaling (16 KiB window), timestamps,
-  or RTT estimate (retransmit timer 250 ms doubling to 4 s, 8 tries). No Nagle
+  or RTT estimate (retransmit timer 250 ms doubling to 4 s, 8 tries; a shut window
+  is probed on the same timer, doubling to 60 s, 10 tries). No Nagle
   (every write goes out at once, like TCP_NODELAY). TIME_WAIT is 2 s, not 60.
   At most 16 connections. Closing with unread data sends RST (as Linux does).
   Local ports are sequential (see network security above).
