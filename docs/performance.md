@@ -34,7 +34,7 @@ QEMU, instruction-count mode (lower is better):
 | boot: kernel ready, 512 MiB (µs)  |        — |    181 | was 4 181 before the bitmap fix (23×) |
 | memcpy 4 KiB                      |   12 315 |  1 053 | 11.7× (`rep movsd`)        |
 | memset 4 KiB                      |   10 266 |  1 049 | 9.8× (`rep stosd`)         |
-| kmalloc+kfree 64 B                |      109 |     63 | 1.7× (size classes)        |
+| kmalloc+kfree 64 B                |      109 |     67 | 1.6× (size classes); +4 for the double-free mark (step 9) |
 | … with 1000 objects live          |   15 105 |     63 | 240×, and now constant     |
 | thread switch                     |      188 |     94 | 2× (run queue, step 8)     |
 | exec + exit (ELF `true`)          |  218 177 | 33 631 | 6.5× (memset, demand paging); 8i: +437, x-bit check, inode refs |
@@ -43,8 +43,8 @@ QEMU, instruction-count mode (lower is better):
 | fork + exit + wait                |        — | 51 403 | step 8 (copy-on-write); 8i: +187, cwd and mapping refs |
 | fork + exec + exit + wait         |        — | 84 316 | step 8; 8i: +128           |
 | slot start jitter, worst (µs)     |        4 |      4 | —                          |
-| disk read 64 KiB, CPU work        |  223 722 | 34 365 | 6.5×: interrupts, 16 sectors per IRQ (was polling every sector) |
-| block-cache hit (bread + brelse)  |        — |    101 | step 9: hash lookup, LRU move |
+| disk read 64 KiB, CPU work        |  223 722 | 49 651 | interrupts, 16 sectors per IRQ (34 365); then +44%: a short spin before sleeping, see below |
+| block-cache hit (bread + brelse)  |        — |    102 | step 9: hash lookup, LRU move |
 | open + close (`/test/numbers.txt`) |       — |  1 441 | step 7: 1 131; +23% symlinks, per-process fds; 8i: +46 (inode refs, O_CREAT/O_TRUNC checks) |
 | lseek + read 4 KiB (initramfs)    |        — |  1 509 | step 7: 1 479; 8i: +30 (access-mode check) |
 | stat (`statx`)                    |        — |  1 271 | step 7: 1 044; 8i: +32 (three separate times) |
@@ -66,6 +66,15 @@ on a P4), or a small initramfs with the rest read by our own DMA disk driver (st
 **Note on boot numbers:** since step 9 the boot reads the disks (partition tables, the
 ext2 superblock and root directory). `make bench` shows that waiting apart from the CPU's
 work, for the same reason as below; on a real hard disk it's a few seeks (~10 ms each).
+
+**Boot from the disk (9c), QEMU wall clock, root mounted -> bash prompt:** 3.1 s with a
+1 MiB block cache; 2.1 s with an eighth of RAM; **0.3 s** with a short spin (2048 status
+reads) before sleeping on the disk's interrupt. QEMU needs ~2.5 ms to wake a halted
+virtual CPU, so every interrupt wait cost that; data is ready within microseconds there.
+On a real disk the spin costs up to ~2 ms of CPU per seek before sleeping — measure on
+hardware; DMA (9d: one interrupt per 64 KiB) makes it mostly moot. CPU work to a prompt
+(make bench, instruction count): 3.3 ms from RAM vs 18.7 ms from the disk — exec copies
+whole files and every page is found through the block map: the page cache (9c-2).
 
 **Note on disk numbers:** QEMU's "disk" answers at once in host time, but while our CPU
 sleeps waiting for it, instruction-count mode jumps the virtual clock ahead by however long
@@ -121,6 +130,9 @@ late; that was the host delivering timer ticks in bursts, not MyOS. In virtual t
 
 ## Designed in, built with its step (binding — see `CLAUDE.md`)
 
+- **Measure on hardware**: a thread woken by a disk interrupt while the CPU idles now
+  runs at once instead of at the next 1 ms tick (up to 8 ticks per 64 KiB read before).
+  QEMU's instruction-count clock can't show it (idle time jumps); a real IDE disk will.
 - **Revisit**: unpack the initramfs lazily (a directory's entries on first lookup) —
   boot grew from 119 to 713 µs with ~330 files (BusyBox links, bash, libraries).
 - **Revisit**: a dynamically linked program's libraries are copied page by page from

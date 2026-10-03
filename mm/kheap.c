@@ -56,7 +56,13 @@ struct slab_page {                      /* the first 16 bytes of each page */
     uint32_t pad[2];
 };
 
-struct free_obj { struct free_obj *next; };
+/* A free object: the link, and a mark that says "I'm on a free list".
+   kfree of an object that already carries the mark is a double free —
+   caught and refused, instead of putting the object on the list twice
+   (which would hand it out to two owners). Objects are >= 16 bytes, so
+   both words fit. */
+#define FREE_MARK 0xF4EEF4EEu
+struct free_obj { struct free_obj *next; uint32_t mark; };
 
 static struct free_obj *free_list[NCLASSES];
 static uint32_t small_in_use;           /* bytes handed out (for kheap_stats) */
@@ -84,6 +90,7 @@ static int refill(int c)
     uint32_t size = class_size[c];
     for (uint32_t off = sizeof *page; off + size <= PAGE_SIZE; off += size) {
         struct free_obj *o = (struct free_obj *)((uint8_t *)page + off);
+        o->mark = FREE_MARK;
         o->next = free_list[c];
         free_list[c] = o;
     }
@@ -97,6 +104,7 @@ static void *small_alloc(uint32_t size)
         return NULL;
     struct free_obj *o = free_list[c];
     free_list[c] = o->next;
+    o->mark = 0;
     small_in_use += class_size[c];
     return o;
 }
@@ -109,6 +117,11 @@ static void small_free(void *ptr)
         return;
     }
     struct free_obj *o = ptr;
+    if (o->mark == FREE_MARK) {
+        kprintf("kfree: %p freed twice (ignored)\n", ptr);
+        return;
+    }
+    o->mark = FREE_MARK;
     o->next = free_list[page->cls];
     free_list[page->cls] = o;
     small_in_use -= class_size[page->cls];

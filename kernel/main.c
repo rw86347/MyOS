@@ -16,6 +16,7 @@
 #include <blockdev.h>
 #include <cpu.h>
 #include <ext2.h>
+#include <string.h>
 #include <cycles.h>
 #include <fpu.h>
 #include <gdt.h>
@@ -25,6 +26,7 @@
 #include <keyboard.h>
 #include <kprintf.h>
 #include <memlayout.h>
+#include <mouse.h>
 #include <mm.h>
 #include <proc.h>
 #include <vfs.h>
@@ -112,9 +114,25 @@ static int has_partitions(struct blockdev *disk)
     return 0;
 }
 
-/* Disks: find them and their partitions. The first ext2 file system on
-   them — a Linux partition (type 0x83), or a whole disk with no partition
-   table — becomes /data: files there survive a restart. */
+/* The whole system on a disk: mount it as "/" and put the device files
+   (/dev, made in RAM at boot) on its /dev. Before any process exists. */
+static void mount_root(struct blockdev *d)
+{
+    struct inode *ram_dev = vfs_child(vfs_root(), "dev", 3);
+    if (ext2_mount(d, "/") < 0)
+        return;                         /* stay on the RAM file system */
+    if (ram_dev && vfs_mount_tree("/dev", ram_dev) < 0)
+        kprintf("root: no /dev on %s\n", d->name);
+}
+
+/* Disks: find them and their partitions, then our own file systems on
+   them, by label — on a Linux partition (type 0x83) or a whole disk with
+   no partition table:
+     "myos-root"  the whole system: becomes "/" (an installed MyOS)
+     "myos-data"  becomes /data
+   Without a "myos-root", MyOS runs from the initramfs in RAM (a live
+   disk). Anything else is left alone: an old PC may still hold someone's
+   Linux disk, and we never write to that. */
 static void storage_init(void)
 {
     ata_init();
@@ -123,13 +141,25 @@ static void storage_init(void)
         partition_scan(blockdev_get(i));
     bcache_init();                      /* and their blocks, cached */
 
+    struct blockdev *rootdev = NULL, *datadev = NULL;
     for (int i = 0; i < blockdev_count(); i++) {
         struct blockdev *d = blockdev_get(i);
+        char label[17];
         if (d->parent ? partition_type(d) != 0x83 : has_partitions(d))
             continue;
-        if (ext2_mount(d, "/data") == 0)
-            break;
+        if (ext2_label(d, label) < 0)
+            continue;                   /* not ext2 */
+        if (!rootdev && strcmp(label, "myos-root") == 0)
+            rootdev = d;
+        else if (!datadev && strcmp(label, "myos-data") == 0)
+            datadev = d;
+        else
+            kprintf("ext2: %s (\"%s\") is not a MyOS disk: left alone\n", d->name, label);
     }
+    if (rootdev)
+        mount_root(rootdev);
+    if (datadev)
+        ext2_mount(datadev, "/data");
 }
 
 void kernel_main(void)
@@ -159,6 +189,7 @@ void kernel_main(void)
     sysenter_init();        /* fast syscalls, if the CPU has sysenter */
     timer_init();           /* IRQ 0: 1 ms tick */
     keyboard_init();        /* IRQ 1 */
+    mouse_init();           /* IRQ 12, if there is a PS/2 mouse */
     interrupts_enable();    /* sti: from now on, IRQs can arrive */
 
     kprintf("Memory: %lu MiB usable, paging on, kernel at %p, heap at %p\n",
@@ -200,5 +231,13 @@ void kernel_main(void)
 #endif
             echo(c);
         }
+#ifdef SELFTEST
+        /* make test moves and clicks the mouse through QEMU's monitor and
+           looks for these lines. */
+        struct mouse_event m;
+        while (mouse_get(&m) == 0)
+            kprintf("\nmouse: dx=%d dy=%d wheel=%d buttons=%u\n",
+                    m.dx, m.dy, m.wheel, (unsigned)m.buttons);
+#endif
     }
 }

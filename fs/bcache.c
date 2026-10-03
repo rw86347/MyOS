@@ -11,7 +11,9 @@
  * writes everything at once.
  *
  * Speed and predictability (CLAUDE.md rules 1, 6):
- *   - fixed size: NBUF buffers of one page each, so memory use is known;
+ *   - fixed size: nbuf buffers of one page each — an eighth of RAM, at
+ *     most NBUF_MAX (8 MiB) — so memory use is known; it holds what a boot
+ *     runs (BusyBox, bash and its libraries: ~3 MiB) several times over;
  *     a buffer's page is taken from the page allocator on first use
  *   - finding a block: O(1), a hash on (device, block number)
  *   - finding a buffer to reuse: O(1) in practice, the tail of the LRU
@@ -31,11 +33,12 @@
 #include <thread.h>
 #include <timer.h>
 
-#define NBUF       256          /* 1 MiB of blocks at most */
-#define HASH_SIZE  256          /* buckets: 2^8, see hash_of */
+#define NBUF_MAX   2048         /* 8 MiB of blocks at most */
+#define HASH_SIZE  2048         /* buckets: 2^11, see hash_of */
 #define FLUSH_MS   1000         /* changes reach the disk within ~1 s */
 
-static struct buf bufs[NBUF];
+static struct buf bufs[NBUF_MAX];
+static int nbuf;                        /* in use: depends on RAM */
 static struct buf *hash[HASH_SIZE];
 static struct buf lru;                  /* list head: lru.lru_next = newest */
 static struct wait_queue io_done;       /* a read ended, or a buffer came free */
@@ -43,11 +46,11 @@ static struct wait_queue flusher_wait;
 static uint32_t ndirty, nreads, nwrites;
 static int flusher_started;
 
-/* Multiplicative hashing: the top 8 bits of the product mix every bit of
+/* Multiplicative hashing: the top 11 bits of the product mix every bit of
    the block number. */
 static uint32_t hash_of(struct blockdev *dev, uint32_t block)
 {
-    return ((block ^ ((uint32_t)(uintptr_t)dev >> 4)) * 2654435761u) >> 24;
+    return ((block ^ ((uint32_t)(uintptr_t)dev >> 4)) * 2654435761u) >> 21;
 }
 
 static void hash_insert(struct buf *b)
@@ -232,7 +235,7 @@ int bsync(void)
     uint32_t flags = irq_save();
     struct blockdev *written[BLOCKDEV_MAX];
     int nwritten = 0, err = 0;
-    for (int i = 0; i < NBUF && ndirty; i++) {
+    for (int i = 0; i < nbuf && ndirty; i++) {
         struct buf *b = &bufs[i];
         if (!b->dirty)
             continue;
@@ -268,10 +271,12 @@ static void flusher(void *arg)
     }
 }
 
+int bcache_size(void) { return nbuf; }
+
 uint32_t bcache_pages(void)
 {
     uint32_t n = 0;
-    for (int i = 0; i < NBUF; i++)
+    for (int i = 0; i < nbuf; i++)
         n += bufs[i].data != NULL;
     return n;
 }
@@ -284,8 +289,13 @@ void bcache_stats(uint32_t *reads, uint32_t *writes)
 
 void bcache_init(void)
 {
+    nbuf = pmm_usable_count() / 8;      /* an eighth of RAM, in pages */
+    if (nbuf > NBUF_MAX)
+        nbuf = NBUF_MAX;
+    if (nbuf < 64)
+        nbuf = 64;
     lru.lru_next = lru.lru_prev = &lru;
-    for (int i = 0; i < NBUF; i++) {
+    for (int i = 0; i < nbuf; i++) {
         bufs[i].lru_next = &lru;        /* append: all start unused */
         bufs[i].lru_prev = lru.lru_prev;
         lru.lru_prev->lru_next = &bufs[i];

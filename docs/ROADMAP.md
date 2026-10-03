@@ -57,7 +57,14 @@ Mark a step `[x]` only when its "Done when" check works.
   - [x] 9b: a data disk with ext2: read and write, mounted at /data at boot. Done: a file
     in /data survives a restart (QEMU and UTM); Linux's e2fsck finds the disk clean after
     every test run.
-  - [ ] 9c: the root file system on ext2 (everything survives).
+  - [x] 9c-1: the root file system on ext2: the kernel mounts the partition labelled
+    myos-root as "/" (live disks without one run from the initramfs, as before), puts
+    /dev on it, and mounts myos-data at /data. `make hd` / `run-hd` / `test-hd` (two
+    boots; e2fsck on the root partition). Everything survives a restart.
+  - [ ] 9c-2: a page cache: programs and libraries run from disk without copying whole
+    files (CPU work to a prompt: 3.3 ms from RAM, 18.7 ms from disk), read-ahead.
+  - [ ] 9c-3: the live disk's installer (partition, mke2fs, copy, boot area), raw block
+    devices (/dev/hda...), and the UTM VM on the installed layout.
   - [ ] 9d: PCI scan + bus-master DMA (PIIX/ICH); AHCI (SATA disks).
   - [ ] 9e: FAT32 in the VFS: read, then write (USB sticks, swapping files with a Mac/PC).
   - Later: ext4 read, exFAT, ext4 write (needs a journal). USB disks need a USB host
@@ -78,6 +85,8 @@ Mark a step `[x]` only when its "Done when" check works.
   A pixel console with big, scalable text; PS/2 mouse; `/dev/fb0`, `/dev/input/event*`,
   AF_UNIX sockets. Then Alpine's X server (fbdev), a small window manager, `xterm`.
   Done when: `xterm` windows can be moved with the mouse. No chip-specific video driver.
+  - [x] PS/2 mouse driver (IRQ 12, IntelliMouse wheel); `make test` moves and clicks it
+    through QEMU's monitor.
 - [ ] **12. Real hardware** — boot from USB/CD on an old Pentium 4 / Pentium M machine.
 - [ ] **12b. GPD Pocket 4** (`docs/hardwareRequirements.md`) — `arch/x86_64`, a UEFI loader,
   ACPI, PCIe with MSI/MSI-X; then NVMe (its boot SSD, native driver) and xHCI; then the

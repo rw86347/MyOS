@@ -203,6 +203,7 @@ void interrupt_dispatch(struct regs *r)
     }
 
     int irq = r->vector - PIC_IRQ_BASE;
+    cpu_idle_end();                 /* if the CPU was halted, it woke up now */
     if (pic_is_spurious(irq))
         return;
     if (irq_handlers[irq])

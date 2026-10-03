@@ -137,6 +137,11 @@ void sched_tick(void)
     }
 }
 
+void sched_need_resched(void)
+{
+    need_resched = 1;
+}
+
 void sched_preempt_check(void)
 {
     /* We're inside an interrupt, so interrupts are already off. */

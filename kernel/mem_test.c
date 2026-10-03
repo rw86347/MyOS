@@ -124,6 +124,16 @@ static void test_kheap(void)
           "kmalloc: size classes up to 1 KiB, big blocks above");
     kfree(s);
     kfree(b);
+
+    /* A double free is caught: the object is handed out once, not twice
+       (the second kfree prints "freed twice (ignored)"). */
+    void *x = kmalloc(48);
+    kfree(x);
+    kfree(x);
+    void *y1 = kmalloc(48), *y2 = kmalloc(48);
+    check(y1 == x && y2 != x, "kfree: a double free is caught");
+    kfree(y1);
+    kfree(y2);
 }
 
 void mem_selftest(void)

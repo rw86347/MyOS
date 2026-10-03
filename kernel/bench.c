@@ -210,6 +210,7 @@ static uint32_t bench_shell(void)
     static const char *const envp[] = {
         "HOME=/", "PATH=/bin:/sbin:/usr/bin:/usr/sbin", "TERM=linux", NULL,
     };
+    uint64_t idle0 = cpu_idle_cycles();
     shell_start = cycles_now();
     struct process *p = proc_spawn("/init", argv, envp);
     if (!p)
@@ -218,7 +219,10 @@ static uint32_t bench_shell(void)
     tty_set_foreground(p->pgid);
     while (!shell_ready)
         cpu_wait();
-    return (uint32_t)((shell_ready - shell_start) / cycles_per_us());
+    /* Waiting (for a disk, when / is on one) is shown apart, as at boot. */
+    uint64_t waited = cpu_idle_cycles() - idle0;
+    kprintf("  %-28s %8lu us\n", "  ...of which waiting", (uint32_t)(waited / cycles_per_us()));
+    return (uint32_t)((shell_ready - shell_start - waited) / cycles_per_us());
 }
 
 void run_benchmarks(uint64_t boot_start)
@@ -243,7 +247,7 @@ void run_benchmarks(uint64_t boot_start)
     run_program("/bin/bench");                          /* prints its own lines */
     bench_slots();                      /* starts the slot scheduler */
     uint32_t shell_us = bench_shell();  /* last: bash stays behind */
-    kprintf("  %-28s %8lu us\n", "/init + bash to a prompt", shell_us);
+    kprintf("  %-28s %8lu us\n", "/init + bash, CPU work", shell_us);
     kprintf("Boot: command line ready after %lu us of CPU work (kernel ready + that)\n",
             ready_us + shell_us);
     kprintf("Benchmarks done\n");

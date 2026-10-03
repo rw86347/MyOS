@@ -137,6 +137,13 @@ struct inode {
     struct inode *children;                         /* directories: entries */
     struct inode *next_sibling, **pprev_sibling;
     struct inode *hash_next, **pprev_hash;          /* lookup hash (vfs.c) */
+
+    /* Mounts, as in Linux: a file system's root sits ON TOP of an existing
+       directory, which it hides until unmounted. Lookups that reach the
+       covered directory continue in `mounted`; ".." from a mounted root
+       climbs out through `covers`. */
+    struct inode *mounted;                          /* what's mounted on us */
+    struct inode *covers;                           /* the directory we sit on */
 };
 
 struct file {
@@ -210,9 +217,14 @@ int  vfs_truncate(struct inode *i, uint32_t size);
 int  vfs_setattr(struct inode *i);          /* after changing mode/owner/times */
 int  vfs_dir_load(struct inode *dir);       /* a disk directory's entries, now */
 
-/* Attach file system m's root directory at path (an empty directory, or
-   nothing yet). The fs fills in the root's attributes in load_dir. */
+/* Mount file system m (root directory root_ino) on the directory at path,
+   which is made if it doesn't exist. Path "/" REPLACES the root: done at
+   boot, before any process exists. Returns 0 or -errno; m->root is the
+   new root node (the caller fills in its attributes). */
 int  vfs_mount(const char *path, struct mount *m, uint32_t root_ino, uint32_t mode);
+/* Mount an existing in-memory directory tree on path (/dev onto a disk
+   root). */
+int  vfs_mount_tree(const char *path, struct inode *tree);
 int  vfs_mount_count(void);
 struct mount *vfs_mount_at(int index);
 /* Move i to new_dir under a new name, replacing what's there (rename()

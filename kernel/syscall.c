@@ -466,6 +466,8 @@ SYSCALL(sys_getcwd)
     if (i == vfs_root())
         path[--at] = '/';
     for (; i != vfs_root(); i = i->parent) {
+        while (i->covers)
+            i = i->covers;              /* a mounted root: named by its spot */
         if (i->name_len + 1 > at)
             return -ENAMETOOLONG;
         at -= i->name_len;

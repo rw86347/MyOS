@@ -1177,11 +1177,26 @@ static const struct fs_ops ext2_ops = {
 
 /* --- mounting --------------------------------------------------------------------- */
 
+/* The superblock, read directly (before we know the block size). */
+static struct { struct ext2_super s; uint8_t rest[1024 - sizeof(struct ext2_super)]; } raw;
+
+static int read_super(struct blockdev *dev)
+{
+    return blockdev_read(dev, 2, 2, &raw) < 0 || raw.s.magic != EXT2_MAGIC ? -1 : 0;
+}
+
+int ext2_label(struct blockdev *dev, char label[17])
+{
+    if (read_super(dev) < 0)
+        return -1;
+    memcpy(label, raw.s.volume_name, 16);
+    label[16] = '\0';
+    return 0;
+}
+
 int ext2_mount(struct blockdev *dev, const char *path)
 {
-    /* The superblock, read once directly (before we know the block size). */
-    static struct { struct ext2_super s; uint8_t rest[1024 - sizeof(struct ext2_super)]; } raw;
-    if (blockdev_read(dev, 2, 2, &raw) < 0 || raw.s.magic != EXT2_MAGIC)
+    if (read_super(dev) < 0)
         return -EINVAL;                 /* not ext2 */
     struct ext2_super *s = &raw.s;
     uint32_t incompat = s->rev_level ? s->feature_incompat : 0;

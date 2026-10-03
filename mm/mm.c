@@ -15,6 +15,7 @@
 #include <paging.h>
 #include <pmm.h>
 #include <string.h>
+#include <thread.h>
 #include <vfs.h>
 
 static struct mm kernel_mm;
@@ -37,6 +38,12 @@ void mm_switch(struct mm *mm)
         vmm_pd_switch(mm->pd);
         current_mm = mm;
     }
+    /* Remember it with the thread: if it sleeps now (loading a program
+       from disk), it must get THIS address space back when it wakes, not
+       its process's usual one (execve loads into a new one). */
+    struct thread *t = thread_current();
+    if (t)
+        t->mm = mm;
 }
 
 struct mm *mm_create(void)

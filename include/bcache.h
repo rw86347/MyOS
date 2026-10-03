@@ -46,5 +46,6 @@ int  bsync(void);               /* 0, or -EIO */
    the cache holds. */
 void bcache_stats(uint32_t *reads, uint32_t *writes);
 uint32_t bcache_pages(void);
+int bcache_size(void);          /* buffers (an eighth of RAM, at most 2048) */
 
 #endif

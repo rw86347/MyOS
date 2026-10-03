@@ -71,6 +71,9 @@
 #define CTL_NIEN  0x02    /* "no interrupts, please" */
 
 #define SPIN_LIMIT    1000000 /* status reads before giving up (~1 s) */
+#ifndef POLL_FIRST
+#define POLL_FIRST    2048     /* status reads before sleeping (see wait_drive) */
+#endif
 #define IRQ_TIMEOUT   5000    /* ms: a disk spinning up from standby is slow */
 #define FLUSH_TIMEOUT 30000   /* ms: writing out a drive's whole cache */
 #define PROBE_TIMEOUT 200     /* ms: does this channel's IRQ work at all? */
@@ -134,22 +137,33 @@ static void channel_irq(struct ata_channel *c)
 static void irq14(struct regs *r) { (void)r; channel_irq(&channels[0]); }
 static void irq15(struct regs *r) { (void)r; channel_irq(&channels[1]); }
 
-/* Wait for the drive's next interrupt — asleep, so other threads run —
-   and return the status it reported, or -1 if it never came. (Interrupts
-   are off: the IRQ can't slip in between the check and the sleep.) A
-   polling channel spins on the status register instead. */
+/*
+ * Wait until the drive is no longer busy, and return its status (-1 if it
+ * never gets there). First a SHORT spin on the alternate status register
+ * (reading it doesn't count as "interrupt seen"): data in the drive's own
+ * cache — and every read in QEMU or UTM — is ready within microseconds,
+ * and a sleep/wake costs far more there (QEMU takes ~2.5 ms to wake a
+ * halted virtual CPU). Only then sleep until the drive's interrupt.
+ *
+ * The interrupt is just a nudge: after waking we look at the drive again.
+ * So an interrupt left over from a block we already took by polling (it
+ * arrives later) is harmless — the drive is still busy, and we wait on.
+ * (Interrupts are off here: one can't slip in between check and sleep.)
+ */
 static int wait_drive(struct ata_channel *c, uint32_t timeout_ms)
 {
-    if (!c->use_irq) {
-        delay400ns(c);
+    delay400ns(c);
+    if (!c->use_irq)
         return wait_not_busy(c);
-    }
     uint32_t deadline = timer_ms() + timeout_ms;
-    while (!c->irq_seen)
+    for (;;) {
+        for (int i = 0; i < POLL_FIRST; i++)
+            if (!(inb(c->ctrl) & ST_BSY))
+                return inb(c->base + REG_STATUS);   /* (and clear the IRQ) */
+        c->irq_seen = 0;
         if (wq_sleep_until(&c->irq_wait, deadline) && !c->irq_seen)
-            return -1;
-    c->irq_seen = 0;
-    return c->irq_status;
+            return -1;                  /* timed out */
+    }
 }
 
 static int bad(int st) { return st < 0 || (st & (ST_ERR | ST_DF)); }

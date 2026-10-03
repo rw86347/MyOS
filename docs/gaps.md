@@ -5,7 +5,8 @@ when it's fixed. File references point at the comment that mentions the gap.
 
 ## Boot
 - **Kernel must end below 4 MiB** (incl. `.bss`): `entry.asm` maps only one 4 MiB page
-  before `paging.c` maps the rest. The kernel is ~33 KiB, so plenty of room.
+  before `paging.c` maps the rest. The kernel is ~110 KiB, ~320 KiB with `.bss` (it ends
+  at ~1.3 MiB physical), so there's room; the linker script now fails the build if not.
 - **Needs a Pentium Pro or later.** `cpu_init()` checks and prints a message, but
   `entry.asm` already turns on 4 MiB pages (PSE) before that — a CPU without PSE would
   crash before the message. (`arch/i386/entry.asm`, `arch/i386/cpu.c`)
@@ -14,8 +15,10 @@ when it's fixed. File references point at the comment that mentions the gap.
 - **Very old BIOSes copy only below 16 MiB** with `int 0x15` AH=0x87 (the 286-era version
   ignores base bits 24-31). Fine while kernel + initramfs fit below 16 MiB; a big
   initramfs (BusyBox + more) on such a machine would need "unreal mode" instead.
-- **Boot disk has no partition table**: stage 2, the kernel and the initramfs sit in raw
-  sectors after the MBR. A real USB stick would want a partition for the data.
+- **The boot disk has no file-system partition**: one partition entry (type 0x7F,
+  `tools/mbr-partition.sh`) covers stage 2, the boot picture, the kernel and the
+  initramfs; /data must be on another disk. Only ext2 disks labelled `myos-data` are
+  mounted — any other (someone's Linux disk in an old PC) is left alone.
 - **E820 map holds at most 32 entries.** (`layout.inc`, `E820_MAX`)
 
 ## CPU / interrupts
@@ -36,8 +39,6 @@ when it's fixed. File references point at the comment that mentions the gap.
   page pool. (`mm/kheap.c`)
 - **Big blocks (> 1 KiB) are first-fit with a walk** over the big blocks. They're rare
   (thread stacks, buffers); small objects are O(1). (`mm/kheap.c`)
-- **`kfree` can't detect a double free of a small object** (no per-object flag). It would
-  corrupt that class's free list. (`mm/kheap.c`)
 - **Nothing above 0xFF000000 is used yet** (planned for temporary mappings etc.).
   (`memlayout.h`)
 
@@ -116,9 +117,16 @@ when it's fixed. File references point at the comment that mentions the gap.
 - **FAT32 long names are ASCII only**; other characters become `?`. (`fs/fat32.c`)
 - **Block devices live in a fixed-size array.** The comment says "no kmalloc yet" — we have
   kmalloc now. (`kernel/blockdev.c`)
-- **Only /data is on a disk** (step 9b): the rest of the tree is in RAM (the initramfs,
-  changeable), and changes outside /data are lost at power-off. Files in RAM may use at
-  most half of RAM, then writes get `-ENOSPC`. (`fs/ramfs.c`)
+- **Root on disk (9c)**: on an installed disk (`make hd`) the whole tree is on ext2. On
+  a live disk only /data (if present) is; the rest is the initramfs in RAM, lost at
+  power-off, at most half of RAM (`-ENOSPC`). After switching to a disk root the RAM tree
+  (and the initramfs's 3 MiB) stays in memory unused; an installed disk still loads the
+  full initramfs at boot. Files that mke2fs copied from the Mac belong to uid 501 (the
+  Mac user), not root. No `mount`/`umount` calls; mounts can't be undone. Only the first
+  `myos-root` counts. Programs on disk are copied whole at exec (page cache: 9c-2).
+- **The disk driver spins up to 2048 status reads** before sleeping on the interrupt (fast
+  in QEMU, where waking a halted CPU is slow); on real hardware that's up to ~2 ms of CPU
+  per seek. (`drivers/ata.c`, `POLL_FIRST`)
 - **ext2** (`fs/ext2.c`): the first ext2 file system found (a type-0x83 partition or a
   whole disk without a partition table) is mounted at /data; no `mount`/`umount` calls
   yet, no FAT32 in the VFS. No journal: switching off mid-change can leave the disk
@@ -161,4 +169,8 @@ when it's fixed. File references point at the comment that mentions the gap.
   On a Pentium M (and early Pentium 4s) it follows SpeedStep's clock changes, so for
   measurements there, turn SpeedStep off in the BIOS. Nothing uses it for timekeeping yet.
 - **Keyboard: US layout, scancode set 1 only.**
+- **PS/2 mouse** (`drivers/mouse.c`): found and set up at boot by polling ~10 command/ACK
+  round trips (instant in QEMU; on a real mouse maybe 10-30 ms of boot time — make it
+  interrupt-driven if a real machine shows it). Movements go into a 64-entry ring that
+  nothing reads yet: `/dev/input` for X comes next (step 11b). No USB mouse.
 - **All drivers are in the kernel**; the plan is to move most to user space. (`docs/DESIGN.md`)

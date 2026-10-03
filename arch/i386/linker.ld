@@ -49,6 +49,12 @@ SECTIONS
 
     __kernel_end = .;           /* first address after the kernel (virtual) */
 
+    /* entry.asm maps only the first 4 MiB before paging.c maps the rest:
+       a kernel (with its zeroed data) bigger than that must fail the build,
+       not the boot. */
+    ASSERT(__kernel_end - KERNEL_VBASE <= 0x400000,
+           "kernel + .bss must end below 4 MiB (entry.asm maps only that)")
+
     /DISCARD/ : {
         *(.comment)
         *(.note*)

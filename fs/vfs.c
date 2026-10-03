@@ -19,13 +19,16 @@
 #define HASH_SIZE  512              /* buckets (power of two) */
 #define MAX_LINKS  8                /* symlinks followed in one lookup */
 
-static struct inode root = {
-    .ino = 1, .mode = S_IFDIR | 0755, .nlink = 2, .name = "", .parent = &root,
+/* The root directory: in RAM (the initramfs) — until a disk holding the
+   whole system is mounted on "/" at boot (vfs_mount). */
+static struct inode ram_root = {
+    .ino = 1, .mode = S_IFDIR | 0755, .nlink = 2, .name = "", .parent = &ram_root,
 };
+static struct inode *root = &ram_root;
 static struct inode *hash[HASH_SIZE];
 static uint32_t next_ino = 2;
 
-struct inode *vfs_root(void) { return &root; }
+struct inode *vfs_root(void) { return root; }
 
 /* FNV-1a over the name, mixed with the directory's address. */
 static uint32_t hash_of(const struct inode *dir, const char *name, uint32_t len)
@@ -294,7 +297,7 @@ int vfs_rename(struct inode *i, struct inode *new_dir, const char *name, uint32_
         for (struct inode *d = new_dir; ; d = d->parent) {
             if (d == i)
                 return -EINVAL;
-            if (d == &root)
+            if (d == root)
                 break;
         }
     }
@@ -338,36 +341,83 @@ static int nmounts;
 int vfs_mount_count(void) { return nmounts; }
 struct mount *vfs_mount_at(int index) { return index < nmounts ? mounts[index] : NULL; }
 
+/* The directory at path, made if missing (a mount point). */
+static int mount_point(const char *path, struct inode **out)
+{
+    int err = vfs_lookup(path, out);
+    if (err == -ENOENT) {
+        struct inode *parent;
+        const char *name;
+        uint32_t len;
+        err = vfs_lookup_parent(NULL, path, &parent, &name, &len);
+        if (!err)
+            err = vfs_create(parent, name, len, S_IFDIR | 0755, 0, out);
+    }
+    if (err)
+        return err;
+    if (!S_ISDIR((*out)->mode))
+        return -ENOTDIR;
+    if ((*out)->mounted || *out == root)
+        return -EBUSY;
+    return 0;
+}
+
+/* Put r on top of directory `old`. Neither can be removed or renamed now. */
+static void cover(struct inode *old, struct inode *r)
+{
+    old->mounted = r;
+    old->flags |= I_MOUNTED;
+    r->covers = old;
+    r->flags |= I_MOUNTED;
+}
+
 int vfs_mount(const char *path, struct mount *m, uint32_t root_ino, uint32_t mode)
 {
     if (nmounts == MOUNT_MAX)
         return -EBUSY;
-    struct inode *parent, *r;
-    const char *name;
-    uint32_t len;
-    int err = vfs_lookup_parent(NULL, path, &parent, &name, &len);
-    if (err)
-        return err;
-    if (len == 0 || vfs_is_dots(name, len))
-        return -EBUSY;
-    struct inode *old = vfs_child(parent, name, len);
-    if (old) {                          /* only over an empty RAM directory */
-        if (!S_ISDIR(old->mode))
-            return -ENOTDIR;
-        if (old->fs || !vfs_dir_empty(old))
-            return -EBUSY;
-        vfs_unlink(old);
+    int whole = path[0] == '/' && path[1] == '\0';
+    struct inode *old = NULL;
+    if (!whole) {
+        int err = mount_point(path, &old);
+        if (err)
+            return err;
     }
-    err = new_node(parent, name, len, S_IFDIR | (mode & 07777), &r);
-    if (err)
-        return err;
+    struct inode *r = kmalloc(sizeof *r);   /* not in any directory list */
+    if (!r)
+        return -ENOMEM;
+    memset(r, 0, sizeof *r);
+    r->ino = next_ino++;
+    r->mode = S_IFDIR | (mode & 07777);
+    r->nlink = 2;
     r->fs = m->ops;
     r->mnt = m;
     r->fs_ino = root_ino;
-    r->flags |= I_MOUNTED | I_UNLOADED;
+    r->flags = I_UNLOADED;
+    r->refs = 1;                        /* the mount holds it */
+    if (whole) {
+        r->name = "";
+        r->parent = r;
+        r->flags |= I_MOUNTED;
+        root = r;                       /* the RAM tree stays behind, unseen */
+    } else {
+        r->name = old->name;
+        r->name_len = old->name_len;
+        r->parent = old->parent;
+        cover(old, r);
+    }
     m->root = r;
     m->dev_minor = 2 + nmounts;         /* "device 0:2", 0:3, ... */
     mounts[nmounts++] = m;
+    return 0;
+}
+
+int vfs_mount_tree(const char *path, struct inode *tree)
+{
+    struct inode *old;
+    int err = mount_point(path, &old);
+    if (err)
+        return err;
+    cover(old, tree);
     return 0;
 }
 
@@ -380,7 +430,7 @@ int vfs_mount(const char *path, struct mount *m, uint32_t root_ino, uint32_t mod
 static int walk(struct inode *dir, const char *path, uint32_t len, int follow_last,
                 int *links, struct inode **out)
 {
-    struct inode *cur = (len && path[0] == '/') ? &root : dir;
+    struct inode *cur = (len && path[0] == '/') ? root : dir;
     uint32_t pos = 0;
 
     for (;;) {
@@ -407,12 +457,20 @@ static int walk(struct inode *dir, const char *path, uint32_t len, int follow_la
         if (cur->flags & I_UNLINKED)
             return -ENOENT;         /* a deleted directory is empty, even of ".." */
         if (n == 2 && name[0] == '.' && name[1] == '.') {
-            cur = cur->parent;      /* root's parent is root */
+            if (cur != root) {
+                while (cur->covers)
+                    cur = cur->covers;  /* out of a mounted file system */
+                cur = cur->parent;
+                while (cur->mounted)
+                    cur = cur->mounted;
+            }
             continue;
         }
         struct inode *next = vfs_child(cur, name, n);
         if (!next)
             return -ENOENT;
+        while (next->mounted)
+            next = next->mounted;       /* a mount point: go into what's on it */
         if (S_ISLNK(next->mode) && (!last || follow_last)) {
             if (++*links > MAX_LINKS)
                 return -ELOOP;
@@ -433,7 +491,7 @@ static struct inode *start_dir(struct inode *dir)
     if (dir)
         return dir;
     struct process *proc = proc_current();
-    return (proc && proc->cwd) ? proc->cwd : &root;
+    return (proc && proc->cwd) ? proc->cwd : root;
 }
 
 int vfs_lookup_at(struct inode *dir, const char *path, int follow, struct inode **out)

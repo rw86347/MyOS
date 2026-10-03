@@ -115,7 +115,8 @@ MKE2FS  := $(E2FS)/mke2fs
 E2FSCK  := $(E2FS)/e2fsck
 DEBUGFS := $(E2FS)/debugfs
 # Plain ext2 (no journal, no hash index), owned by root.
-MKE2FS_OPTS := -q -t ext2 -O none,filetype,sparse_super -E root_owner=0:0 -L myos-data
+MKE2FS_BASE := -q -t ext2 -O none,filetype,sparse_super
+MKE2FS_OPTS := $(MKE2FS_BASE) -E root_owner=0:0 -L myos-data
 DATA    := disks/data.img
 ifneq ($(MODE),normal)
   DATA  := $(BUILD)/data.img
@@ -129,7 +130,7 @@ QEMU_FLAGS = -m 64M -cpu pentium3 \
              -drive format=raw,file=$(USB),index=1,media=disk \
              -drive format=raw,file=$(DATA),index=2,media=disk
 
-.PHONY: all dist utm run run-full run-text debug test check-selftests test-shell bench run-bench usb clean
+.PHONY: all dist utm hd run-hd test-hd run run-full run-text debug test check-selftests test-shell bench run-bench usb clean
 
 all: $(IMG) $(USB)
 
@@ -317,6 +318,59 @@ $(USB): tools/mkusb.sh
 usb:
 	tools/mkusb.sh $(USB)
 
+# --- an installed MyOS: the whole system on the disk (step 9c) -----------------
+#   myos-hd.img = [ the boot area, as in myos.img | ext2 "myos-root", ROOT_MB ]
+# The kernel finds the partition labelled myos-root and mounts it as "/";
+# everything (programs, /etc, /root, /tmp) is then on the disk and survives
+# a restart. The installer (to come) makes the same layout on a real disk.
+# The file system is filled from the same files as the initramfs (mke2fs -d).
+HD      := $(BUILD)/myos-hd.img
+ROOT_MB := 256
+$(HD): $(IMG) tools/mbr-partition.sh
+	@rm -rf $(BUILD)/rootfs; cp -R $(BUILD)/initramfs $(BUILD)/rootfs
+	@mkdir -p $(BUILD)/rootfs/dev $(BUILD)/rootfs/data   # mount points
+	cp $(IMG) $@
+	S=$$(( $$(wc -c < $(IMG)) / 512 )); START=$$(( (S + 2047) / 2048 * 2048 )); \
+	  $(MKE2FS) $(MKE2FS_BASE) -L myos-root -b 4096 -d $(BUILD)/rootfs \
+	    -E offset=$$((START * 512)),root_owner=0:0 -F $@ $(ROOT_MB)M && \
+	  tools/mbr-partition.sh $@ $$S $$START $$(( $(ROOT_MB) * 2048 ))
+	@echo "Built $@ (boot area + $(ROOT_MB) MiB ext2 myos-root)"
+
+hd: $(HD)
+
+run-hd: $(HD) $(USB)
+	$(QEMU) -m 64M -cpu pentium3 -drive format=raw,file=$(HD),index=0,media=disk \
+	  -drive format=raw,file=$(USB),index=1,media=disk $(DISPLAY_OPTS) -serial stdio
+
+# Boot the installed disk twice: the first boot changes files all over the
+# tree, the second must see them. Then Linux's e2fsck checks the root
+# partition and debugfs reads a file MyOS wrote.
+HD_TEST := $(BUILD)/test-hd.img
+define boot-hd-typing
+	@rm -f $(BUILD)/serial.log
+	@(sleep 10; for c in $(1); do \
+	    tools/qemu-type.sh "$$c" | while read k; do echo "$$k"; sleep 0.04; done; sleep 2; \
+	  done; sleep 1; echo quit) \
+	  | $(QEMU) -m 64M -cpu pentium3 -drive format=raw,file=$(HD_TEST),index=0,media=disk \
+	    -display none -serial file:$(BUILD)/serial.log -monitor stdio >/dev/null
+	@perl -pe 's/\e\[[0-9;?]*[A-Za-z]//g; s/\r//g' $(BUILD)/serial.log >> $(BUILD)/serial-hd.txt
+endef
+test-hd: $(HD)
+	@cp $(HD) $(HD_TEST); rm -f $(BUILD)/serial-hd.txt
+	$(call boot-hd-typing,'echo kept > /root/notes.txt; mkdir /work; echo hi >> /etc/hostname; sync')
+	$(call boot-hd-typing,'cat /root/notes.txt; ls -d /work; tail -n 1 /etc/hostname')
+	@sed -n '/mounted at \//p;/^myos:/,$$p' $(BUILD)/serial-hd.txt | grep -v '^$$'
+	@L=$(BUILD)/serial-hd.txt; ok=1; \
+	  [ $$(grep -c "ext2: hda2 mounted at /:" $$L) = 2 ] || { echo "FAIL: root not mounted from hda2"; ok=0; }; \
+	  grep -q "^kept" $$L || { echo "FAIL: /root/notes.txt lost"; ok=0; }; \
+	  grep -q "^/work" $$L || { echo "FAIL: /work lost"; ok=0; }; \
+	  grep -q "^hi" $$L || { echo "FAIL: /etc change lost"; ok=0; }; \
+	  [ $$ok = 1 ] || { echo "HD TEST FAILED"; exit 1; }
+	@S=$$(( $$(wc -c < $(IMG)) / 512 )); START=$$(( (S + 2047) / 2048 * 2048 )); \
+	  dd if=$(HD_TEST) of=$(BUILD)/test-root.img bs=512 skip=$$START count=$$(( $(ROOT_MB) * 2048 )) 2>/dev/null
+	$(call check-test-disk,$(BUILD)/test-root.img,/root/notes.txt,kept)
+	@echo "HD TEST OK"
+
 # --- the ext2 data disk -------------------------------------------------------
 # 64 MiB with 4 KiB blocks. Made only if it isn't there.
 disks/data.img:
@@ -377,6 +431,8 @@ check-selftests: $(IMG) $(USB)
 	$(call make-test-disk,$(DATA),1024)
 	@rm -f $(BUILD)/serial.log
 	@(sleep 4; for k in h i ret; do echo "sendkey $$k"; sleep 0.2; done; \
+	  echo "mouse_move 10 5"; sleep 0.3; echo "mouse_button 1"; sleep 0.3; \
+	  echo "mouse_button 0"; sleep 0.3; \
 	  echo "sendkey f10"; sleep 1; echo quit) \
 	  | $(QEMU) $(QEMU_FLAGS) -display none \
 	    -serial file:$(BUILD)/serial.log -monitor stdio >/dev/null
@@ -385,6 +441,9 @@ check-selftests: $(IMG) $(USB)
 	  grep -q "Timer: 1000 Hz (sleep 100 ms = 10[0-9] ticks)" $$L || { echo "FAIL: timer"; ok=0; }; \
 	  grep -q "Self-tests: [0-9]* passed, 0 failed" $$L || { echo "FAIL: disk self-tests"; ok=0; }; \
 	  grep -q "fault)> hi" $$L || { echo "FAIL: keyboard echo"; ok=0; }; \
+	  grep -q "mouse: PS/2, with a wheel" $$L || { echo "FAIL: PS/2 mouse found"; ok=0; }; \
+	  grep -q "mouse: dx=10 dy=-5 wheel=0 buttons=0" $$L || { echo "FAIL: mouse movement"; ok=0; }; \
+	  grep -q "mouse: dx=0 dy=0 wheel=0 buttons=1" $$L || { echo "FAIL: mouse click"; ok=0; }; \
 	  grep -q "Memory: [0-9]* MiB usable, paging on" $$L || { echo "FAIL: memory init"; ok=0; }; \
 	  grep -q "initramfs: [0-9]* KiB at physical" $$L || { echo "FAIL: initramfs loaded"; ok=0; }; \
 	  grep -q "Context switch: ping pong ping pong ping pong" $$L || { echo "FAIL: context switch"; ok=0; }; \

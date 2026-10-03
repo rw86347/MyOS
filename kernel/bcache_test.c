@@ -52,8 +52,9 @@ void bcache_selftest(void)
     check(bsync() == 0, "bcache: restore the block");
 
     /* 3. More blocks than buffers: the least recently used are reused, and
-          a reused block comes back from the disk, intact. */
-    for (uint32_t blk = 2; blk < 2 + 300; blk++) {  /* sectors 4-603 */
+          a reused block comes back from the disk, intact. (Only reading, so
+          going past the gap into the partition is fine.) */
+    for (uint32_t blk = 2; blk < 2 + (uint32_t)bcache_size() + 50; blk++) {
         struct buf *x = bread(disk, blk, 1024);
         if (!x) {
             check(0, "bcache: read 300 blocks");
@@ -65,7 +66,7 @@ void bcache_selftest(void)
     b = bread(disk, 1, 1024);
     bcache_stats(&r, &w);
     check(b && r == r0 + 1 && memcmp(b->data, saved, sizeof saved) == 0,
-          "bcache: 300 blocks through 256 buffers (LRU reuse)");
+          "bcache: more blocks than buffers (LRU reuse)");
     if (b)
         brelse(b);
     check(bread(disk, disk->sectors, 1024) == NULL, "bcache: reading past the end fails");

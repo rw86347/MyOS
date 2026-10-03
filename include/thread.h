@@ -22,12 +22,17 @@ enum thread_state {
     THREAD_DEAD,
 };
 
+struct mm;
+
 struct thread {
     char name[16];
     enum thread_state state;
     uint32_t esp;                     /* saved stack pointer while paused */
     void *stack;                      /* kmalloc'd stack (NULL for "main") */
     struct process *proc;             /* the process it runs, or NULL */
+    struct mm *mm;                    /* the address space it's using now
+                                         (NULL: its process's; a kernel
+                                         thread keeps whatever is loaded) */
     struct regs *uregs;               /* user registers saved at the last
                                          syscall (fork copies them) */
     struct wait_queue *wq;            /* the queue it sleeps on (or NULL) */
@@ -113,6 +118,7 @@ void thread_timer_tick(uint32_t now_ms);
 /* Halt until an interrupt, counting the time as idle (interrupts must be
    off; they're off again afterwards). */
 void cpu_idle(void);
+void cpu_idle_end(void);                /* interrupt entry: the CPU woke up */
 uint64_t cpu_idle_cycles(void);         /* total so far */
 
 /* --- for the scheduler --- */

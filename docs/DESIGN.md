@@ -116,6 +116,14 @@ GPLv2 too; MyOS has no licence file yet — pick one before step 10.
 Decided (2026-10-01): **file systems and the VFS run in the kernel**, so every `read()` stays
 one syscall with no extra context switches. (Block *device drivers* still move to user space.)
 
+Decided (2026-10-03): **the root file system.** The kernel itself mounts the ext2
+partition labelled `myos-root` as "/" at boot (no switch_root program, no driver
+initramfs): disk drivers are in the kernel. Without one — a live USB stick or CD — MyOS
+runs from the initramfs in RAM. `myos-data` is mounted at /data. Other ext2 disks are
+left alone. Storage drivers (IDE, AHCI, later NVMe) stay in the kernel: one syscall per
+read, no extra context switches; the user-space driver ring is for shim drivers (NICs,
+WiFi, USB host).
+
 Open questions:
 - Block drivers in user space need a fast path: kernel and driver share a request ring and the
   data buffers (no copying), and an IRQ wakes the driver. Can a disk driver own one of the

@@ -223,3 +223,37 @@ Short dated notes after each work session: what was done, what broke, what was l
   AX is saved around it. The picture and progress bar show (checked with a QEMU
   screendump); make test and test-shell pass. Cost: the 2-second `hold` makes boot to a
   bash prompt 2.5 s instead of 0.5 s in QEMU (the kernel's own 6.9 ms is unchanged).
+- 2026-10-02: Working ahead on graphics (step 11b), for an XP-like desktop with IceWM on
+  X11: drivers/mouse.c, the PS/2 mouse on the 8042's AUX port (IRQ 12): AUX on, IRQ 12 in
+  the controller's config byte, defaults, the IntelliMouse "knock" (sample rates 200,
+  100, 80 -> ID 3 = wheel, 4-byte packets), streaming on. The IRQ handler only collects
+  packet bytes (resyncing on bit 3 of the first byte), decodes 9-bit dx/dy and the
+  4-bit wheel and puts the movement in a ring. keyboard.c now ignores bytes that are the
+  mouse's (status bit 5). `make test` sends mouse_move/mouse_button through QEMU's
+  monitor and checks the decoded packets. Boot +5 us of CPU work.
+- 2026-10-03: Deferred-work audit (workflow; 45 items from 4 of 8 areas came back before
+  the usage limit) and the fixes it found due, each checked in the code first: the linker
+  script fails the build if kernel + .bss pass 4 MiB; only ext2 disks labelled myos-data
+  are mounted (a foreign Linux disk in an old PC is left alone — tested); a thread woken
+  by an interrupt while the CPU idles runs at once, not at the next tick (disk reads woke
+  up to 8 times per 64 KiB, each waiting up to 1 ms); CMOV is now a required CPU feature
+  (the kernel is built for i686); kfree catches a double free of a small object (a mark
+  in the free object; new self-test). kmalloc+kfree 63 -> 67 cycles.
+- 2026-10-03: Step 9c-1: the whole system on a disk. VFS: mounts now COVER a directory
+  (Linux-style: lookups continue in the mounted root, ".." climbs out, the covered
+  directory can't be removed), the root can be switched before any process exists, and
+  an in-memory tree (/dev) can be mounted on a disk directory. Boot finds our file
+  systems by label: myos-root -> "/", myos-data -> /data, anything else left alone.
+  `make hd` builds an installed-style disk: the boot area plus a 256 MiB ext2 myos-root
+  partition (mke2fs -d at an offset; tools/mbr-partition.sh writes both entries);
+  `run-hd`; `test-hd` boots it twice (files in /root, /work, /etc survive) and checks
+  the root partition with e2fsck and debugfs. Found on the way: (1) a real kernel bug —
+  a thread that borrowed an address space (execve loading the new program, the kernel
+  spawning /init) got its process's usual one back after sleeping on the disk, so the
+  program was written into the wrong address space (crash on a copy-on-write page);
+  threads now remember the address space they use; (2) idle-time accounting counted
+  other threads' work as idle when the idle thread was switched away mid-wait: the
+  interrupt that wakes the CPU now ends idle time; (3) booting from disk took 3.1 s in
+  QEMU from root to prompt: a bigger block cache (an eighth of RAM, up to 8 MiB) gave
+  2.1 s, and a short spin before sleeping on the disk interrupt 0.3 s (QEMU takes ~2.5 ms
+  to wake a halted CPU). Thread switch 94 -> 97 cycles.

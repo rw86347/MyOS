@@ -105,6 +105,9 @@ static void put(int c)
 static void keyboard_irq(struct regs *r)
 {
     (void)r;
+    uint8_t st = inb(KBD_STATUS);
+    if (!(st & 0x01) || (st & 0x20))
+        return;                 /* nothing, or the mouse's byte (mouse.c) */
     uint8_t sc = inb(KBD_DATA);
 
     if (sc == 0xE0) {           /* prefix: the real code comes next */

@@ -18,8 +18,9 @@
 #define CPU_SSE   (1u << 25)
 #define CPU_SSE2  (1u << 26)
 
-/* What MyOS can't run without: a Pentium Pro / Pentium II or later. */
-#define CPU_REQUIRED (CPU_FPU | CPU_PSE | CPU_TSC | CPU_MSR)
+/* What MyOS can't run without: a Pentium Pro / Pentium II or later.
+   (CMOV: the kernel is compiled for i686, so the compiler uses it.) */
+#define CPU_REQUIRED (CPU_FPU | CPU_PSE | CPU_TSC | CPU_MSR | CPU_CMOV)
 
 extern uint32_t cpu_features;
 

@@ -42,5 +42,6 @@ struct thread *sched_pick(int yielding);
 
 void sched_tick(void);              /* timer IRQ, every 1 ms */
 void sched_preempt_check(void);     /* end of every interrupt, after the EOI */
+void sched_need_resched(void);      /* switch at the end of this interrupt */
 
 #endif

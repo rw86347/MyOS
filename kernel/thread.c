@@ -61,6 +61,12 @@ static void set_ready(struct thread *t)
         rq_head->rq_prev = t;
     }
     nready++;
+    /* The CPU was idle (the idle thread runs): don't make the newly ready
+       thread wait for the next timer tick — switch when this interrupt
+       ends. A disk read wakes its thread up to 8 times per 64 KiB; on a
+       busy CPU nothing changes (slot owners are never cut short). */
+    if (current && current->is_idle)
+        sched_need_resched();
 }
 
 static void set_state(struct thread *t, enum thread_state s)
@@ -145,6 +151,7 @@ static struct thread *new_thread(struct process *proc, const char *name)
     }
     thread_set_name(t, name);
     t->proc = proc;
+    t->mm = NULL;                       /* (slots are reused: no stale one) */
     t->uregs = NULL;
     t->wq = NULL;
     t->wq_next = NULL;
@@ -246,11 +253,12 @@ void thread_switch(struct thread *next)
     /* Its process's address space. Kernel threads just keep whatever is
        loaded (the kernel half is the same everywhere): no CR3 load, no TLB
        flush when switching to them. */
-    if (next->proc) {
+    if (next->mm)
+        mm_switch(next->mm);            /* the one it was using (see mm_switch) */
+    else if (next->proc)
         mm_switch(next->proc->mm);
-        if (memcmp(next->tls, loaded_tls, sizeof loaded_tls) != 0)
-            thread_load_tls(next);      /* its thread-local storage */
-    }
+    if (next->proc && memcmp(next->tls, loaded_tls, sizeof loaded_tls) != 0)
+        thread_load_tls(next);          /* its thread-local storage */
     /* The FPU/SSE registers aren't part of switch_context: save them
        separately, for user threads only (the kernel never uses them). */
     if (prev->uses_fpu)
@@ -275,8 +283,18 @@ void thread_yield(void)
 
 /* Cycles the CPU spent halted, waiting for an interrupt: `top` and
    /proc/stat show it, and benchmarks subtract it to count only work.
-   (It includes the interrupt handler that ends each wait.) */
-static uint64_t idle_cycles;
+   The interrupt that wakes the CPU ends the idle time at once (it may
+   switch to another thread before the halted one runs again). */
+static uint64_t idle_cycles, idle_since;
+static volatile int idling;
+
+void cpu_idle_end(void)                 /* first thing in every interrupt */
+{
+    if (idling) {
+        idling = 0;
+        idle_cycles += cycles_now() - idle_since;
+    }
+}
 
 uint64_t cpu_idle_cycles(void)
 {
@@ -288,9 +306,10 @@ uint64_t cpu_idle_cycles(void)
 
 void cpu_idle(void)                     /* interrupts off, and off again after */
 {
-    uint64_t t = cycles_now();
+    idle_since = cycles_now();
+    idling = 1;
     __asm__ volatile ("sti; hlt; cli");     /* `sti; hlt` can't miss an IRQ */
-    idle_cycles += cycles_now() - t;
+    cpu_idle_end();                     /* (the interrupt normally did it) */
 }
 
 void thread_exit(void)
