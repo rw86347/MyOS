@@ -268,14 +268,30 @@ static int dns_lookup(const char *name, uint32_t *ip)
         return -ENOMEM;
     dns_got = 0;
     dns_len = 0;
+    /*
+     * Three tries, waiting 1s, 2s then 4s. This was two tries of 700ms, which
+     * is plenty against QEMU's built-in resolver -- it answers in microseconds
+     * from the same machine -- and not enough against a real one. On a tethered
+     * link with a 350ms round trip, a reply arrives near the end of the first
+     * window and a single lost datagram spends the whole budget, so `make test`
+     * failed its DNS check on most runs with -ETIMEDOUT. The host's own `dig`
+     * needed two tries on the same link, which is what gave it away.
+     *
+     * Growing the wait rather than repeating it matters for the same reason it
+     * does in the DHCP client: the question is re-sent with the same id, so a
+     * late answer to an earlier try still counts, and the later windows are
+     * long enough to catch one. Nothing pays for this when the resolver is
+     * quick, because the wait ends the moment a reply arrives.
+     */
     int rc = -ETIMEDOUT;
-    for (int try = 0; try < 2 && rc == -ETIMEDOUT; try++) {
+    uint32_t wait = 1000;
+    for (int try = 0; try < 3 && rc == -ETIMEDOUT; try++, wait *= 2) {
         if (udp_sendto(ipv4_dns, port, 53, q, qlen) < 0) {
             rc = -EIO;
             break;
         }
         uint32_t t0 = timer_ms();
-        while (timer_ms() - t0 < 700) {
+        while (timer_ms() - t0 < wait) {
             net_rx_action();
             if (dns_got) {
                 rc = parse_a(dns_pkt, dns_len, ip) == 0 ? 0 : -EIO;

@@ -125,7 +125,12 @@ void net_selftest(void)
         if (tc == 0) {
             int ts = tcp_write(c, req, (uint32_t)strlen(req), 0, 0);
             char buf[64];
-            int n = ts > 0 ? tcp_read(c, buf, sizeof buf, 0, 0, 0, 2000) : ts;
+            /* 5s, not 2s. Fetching this needs a handshake and a round trip
+               to a real server, so on a link with a 350ms round trip 2s left
+               no room for a single retransmit and the check failed at random.
+               The wait ends when the data arrives, so a quick network pays
+               nothing for the larger number. */
+            int n = ts > 0 ? tcp_read(c, buf, sizeof buf, 0, 0, 0, 5000) : ts;
             tcp_release(c);
             c = 0;
             int http = n >= 5 && memcmp(buf, "HTTP/", 5) == 0;
