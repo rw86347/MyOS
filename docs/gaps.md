@@ -392,13 +392,17 @@ when it's fixed. File references point at the comment that mentions the gap.
 
 ## Drivers
 
-- The e1000's transmit descriptors are only reclaimed inside `e1000_poll`,
-  which runs from `net_rx_action`. Nothing on the transmit path calls it and a
-  completed transmit raises no interrupt (only `IMS_RXT0|IMS_LSC` are
-  unmasked), so 15 sends with no inbound traffic fill the ring and every
-  further `sendto` returns `EAGAIN` until something happens to receive. Found
-  2026-10-03, not fixed: it wants either `IMS_TXDW` or a reap at the top of
-  `e1000_xmit`.
+- The e1000's transmit descriptors were only reclaimed inside `e1000_poll`,
+  which runs from `net_rx_action`. Nothing on the transmit path called it and
+  a completed transmit raises no interrupt (only `IMS_RXT0|IMS_LSC` are
+  unmasked), so 15 sends with no inbound traffic filled the ring and every
+  further `sendto` returned `EAGAIN` until something happened to receive. Found
+  2026-10-03, fixed 2026-10-04: `tx_reap()` is called at the top of
+  `e1000_xmit`, so the transmit path reclaims its own slots and does not depend
+  on an RX interrupt. No transmit-done interrupt was added, to keep interrupt
+  load off the slow target CPUs; the drained slots are not needed until the
+  next transmit, which is when the reap runs. `kernel/net_test.c` sends past a
+  full ring on a quiet link with interrupts off and checks none wedge.
 - `net_rx_action` re-polls up to 8 times at a weight of 16 but only `drain()`s
   before and after the loop, into a 32-slot queue — so a receive flood
   allocates and copies up to 128 frames and throws ~96 away. Bounded, but it

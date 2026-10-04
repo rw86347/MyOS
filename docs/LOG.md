@@ -1111,3 +1111,26 @@ a picture it repeats must have no border of its own, or every repeat shows as a 
 it reduces alpha to a one-bit mask, so a round button needs its background baked in. Xft
 sizes are points and the theme's are pixels — `pixelsize=` is the only honest way to ask
 for "the size it was drawn". And musl's strftime has no `%l`.
+
+## 2026-10-04 — e1000 transmit no longer wedges on a quiet link
+
+The card raises its interrupt on receive and link change, never on
+transmit-done, and the only code that reclaimed finished transmit slots lived
+in the NAPI poll that an interrupt schedules. So on a link with no inbound
+traffic — a point-to-point cable, or the kernel's own first ARP before any
+reply exists — nothing ever reclaimed a slot, and the 16th transmit found the
+ring full and returned NETDEV_TX_BUSY for good. `tools/` fuzzing and the audit
+both flagged it; it was the last open item in docs/gaps.md's Drivers section.
+
+Fixed by reaping finished slots at the top of `e1000_xmit` (a bounded walk of
+at most the 15-slot ring), so the transmit path is self-sufficient. I did not
+enable the transmit-done interrupt: it would add an interrupt per batch on the
+slow P4/Pentium M we tune for, and the completed slots are not needed until
+the next transmit anyway, which is exactly when the reap runs. The reap in the
+poll stays, so slots are also freed promptly whenever the stack is already
+polling for receives.
+
+The test sends twice a full ring on a quiet link with interrupts off, which is
+the one arrangement where the poll cannot run and the transmit path is the
+only thing that can reclaim a slot. With the fix removed it fails "wedged after
+15 transmits" — the ring size minus one, exactly as predicted.

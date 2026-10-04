@@ -219,6 +219,29 @@ static int setup_rings(void)
     return 0;
 }
 
+/* Give back transmit slots the card has finished with (TX_DD set, which it
+   writes because every descriptor carries TX_RS). This reclaims ring space
+   only: e1000_xmit copied the frame into the slot's buffer and freed the skb
+   already, so nothing here owns a packet.
+
+   Called from the transmit path, not only from the poll an interrupt
+   schedules. The card raises its interrupt on receive and link change, never
+   on transmit-done (IMS below), so on a quiet link -- a point-to-point cable,
+   or the kernel's own first ARP before any reply exists -- no poll ran, no
+   slot was ever reclaimed, and the 16th transmit found the ring full and
+   returned NETDEV_TX_BUSY for good. Reaping here instead of enabling a
+   transmit-done interrupt keeps one fewer interrupt per packet off the slow
+   target CPUs; the completed slots are not needed until the next transmit,
+   which is exactly when this runs. */
+static void tx_reap(void)
+{
+    while (nic.tx_head != nic.tx_tail) {
+        if (!(nic.tx[nic.tx_head].status & TX_DD))
+            break;
+        nic.tx_head = (nic.tx_head + 1) % TX_N;
+    }
+}
+
 static int e1000_poll(struct napi_struct *napi, int budget)
 {
     (void)napi;
@@ -253,11 +276,7 @@ static int e1000_poll(struct napi_struct *napi, int budget)
         dma_sync();                     /* status 0 is in RAM before the card reuses it */
         wr(E1000_RDT, (uint32_t)last);
     }
-    while (nic.tx_head != nic.tx_tail) {
-        if (!(nic.tx[nic.tx_head].status & TX_DD))
-            break;
-        nic.tx_head = (nic.tx_head + 1) % TX_N;
-    }
+    tx_reap();                          /* timely when the stack is already polling */
     if (work < budget) {
         dma_sync();
         if (nic.rx[nic.rx_cur].status & RX_DD)
@@ -286,9 +305,10 @@ static int e1000_xmit(struct sk_buff *skb, struct net_device *dev)
         kfree_skb(skb);
         return NETDEV_TX_OK;
     }
+    tx_reap();                          /* free any slots the card has drained */
     unsigned next = (nic.tx_tail + 1) % TX_N;
     if (next == nic.tx_head)
-        return NETDEV_TX_BUSY;          /* caller still owns the skb */
+        return NETDEV_TX_BUSY;          /* genuinely full: caller still owns the skb */
     memcpy(nic.tx_buf[nic.tx_tail], skb->data, skb->len);
     /* TCTL_PSP has the card pad up to the 60-byte minimum frame out of this
        buffer, and the buffer is reused. Zero the padding, or a short frame

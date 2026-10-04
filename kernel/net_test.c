@@ -15,6 +15,7 @@
 #include <dns.h>
 #include <errno.h>
 #include <e1000.h>
+#include <interrupts.h>
 #include <ipv4.h>
 #include <tcp.h>
 #include <kprintf.h>
@@ -82,6 +83,47 @@ void net_selftest(void)
     if (saw == 4 && first == 0x11)
         kprintf("net: loopback delivered\n");
     check(skb_live() == before, "net: the packet was freed");
+
+    /* Transmit more than a full ring (TX_N = 16) on a quiet link. Interrupts
+       are off for the loop, so no RX interrupt fires and the net thread
+       cannot run: the only thing that can reclaim a transmit slot is the
+       transmit path itself. The card completes each frame as QEMU processes
+       the TDT write, so with reaping in e1000_xmit every send finds a free
+       slot; without it the ring fills after 15 and the rest return -EAGAIN.
+       A bogus locally-administered destination that answers nothing keeps the
+       link quiet from our side. */
+    struct net_device *eth = dev_get_by_name("eth0");
+    if (eth && (eth->flags & IFF_UP)) {
+        const int tries = 2 * 32;       /* comfortably past the 16-slot ring */
+        int sent = 0;
+        uint32_t f = irq_save();
+        for (int i = 0; i < tries; i++) {
+            struct sk_buff *s = alloc_skb(ETH_ZLEN);
+            if (!s)
+                break;
+            unsigned char *q = skb_put(s, ETH_ZLEN);
+            if (!q) {
+                kfree_skb(s);
+                break;
+            }
+            memset(q, 0, ETH_ZLEN);
+            memset(q, 0x02, ETH_ALEN);              /* bogus unicast dest */
+            memcpy(q + 6, eth->dev_addr, ETH_ALEN);
+            q[12] = 0x90;                           /* type 0x9000: nobody replies */
+            s->dev = eth;
+            if (dev_queue_xmit(s) == 0)
+                sent++;
+            else {
+                kfree_skb(s);           /* -EAGAIN: dev_queue_xmit left it to us */
+                break;
+            }
+        }
+        irq_restore(f);
+        check(sent == tries, "net: e1000 transmit keeps flowing on a quiet link");
+        if (sent != tries)
+            kprintf("net: e1000 wedged after %d transmits (TX reaping)\n", sent);
+    }
+    check(skb_live() == before, "net: the quiet-link transmits were all freed");
 
     static struct napi_struct napi;
     static struct net_device dummy;
