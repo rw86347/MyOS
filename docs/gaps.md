@@ -366,9 +366,15 @@ when it's fixed. File references point at the comment that mentions the gap.
   finally a second vmnet probe crossing program against hostname — ping, wget
   and nslookup, `example.com` and `google.com`, three rounds — which came back
   18 of 18 with every query answered in the packet capture.
-  So it is a transient at a rate below 1 in 32. The likeliest explanation is a
-  single lost datagram that musl's retry budget did not cover, which would be
-  invisible from here. If it recurs, the method that works is a probe image
+  The cause was found afterwards, while chasing an unrelated DNS failure in
+  `make test`: the Mac was on a tethered link where **one DNS lookup takes 2.1
+  to 4.3 seconds** (the host's own `dig` reported 3550 ms, with 0% packet loss
+  over 30 pings and no bad checksums in any capture). musl asks for A and AAAA
+  together and has its own budget; on a link that slow it can run out. So
+  nothing was lost and nothing was corrupted — the answer arrived later than
+  anyone was willing to wait, which from inside the guest is indistinguishable
+  from never arriving. That also explains why it would not reproduce: the
+  latency varies, and most of the time it is fast enough. If it recurs, the method that works is a probe image
   that writes its results to its own disk and is read back with `debugfs` —
   there is no usable serial console under UTM. See `docs/utm.md`.
 - **`sendfile64` (syscall 239) is not implemented.** BusyBox's `cp` and `cat`

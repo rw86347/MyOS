@@ -269,19 +269,25 @@ static int dns_lookup(const char *name, uint32_t *ip)
     dns_got = 0;
     dns_len = 0;
     /*
-     * Three tries, waiting 1s, 2s then 4s. This was two tries of 700ms, which
-     * is plenty against QEMU's built-in resolver -- it answers in microseconds
-     * from the same machine -- and not enough against a real one. On a tethered
-     * link with a 350ms round trip, a reply arrives near the end of the first
-     * window and a single lost datagram spends the whole budget, so `make test`
-     * failed its DNS check on most runs with -ETIMEDOUT. The host's own `dig`
-     * needed two tries on the same link, which is what gave it away.
+     * Three tries, waiting 1s, 2s then 4s -- seven seconds in total, which
+     * looks absurd next to QEMU's built-in resolver answering in microseconds
+     * from the same machine. It is not. This was two tries of 700ms, and on a
+     * tethered link a lookup was measured at 2.1 to 4.3 seconds (the host's
+     * own dig reported a 3550ms query time on the same link, with 0% packet
+     * loss over 30 pings). A 1.4-second budget against a 3-second answer fails
+     * every time, which is what `make test` was doing: -ETIMEDOUT on most runs.
+     *
+     * Worth being precise about the failure, because the obvious guess is
+     * wrong: nothing was lost and nothing was corrupted. The replies were
+     * arriving, just later than we were willing to wait -- and from in here a
+     * reply that arrives after you have given up looks exactly like one that
+     * never came. Only measuring the link told them apart.
      *
      * Growing the wait rather than repeating it matters for the same reason it
      * does in the DHCP client: the question is re-sent with the same id, so a
      * late answer to an earlier try still counts, and the later windows are
-     * long enough to catch one. Nothing pays for this when the resolver is
-     * quick, because the wait ends the moment a reply arrives.
+     * long enough to catch one. A quick resolver pays nothing for any of this,
+     * because the wait ends the moment a reply arrives.
      */
     int rc = -ETIMEDOUT;
     uint32_t wait = 1000;
