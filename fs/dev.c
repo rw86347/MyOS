@@ -10,13 +10,19 @@
  *   1,5  zero      reads: zero bytes; writes: thrown away
  *   5,0  tty       the terminal of the process  } both the console here
  *   5,1  console   the system console           }
+ *   5,2  ptmx      a new pseudo-terminal pair (pty.c); its slave is
+ * 136,n  pts/n     ...this, made and removed by pty.c
  *   4,n  ttyN      virtual terminals: the console too, for now
+ *  13,64 input/event0   the keyboard as input events (evdev.c)
+ *  13,65 input/event1   the mouse
  *  29,0  fb0       the screen's pixels (drivers/video/fbmem.c), once a
  *                  display driver has registered one
  */
 #include <errno.h>
+#include <evdev.h>
 #include <kprintf.h>
 #include <linux/fb.h>
+#include <pty.h>
 #include <serial.h>
 #include <string.h>
 #include <tty.h>
@@ -55,6 +61,19 @@ static int32_t console_write_user(struct file *f, const void *user_buf, uint32_t
 /* Reading goes through the terminal's line editing (tty.c). */
 const struct file_ops console_ops = {
     .read = tty_read, .write = console_write_user, .ioctl = tty_ioctl, .poll = tty_poll,
+};
+
+/* /dev/tty: "my terminal". In a terminal window that's the window's pty
+   (the session's controlling terminal); otherwise the console. */
+static int devtty_open(struct file *f)
+{
+    pty_open_ctty(f);
+    return 0;
+}
+
+static const struct file_ops devtty_ops = {
+    .read = tty_read, .write = console_write_user, .ioctl = tty_ioctl, .poll = tty_poll,
+    .open = devtty_open,
 };
 
 static struct inode console_inode = {
@@ -111,12 +130,17 @@ void dev_attach(struct inode *i)
     switch (i->rdev) {
     case DEV(1, 3): i->ops = &null_ops;    break;
     case DEV(1, 5): i->ops = &zero_ops;    break;
-    case DEV(5, 0):
+    case DEV(5, 0): i->ops = &devtty_ops;  break;
     case DEV(5, 1): i->ops = &console_ops; break;
+    case DEV(5, 2): i->ops = pty_master_ops(); break;
     case DEV(29, 0): i->ops = fb_file_ops(); break;     /* fb0 (NULL: no screen) */
     default:
         if ((i->rdev >> 8) == 4)
             i->ops = &console_ops;          /* tty0, tty1, ... */
+        else if ((i->rdev >> 8) == PTY_SLAVE_MAJOR)
+            i->ops = pty_slave_ops();       /* pts/N: open() checks N */
+        else if ((i->rdev >> 8) == 13)
+            i->ops = evdev_ops(i->rdev & 0xFF);     /* input/event0, event1 */
         break;                              /* unknown: open() fails */
     }
 }
@@ -156,4 +180,19 @@ void dev_init(void)
     make_node(dev, "zero", DEV(1, 5));
     make_node(dev, "tty", DEV(5, 0));
     make_node(dev, "console", DEV(5, 1));
+    make_node(dev, "ptmx", DEV(5, 2));
+    pty_init(dev);
+    /* Virtual terminals: one console behind them all, for now. An X
+       server opens tty0 to ask for a free one, then ttyN. */
+    static const char tty_names[8][5] = {
+        "tty0", "tty1", "tty2", "tty3", "tty4", "tty5", "tty6", "tty7" };
+    for (int n = 0; n < 8; n++)
+        make_node(dev, tty_names[n], DEV(4, n));
+    struct inode *input = vfs_child(dev, "input", 5);
+    if (!input)
+        input = vfs_add(dev, "input", 5, S_IFDIR | 0755);
+    if (input) {
+        make_node(input, "event0", DEV(13, 64));    /* keyboard (evdev.c) */
+        make_node(input, "event1", DEV(13, 65));    /* mouse */
+    }
 }

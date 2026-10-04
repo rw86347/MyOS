@@ -1038,3 +1038,76 @@ stops matching. Those three are now unanchored, which is still exact because
 each pattern contains something the echoed command line cannot: a received
 count, a resolved address, a byte count. Worth saying plainly: a test that
 fails at random is worse than no test, because it trains you to ignore it.
+
+## 2026-10-04 — reviewing the fd-sharing work
+
+Read through the new terminal, input and epoll code and found one bug class running
+underneath all of it: `fd_get` returns the `struct file` without taking a reference, and
+threads share the fd table, so a sibling's `close()` frees it while another thread is
+asleep inside a blocking read. Fixed in `rw()` — which covers every `read` and `write`, and
+with it the new pty, evdev and unix-socket readers — and separately in the two places in
+`fs/epoll.c` that are not reached through `rw()`. `docs/security.md` has the detail,
+including the parts that are still open: sockets have no reference count at all.
+
+Two things worth remembering from doing it. First, the test for the `read`/`write` bug
+passed against the bug twice before it measured anything, once because it closed a
+different fd than the one the readers were asleep in, and once because `close()` hands back
+the fd number *and* the heap block, so the fixed and broken kernels agree. `dup2` separates
+them. Second, the test suite had been failing about one run in ten with a kernel page fault
+in `memcpy`, and it was not in the kernel at all: `kernel/user_test.c` read the program's
+name through `p->threads` after `proc_spawn` had already made the program runnable, so a
+program that exited immediately had its thread freed first and the read came from address
+zero. The name comes from `path` now, which cannot race. A stack scan in the fault handler
+found it in one run after an afternoon of guessing at register values — worth building a
+real backtrace next time rather than reading `nm` output by hand.
+
+Followed up by extending the same fix to everything else that holds an object from an fd
+across a sleep: the thirteen socket calls (`SOCK_SYSCALL` in `net/socket.c`, one wrapper
+rather than a `file_put` on each of fifty return paths), and the terminal ioctls, which had
+no permission checks at all — `KDSKBMODE K_OFF` let any process turn the console keyboard
+off, and turning it back on means typing. `epoll` was identifying a registered file by its
+address, which a closed-and-reopened fd can reuse, so `struct file` now carries a per-open
+serial number. Two percent on `read`, 1.6% on `open`, numbers in `docs/performance.md`.
+
+The socket part has no test, and `verify-racetests.sh` is why: one was written and it passed
+against the unfixed kernel, so it went in the bin rather than the tree. The fix keeps
+Linux's semantics — a call whose fd is taken away still finishes against the socket it
+started with — so there is no wrong answer to assert on, only corruption of whoever took the
+freed block.
+
+## 2026-10-04 — the graphical login, and two ways to draw nothing
+
+The live disk boots to a login screen now: `live/myos-login`, about 650 lines of C over
+Xlib, Xft and PAM, which starts the X server, draws the Golden Hour login from
+`assets/themes/golden-hour`, checks the password the way `/bin/login` does and runs the
+session. Underneath it went everything X needs that we didn't have: evdev input, AF_UNIX
+sockets, epoll, pseudo-terminals, and one file in `/sys`. Writing our own greeter instead
+of configuring xdm was the right call for a second reason: xdm had already worked (the
+stock login box appeared and logged in), so the hard parts were proven before any of the
+drawing existed, and the drawing is ours to match the mockup with.
+
+Then the thing worth writing down. The first boot of the finished login screen showed the
+text and nothing else — no photograph, no bands, no tiles — on black. IceWM, booted the
+same way, ignored every picture in its theme and fell back to its own. Two programs, same
+symptom, one cause: the X server announces MIT-SHM, MyOS has no System V shared memory at
+all, and Imlib2 — which both programs use — takes the shared-memory path on sight and
+quietly draws nothing. No error, no log line. Turning the extension off in `xorg.conf.d`
+fixed both at once. The lesson is about *advertising*: a kernel that doesn't implement
+something must not let a server tell clients that it does. We got away with the X server
+itself failing loudly on missing syscalls; this failed silently because the client-side
+library decided the feature was there and then handled its own failure by doing nothing.
+
+The second false trail cost longer than it should have. IceWM's theme was written with
+`Look="flat"`, and flat is precisely the look that draws rectangles from the colour list
+and never opens a picture. The colours *were* ours, so the desktop looked plausibly themed
+while every image was being ignored — a half-right result is much slower to diagnose than a
+wrong one. The way out was comparing a crop of the screen against the PNG we had generated,
+pixel for pixel, instead of judging by eye: the stock Start button and ours are both green
+XP-style buttons and I had been calling ours "stock" for an hour.
+
+Smaller things learned: IceWM asks for every theme picture by its `.xpm` name and then
+tries `.png`, so `Gradients=` must list the `.xpm` names whatever the files are called;
+a picture it repeats must have no border of its own, or every repeat shows as a seam; and
+it reduces alpha to a one-bit mask, so a round button needs its background baked in. Xft
+sizes are points and the theme's are pixels — `pixelsize=` is the only honest way to ask
+for "the size it was drawn". And musl's strftime has no `%l`.

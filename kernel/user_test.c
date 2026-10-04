@@ -45,7 +45,20 @@ static int run(const char *path, const char *const argv[])
         kprintf("User mode: %s failed to load\n", path);
         return -1;
     }
-    const char *name = p->threads->name;
+    /* The name comes from `path` and not from p->threads->name, which is the
+       whole point: proc_spawn makes the program runnable before it returns,
+       so one that exits immediately can have its thread freed and unlinked
+       from p->threads before this line runs. p->threads is NULL then and the
+       read comes from address 0 -- a kernel page fault that took out about
+       one test run in ten, and only ever after a short program.
+       Reading it through the thread cannot be made safe by a NULL check
+       either: the thread can go between the check and the copy. `path` is the
+       caller's string literal, it outlives the wait, and proc_spawn derives
+       the thread's name from it the same way (base_name in kernel/proc.c). */
+    const char *name = path;
+    for (const char *s = path; *s; s++)
+        if (*s == '/')
+            name = s + 1;
     int status = proc_wait_kernel(p);
     int code = W_IFEXITED(status) ? W_EXITSTATUS(status) : 128 + W_TERMSIG(status);
     kprintf("User mode: %s exited with code %d\n", name, code);

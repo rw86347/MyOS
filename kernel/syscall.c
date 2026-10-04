@@ -71,8 +71,16 @@ static int32_t rw(uint32_t fd, uint32_t buf, uint32_t len, int writing)
        kernel writing into the user's buffer. */
     if (fault_in_user((const void *)buf, len, !writing) < 0)
         return -EFAULT;
-    return writing ? f->ops->write(f, (const void *)buf, len)
-                   : f->ops->read(f, (void *)buf, len);
+    /*
+     * Held across the call, because a blocking read sleeps inside it and the
+     * fd table is shared with this process's other threads: without this, a
+     * sibling's close() frees the file under the sleeper. See file_get.
+     */
+    file_get(f);
+    int32_t rc = writing ? f->ops->write(f, (const void *)buf, len)
+                         : f->ops->read(f, (void *)buf, len);
+    file_put(f);
+    return rc;
 }
 
 /* ssize_t read(int fd, void *buf, size_t count) */
@@ -936,6 +944,11 @@ static const syscall_fn syscall_table[] = {
     [NR_fdatasync]  = sys_fsync,
     [NR_nanosleep]  = sys_nanosleep,
     [NR_poll]       = sys_poll,
+    [NR_epoll_create] = sys_epoll_create,
+    [NR_epoll_create1] = sys_epoll_create1,
+    [NR_epoll_ctl]  = sys_epoll_ctl,
+    [NR_epoll_wait] = sys_epoll_wait,
+    [NR_epoll_pwait] = sys_epoll_pwait,
     [NR_ugetrlimit] = sys_getrlimit,
     [NR_truncate64] = sys_truncate64,
     [NR_ftruncate64] = sys_ftruncate64,

@@ -102,6 +102,7 @@ void proc_thread_exit(int status) __attribute__((noreturn)); /* exit */
 int  proc_wait4(int pid, uint32_t user_status, int options);
 int  proc_setpgid(int pid, int pgid);
 int  proc_setsid(void);
+int  proc_pgid_in_session(int pgid, int sid);   /* for TIOCSPGRP */
 void proc_set_cwd(struct process *p, struct inode *dir);    /* chdir */
 
 #endif

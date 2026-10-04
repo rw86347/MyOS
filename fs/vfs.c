@@ -727,6 +727,8 @@ struct file *file_new(const struct file_ops *ops, struct inode *i, uint32_t flag
     f->refs = 1;
     f->priv = NULL;
     f->flock = 0;
+    static uint32_t next_serial = 1;    /* 0 means "no file" to a holder */
+    f->serial = next_serial++;
     if (i)
         vfs_get(i);                     /* an open file keeps its inode alive */
     return f;
@@ -772,6 +774,11 @@ int vfs_open_at(struct inode *dir, const char *path, uint32_t flags, uint32_t mo
     struct file *f = file_new(ops, i, flags);
     if (!f)
         return -ENOMEM;
+    if (ops->open && (err = ops->open(f)) < 0) {
+        vfs_put(i);
+        kfree(f);
+        return err;
+    }
     *out = f;
     return 0;
 }

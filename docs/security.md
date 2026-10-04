@@ -1097,6 +1097,112 @@ an address that belongs to someone else. Renewal also means the four words
 could change under a live socket, which nothing is currently written to expect
 — so it needs the sockets to be told, not just a timer.
 
+## The object behind the fd, and who is holding it (2026-10-04)
+
+The sleeping-copy audit above asked the right question about *data*: who else can see this
+shared counter while I am in the copy? It did not ask the same question about the *object*.
+`fd_get` returns `p->files[fd]` and takes no reference, and `clone(CLONE_THREAD)` puts the
+new thread in the same `struct process`, so threads share the fd table outright. A sibling's
+`close()` therefore runs `file_put` — `->release(f)` and then `kfree(f)` — while another
+thread is asleep inside `f->ops->read`. It wakes holding a pointer into a freed heap block.
+
+This is one class, not three bugs, and it is worth stating as a rule rather than a list:
+
+> An fd's `struct file`, and anything reached through `f->priv`, is only yours until you
+> sleep. `copy_to_user`, `copy_from_user` and `wq_sleep` are all sleeps.
+
+`rw()` in `kernel/syscall.c` is the one that matters most, because every `read` and `write`
+goes through it. The fix is Linux's `fdget`/`fdput`: `file_get(f)` before the call and
+`file_put(f)` after (`include/vfs.h`). Pinning the file is enough for all of the new
+subsystems at once, because `pty`, `evdev`, `epoll` and the unix sockets all free their
+`priv` from `->release`, which only runs when the last reference goes.
+
+That is not a small matter in the `evdev` case. `ev_read` sleeps on the device's queue and
+then does `r->q[r->tail++ % QLEN]` — a *write* through the pointer — while `ev_release`
+does `kfree(r)`. A read of freed memory leaks; a write to freed memory is an attacker's
+tool. The others are reads: `pipe_read` and `tty_read_from` both re-test
+`f->flags & O_NONBLOCK` after every wake.
+
+`fs/epoll.c` had two of its own, both writes, and both needed fixing separately because
+they are not reached through `rw()`:
+
+- `sys_epoll_ctl` fetched `ep`, then copied the caller's `epoll_event` in, then wrote into
+  `ep`. Now the fds are checked before the copy and the pointers fetched again after it —
+  checked first so the errors still come out in Linux's order, `EBADF` before `EFAULT`.
+- `do_wait` re-fetched `ep` after sleeping, but only for the next round of the loop: the
+  timeout path still called `scan` on the pre-sleep pointer, and `scan` writes (it drops
+  entries whose file went away and clears `EPOLLONESHOT`).
+
+### The test that passed against the bug, for the fifth time
+
+`racetest` now has `close during read`, and it took three attempts to make it measure
+anything. The first version blocked two readers on one fd and closed a *different* one, so
+the file being freed was not the file anybody was sleeping in — it could not have failed.
+The second worked, and the shape of it is worth keeping: with heap poisoning on, the freed
+`struct file` is recycled and `f->flags` reads as `0xA5A5A5A5`, which has `O_NONBLOCK` set,
+so a *blocking* read returns `EAGAIN`. That is a rule a test can assert without knowing
+anything about the implementation — a blocking read may return data, or 0, or an error, but
+never `EAGAIN`.
+
+The epoll test failed the same way and the reason is the better lesson. It had a sibling
+`close()` the epoll fd and immediately create another one. But `close()` frees the fd
+*number* as well as the heap block, so `epoll_create1` takes both back — and "the kernel
+re-read the fd after the copy" and "the kernel kept the pointer it had" then land on the
+same object and give the same answer. `verify-racetests.sh` said `NOT CAUGHT`, which is
+exactly what it is for. Using `dup2` instead frees the epoll while leaving an ordinary file
+at that fd number, and the two answers differ: `epoll_ctl` must now fail, and returning 0
+means it added an entry to a list that had already been freed.
+
+Both cases are registered in `tools/fuzz/verify-racetests.sh`, so the fixes cannot be
+removed without a test noticing.
+
+### The sockets, which have no count of their own
+
+`sock_of` hands back `f->priv`, and `struct sock` has no reference count — the open file is
+the only thing keeping it alive, and `sock_release` does `kfree(s)`. Every blocking socket
+call sleeps while holding it: `sendmsg`, `recvmsg`, `sendto`, `recvfrom`, `connect`,
+`accept`, and `bind`, `listen`, `getsockname`, `getpeername`, `setsockopt`, `getsockopt`,
+`shutdown` all sleep in a copy before they are done.
+
+Thirteen calls, and about fifty `return` statements between them, which is the wrong shape
+for a `file_put` added by hand to each one — a refcount fix that misses a single path leaks
+a socket for the life of the machine. So it is one wrapper, `SOCK_SYSCALL`, that holds the
+fd's open file around the whole call and leaves every body untouched.
+
+**This one is not independently tested, and that is worth stating rather than glossing.**
+A test was written and `verify-racetests.sh` said `NOT CAUGHT`, so it was deleted instead of
+kept. The reason it cannot easily be caught is interesting: the fix *preserves* the
+semantics — a call whose fd is taken away mid-flight still completes against the socket it
+started with, exactly as Linux does — so there is no different return value to assert on.
+The only observable difference is corruption of whatever took the freed block, and getting
+the sibling to both free the socket and allocate the replacement before this thread resumes
+needs more ordering control than one armed yield gives. The mechanism itself is the one
+proven by the `read`/`write` case above.
+
+### Fixed with it
+
+- **`epoll` identified a registered file by `fd` plus the pointer value.** Close an fd and
+  open another and the new `struct file` can land at the same heap address with the same fd
+  number, and `entry_ready` would poll a file the program never registered. Holding a
+  reference — Linux's answer — is not available here: it would keep the file alive past its
+  last close, so a pipe registered in an epoll would never reach `pipe_release`. Instead
+  `struct file` now carries a per-open serial number and the entry remembers it. 32 bits,
+  for a size-class reason given in `docs/performance.md`.
+- **`TIOCSPGRP` took any value.** The foreground group is who gets the keyboard and
+  `SIGINT`, so any process could point the terminal at itself and read what was typed at
+  the shell. Now the group has to be live and in the caller's session
+  (`proc_pgid_in_session`), as Linux requires.
+- **`KDSKBMODE`, `KDSETMODE`, `VT_ACTIVATE` and `VT_SETMODE` had no permission check.**
+  `K_OFF` stops keys reaching the console at all, and turning them back on means issuing
+  the ioctl again, which means typing — so any unprivileged process could lock the console
+  with no way back. Now `euid == 0`; Linux asks for `CAP_SYS_TTY_CONFIG`, which we do not
+  have yet.
+- **`VT_SETMODE` copied straight into the global `vt_mode`**, so a copy that faulted
+  half-way left it torn for good. Into a local, then assigned.
+- **`VT_GETSTATE` evaluated `1 << active_vt`** on a 32-bit `int` where `VT_ACTIVATE` accepts
+  up to 63 — undefined above 31, and on x86 the hardware shifts by the count modulo 32, so
+  32 would have set bit 0. Bounded at 16, which loses nothing: the field is 16 bits.
+
 ## Plan
 
 In rough dependency order. Each step should end with something testable, and anything on a

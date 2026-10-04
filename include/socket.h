@@ -31,4 +31,24 @@ SYSCALL_DEF(sys_accept4);
 SYSCALL_DEF(sys_socketpair);
 SYSCALL_DEF(sys_socketcall);
 
+/* net/unix.c: AF_UNIX sockets. socket.c sends a call here when the fd is
+   one (unix_fd), with the same arguments. */
+#define AF_UNIX 1
+int unix_fd(uint32_t fd);
+int32_t unix_socket(uint32_t type, uint32_t protocol);
+int32_t unix_socketpair(uint32_t type, uint32_t protocol, uint32_t usv);
+SYSCALL_DEF(unix_bind);
+SYSCALL_DEF(unix_listen);
+SYSCALL_DEF(unix_connect);
+SYSCALL_DEF(unix_accept4);
+SYSCALL_DEF(unix_getsockname);
+SYSCALL_DEF(unix_getpeername);
+SYSCALL_DEF(unix_sendto);
+SYSCALL_DEF(unix_recvfrom);
+SYSCALL_DEF(unix_sendmsg);
+SYSCALL_DEF(unix_recvmsg);
+SYSCALL_DEF(unix_setsockopt);
+SYSCALL_DEF(unix_getsockopt);
+SYSCALL_DEF(unix_shutdown);
+
 #endif

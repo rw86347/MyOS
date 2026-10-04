@@ -47,6 +47,7 @@
 #define EPROTOTYPE 91   /* wrong protocol for this socket type */
 #define ENOPROTOOPT 92  /* that socket option does not exist */
 #define EPROTONOSUPPORT 93 /* protocol not supported */
+#define ESOCKTNOSUPPORT 94 /* socket type not supported */
 #define EOPNOTSUPP 95   /* not supported on this socket */
 #define EAFNOSUPPORT 97 /* address family not supported */
 #define EADDRINUSE 98   /* address already in use */

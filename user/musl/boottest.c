@@ -13,6 +13,7 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/auxv.h>
 #include <sys/file.h>
@@ -22,7 +23,12 @@
 #include <sys/reboot.h>
 #include <sys/stat.h>
 #include <sys/statfs.h>
+#include <sys/socket.h>
 #include <sys/syscall.h>
+#include <sys/un.h>
+#include <poll.h>
+#include <stddef.h>
+#include <sys/ioctl.h>
 #include <sys/utsname.h>
 #include <sys/wait.h>
 #include <grp.h>
@@ -90,7 +96,10 @@ static void tmpfs(void)
           "mount on a file: ENOTDIR");
     check(fails(mount("x", "/boottest-none", "tmpfs", 0, NULL), ENOENT),
           "mount on a missing directory: ENOENT");
-    check(fails(mount("sys", dir, "sysfs", 0, NULL), ENODEV), "sysfs: ENODEV");
+    check(fails(mount("x", dir, "nfs", 0, NULL), ENODEV), "unknown type: ENODEV");
+    mkdir("/sys", 0555);
+    check(mount("sys", "/sys", "sysfs", 0, NULL) == 0 &&
+          stat("/sys/class/graphics", &st) == 0 && S_ISDIR(st.st_mode), "mount -t sysfs");
     check(fails(mount("/dev/sda1", dir, "ext2", 0, NULL), ENOTBLK),
           "ext2 from a device: ENOTBLK");
     check(mount(NULL, dir, NULL, MS_REMOUNT | MS_NOSUID, NULL) == 0, "remount nosuid");
@@ -135,6 +144,120 @@ static void procfs(void)
 
     check(chdir("/bin") == 0 && getcwd(buf, sizeof buf) && strcmp(buf, "/bin") == 0 &&
           chdir("/") == 0, "getcwd still right");
+}
+
+/* A pseudo-terminal, the way xterm makes one: typing on the master comes
+   out of the slave a line at a time, echoed back to the master; the
+   slave's output gets "\r\n"; the master sees EIO once the slave is gone. */
+static void ptys(void)
+{
+    int m = posix_openpt(O_RDWR | O_NOCTTY);
+    check(m >= 0 && grantpt(m) == 0 && unlockpt(m) == 0, "posix_openpt, unlockpt");
+    const char *name = ptsname(m);
+    check(name && strncmp(name, "/dev/pts/", 9) == 0, "ptsname is /dev/pts/N");
+    int s = name ? open(name, O_RDWR | O_NOCTTY) : -1;
+    char buf[32] = { 0 };
+    check(s >= 0 && isatty(s), "open the slave; isatty");
+    check(write(m, "hi\n", 3) == 3 && read(s, buf, sizeof buf) == 3 &&
+          memcmp(buf, "hi\n", 3) == 0, "master types a line, slave reads it");
+    check(read(m, buf, sizeof buf) == 4 && memcmp(buf, "hi\r\n", 4) == 0,
+          "the echo comes back to the master");
+    check(write(s, "out\n", 4) == 4 && read(m, buf, sizeof buf) == 5 &&
+          memcmp(buf, "out\r\n", 5) == 0, "slave output: \\n becomes \\r\\n");
+    struct winsize ws = { .ws_row = 40, .ws_col = 100 }, got = { 0 };
+    check(ioctl(m, TIOCSWINSZ, &ws) == 0 && ioctl(s, TIOCGWINSZ, &got) == 0 &&
+          got.ws_row == 40 && got.ws_col == 100, "window size set on the master");
+    close(s);
+    check(fails(read(m, buf, sizeof buf), EIO), "slave closed: master read EIO");
+    close(m);
+    check(name && access(name, F_OK) != 0, "master closed: /dev/pts/N gone");
+}
+
+/* AF_UNIX: what X11 runs on. A server and a forked client, by path and by
+   abstract name; more bytes than the ring holds; end of file; peer creds. */
+static void unix_sockets(void)
+{
+    struct sockaddr_un sa = { .sun_family = AF_UNIX };
+    strcpy(sa.sun_path, "/boottest.sock");
+    unlink(sa.sun_path);
+    int l = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    struct stat st;
+    check(l >= 0 && bind(l, (struct sockaddr *)&sa, sizeof sa) == 0 && listen(l, 4) == 0 &&
+          stat(sa.sun_path, &st) == 0 && S_ISSOCK(st.st_mode), "unix: bind + listen makes a socket file");
+    int c0 = socket(AF_UNIX, SOCK_STREAM, 0);
+    check(fails(bind(c0, (struct sockaddr *)&sa, sizeof sa), EADDRINUSE), "unix: name taken: EADDRINUSE");
+    close(c0);
+
+    static char big[65536], got[65536];
+    for (unsigned i = 0; i < sizeof big; i++)
+        big[i] = (char)(i * 7 + i / 251);
+    pid_t pid = fork();
+    if (pid == 0) {
+        int c = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (connect(c, (struct sockaddr *)&sa, sizeof sa) != 0)
+            _exit(1);
+        size_t off = 0;
+        while (off < sizeof big) {
+            ssize_t n = write(c, big + off, sizeof big - off);
+            if (n <= 0)
+                _exit(2);
+            off += n;
+        }
+        char ack;
+        _exit(read(c, &ack, 1) == 1 && ack == 'k' ? 0 : 3);
+    }
+    int a = accept(l, NULL, NULL);
+    struct ucred cr;
+    socklen_t crl = sizeof cr;
+    check(a >= 0 && getsockopt(a, SOL_SOCKET, SO_PEERCRED, &cr, &crl) == 0 && cr.pid == pid,
+          "unix: accept, SO_PEERCRED names the client");
+    size_t off = 0;
+    while (off < sizeof got) {
+        ssize_t n = read(a, got + off, sizeof got - off);
+        if (n <= 0)
+            break;
+        off += n;
+    }
+    check(off == sizeof got && memcmp(big, got, sizeof got) == 0, "unix: 64 KiB through a 4 KiB ring");
+    int ok = write(a, "k", 1) == 1;
+    int status;
+    check(ok && waitpid(pid, &status, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0,
+          "unix: answer the client");
+    char x;
+    check(read(a, &x, 1) == 0, "unix: client gone: end of file");
+    signal(SIGPIPE, SIG_IGN);
+    check(fails(write(a, "z", 1), EPIPE), "unix: write to a closed peer: EPIPE");
+    close(a);
+    close(l);
+    int c = socket(AF_UNIX, SOCK_STREAM, 0);
+    check(fails(connect(c, (struct sockaddr *)&sa, sizeof sa), ECONNREFUSED),
+          "unix: socket file with no listener: ECONNREFUSED");
+    close(c);
+    unlink(sa.sun_path);
+
+    struct sockaddr_un ab = { .sun_family = AF_UNIX };
+    memcpy(ab.sun_path, "\0boottest", 9);
+    socklen_t ablen = offsetof(struct sockaddr_un, sun_path) + 9;
+    l = socket(AF_UNIX, SOCK_STREAM, 0);
+    c = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    struct pollfd pf = { .fd = l, .events = POLLIN };
+    check(bind(l, (struct sockaddr *)&ab, ablen) == 0 && listen(l, 1) == 0 &&
+          connect(c, (struct sockaddr *)&ab, ablen) == 0 && poll(&pf, 1, 0) == 1,
+          "unix: abstract name; poll sees the connection");
+    a = accept4(l, NULL, NULL, SOCK_NONBLOCK);
+    check(a >= 0 && fails(read(a, &x, 1), EAGAIN) && write(c, "hi", 2) == 2 &&
+          read(a, got, 8) == 2, "unix: non-blocking read");
+    close(a);
+    close(c);
+    close(l);
+
+    int sv[2];
+    check(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0 && write(sv[0], "ab", 2) == 2 &&
+          read(sv[1], got, 2) == 2 && write(sv[1], "c", 1) == 1 && read(sv[0], got, 1) == 1 &&
+          got[0] == 'c', "unix: socketpair both ways");
+    close(sv[0]);
+    close(sv[1]);
+    signal(SIGPIPE, SIG_DFL);
 }
 
 /* Two opens of one file are two lock owners; a fork shares its parent's. */
@@ -320,6 +443,8 @@ int main(int argc, char **argv)
     priority();
     tmpfs();
     procfs();
+    unix_sockets();
+    ptys();
     locks();
     fifos();
     hangup();

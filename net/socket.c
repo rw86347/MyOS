@@ -12,7 +12,7 @@
  * then sleeps on net_wait, which the e1000 interrupt wakes.
  *
  * Supported: AF_INET with SOCK_STREAM (TCP, client side: tcp.c), SOCK_DGRAM
- * (UDP) and SOCK_RAW + IPPROTO_ICMP (ping). AF_INET6 says EAFNOSUPPORT, which musl's resolver expects on a
+ * (UDP) and SOCK_RAW + IPPROTO_ICMP (ping). AF_UNIX is in unix.c. AF_INET6 says EAFNOSUPPORT, which musl's resolver expects on a
  * machine without IPv6.
  */
 #include <errno.h>
@@ -208,6 +208,40 @@ static int32_t bad_fd(uint32_t fd)
 {
     return fd_get((int)fd) ? -ENOTSOCK : -EBADF;
 }
+
+/*
+ * A socket call whose first argument is an fd, with that fd's open file held
+ * for the length of the call.
+ *
+ * It has to be held because every one of these sleeps: in a copy_from_user
+ * for the address or the message header, or waiting for data to arrive. A
+ * sleep is where another thread runs, clone(CLONE_THREAD) gives it the same
+ * fd table, and its close() takes the last reference -- file_put runs
+ * sock_release, which does kfree(s). `struct sock` has no count of its own,
+ * so the open file is what keeps it alive. docs/security.md has the whole
+ * class and the test that shows it.
+ *
+ * Written as a wrapper rather than a file_put before each `return` because
+ * the thirteen calls below have about fifty of them between them, and a
+ * refcount fix that misses one leaks a socket for the life of the machine.
+ * The cost is two increments and a branch on calls that already copy a
+ * message header, which is below the noise in `make bench`.
+ */
+#define SOCK_SYSCALL(name)                                                     \
+    static int32_t name##_held(uint32_t, uint32_t, uint32_t,                   \
+                               uint32_t, uint32_t, uint32_t);                  \
+    SYSCALL_DEF(name)                                                          \
+    {                                                                          \
+        struct file *f = fd_get((int)a1);                                      \
+        if (f)                                                                 \
+            file_get(f);                                                       \
+        int32_t rc = name##_held(a1, a2, a3, a4, a5, a6);                      \
+        if (f)                                                                 \
+            file_put(f);                                                       \
+        return rc;                                                             \
+    }                                                                          \
+    static int32_t name##_held(SYSCALL_ARG a1, SYSCALL_ARG a2, SYSCALL_ARG a3, \
+                               SYSCALL_ARG a4, SYSCALL_ARG a5, SYSCALL_ARG a6)
 
 static int read_addr(uint32_t uaddr, uint32_t alen, uint32_t *ip, uint16_t *port, int *unspec)
 {
@@ -525,9 +559,15 @@ static const struct file_ops sock_ops = {
 
 /* --- the syscalls -------------------------------------------------------- */
 
+/* An AF_UNIX socket's calls are in unix.c. */
+#define TO_UNIX(fn) \
+    do { if (unix_fd(a1)) return fn(a1, a2, a3, a4, a5, a6); } while (0)
+
 /* int socket(int domain, int type, int protocol) */
 SYSCALL_DEF(sys_socket)
 {
+    if (a1 == AF_UNIX)
+        return unix_socket(a2, a3);
     if (a1 != AF_INET)
         return -EAFNOSUPPORT;
     uint32_t type = a2 & SOCK_TYPE_MASK;
@@ -575,8 +615,9 @@ SYSCALL_DEF(sys_socket)
 }
 
 /* int bind(int fd, const struct sockaddr *addr, socklen_t len) */
-SYSCALL_DEF(sys_bind)
+SOCK_SYSCALL(sys_bind)
 {
+    TO_UNIX(unix_bind);
     struct sock *s = sock_of(a1, 0);
     if (!s)
         return bad_fd(a1);
@@ -602,8 +643,9 @@ SYSCALL_DEF(sys_bind)
 
 /* int connect(int fd, const struct sockaddr *addr, socklen_t len)
    UDP and raw: remember the peer. AF_UNSPEC forgets it. */
-SYSCALL_DEF(sys_connect)
+SOCK_SYSCALL(sys_connect)
 {
+    TO_UNIX(unix_connect);
     struct file *f;
     struct sock *s = sock_of(a1, &f);
     if (!s)
@@ -639,8 +681,9 @@ SYSCALL_DEF(sys_connect)
 }
 
 /* int getsockname(int fd, struct sockaddr *addr, socklen_t *len) */
-SYSCALL_DEF(sys_getsockname)
+SOCK_SYSCALL(sys_getsockname)
 {
+    TO_UNIX(unix_getsockname);
     struct sock *s = sock_of(a1, 0);
     if (!s)
         return bad_fd(a1);
@@ -653,8 +696,9 @@ SYSCALL_DEF(sys_getsockname)
     return write_addr(a2, a3, s->connected ? ipv4_addr : 0, s->lport);
 }
 
-SYSCALL_DEF(sys_getpeername)
+SOCK_SYSCALL(sys_getpeername)
 {
+    TO_UNIX(unix_getpeername);
     struct sock *s = sock_of(a1, 0);
     if (!s)
         return bad_fd(a1);
@@ -673,8 +717,9 @@ SYSCALL_DEF(sys_getpeername)
 
 /* ssize_t sendto(int fd, const void *buf, size_t len, int flags,
                   const struct sockaddr *to, socklen_t tolen) */
-SYSCALL_DEF(sys_sendto)
+SOCK_SYSCALL(sys_sendto)
 {
+    TO_UNIX(unix_sendto);
     struct file *f;
     struct sock *s = sock_of(a1, &f);
     if (!s)
@@ -687,8 +732,9 @@ SYSCALL_DEF(sys_sendto)
 
 /* ssize_t recvfrom(int fd, void *buf, size_t len, int flags,
                     struct sockaddr *from, socklen_t *fromlen) */
-SYSCALL_DEF(sys_recvfrom)
+SOCK_SYSCALL(sys_recvfrom)
 {
+    TO_UNIX(unix_recvfrom);
     struct file *f;
     struct sock *s = sock_of(a1, &f);
     if (!s)
@@ -713,8 +759,9 @@ static int read_msg(uint32_t umsg, struct msghdr32 *m, struct iovec32 *iov)
 }
 
 /* ssize_t sendmsg(int fd, const struct msghdr *msg, int flags) */
-SYSCALL_DEF(sys_sendmsg)
+SOCK_SYSCALL(sys_sendmsg)
 {
+    TO_UNIX(unix_sendmsg);
     struct file *f;
     struct sock *s = sock_of(a1, &f);
     if (!s)
@@ -773,8 +820,9 @@ SYSCALL_DEF(sys_sendmsg)
 }
 
 /* ssize_t recvmsg(int fd, struct msghdr *msg, int flags) */
-SYSCALL_DEF(sys_recvmsg)
+SOCK_SYSCALL(sys_recvmsg)
 {
+    TO_UNIX(unix_recvmsg);
     struct file *f;
     struct sock *s = sock_of(a1, &f);
     if (!s)
@@ -800,15 +848,17 @@ SYSCALL_DEF(sys_recvmsg)
 
 /* Options we accept and ignore: buffer sizes, broadcast, reuseaddr, TTL.
    The values change nothing here yet. */
-SYSCALL_DEF(sys_setsockopt)
+SOCK_SYSCALL(sys_setsockopt)
 {
+    TO_UNIX(unix_setsockopt);
     if (!sock_of(a1, 0))
         return bad_fd(a1);
     return 0;
 }
 
-SYSCALL_DEF(sys_getsockopt)
+SOCK_SYSCALL(sys_getsockopt)
 {
+    TO_UNIX(unix_getsockopt);
     struct sock *s = sock_of(a1, 0);
     if (!s)
         return bad_fd(a1);
@@ -834,8 +884,9 @@ SYSCALL_DEF(sys_getsockopt)
 }
 
 /* int shutdown(int fd, int how): 1 or 2 sends our FIN after the data. */
-SYSCALL_DEF(sys_shutdown)
+SOCK_SYSCALL(sys_shutdown)
 {
+    TO_UNIX(unix_shutdown);
     struct sock *s = sock_of(a1, 0);
     if (!s)
         return bad_fd(a1);
@@ -850,18 +901,22 @@ SYSCALL_DEF(sys_shutdown)
     return 0;
 }
 
-SYSCALL_DEF(sys_listen)
+SOCK_SYSCALL(sys_listen)
 {
+    TO_UNIX(unix_listen);
     return sock_of(a1, 0) ? -EOPNOTSUPP : bad_fd(a1);
 }
 
-SYSCALL_DEF(sys_accept4)
+SOCK_SYSCALL(sys_accept4)
 {
+    TO_UNIX(unix_accept4);
     return sock_of(a1, 0) ? -EOPNOTSUPP : bad_fd(a1);
 }
 
 SYSCALL_DEF(sys_socketpair)
 {
+    if (a1 == AF_UNIX)
+        return unix_socketpair(a2, a3, a4);
     return a1 == AF_INET ? -EOPNOTSUPP : -EAFNOSUPPORT;
 }
 

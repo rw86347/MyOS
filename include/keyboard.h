@@ -16,4 +16,8 @@ int keyboard_getc(void);
    the keyboard interrupt. */
 void keyboard_set_listener(void (*fn)(const char *bytes, int n));
 
+/* 0: keys stop going to the terminal; only /dev/input/event0 sees them
+   (an X server's KDSKBMODE K_OFF). 1: back to normal. */
+void keyboard_set_tty(int on);
+
 #endif

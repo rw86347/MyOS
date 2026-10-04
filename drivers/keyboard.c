@@ -14,6 +14,7 @@
  * small ring buffer; keyboard_getc() takes characters out later. Keeping
  * interrupt handlers short like this is a general rule.
  */
+#include <evdev.h>
 #include <interrupts.h>
 #include <io.h>
 #include <keyboard.h>
@@ -50,6 +51,43 @@ static const char shift_map[128] = {
 
 static int shift, ctrl, alt, caps;
 static int extended;            /* the previous byte was the 0xE0 prefix */
+static int tty_on = 1;          /* 0: keys go only to /dev/input (an X server
+                                   set KDSKBMODE K_OFF on the console) */
+
+void keyboard_set_tty(int on)
+{
+    tty_on = on;
+}
+
+/* The key's Linux code (KEY_*, input-event-codes.h), for /dev/input. For
+   set-1 scancodes below 0x59 it IS the scancode; the 0xE0 keys have codes
+   of their own. 0: none (the fake Shifts around Print Screen). */
+static uint16_t linux_key(uint8_t sc, int ext)
+{
+    if (!ext)
+        return sc < 0x59 ? sc : 0;
+    switch (sc) {
+    case 0x1C: return 96;       /* keypad Enter */
+    case 0x1D: return 97;       /* right Ctrl */
+    case 0x35: return 98;       /* keypad / */
+    case 0x37: return 99;       /* Print Screen */
+    case 0x38: return 100;      /* right Alt */
+    case 0x47: return 102;      /* Home */
+    case 0x48: return 103;      /* up */
+    case 0x49: return 104;      /* Page Up */
+    case 0x4B: return 105;      /* left */
+    case 0x4D: return 106;      /* right */
+    case 0x4F: return 107;      /* End */
+    case 0x50: return 108;      /* down */
+    case 0x51: return 109;      /* Page Down */
+    case 0x52: return 110;      /* Insert */
+    case 0x53: return 111;      /* Delete */
+    case 0x5B: return 125;      /* left Windows key */
+    case 0x5C: return 126;      /* right Windows key */
+    case 0x5D: return 127;      /* Menu */
+    default:   return 0;
+    }
+}
 
 /* Once a terminal (tty.c) listens, keys go to it as the bytes a real
    terminal sends: Enter = CR, Backspace = DEL (0x7F), and the keys
@@ -119,6 +157,13 @@ static void keyboard_irq(struct regs *r)
     }
     int released = sc & 0x80;
     sc &= 0x7F;
+    uint16_t key = linux_key(sc, extended);
+    if (key)
+        evdev_key(key, !released);
+    if (!tty_on) {              /* the X server has the keyboard */
+        extended = 0;
+        return;
+    }
 
     if (extended) {             /* arrows, Home, Delete, right Ctrl... */
         extended = 0;

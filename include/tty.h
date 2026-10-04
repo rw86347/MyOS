@@ -34,4 +34,21 @@ void tty_set_foreground(int pgid);
    Linux would make them fail, so the next user can't be listened to. */
 void tty_hangup(void);
 
+/* --- the line discipline for other terminals (pty.c) --- */
+struct tty;
+typedef void (*tty_out_fn)(void *owner, const char *s, uint32_t n);
+
+struct tty *tty_new(tty_out_fn out, void *owner);  /* echo goes to out */
+void     tty_free(struct tty *t);
+void     tty_feed(struct tty *t, const char *bytes, uint32_t n);    /* typing */
+int32_t  tty_read_from(struct tty *t, struct file *f, void *user_buf, uint32_t n);
+int32_t  tty_ioctl_on(struct tty *t, uint32_t cmd, uint32_t arg); /* termios, size, pgrp */
+int      tty_readable(struct tty *t);
+uint32_t tty_space(struct tty *t);          /* bytes tty_feed takes without dropping */
+void     tty_wait_space(struct tty *t);     /* sleep until a read makes room */
+int      tty_onlcr(struct tty *t);          /* write '\n' as "\r\n"? */
+void     tty_set_hung(struct tty *t);       /* other end gone: SIGHUP, then EOF */
+int      tty_get_fg(struct tty *t);
+void     tty_set_fg(struct tty *t, int pgid);
+
 #endif

@@ -96,6 +96,12 @@ SYSCALL_DEF(sys_flock);
 
 /* fs/poll.c */
 SYSCALL_DEF(sys_poll);
+/* fs/epoll.c */
+SYSCALL_DEF(sys_epoll_create);
+SYSCALL_DEF(sys_epoll_create1);
+SYSCALL_DEF(sys_epoll_ctl);
+SYSCALL_DEF(sys_epoll_wait);
+SYSCALL_DEF(sys_epoll_pwait);
 SYSCALL_DEF(sys_ppoll64);
 SYSCALL_DEF(sys_ppoll32);
 SYSCALL_DEF(sys_pselect32);

@@ -30,6 +30,10 @@
 #include <pthread.h>
 #include <stdio.h>
 #include <string.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <sys/epoll.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
@@ -461,6 +465,206 @@ static void test_readdir_unlink(void)
     check(survivors == sweep, "readdir: the entry that was never deleted was listed");
 }
 
+/*
+ * Closing an fd while a sibling thread is blocked reading it.
+ *
+ * rw() in kernel/syscall.c fetches the struct file with fd_get and calls
+ * f->ops->read(f, ...) without taking a reference. A blocking read sleeps
+ * inside that call, so a sibling thread's close() can take the last
+ * reference: file_put runs ->release and then kfree(f), and the sleeping
+ * reader resumes holding a pointer into freed memory. clone(CLONE_THREAD)
+ * puts the new thread in the same struct process, so the fd table is shared
+ * outright and nothing stands in the way.
+ *
+ * pipe_read re-reads `f->flags` after every wake, so seeing it needs a wake
+ * with nothing to read:
+ *
+ *   two readers sleep on one FIFO, one byte is written, both wake, one takes
+ *   the byte and the other goes round the loop and tests f->flags again.
+ *
+ * The assertion is a rule rather than a value: read() on a blocking fd may
+ * return data, or 0, or an error, but never EAGAIN. One that does has read
+ * its O_NONBLOCK bit out of a struct file that was freed underneath it.
+ *
+ * FIFOs rather than pipe(): two opens of a FIFO give two struct files on one
+ * pipe, so one can be freed while the other keeps the pipe alive and
+ * writable. Closing an anonymous pipe's only read end takes the reader count
+ * to zero with it, and then nothing can write to wake anybody.
+ */
+#define UAF_FIFO "/tmp/raceuaf"
+
+static int uaf_rfd;                     /* the fd the blocked readers use */
+static volatile int uaf_rc[2], uaf_errno[2];
+
+static void *uaf_reader(void *arg)
+{
+    int i = (int)(long)arg;
+    char c = 0;
+    errno = 0;
+    uaf_rc[i] = (int)read(uaf_rfd, &c, 1);
+    uaf_errno[i] = errno;
+    return 0;
+}
+
+static void spin(void)
+{
+    for (volatile int i = 0; i < 3000000; i++)
+        ;
+}
+
+static void test_close_during_read(void)
+{
+    int eagain = 0, rounds = 0;
+
+    for (int round = 0; round < 8; round++) {
+        unlink(UAF_FIFO);
+        if (mkfifo(UAF_FIFO, 0600) != 0)
+            break;                      /* no FIFOs: nothing to test here */
+
+        /* O_NONBLOCK so opening a reader does not wait for a writer; cleared
+           again below, because the point is a read that blocks. */
+        int r1 = open(UAF_FIFO, O_RDONLY | O_NONBLOCK);
+        int r2 = open(UAF_FIFO, O_RDONLY | O_NONBLOCK);
+        int w  = open(UAF_FIFO, O_WRONLY);
+        if (r1 < 0 || r2 < 0 || w < 0) {
+            if (r1 >= 0) close(r1);
+            if (r2 >= 0) close(r2);
+            if (w >= 0) close(w);
+            break;
+        }
+        fcntl(r1, F_SETFL, 0);
+
+        /* Both threads block on r1 -- the fd that is about to be closed, so
+           the struct file they are asleep inside is the one that gets freed.
+           r2 is the spare reference that keeps p->readers above zero, so the
+           pipe stays writable and there is still something able to wake them.
+           Blocking on r2 instead frees a file nobody is using, which is the
+           mistake this comment exists to stop being made twice. */
+        uaf_rfd = r1;
+        uaf_rc[0] = uaf_rc[1] = -999;
+        uaf_errno[0] = uaf_errno[1] = 0;
+        pthread_t t[2];
+        if (pthread_create(&t[0], 0, uaf_reader, (void *)0L) != 0 ||
+            pthread_create(&t[1], 0, uaf_reader, (void *)1L) != 0) {
+            close(r1); close(r2); close(w);
+            break;
+        }
+        spin();                         /* let both reach the sleep */
+
+        close(r1);
+
+        /* Groom: the block just freed goes back on a kmalloc size class and
+           the next allocation of that size gets it. Opening files puts a
+           struct file there, with flags of our choosing. Freed memory that
+           still holds its old contents hides the bug, which is the whole
+           lesson of the readdir test above. */
+        int g[8];
+        for (int i = 0; i < 8; i++)
+            g[i] = open("/etc/hostname", O_RDONLY | O_NONBLOCK);
+
+        /* One byte, two sleepers: one leaves with it, the other goes round
+           the loop and reads f->flags again. */
+        write(w, "x", 1);
+        spin();
+        write(w, "y", 1);               /* let the second one out */
+
+        pthread_join(t[0], 0);
+        pthread_join(t[1], 0);
+        for (int i = 0; i < 8; i++)
+            if (g[i] >= 0)
+                close(g[i]);
+        close(r2);
+        close(w);
+        unlink(UAF_FIFO);
+
+        rounds++;
+        for (int i = 0; i < 2; i++)
+            if (uaf_rc[i] < 0 && uaf_errno[i] == EAGAIN)
+                eagain++;
+    }
+
+    if (rounds == 0) {
+        printf("racetest: close-during-read needs FIFOs -- skipped\n");
+        return;
+    }
+    check(eagain == 0, "close during read: a blocking read never returned EAGAIN");
+}
+
+/*
+ * epoll_ctl while a sibling takes the epoll fd away.
+ *
+ * sys_epoll_ctl in fs/epoll.c fetched the struct epoll, then copied the
+ * caller's epoll_event in, then wrote into the struct:
+ *
+ *      struct epoll *ep = epoll_of(a1, &err);     <- the object
+ *      copy_from_user(&ev, (const void *)a4, ...) <- can sleep
+ *      while (k < ep->n && ...)                   <- the object again
+ *      ep->e[k].fd = ...; ep->n++;                <- written to
+ *
+ * The copy in the middle can sleep, and epoll_release does kfree(f->priv),
+ * so a sibling can free `ep` while this thread is in the copy. It resumes
+ * and writes into a freed heap block.
+ *
+ * dup2 rather than close, and that is the whole difficulty of writing this
+ * test. With close() the next epoll_create1 takes back both the fd number
+ * and the freed heap block, so "the kernel re-read the fd after the copy"
+ * and "the kernel kept the pointer it had" land on the same object and
+ * agree -- the first version of this test passed against the bug it was
+ * written for, and verify-racetests.sh said so. dup2 frees the epoll the
+ * same way (fd_install_at calls file_put on what was there) but leaves an
+ * ordinary file at that fd number, so the two answers differ.
+ *
+ * The law: once that fd names something that is not an epoll, epoll_ctl on
+ * it cannot succeed. Returning 0 means it added an entry to an interest list
+ * that had already been freed.
+ */
+static int ep_fd = -1, ep_spare = -1;
+static volatile int ep_rc, ep_errno;
+
+static void *ep_taker(void *unused)
+{
+    (void)unused;
+    sib_ready = 1;
+    wait_for(&sib_go);
+    dup2(ep_spare, ep_fd);          /* frees the epoll, keeps the fd number */
+    sib_done = 1;
+    return 0;
+}
+
+static void test_epoll_ctl_close(void)
+{
+    ep_fd = epoll_create1(0);
+    ep_spare = open("/etc/hostname", O_RDONLY);
+    int victim = open("/etc/hostname", O_RDONLY);
+    if (ep_fd < 0 || ep_spare < 0 || victim < 0) {
+        printf("racetest: epoll not available -- skipped\n");
+        return;
+    }
+
+    sib_ready = sib_go = sib_done = 0;
+    pthread_t t;
+    if (pthread_create(&t, 0, ep_taker, 0) != 0) {
+        close(ep_fd); close(ep_spare); close(victim);
+        return;
+    }
+    wait_for(&sib_ready);
+
+    struct epoll_event ev = { .events = EPOLLIN, .data.fd = victim };
+    sib_go = 1;
+    arm();                          /* the next copy yields before copying */
+    errno = 0;
+    ep_rc = epoll_ctl(ep_fd, EPOLL_CTL_ADD, victim, &ev);
+    ep_errno = errno;
+
+    pthread_join(t, 0);
+    close(ep_fd);
+    close(ep_spare);
+    close(victim);
+
+    check(ep_rc < 0 && (ep_errno == EINVAL || ep_errno == EBADF),
+          "epoll_ctl while the fd is replaced: no entry added to a freed list");
+}
+
 int main(void)
 {
     if (arm() != 0) {
@@ -473,6 +677,8 @@ int main(void)
     test_pipe_write();
     test_wait_reap();
     test_readdir_unlink();
+    test_close_during_read();
+    test_epoll_ctl_close();
 
     if (failures) {
         printf("racetest: %d of %d checks FAILED\n", failures, checks);

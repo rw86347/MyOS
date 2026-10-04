@@ -22,16 +22,16 @@ when it's fixed. File references point at the comment that mentions the gap.
 - **E820 map holds at most 32 entries.** (`layout.inc`, `E820_MAX`)
 
 ## Live disk userland (`live/`, 2026-10-03)
-- **Boots and logs in, on the console only** (`make live-hd`, `make utm-live`). agetty
-  runs on `/dev/console`: there are no `/dev/tty1`/`ttyS0` nodes yet. Alpine's apk was
-  never run against the generated database (no Docker), and the desktop (`startx`)
-  was not tried on it.
+- **Boots to the graphical login** (`make live-hd`, `make utm-live`): `myos-login`
+  starts X, checks the password with PAM and runs IceWM. agetty also runs on
+  `/dev/console`: there are no `/dev/tty1`/`ttyS0` nodes yet. Alpine's apk was never
+  run against the generated database (no Docker).
 - **The live user is made at build time** (`tools/fetch-live.py`, `add_live_user`):
   shadow's `useradd` and `passwd` lock `/etc/passwd` with a hard link, and the VFS has
   none (each name is its inode). Until `link()` exists, adding users or changing a
   password inside the running system fails.
-- **No UNIX sockets.** syslog() goes nowhere ("agetty: cannot open UNIX socket"), so
-  login failures aren't logged; D-Bus and X11's local socket can't work either.
+- **Nothing reads the syslog socket.** `net/unix.c` has UNIX sockets now, but no
+  syslog daemon runs, so login failures still go nowhere.
 - **32 fds per process** (`PROC_FILES`). bash moves its terminal to fd 255 for job
   control and gets `EBADF`, so the login shell has no Ctrl-Z / `fg`. `cloexec` is a
   32-bit mask; growing the table means a bitmap.
@@ -46,9 +46,9 @@ when it's fixed. File references point at the comment that mentions the gap.
   not its old directory.
 - **Named pipes: at most 64 open at once** (`FIFO_MAX`, `fs/pipe.c`), and a process
   may have at most 1024 memory areas (`MM_AREAS_MAX`, `mm/mm.c`; Linux allows 65530).
-- **mount/umount2 are partial** (`kernel/sys_fs.c`). Only `tmpfs` and `proc` can be
-  mounted (`mode=` is the one option read; `size=` is ignored: it shares the RAM file
-  system's pages). No sysfs, devpts (`-ENODEV`); no block device files, so ext2/vfat
+- **mount/umount2 are partial** (`kernel/sys_fs.c`). Only `tmpfs`, `proc` and `sysfs`
+  can be mounted (`mode=` is the one option read; `size=` is ignored: it shares the RAM
+  file system's pages). No devpts (`-ENODEV`); no block device files, so ext2/vfat
   give `-ENOTBLK`; no bind or move mounts. A mount can't be undone: `umount2` says
   `-EBUSY`, because the VFS doesn't count open files and cwds per mount. Remount
   accepts nosuid/nodev/noexec without enforcing them and refuses read-only. tmpfs and
@@ -97,6 +97,12 @@ when it's fixed. File references point at the comment that mentions the gap.
   (thread stacks, buffers); small objects are O(1). (`mm/kheap.c`)
 - **Nothing above 0xFF000000 is used yet** (planned for temporary mappings etc.).
   (`memlayout.h`)
+- **Add System V shared memory** (`shmget`, `shmat`, `shmdt`, `shmctl`). Not there yet. The
+  X server's MIT-SHM extension uses it, and so do GTK, xterm's images and picom: they
+  hand pictures to X through a shared segment instead of copying them down the socket.
+  Without it they fall back to the slower copy, or fail. musl on i386 calls them through
+  the old `ipc` multiplexer (syscall 117), so that is the number to implement first; Linux
+  also has the direct calls (395-398).
 
 ## Threads / scheduler
 - **No locks.** Preemption is on, so two threads can be inside the same code at once.
@@ -541,3 +547,67 @@ when it's fixed. File references point at the comment that mentions the gap.
   pick a transfer mode ourselves (SET FEATURES, PIIX timing registers): DMA runs at
   whatever mode the BIOS set up, checked by a test read at boot. Not yet tried on
   real hardware. LBA28 only (128 GiB).
+
+## Open files and the objects behind them (found 2026-10-04)
+
+All of these are fixed; what is left is the testing gap and the capability one.
+`docs/security.md` has the class, `docs/performance.md` the cost.
+
+- **The socket pinning is not covered by a test.** Thirteen socket calls now hold their fd
+  (`SOCK_SYSCALL` in `net/socket.c`), but a test for it was written, found to pass against
+  the unfixed kernel by `verify-racetests.sh`, and deleted rather than kept. The fix keeps
+  the semantics — a call whose fd is taken away still completes against the socket it
+  started with, as Linux does — so there is no return value that differs; only the
+  corruption of whatever took the freed block, and one armed yield is not enough ordering
+  control to make the sibling free *and* reallocate before this thread resumes. The
+  mechanism is the one the `read`/`write` case does prove.
+- **The terminal ioctls check `euid == 0`, not a capability.** Linux wants
+  `CAP_SYS_TTY_CONFIG` for `KDSKBMODE`, `KDSETMODE`, `VT_ACTIVATE` and `VT_SETMODE`. There
+  are no capabilities here yet, which is tracked in `docs/security.md`'s plan; root is the
+  stand-in. An X server is started by root, so nothing real is blocked by it today.
+- **`struct file`'s serial number is 32 bits**, so it wraps after 2^32 opens. A collision
+  then needs the new file to land on the same heap address *and* at the same fd number, and
+  its consequence is `epoll` polling the wrong file rather than touching freed memory. The
+  64-bit version cost twice the memory per open file (size classes — `docs/performance.md`).
+- **`racetest`'s `wait` checks fail under host load.** They assert that an interleaving
+  *happened*, so when the Mac is busy — another QEMU running in the next window — the
+  sibling does not get scheduled in time and four checks fail. Nothing is wrong with the
+  kernel when that happens, but it is indistinguishable from a real failure at a glance,
+  which is the thing a test must not be.
+
+## The graphical desktop (step 11b, 2026-10-04)
+
+- **No System V shared memory** (no `shmget`/`shmat`, no `sys_ipc`). The X server
+  announces MIT-SHM anyway, and every image library believes it: Imlib2 then draws
+  nothing at all, which is why IceWM's theme and the login screen came up black. The
+  extension is switched off in `live/overlay/etc/X11/xorg.conf.d/10-myos.conf`, so
+  pictures travel down the socket instead. Every local X client pays for that in
+  copies — the first thing to measure if the desktop feels slow.
+- **`link()` is still missing**, so the X server cannot make its lock file and is
+  started with `-nolock` (`live/myos-login/myos-login.c`). Two X servers on one
+  display would not be noticed.
+- **16 pseudo-terminals** (`PTY_MAX`, `drivers/pty.c`), each with a one-page ring in
+  each direction. `/dev/pts` is an ordinary RAM directory, not devpts: the nodes are
+  made and removed by hand, and a `mount -t devpts` still fails.
+- **`epoll` is an array, scanned** (`EPOLL_MAX` 64 per epoll fd, `fs/epoll.c`): every
+  wait walks all of them and calls each file's `poll`. That is the cost X pays per
+  event; Linux keeps a ready list. `EPOLLET` is accepted and treated as level
+  triggered, and `epoll_pwait`'s signal mask is ignored.
+- **`/sys` holds one thing**: `class/graphics/fb0`, because the X server's fbdev
+  driver refuses a screen without it (`fs/sysfs.c`). Anything else that reads /sys —
+  udev, libinput, power management — finds nothing.
+- **Programs that look at other processes find nothing.** With no `/proc/<pid>`,
+  `pidof`, `pgrep`, `ps` and `top` come back empty, so service scripts that wait for
+  a program to appear spin for ever.
+- **`FBIOPUTCMAP` fails** (`-EINVAL`), and the fbdev driver calls it even on a
+  TrueColor screen: ten "(EE) FBIOPUTCMAP: Invalid argument" lines in `Xorg.0.log`
+  that mean nothing. Gamma is not adjustable.
+- **The desktop only looks right at the size it was drawn for.** IceWM's fonts are
+  fixed point sizes at 96 dpi, so on a 1920x1200 screen the menus and title text are
+  smaller, relative to everything else, than the mockup
+  (`assets/themes/golden-hour/mockup.png`). The login screen does scale: it measures
+  the screen and draws against a 768-high design. A real fix is one DPI for the whole
+  session.
+- **The mockup's programs do not exist**: no file manager, text editor, browser or
+  settings app, so there are no desktop icons and the Start menu is IceWM's own list
+  of what is installed, not the two-column menu in the picture.

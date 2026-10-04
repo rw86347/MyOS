@@ -427,6 +427,21 @@ void signal_send_group(int pgid, int sig)
     }
 }
 
+/* Is pgid a live process group in session sid? TIOCSPGRP has to know, because
+   the foreground group is who gets the keyboard and SIGINT: handing the
+   terminal to a group in someone else's session lets any process take the
+   keyboard away from the shell that owns it. A scan of the table, which is
+   fine for an ioctl a shell calls once per job. */
+int proc_pgid_in_session(int pgid, int sid)
+{
+    for (int i = 0; i < PROC_MAX; i++) {
+        struct process *p = proc_at(i);
+        if (p->state == PROC_ALIVE && p->pgid == pgid && p->sid == sid)
+            return 1;
+    }
+    return 0;
+}
+
 int32_t sys_rt_sigsuspend_impl(uint32_t set, uint32_t size)
 {
     struct thread *t = thread_current();

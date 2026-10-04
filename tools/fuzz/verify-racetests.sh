@@ -15,12 +15,12 @@ set -e
 trap '' PIPE
 cd "$(dirname "$0")/../.."
 
-SRC="fs/pipe.c kernel/proc.c kernel/syscall.c"
+SRC="fs/pipe.c kernel/proc.c kernel/syscall.c fs/epoll.c"
 TMP=$(mktemp -d)
 restore() { for f in $SRC; do cp "$TMP/$(echo $f | tr / _)" "$f"; done; }
 # Delete the objects as well: a restored source and a stale object leave the
 # next case running the previous case's kernel.
-trap 'restore; rm -rf "$TMP"; rm -f build/test/kernel/syscall.o build/test/kernel/proc.o build/test/fs/pipe.o' EXIT
+trap 'restore; rm -rf "$TMP"; rm -f build/test/kernel/syscall.o build/test/kernel/proc.o build/test/fs/pipe.o build/test/fs/epoll.o' EXIT
 for f in $SRC; do cp "$f" "$TMP/$(echo $f | tr / _)"; done
 
 run_case() {
@@ -41,7 +41,7 @@ PY
         printf '\n=== %s ===\nPATCH DID NOT APPLY: the source moved under it\n' "$name"
         return 1
     fi
-    rm -f build/test/kernel/syscall.o build/test/kernel/proc.o build/test/fs/pipe.o
+    rm -f build/test/kernel/syscall.o build/test/kernel/proc.o build/test/fs/pipe.o build/test/fs/epoll.o
     printf '\n=== %s ===\n' "$name"
     # QEMU holds a write lock on the disk image, so a concurrent `make test`
     # (another agent, another window) makes this fail for the wrong reason.
@@ -131,6 +131,47 @@ run_case "getdents64 anchoring a cursor on a deleted entry" \
                 break;' \
     '            if (0)
                 break;' || fail=1
+
+run_case "read/write not holding the open file across the call" \
+    kernel/syscall.c \
+    '    file_get(f);
+    int32_t rc = writing ? f->ops->write(f, (const void *)buf, len)
+                         : f->ops->read(f, (void *)buf, len);
+    file_put(f);
+    return rc;' \
+    '    return writing ? f->ops->write(f, (const void *)buf, len)
+                   : f->ops->read(f, (void *)buf, len);' || fail=1
+
+run_case "epoll_ctl fetching the interest list before the copy instead of after" \
+    fs/epoll.c \
+    '    int err = 0;
+    if (!epoll_of(a1, &err))
+        return err;
+    if (!fd_get((int)a3))
+        return -EBADF;
+    if (a3 == a1)
+        return -EINVAL;
+    struct epoll_event ev = { 0, { 0, 0 } };
+    if (a2 != EPOLL_CTL_DEL && copy_from_user(&ev, (const void *)a4, sizeof ev) < 0)
+        return -EFAULT;
+    struct epoll *ep = epoll_of(a1, &err);
+    if (!ep)
+        return err;                 /* closed while we were in the copy */
+    struct file *f = fd_get((int)a3);
+    if (!f)
+        return -EBADF;' \
+    '    int err = 0;
+    struct epoll *ep = epoll_of(a1, &err);
+    if (!ep)
+        return err;
+    struct file *f = fd_get((int)a3);
+    if (!f)
+        return -EBADF;
+    if (a3 == a1)
+        return -EINVAL;
+    struct epoll_event ev = { 0, { 0, 0 } };
+    if (a2 != EPOLL_CTL_DEL && copy_from_user(&ev, (const void *)a4, sizeof ev) < 0)
+        return -EFAULT;' || fail=1
 
 printf '\n'
 if [ $fail -ne 0 ]; then

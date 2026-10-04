@@ -87,6 +87,11 @@
 #define NR_flock       143
 #define NR_getpriority  96
 #define NR_setpriority  97
+#define NR_epoll_create 254
+#define NR_epoll_ctl   255
+#define NR_epoll_wait  256
+#define NR_epoll_pwait 319
+#define NR_epoll_create1 329
 #define NR_rename       38
 #define NR_mkdir        39
 #define NR_rmdir        40

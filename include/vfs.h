@@ -80,6 +80,10 @@ struct file_ops {
        with vm_iomap_memory (mm.h). vma->start is 0 here, end the length.
        NULL: mmap gives -ENODEV. */
     int (*mmap)(struct file *f, struct vma *vma);
+    /* open() of the device node made f: set f->priv, or switch f->ops to
+       another device's (/dev/tty -> the caller's terminal). -errno fails
+       the open. NULL: nothing to do. */
+    int (*open)(struct file *f);
 };
 
 /* inode flags */
@@ -197,6 +201,21 @@ struct file {
     uint32_t refs;                  /* fds pointing at it */
     void *priv;                     /* pipe: the pipe; directory: its cursor */
     uint32_t flock;                 /* the flock() it holds: 0, LOCK_SH or LOCK_EX */
+    /* Which open this is, counted from boot. Anything that remembers a
+       struct file without holding a reference — epoll's interest list — needs
+       to tell "still the file I was given" from "a different file that landed
+       on the same freed block", and the address alone cannot: close one and
+       open another and kmalloc hands back the same bytes at the same fd
+       number.
+       32 bits and not 64, which is a size-class decision rather than a
+       guess: this struct is 28 bytes, so it comes from kmalloc's 32-byte
+       class, and eight more bytes would push every open file in the system
+       into the 64-byte one. `make bench` put that at 35 cycles on open+close
+       and twice the memory per open file, to remove a collision that needs
+       the counter to wrap through 2^32 opens *and* the new file to land on
+       the same address *and* at the same fd number — and whose consequence
+       is polling the wrong file, not touching freed memory. */
+    uint32_t serial;
 };
 
 /* --- the tree ---------------------------------------------------------- */
@@ -228,6 +247,24 @@ int  vfs_open_at(struct inode *dir, const char *path, uint32_t flags, uint32_t m
                  struct file **out);
 struct file *file_new(const struct file_ops *ops, struct inode *i, uint32_t flags);
 void file_put(struct file *f);                  /* drop one reference */
+
+/*
+ * Hold an open file across something that can sleep.
+ *
+ * fd_get hands back the struct file without a reference, which is fine only
+ * for a syscall that finishes without sleeping. A blocking read does sleep
+ * inside f->ops->read, and clone(CLONE_THREAD) puts the new thread in the
+ * same struct process -- so the fd table is shared, a sibling's close() can
+ * take the last reference, and file_put runs ->release and kfree(f) while
+ * the reader is still asleep holding the pointer. It then resumes and reads
+ * f->flags out of a recycled heap block.
+ *
+ * That is not theory: user/musl/racetest.c arms it and a blocking read comes
+ * back EAGAIN, which a blocking read may never do -- the O_NONBLOCK bit came
+ * out of someone else's object. Pair this with file_put around anything that
+ * can sleep, as Linux pairs fdget with fdput.
+ */
+static inline void file_get(struct file *f) { f->refs++; }
 
 /* Reading a directory (getdents64), in order, while entries may come and
    go between calls: the first entry not yet returned through f (NULL: no
@@ -316,6 +353,8 @@ int  fifo_open(struct inode *i, uint32_t flags, struct file **out);  /* a named 
 /* procfs.c: mount -t proc, and readlink of a /proc/self/fd/N link. */
 int  procfs_mount(const char *path);
 int  procfs_readlink(struct inode *link, char *buf, uint32_t size);
+/* sysfs.c: mount -t sysfs (just what Xorg checks: /sys/class/graphics/fb0). */
+int  sysfs_mount(const char *path);
 /* flock.c: drop f's flock() (its last fd closed). */
 void flock_release(struct file *f);
 extern struct wait_queue poll_wait;     /* poll.c: woken when a file's state changes */

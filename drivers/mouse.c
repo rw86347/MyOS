@@ -21,6 +21,7 @@
  * QEMU and UTM give the machine a PS/2 mouse (UTM: with USB off). On a real
  * PC without one, mouse_init just says so.
  */
+#include <evdev.h>
 #include <interrupts.h>
 #include <io.h>
 #include <kprintf.h>
@@ -114,6 +115,7 @@ static void mouse_irq(struct regs *r)
     e.dx = (int16_t)(packet[1] - ((packet[0] << 4) & 0x100));   /* bit 4: dx < 0 */
     e.dy = (int16_t)(packet[2] - ((packet[0] << 3) & 0x100));   /* bit 5: dy < 0 */
     e.wheel = packet_size == 4 ? (int8_t)(packet[3] << 4) >> 4 : 0;   /* 4-bit signed */
+    evdev_mouse(&e);                    /* /dev/input/event1 (X) */
     if (head - tail == RING)
         return;                         /* nobody reads: keep the oldest */
     ring[head % RING] = e;

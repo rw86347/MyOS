@@ -587,3 +587,46 @@ a `kmalloc` + copy inside `mmap`/`mprotect`, never in the page-fault path.
 Unchanged within noise: small programs have few areas, and `fork` copies one array as
 before. Not measured: a page fault in a process with hundreds of areas, where the
 binary search replaces what would have been a long scan.
+
+## Holding the open file across a syscall (2026-10-04)
+
+`fd_get` returned the `struct file` without taking a reference, so a sibling thread's
+`close()` could free it while this one was asleep inside a blocking read — a use-after-free,
+with `racetest` able to make a *blocking* read return `EAGAIN` out of a recycled object
+(`docs/security.md`). The fix is `file_get`/`file_put` around the call, as Linux pairs
+`fdget` with `fdput`: in `rw()` for every `read` and `write`, in the thirteen socket calls
+that take an fd, and in `fs/epoll.c`. Separately, `struct file` gained a per-open serial
+number so `epoll` can tell a registered file from a different one that landed on the same
+freed block.
+
+`make bench`, QEMU, `-icount shift=0` so the numbers are deterministic rather than medians:
+
+| | before | after | |
+|---|---|---|---|
+| `lseek + read 4 KiB` | 1540 | 1571 | +31 (+2.0%), the `rw()` pin |
+| `open + close` (2-part path) | 1482 | 1505 | +23 (+1.6%), the serial |
+| `null syscall, int 0x80` | 127 | 127 | — |
+| `null syscall, sysenter` | 155 | 155 | — |
+| `stat (statx)` | 1300 | 1300 | — |
+| `thread switch` | 97 | 97 | — |
+| `fork + exit + wait` | 51786 | 51788 | — |
+| `exec + exit (ELF 'true')` | 35381 | 35376 | — |
+
+Two percent on the read path is the real cost of this, and it is worth being clear that it
+buys correctness rather than anything else — rule 1 of the project is that we never trade
+correctness for speed, so the question was only ever how to pay it cheaply.
+
+The serial was 64 bits first, which measured +35 rather than +23. The reason is worth
+keeping: `struct file` is 28 bytes and comes from `kmalloc`'s 32-byte size class, and eight
+more bytes pushed every open file in the system into the 64-byte class. Thirty-two bits
+keeps it where it was and halves the cost, in exchange for a collision that needs the
+counter to wrap through 2^32 opens *and* the new file to land on the same address *and* at
+the same fd number.
+
+Not measured: the thirteen socket wrappers. `netbench` echoes through `write`/`read`, which
+go through `rw()`, so it exercises that pin and not `sendto`/`recvfrom`/`sendmsg`. Those
+calls already copy a `msghdr` and an iovec before they do anything, so two increments and a
+branch are not where their time goes, but that is an argument and not a number. For the
+record, with `tools/echo-server.py` running, after the fixes: UDP `write()` 64 B 1827
+cycles, UDP `read()` 484, UDP total per echo 3767; TCP `write()` 1910, `read()` 495, total
+per echo 5810.

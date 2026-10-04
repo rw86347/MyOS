@@ -404,10 +404,10 @@ SYSCALL_DEF(sys_fstatfs64)
 /*
  * The kernel mounts the disks itself at boot (by label, main.c). What a
  * program can mount is a tmpfs (a fresh RAM directory, for /run and /tmp)
- * or proc (fs/procfs.c). There are no block device files yet, so
- * "mount /dev/sda1 /mnt" can't name a disk, and no sysfs: that fails the
- * way Linux fails for a file system type it wasn't built with. Boot
- * scripts expect that and go on.
+ * proc (fs/procfs.c) or sysfs (fs/sysfs.c). There are no block device
+ * files yet, so "mount /dev/sda1 /mnt" can't name a disk; any other type
+ * fails the way Linux fails for a file system type it wasn't built with.
+ * Boot scripts expect that and go on.
  */
 #define MS_RDONLY   1
 #define MS_REMOUNT  32
@@ -479,6 +479,8 @@ SYSCALL_DEF(sys_mount)
         return vfs_mount_ram(target, tmpfs_mode(a5));
     if (strcmp(type, "proc") == 0)
         return procfs_mount(target);
+    if (strcmp(type, "sysfs") == 0)
+        return sysfs_mount(target);
     if (strcmp(type, "ext2") == 0 || strcmp(type, "vfat") == 0)
         return -ENOTBLK;                /* no block device files to name */
     return -ENODEV;
