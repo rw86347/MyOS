@@ -843,3 +843,19 @@ fuzz-replay: $(FUZZ_DIR)/fuzz_net
 
 clean:
 	rm -rf $(BUILD)
+	@$(MAKE) -s dropbox-ignore
+
+# This tree lives in Dropbox, and build/ is 1.6 GB of object files and disk
+# images that `make` regenerates. Syncing it wastes the account's space and
+# the link's bandwidth, so it is marked with Dropbox's own ignore attribute --
+# which keeps the files here and removes them from the cloud copy.
+#
+# The attribute lives on the directory, so `make clean` destroys it and the
+# sync starts over. Hence re-applying it here, and after clean. Silent and
+# never fatal: the attribute only exists on macOS, and a missing directory or
+# a machine without Dropbox is not an error.
+.PHONY: dropbox-ignore
+dropbox-ignore:
+	@for d in $(BUILD) dist disks; do \
+	  [ -d "$$d" ] && xattr -w com.dropbox.ignored 1 "$$d" 2>/dev/null; \
+	done; true
