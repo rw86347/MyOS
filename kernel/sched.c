@@ -21,6 +21,8 @@
  * no best-effort thread is ready does the idle thread run (hlt).
  */
 #include <interrupts.h>
+#include <kprintf.h>
+#include <pmm.h>
 #include <sched.h>
 #include <stddef.h>
 #include <string.h>
@@ -84,6 +86,11 @@ static void idle_loop(void *arg)
 void sched_start(void)
 {
     idle = thread_create("idle", idle_loop, NULL);
+    if (!idle) {
+        kprintf("sched: idle thread failed (%u frames free)\n",
+                (unsigned)pmm_free_count());
+        return;
+    }
     idle->is_idle = 1;
 
     uint32_t flags = irq_save();

@@ -1649,3 +1649,35 @@ lock file, same `make test`). The 64-bit kernel is not written yet:
 (drop Firefox, add Chromium) when someone runs `--update`. Physical
 addresses are `phys_addr_t` in `include/types.h`. Design: "Two chips,
 one tree" in `docs/DESIGN.md`.
+
+## 2026-10-05 — x86_64 kernel: hello in long mode
+
+`make ARCH=x86_64` builds `arch/x86_64/early.c` and a UEFI loader that
+stays in long mode. The loader leaves GOP + an 8×16 font in bootinfo at
+`0x1000`. The kernel writes COM1 (QEMU) and paints the framebuffer
+(real PC). QEMU+OVMF prints "Hello world from MyOS!  (long mode, UEFI)".
+The same 66 MiB image on the MSI Tiger Lake-H painted the gold bar and
+those two lines — GOP at `0x400000000` is just a pointer in long mode.
+The Pentium path is unchanged. Next: paging and a higher half, then
+link portable `kernel/*.c`.
+
+## 2026-10-05 — x86_64 live rootfs tarball
+
+`tools/fetch-live.py --arch x86_64 --update` wrote
+`live/packages.x86_64.lock` (563 packages). `make ARCH=x86_64 live-extra`
+cross-compiles myos-login, menu, Settings, My Files, Preview and
+WritePerfect as ELF64 musl (`ld-musl-x86_64.so.1`) into
+`build/live/extra.x86_64`. `make ARCH=x86_64 live-uefi` then writes
+`build/x86_64/myos-live-uefi.img` (2.2 GiB: 152 MiB ESP with a 120 MiB
+login initrd + 2048 MiB ext2 myos-root, Chromium not Firefox). The
+64-bit kernel is still hello-only, so that image paints hello, not the
+login.
+
+## 2026-10-05 — x86_64 full kernel port begun
+
+Rodger asked to run the x86_64 live userland on a real x86_64 kernel.
+`docs/x86_64-PORT-PLAN.md` breaks the work into phases A–G. Makefile now
+builds the portable kernel when `ARCH=x86_64`; the UEFI loader loads
+initrd + E820; `include/user.h` adds 64-bit user addresses. `arch/x86_64/`
+still needs real paging, IDT, syscall, and ELF64 — `port_stubs.c` is
+temporary. Pentium `make test` unchanged.

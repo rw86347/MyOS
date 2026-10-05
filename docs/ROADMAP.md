@@ -229,8 +229,11 @@ Mark a step `[x]` only when its "Done when" check works.
   ACPI, PCIe with MSI/MSI-X; then NVMe (its boot SSD, native driver) and xHCI; then the
   Linux drivers through the shim (`r8169` for its Ethernet, `amdgpu`, ...).
   Branch `dualChip` started the tree shape: `ARCH=`, `phys_addr_t`,
-  `live/packages.x86_64.txt`, `arch/x86_64/PORT`. The 64-bit kernel is not
-  built yet. First visible check: QEMU+OVMF prints hello from long mode.
+  `live/packages.x86_64.txt`, `arch/x86_64/PORT`.
+  First visible check (done): hello on QEMU + MSI (GOP at `0x400000000`).
+  x86_64 live userland built (`make ARCH=x86_64 live-uefi`). **In progress:**
+  full kernel port — see `docs/x86_64-PORT-PLAN.md` (paging, syscall, ELF64,
+  then Golden Hour on the same stick).
 - [ ] **13. WiFi** — pick ONE chip with open docs (e.g. Atheros AR5xxx / ath5k), port driver + firmware loading,
   802.11 + WPA2 (run `wpa_supplicant` in user space).
   Done when: connects to a WPA2 network.

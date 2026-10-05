@@ -21,8 +21,11 @@ when it's fixed. File references point at the comment that mentions the gap.
   mounted — any other (someone's Linux disk in an old PC) is left alone.
 - **E820 map holds at most 32 entries.** (`layout.inc`, `E820_MAX`)
 - **UEFI loader starts the existing 32-bit kernel** (`make uefi` / `make live-uefi`).
-  There is no `arch/x86_64` kernel yet (`dualChip` has the PORT list and
-  `ARCH=`). GOP above 4 GiB is mapped with PSE-36
+  The x86_64 kernel is a long-mode hello at physical 1 MiB (no paging.c,
+  no portable `kernel/` yet). It paints GOP as a 64-bit pointer (MSI
+  at `0x400000000` worked). `make ARCH=x86_64 live-uefi` builds the
+  userland disk; the kernel does not load the initrd or exec
+  myos-login. GOP above 4 GiB on i386 is mapped with PSE-36
   for the kernel console (32-bit virtual address, 36-bit physical in
   the PDE). User `mmap` of `/dev/fb0` cannot name that address (32-bit
   PTEs), so `simplefb` keeps an 8 MiB RAM shadow and, on the first mmap,

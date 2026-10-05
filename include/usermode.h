@@ -20,6 +20,10 @@ int program_load(const char *path, const char *const argv[],
                  struct cred *cred, struct inode **exe_out);
 
 /* Jump to user mode at eip with stack esp (usermode.asm). Never returns. */
+#ifdef ARCH_X86_64
+void user_enter(uint64_t rip, uint64_t rsp) __attribute__((noreturn));
+#else
 void user_enter(uint32_t eip, uint32_t esp) __attribute__((noreturn));
+#endif
 
 #endif

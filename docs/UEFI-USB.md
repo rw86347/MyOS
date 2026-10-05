@@ -1,15 +1,21 @@
 # Write the UEFI image to a USB stick
 
-The file to write for a real UEFI PC:
+The file to write for the 64-bit hello (this test):
 
-    /Users/rwilson/Dropbox/dev/MyOS/build/myos-live-uefi.img
+    /Users/rwilson/Dropbox/dev/MyOS/build/x86_64/myos-uefi.img
 
-About 1.5 GiB. GPT with a FAT32 ESP plus ext2 `myos-root`.
-`make test-uefi` and `make test-live-uefi` cover QEMU+OVMF.
-`make test` (Pentium BIOS, 64 MiB, `-cpu pentium3`) is a separate
-image and must stay green. Rebuild with `make live-uefi`.
+Also on the Desktop as `MyOS-x64-hello.img`. About 66 MiB. FAT32
+ESP only: `BOOTX64.EFI`, `KERNEL.BIN`, `FONT.BIN`. Rebuild with
+`make ARCH=x86_64`. QEMU+OVMF: `make ARCH=x86_64 test-uefi`.
 
-The small RAM-only image is still `build/myos-uefi.img`.
+The 64-bit live disk is `build/x86_64/myos-live-uefi.img` (~2.2 GiB,
+Chromium, ELF64 myos-login). The kernel on that stick is still the
+hello binary: you will see the gold bar and "Hello world", not the
+login. Rebuild with `make ARCH=x86_64 live-uefi`.
+
+The 32-bit live desktop image is still
+`build/myos-live-uefi.img` (~1.5 GiB). `make test` (Pentium BIOS)
+is a separate image.
 
 ## Do not use BalenaEtcher
 
@@ -18,7 +24,7 @@ In Terminal, with the stick as `disk6` (check `diskutil list`):
 
 ```
 diskutil unmountDisk /dev/disk6
-sudo dd if=/Users/rwilson/Dropbox/dev/MyOS/build/myos-live-uefi.img of=/dev/rdisk6 bs=4m status=progress && sync && diskutil eject /dev/disk6 && echo WRITE_DONE
+sudo dd if=/Users/rwilson/Dropbox/dev/MyOS/build/x86_64/myos-uefi.img of=/dev/rdisk6 bs=4m status=progress && sync && diskutil eject /dev/disk6 && echo WRITE_DONE
 ```
 
 Do not pick `build/myos.img` or `build/myos-live.img` for a UEFI-only PC.
@@ -31,9 +37,11 @@ it has the memory map (ConOut can hang ExitBootServices):
 
 - **Blue** — about to call ExitBootServices. If it stays blue, firmware
   did not return.
-- **Gold** — left UEFI, jumping to the 32-bit kernel.
+- **Gold** — left UEFI, jumping to the kernel.
 - **Red** — ExitBootServices failed.
-- Kernel text, then the Golden Hour login — that is success.
+- **Dark screen, gold bar, "Hello world from MyOS!" / "long mode  x86_64"**
+  — the 64-bit kernel painted the GOP. That is success for this image.
+- Kernel text, then the Golden Hour login — that is the 32-bit live image.
 
 A 32-bit pointer cannot hold the GOP at `0x400000000`. The kernel
 reaches it with PSE-36 (extra physical bits in the page directory).

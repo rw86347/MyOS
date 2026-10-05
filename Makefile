@@ -22,7 +22,7 @@
 #   make live-root  build/live/rootfs.tar: all the live disk's software
 #   make uefi       build/myos-uefi.img: GPT + FAT16 ESP, boots on UEFI (no CSM)
 #   ARCH=i386       default: Pentium kernel + Alpine x86 userland
-#   ARCH=x86_64     64-bit kernel is not built yet (arch/x86_64/PORT).
+#   ARCH=x86_64     64-bit kernel (long mode hello). make / make test-uefi
 #                   Userland fetch: python3 tools/fetch-live.py --arch x86_64
 #   make run-uefi-text  boot that image in QEMU+OVMF, serial only
 #   make clean      delete build/
@@ -42,8 +42,7 @@
 #   myos.img = [ mbr.bin | stage2.bin | splash.bin | kernel.bin | initrd.cpio | padding ]
 # =============================================================================
 
-# One tree, two chips. ARCH picks the CPU dir and the Alpine arch name.
-# The kernel still only links for i386; x86_64 is the 12b port.
+# One tree, two chips. ARCH picks the CPU dir, the toolchain, and Alpine.
 ARCH ?= i386
 ifeq ($(filter $(ARCH),i386 x86_64),)
   $(error ARCH must be i386 or x86_64 (got $(ARCH)))
@@ -54,10 +53,17 @@ else
   ALPINE_ARCH := x86_64
 endif
 
-CC      := i686-elf-gcc
-OBJCOPY := i686-elf-objcopy
-LD      := i686-elf-ld
-NM      := i686-elf-nm
+ifeq ($(ARCH),x86_64)
+  CC      := x86_64-elf-gcc
+  OBJCOPY := x86_64-elf-objcopy
+  LD      := x86_64-elf-ld
+  NM      := x86_64-elf-nm
+else
+  CC      := i686-elf-gcc
+  OBJCOPY := i686-elf-objcopy
+  LD      := i686-elf-ld
+  NM      := i686-elf-nm
+endif
 NASM    := nasm
 QEMU    := qemu-system-i386
 
@@ -73,6 +79,15 @@ else
   BUILD      := build
   MODE_FLAGS :=
 endif
+ifeq ($(ARCH),x86_64)
+  ifeq ($(MODE),test)
+    BUILD := build/x86_64/test
+  else ifeq ($(MODE),bench)
+    BUILD := build/x86_64/bench
+  else
+    BUILD := build/x86_64
+  endif
+endif
 
 # Freestanding: no host OS, no C library. Only compiler-provided headers like
 # <stdint.h> and <stddef.h> are available.
@@ -83,7 +98,7 @@ endif
 # -march=i686: Pentium Pro instruction set (cmov etc.), which every target has.
 CFLAGS  := -std=c11 -ffreestanding -O2 -Wall -Wextra -g -march=i686 \
            -fno-tree-loop-distribute-patterns -mgeneral-regs-only \
-           -Iinclude -Iarch/i386/include $(MODE_FLAGS)
+           -DARCH_I386 -Iinclude -Iarch/i386/include $(MODE_FLAGS)
 # --no-warn-rwx-segments: the kernel is one read/write/execute blob for now
 # (code isn't write-protected; see docs/gaps.md).
 LDFLAGS := -T arch/i386/linker.ld -nostdlib -ffreestanding -O2 -Wl,--no-warn-rwx-segments
@@ -117,7 +132,47 @@ USER_LIB  := $(BUILD)/user/lib/crt0.o $(BUILD)/user/lib/mini.o
 # Alpine Linux packages, unpacked (tools/fetch-alpine.sh; see the initramfs).
 ALPINE := build/ext/alpine
 ALPINE_STAMP := $(ALPINE)/.fetched
+ifeq ($(ARCH),x86_64)
+ALPINE := build/ext/alpine64
+ALPINE_STAMP := $(ALPINE)/.fetched64
+endif
 OBJS    := $(BUILD)/arch/i386/entry.o $(ASM_OBJS) $(C_OBJS) $(GEN_OBJS)
+LINKER_SCRIPT := arch/i386/linker.ld
+NASM_FMT := elf32
+
+# x86_64: hello = UEFI smoke test (early.c). full = portable kernel (PORT-PLAN).
+#   make ARCH=x86_64 test-uefi          # hello (default)
+#   make ARCH=x86_64 X86_64_KERNEL=full # port build (needs asm twins)
+X86_64_KERNEL ?= full
+ifeq ($(ARCH),x86_64)
+  CFLAGS  := -std=c11 -ffreestanding -O2 -Wall -Wextra -g \
+             -m64 -mno-red-zone -mcmodel=small -mgeneral-regs-only \
+             -fno-tree-loop-distribute-patterns -DARCH_X86_64 \
+             -Iinclude -Iarch/x86_64/include $(MODE_FLAGS)
+  LDFLAGS := -T arch/x86_64/linker.ld -nostdlib -ffreestanding -O2 \
+             -Wl,--no-warn-rwx-segments
+  LINKER_SCRIPT := arch/x86_64/linker.ld
+  NASM_FMT := elf64
+  ifeq ($(X86_64_KERNEL),full)
+    C_SRCS  := $(filter-out $(TEST_SRCS) $(BENCH_SRCS) arch/x86_64/early.c kernel/elf.c kernel/signal.c, \
+               $(wildcard arch/x86_64/*.c kernel/*.c drivers/*.c fs/*.c mm/*.c net/*.c \
+                          drivers/gpu/drm/*.c drivers/gpu/drm/tiny/*.c drivers/video/*.c))
+    ifeq ($(MODE),test)
+      C_SRCS += $(TEST_SRCS)
+    endif
+    ifeq ($(MODE),bench)
+      C_SRCS += $(BENCH_SRCS)
+    endif
+    C_OBJS  := $(patsubst %.c,$(BUILD)/%.o,$(C_SRCS))
+    ASM_SRCS := $(filter-out arch/x86_64/entry.asm,$(wildcard arch/x86_64/*.asm))
+    ASM_OBJS := $(patsubst %.asm,$(BUILD)/%.o,$(ASM_SRCS))
+    OBJS    := $(BUILD)/arch/x86_64/entry.o $(ASM_OBJS) $(C_OBJS) $(GEN_OBJS)
+  else
+    C_SRCS  := arch/x86_64/early.c
+    C_OBJS  := $(patsubst %.c,$(BUILD)/%.o,$(C_SRCS))
+    OBJS    := $(BUILD)/arch/x86_64/entry.o $(C_OBJS)
+  endif
+endif
 
 IMG     := $(BUILD)/myos.img
 INITRD  := $(BUILD)/initrd.cpio
@@ -156,14 +211,10 @@ QEMU_FLAGS = -m 64M -cpu pentium3 \
 .PHONY: diskattacks verify-disktests verify-tests attacks all dist utm utm-hd hd live-root live-extra live-theme live-hd utm-live run-live run-hd test-hd run run-full run-text debug test check-selftests test-shell bench run-bench usb clean fuzz fuzz-build fuzz-replay diskfuzz diskfuzz-replay verify-racetests uefi run-uefi-text test-uefi live-uefi test-live-uefi live-login-initrd test-uefi-login
 
 ifeq ($(ARCH),x86_64)
-.PHONY: need-x86_64-kernel
-need-x86_64-kernel:
-	@echo "ARCH=x86_64: no kernel yet. See arch/x86_64/PORT and docs/DESIGN.md." >&2
-	@exit 1
-$(IMG) $(BUILD)/kernel.elf $(BUILD)/kernel.bin: need-x86_64-kernel
-endif
-
+all: uefi
+else
 all: $(IMG) $(USB)
+endif
 
 # --- user programs -----------------------------------------------------------
 # (These rules come before the kernel's: make 3.81 uses the first pattern
@@ -211,7 +262,7 @@ $(BUILD)/%.o: %.c
 
 $(BUILD)/%.o: %.asm
 	@mkdir -p $(dir $@)
-	$(NASM) -f elf32 $< -o $@
+	$(NASM) -f $(NASM_FMT) $< -o $@
 
 -include $(C_OBJS:.o=.d)
 
@@ -225,7 +276,7 @@ $(BUILD)/gen/slots_conf.c: config/slots.conf tools/slots2c.awk
 $(BUILD)/gen/slots_conf.o: $(BUILD)/gen/slots_conf.c include/sched.h include/thread.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(BUILD)/kernel.elf: $(OBJS) arch/i386/linker.ld
+$(BUILD)/kernel.elf: $(OBJS) $(LINKER_SCRIPT)
 	$(CC) $(LDFLAGS) $(OBJS) -o $@ $(LIBS)
 
 # Strip the ELF wrapper: stage 2 just copies raw bytes into memory.
@@ -240,8 +291,10 @@ $(BUILD)/kernel.bin: $(BUILD)/kernel.elf
 #            (/lib/ld-musl-i386.so.1), readline and ncurses (/usr/lib), and
 #            terminal descriptions (/etc/terminfo)
 # (ALPINE and ALPINE_STAMP are set further up: the user programs use them.)
+ifneq ($(ARCH),x86_64)
 $(ALPINE_STAMP): tools/fetch-alpine.sh
 	tools/fetch-alpine.sh $(ALPINE)
+endif
 
 # --- initramfs ---------------------------------------------------------------
 # The root file system, packed into a cpio archive ("newc" format, the one
@@ -257,6 +310,23 @@ $(ALPINE_STAMP): tools/fetch-alpine.sh
 INITRD_FILES := $(shell find initramfs -type f 2>/dev/null)
 TEST_FILES   := $(shell find user/rootfs -type f 2>/dev/null)
 
+ifeq ($(ARCH),x86_64)
+$(ALPINE_STAMP):
+	tools/fetch-alpine64.sh $(ALPINE)
+
+$(INITRD): $(INITRD_FILES) $(ALPINE_STAMP) tools/busybox-applets.txt Makefile
+	@rm -rf $(BUILD)/initramfs
+	@mkdir -p $(BUILD)/initramfs/bin $(BUILD)/initramfs/dev $(BUILD)/initramfs/proc \
+	          $(BUILD)/initramfs/tmp $(BUILD)/initramfs/etc
+	cp -R initramfs/. $(BUILD)/initramfs/
+	cp $(ALPINE)/bin/busybox.static $(BUILD)/initramfs/bin/busybox
+	cd $(BUILD)/initramfs/bin && for a in $$(cat $(CURDIR)/tools/busybox-applets.txt); do \
+	  [ -e "$$a" ] || ln -sf busybox "$$a"; done
+	ln -sf bin $(BUILD)/initramfs/sbin
+	chmod 1777 $(BUILD)/initramfs/tmp
+	cd $(BUILD)/initramfs && find . -mindepth 1 ! -name .DS_Store | sort \
+	  | cpio -o -H newc -R 0:0 --quiet > ../initrd.cpio
+else
 $(INITRD): $(INITRD_FILES) $(ALPINE_STAMP) tools/busybox-applets.txt \
            $(if $(MODE_FLAGS),$(USER_BINS) $(TEST_FILES)) Makefile
 	@rm -rf $(BUILD)/initramfs
@@ -285,6 +355,7 @@ endif
 	chmod 1777 $(BUILD)/initramfs/tmp
 	cd $(BUILD)/initramfs && find . -mindepth 1 ! -name .DS_Store | sort \
 	  | cpio -o -H newc -R 0:0 --quiet > ../initrd.cpio
+endif
 
 # --- bootloader --------------------------------------------------------------
 # Size of a file in 512-byte sectors, rounded up (worked out by the shell).
@@ -355,16 +426,14 @@ $(BUILD)/efi/efi_jump.bin: arch/i386/boot/efi/efi_jump.asm
 $(BUILD)/efi/efi_jump.inc: $(BUILD)/efi/efi_jump.bin
 	python3 -c 'import sys; d=open(sys.argv[1],"rb").read(); print(",".join("0x%02x"%b for b in d))' $< > $@
 
-$(BUILD)/efi/efi_main.o: arch/i386/boot/efi/efi_main.c $(BUILD)/efi/efi_jump.inc \
-                         arch/i386/boot/efi/efi.h $(BUILD)/kernel.elf
+ifeq ($(ARCH),x86_64)
+$(BUILD)/efi/efi_main.o: arch/x86_64/boot/efi/efi_main.c arch/i386/boot/efi/efi.h \
+                         arch/x86_64/include/bootinfo.h $(BUILD)/kernel.elf
 	@mkdir -p $(dir $@)
 	END=0x$$($(NM) $(BUILD)/kernel.elf | awk '$$3 == "__kernel_end" { print $$1 }'); \
-	LOAD=$$(( (END - 0xC0000000 + 4095) / 4096 * 4096 )); \
-	$(CLANG_EFI) -DINITRD_LOAD=$$LOAD -I$(BUILD)/efi -Iarch/i386/boot/efi \
-	  -c $< -o $@
-
-$(BUILD)/BOOTX64.EFI: $(BUILD)/efi/efi_main.o tools/coff2efi.py
-	python3 tools/coff2efi.py -o $@ $<
+	LOAD=$$(( (END + 4095) / 4096 * 4096 )); \
+	$(CLANG_EFI) -DKERNEL_LOAD=0x100000 -DKERNEL_END=$$END -DINITRD_LOAD=$$LOAD \
+	  -Iinclude -Iarch/i386/boot/efi -Iarch/x86_64/include -c $< -o $@
 
 $(UEFI_IMG): $(BUILD)/BOOTX64.EFI $(BUILD)/kernel.bin $(INITRD) \
              arch/i386/boot/efi/vga-font.bin tools/mkuefi.py
@@ -373,6 +442,26 @@ $(UEFI_IMG): $(BUILD)/BOOTX64.EFI $(BUILD)/kernel.bin $(INITRD) \
 	  --file EFI/MYOS/KERNEL.BIN=$(BUILD)/kernel.bin \
 	  --file EFI/MYOS/INITRD.CPIO=$(INITRD) \
 	  --file EFI/MYOS/FONT.BIN=arch/i386/boot/efi/vga-font.bin
+else
+$(BUILD)/efi/efi_main.o: arch/i386/boot/efi/efi_main.c $(BUILD)/efi/efi_jump.inc \
+                         arch/i386/boot/efi/efi.h $(BUILD)/kernel.elf
+	@mkdir -p $(dir $@)
+	END=0x$$($(NM) $(BUILD)/kernel.elf | awk '$$3 == "__kernel_end" { print $$1 }'); \
+	LOAD=$$(( (END - 0xC0000000 + 4095) / 4096 * 4096 )); \
+	$(CLANG_EFI) -DINITRD_LOAD=$$LOAD -I$(BUILD)/efi -Iarch/i386/boot/efi \
+	  -c $< -o $@
+
+$(UEFI_IMG): $(BUILD)/BOOTX64.EFI $(BUILD)/kernel.bin $(INITRD) \
+             arch/i386/boot/efi/vga-font.bin tools/mkuefi.py
+	python3 tools/mkuefi.py --out $@ --esp-mb 64 \
+	  --file EFI/BOOT/BOOTX64.EFI=$(BUILD)/BOOTX64.EFI \
+	  --file EFI/MYOS/KERNEL.BIN=$(BUILD)/kernel.bin \
+	  --file EFI/MYOS/INITRD.CPIO=$(INITRD) \
+	  --file EFI/MYOS/FONT.BIN=arch/i386/boot/efi/vga-font.bin
+endif
+
+$(BUILD)/BOOTX64.EFI: $(BUILD)/efi/efi_main.o tools/coff2efi.py
+	python3 tools/coff2efi.py -o $@ $<
 
 uefi: $(UEFI_IMG)
 
@@ -398,23 +487,56 @@ test-uefi: $(UEFI_IMG)
 	@cat $(BUILD)/uefi-serial.log; echo
 	@grep -q "Hello world from MyOS" $(BUILD)/uefi-serial.log \
 	  || { echo "FAIL: UEFI did not start the kernel"; exit 1; }
+ifeq ($(ARCH),i386)
 	@grep -q "initramfs:" $(BUILD)/uefi-serial.log \
 	  || { echo "FAIL: UEFI kernel ran but initramfs missing"; exit 1; }
 	@echo "UEFI OK: OVMF started the 32-bit kernel"
+else
+	@grep -q "long mode" $(BUILD)/uefi-serial.log \
+	  || { echo "FAIL: 64-bit kernel did not say long mode"; exit 1; }
+	@echo "UEFI OK: OVMF started the 64-bit kernel"
+endif
 
 # Login-only initramfs (rules sit with live-hd: they need LOGIN_BIN).
-LIVE_LOGIN_TAR    := $(BUILD)/live/login-root.tar
-LIVE_LOGIN_INITRD := $(BUILD)/live/login-initrd.cpio
+# x86_64 paths match tools/fetch-live.py --arch x86_64 (not build/x86_64/live).
+ifeq ($(ARCH),x86_64)
+  LIVE_SYSROOT      := build/live/sysroot-x86_64
+  LIVE_EXTRA        := build/live/extra.x86_64
+  LIVE_TAR          := build/live/rootfs-x86_64.tar
+  LIVE_LOGIN_TAR    := build/live/login-root-x86_64.tar
+  LIVE_LOGIN_INITRD := build/live/login-initrd-x86_64.cpio
+  LIVE_LOCK         := live/packages.x86_64.lock
+  LIVE_HD           := $(BUILD)/myos-live-root.img
+  LIVE_MB           := 2048
+  MUSL_LDSO         := /lib/ld-musl-x86_64.so.1
+  LIVE_MARCH        := -march=x86-64
+  ALPINE_TRIPLET    := x86_64-alpine-linux-musl
+  MKUEFI_ROOT       := --root-file $(LIVE_HD)
+else
+  LIVE_SYSROOT      := $(BUILD)/live/sysroot
+  LIVE_EXTRA        := $(BUILD)/live/extra
+  LIVE_TAR          := $(BUILD)/live/rootfs.tar
+  LIVE_LOGIN_TAR    := $(BUILD)/live/login-root.tar
+  LIVE_LOGIN_INITRD := $(BUILD)/live/login-initrd.cpio
+  LIVE_LOCK         := live/packages.lock
+  LIVE_HD           := $(BUILD)/myos-live.img
+  LIVE_MB           := 1536
+  MUSL_LDSO         := /lib/ld-musl-i386.so.1
+  LIVE_MARCH        := -march=i686
+  ALPINE_TRIPLET    := i586-alpine-linux-musl
+  MKUEFI_ROOT       := --root-file $(LIVE_HD) --root-from-mbr
+endif
 
 # Live desktop on the same GPT disk: ESP + ext2 "myos-root" from make live-hd.
 # The ESP carries the login initrd so a machine with no visible disks still
 # reaches myos-login from RAM. QEMU still mounts the ext2 partition.
+# The 64-bit kernel is still hello-only: it will not start this initrd yet.
 LIVE_UEFI := $(BUILD)/myos-live-uefi.img
-$(LIVE_UEFI): $(BUILD)/BOOTX64.EFI $(BUILD)/kernel.bin $(LIVE_LOGIN_INITRD) $(BUILD)/myos-live.img \
+$(LIVE_UEFI): $(BUILD)/BOOTX64.EFI $(BUILD)/kernel.bin $(LIVE_LOGIN_INITRD) $(LIVE_HD) \
               arch/i386/boot/efi/vga-font.bin tools/mkuefi.py
 	ESP=$$(( $$(wc -c < $(LIVE_LOGIN_INITRD)) / 1048576 + 32 )); \
 	  [ $$ESP -lt 128 ] && ESP=128; \
-	  python3 tools/mkuefi.py --out $@ --esp-mb $$ESP --root-file $(BUILD)/myos-live.img --root-from-mbr \
+	  python3 tools/mkuefi.py --out $@ --esp-mb $$ESP $(MKUEFI_ROOT) \
 	    --file EFI/BOOT/BOOTX64.EFI=$(BUILD)/BOOTX64.EFI \
 	    --file EFI/MYOS/KERNEL.BIN=$(BUILD)/kernel.bin \
 	    --file EFI/MYOS/INITRD.CPIO=$(LIVE_LOGIN_INITRD) \
@@ -541,11 +663,9 @@ live-root: live-extra
 # `tools/fetch-live.py --sysroot`, and linked the way every program on the
 # disk is -- dynamically, against musl's loader. (PAM needs that: it opens
 # its modules at run time.)
-LIVE_SYSROOT := $(BUILD)/live/sysroot
-LIVE_EXTRA   := $(BUILD)/live/extra
 LOGIN_BIN    := $(LIVE_EXTRA)/usr/bin/myos-login
 GCC_INC      := $(shell $(CC) -print-file-name=include)
-LOGIN_CFLAGS := -std=c11 -O2 -Wall -Wextra -march=i686 -D_GNU_SOURCE -nostdinc \
+LOGIN_CFLAGS := -std=c11 -O2 -Wall -Wextra $(LIVE_MARCH) -D_GNU_SOURCE -nostdinc \
                 -isystem $(LIVE_SYSROOT)/usr/include \
                 -isystem $(LIVE_SYSROOT)/usr/include/freetype2 -isystem $(GCC_INC)
 LOGIN_LDLIBS := -lX11 -lXft -lImlib2 -lpam -lc -lgcc
@@ -556,7 +676,7 @@ $(LIVE_SYSROOT)/.done:
 $(LOGIN_BIN): live/myos-login/myos-login.c live/common/xpic.h | $(LIVE_SYSROOT)/.done
 	@mkdir -p $(dir $@) $(BUILD)/live
 	$(CC) $(LOGIN_CFLAGS) -Ilive/common -c $< -o $(BUILD)/live/myos-login.o
-	$(CC) -nostdlib -Wl,-z,noexecstack -Wl,-dynamic-linker,/lib/ld-musl-i386.so.1 \
+	$(CC) -nostdlib -Wl,-z,noexecstack -Wl,-dynamic-linker,$(MUSL_LDSO) \
 	  -Wl,-rpath-link,$(LIVE_SYSROOT)/usr/lib:$(LIVE_SYSROOT)/lib \
 	  $(LIVE_SYSROOT)/usr/lib/crt1.o $(LIVE_SYSROOT)/usr/lib/crti.o \
 	  $(BUILD)/live/myos-login.o -L$(LIVE_SYSROOT)/usr/lib -L$(LIVE_SYSROOT)/lib \
@@ -567,7 +687,7 @@ MENU_BIN := $(LIVE_EXTRA)/usr/bin/myos-menu
 $(MENU_BIN): live/myos-menu/myos-menu.c live/common/xpic.h | $(LIVE_SYSROOT)/.done
 	@mkdir -p $(dir $@) $(BUILD)/live
 	$(CC) $(LOGIN_CFLAGS) -Ilive/common -c $< -o $(BUILD)/live/myos-menu.o
-	$(CC) -nostdlib -Wl,-z,noexecstack -Wl,-dynamic-linker,/lib/ld-musl-i386.so.1 \
+	$(CC) -nostdlib -Wl,-z,noexecstack -Wl,-dynamic-linker,$(MUSL_LDSO) \
 	  -Wl,-rpath-link,$(LIVE_SYSROOT)/usr/lib:$(LIVE_SYSROOT)/lib \
 	  $(LIVE_SYSROOT)/usr/lib/crt1.o $(LIVE_SYSROOT)/usr/lib/crti.o \
 	  $(BUILD)/live/myos-menu.o -L$(LIVE_SYSROOT)/usr/lib -L$(LIVE_SYSROOT)/lib \
@@ -581,7 +701,7 @@ XSETTINGS_BIN := $(LIVE_EXTRA)/usr/bin/myos-xsettings
 GTK_CFLAGS := $(addprefix -isystem $(LIVE_SYSROOT)/usr/include/,gtk-3.0 glib-2.0 pango-1.0 cairo \
                 gdk-pixbuf-2.0 atk-1.0 harfbuzz webkitgtk-4.1 javascriptcoregtk-4.1 libsoup-3.0) \
                 -isystem $(LIVE_SYSROOT)/usr/lib/glib-2.0/include
-LIVE_LINK = $(CC) -nostdlib -Wl,-z,noexecstack -Wl,-dynamic-linker,/lib/ld-musl-i386.so.1 \
+LIVE_LINK = $(CC) -nostdlib -Wl,-z,noexecstack -Wl,-dynamic-linker,$(MUSL_LDSO) \
 	  -Wl,-rpath-link,$(LIVE_SYSROOT)/usr/lib:$(LIVE_SYSROOT)/lib \
 	  $(LIVE_SYSROOT)/usr/lib/crt1.o $(LIVE_SYSROOT)/usr/lib/crti.o \
 	  $(1) -L$(LIVE_SYSROOT)/usr/lib -L$(LIVE_SYSROOT)/lib \
@@ -647,14 +767,14 @@ WP_DIR   ?= ../wp51/wp51c
 WP_LT    := $(WP_DIR)/../languagetool-native
 WP_OUT   := $(BUILD)/live/wp
 WP_BIN   := $(LIVE_EXTRA)/usr/lib/writeperfect/wp
-WP_GCC   := $(firstword $(wildcard $(LIVE_SYSROOT)/usr/lib/gcc/i586-alpine-linux-musl/*))
+WP_GCC   := $(firstword $(wildcard $(LIVE_SYSROOT)/usr/lib/gcc/$(ALPINE_TRIPLET)/*))
 WP_CXXV  := $(notdir $(firstword $(wildcard $(LIVE_SYSROOT)/usr/include/c++/*)))
-LIVE_CLANG := clang --target=i386-alpine-linux-musl -march=i686 --sysroot=$(abspath $(LIVE_SYSROOT)) -O2 -MMD -MP
+LIVE_CLANG := clang --target=$(ALPINE_TRIPLET) $(LIVE_MARCH) --sysroot=$(abspath $(LIVE_SYSROOT)) -O2 -MMD -MP
 # agent.c calls select() without <sys/select.h>; glibc brings it in through
 # other headers, musl doesn't.
 WP_CFLAGS  := -std=c11 -D_DEFAULT_SOURCE -w -include sys/select.h -I$(WP_DIR)/src -I$(WP_LT)/engine/include $(GTK_CFLAGS)
 WP_CXXFLAGS := -std=c++17 -w -nostdinc++ -isystem $(LIVE_SYSROOT)/usr/include/c++/$(WP_CXXV) \
-               -isystem $(LIVE_SYSROOT)/usr/include/c++/$(WP_CXXV)/i586-alpine-linux-musl \
+               -isystem $(LIVE_SYSROOT)/usr/include/c++/$(WP_CXXV)/$(ALPINE_TRIPLET) \
                -isystem $(LIVE_SYSROOT)/usr/include/libxml2 -I$(WP_LT)/engine/include \
                -I$(WP_LT)/morfologik/include -DPCRE2_CODE_UNIT_WIDTH=8 \
                '-DLT_RESOURCE_DIR="/usr/share/writeperfect/languagetool"'
@@ -681,7 +801,7 @@ $(WP_BIN): $(WP_OBJS) live/writeperfect/wp live/writeperfect/writeperfect \
            live/writeperfect/writeperfect.desktop
 	@mkdir -p $(dir $@) $(LIVE_EXTRA)/usr/bin $(LIVE_EXTRA)/usr/share/applications
 	$(CC) -nostdlib -s -Wl,-z,noexecstack -Wl,--eh-frame-hdr -Wl,--as-needed \
-	  -Wl,-dynamic-linker,/lib/ld-musl-i386.so.1 \
+	  -Wl,-dynamic-linker,$(MUSL_LDSO) \
 	  -Wl,-rpath-link,$(LIVE_SYSROOT)/usr/lib:$(LIVE_SYSROOT)/lib \
 	  $(LIVE_SYSROOT)/usr/lib/crt1.o $(LIVE_SYSROOT)/usr/lib/crti.o $(WP_GCC)/crtbegin.o \
 	  $(WP_OBJS) -L$(LIVE_SYSROOT)/usr/lib -L$(LIVE_SYSROOT)/lib -L$(WP_GCC) \
@@ -712,7 +832,7 @@ endif
 LIVE_THEME := $(LIVE_EXTRA)/.theme
 $(LIVE_THEME): live/theme/make-live-theme.py assets/themes/golden-hour/make-theme.py \
                live/writeperfect/writeperfect.svg live/myos-preview/preview.svg
-	python3 live/theme/make-live-theme.py
+	LIVE_EXTRA=$(LIVE_EXTRA) python3 live/theme/make-live-theme.py
 	@touch $@
 
 live-theme: $(LIVE_THEME)
@@ -720,19 +840,21 @@ live-extra: $(LIVE_THEME) $(LOGIN_BIN) $(MENU_BIN) $(SETTINGS_BIN) $(XSETTINGS_B
 
 # The live disk: like `make hd`, but myos-root holds the live userland
 # (tools/mklivehd.sh: owners, setuid bits and case-only names kept).
-LIVE_TAR := $(BUILD)/live/rootfs.tar
-LIVE_HD  := $(BUILD)/myos-live.img
-LIVE_MB  := 1536
-$(LIVE_TAR): $(LIVE_THEME) $(LOGIN_BIN) $(MENU_BIN) $(SETTINGS_BIN) $(XSETTINGS_BIN) $(ADDUSER_BIN) $(FILES_BIN) $(PREVIEW_BIN) $(WP_BIN) live/packages.lock $(shell find live/overlay -type f)
+$(LIVE_TAR): $(LIVE_THEME) $(LOGIN_BIN) $(MENU_BIN) $(SETTINGS_BIN) $(XSETTINGS_BIN) $(ADDUSER_BIN) $(FILES_BIN) $(PREVIEW_BIN) $(WP_BIN) $(LIVE_LOCK) $(shell find live/overlay -type f)
 	python3 tools/fetch-live.py --arch $(ALPINE_ARCH)
+ifeq ($(ARCH),x86_64)
+$(LIVE_HD): $(LIVE_TAR) tools/mklivehd.sh
+	E2FS=$(E2FS) tools/mklivehd.sh - $(LIVE_TAR) $@ $(LIVE_MB)
+else
 $(LIVE_HD): $(IMG) $(LIVE_TAR) tools/mklivehd.sh tools/mbr-partition.sh
 	E2FS=$(E2FS) tools/mklivehd.sh $(IMG) $(LIVE_TAR) $@ $(LIVE_MB)
+endif
 live-hd: $(LIVE_HD)
 
 # RAM login for a UEFI stick when the kernel cannot see the ext2 root.
 # The Pentium floppy initrd stays BusyBox. WritePerfect is left on disk.
 $(LIVE_LOGIN_TAR): $(LIVE_THEME) $(LOGIN_BIN) $(MENU_BIN) $(XSETTINGS_BIN) \
-                   live/packages.lock tools/fetch-live.py \
+                   $(LIVE_LOCK) tools/fetch-live.py \
                    $(shell find live/overlay -type f)
 	python3 tools/fetch-live.py --arch $(ALPINE_ARCH) --login-root
 	@tar -tf $@ | grep -q '^usr/bin/myos-login$$' \
@@ -841,8 +963,12 @@ debug: $(IMG) $(USB) $(DATA)
 # Boot with no display and drive it through QEMU's monitor: wait for boot,
 # "type" h, i, Enter, press F10 (NULL pointer -> page fault), then quit.
 # The kernel's serial output is the test result; each grep checks one thing.
+ifeq ($(ARCH),x86_64)
+test: test-uefi
+else
 test:
 	@$(MAKE) --no-print-directory MODE=test check-selftests
+endif
 
 check-selftests: $(IMG) $(USB)
 	$(call make-test-disk,$(DATA),1024)

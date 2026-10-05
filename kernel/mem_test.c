@@ -31,6 +31,7 @@ static void test_pmm(void)
     check(pmm_free_count() == before, "pmm: free count restored");
 }
 
+#ifndef ARCH_X86_64
 static void test_paging(void)
 {
     check(vmm_translate(0) == 0, "paging: address 0 (NULL) is not mapped");
@@ -52,6 +53,7 @@ static void test_paging(void)
     check(vmm_unmap(va) == frame && vmm_translate(va) == 0, "paging: unmap");
     pmm_free(frame);
 }
+#endif /* !ARCH_X86_64 */
 
 #define SMALL_SIZE_MAX 1024
 
@@ -139,6 +141,8 @@ static void test_kheap(void)
 void mem_selftest(void)
 {
     test_pmm();
+#ifndef ARCH_X86_64
     test_paging();
+#endif
     test_kheap();
 }

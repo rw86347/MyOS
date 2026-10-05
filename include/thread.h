@@ -27,7 +27,9 @@ struct mm;
 struct thread {
     char name[16];
     enum thread_state state;
-    uint32_t esp;                     /* saved stack pointer while paused */
+    uintptr_t esp;                    /* saved stack pointer while paused
+                                         (64 bits on x86_64: switch.asm
+                                         stores all of rsp) */
     void *stack;                      /* kmalloc'd stack (NULL for "main") */
     struct process *proc;             /* the process it runs, or NULL */
     struct thread *proc_next;         /* the next thread of the same process */

@@ -223,8 +223,8 @@ They do **not** share a kernel binary or a `/usr` tree.
   interrupts, and syscall *entry*. `kernel/`, `mm/`, `fs/`, `net/` stay one
   copy. No `#ifdef __x86_64__` in the middle of a syscall. Physical addresses
   are `phys_addr_t` (64-bit) even on i386 (`include/types.h`). The file list
-  for the new dir is `arch/x86_64/PORT`. `make ARCH=x86_64` refuses to link
-  a kernel until that port exists.
+  for the new dir is `arch/x86_64/PORT`. `make ARCH=x86_64` builds the
+  long-mode hello kernel; portable `kernel/*.c` is not linked yet.
 - **Userland.** One `live/packages.txt` (package *names*).
   `live/packages.x86_64.txt` is only the delta (`!firefox`, `chromium`).
   `tools/fetch-live.py --arch x86_64` merges them and writes
@@ -235,8 +235,11 @@ They do **not** share a kernel binary or a `/usr` tree.
 - **Disk.** Two images from one Makefile: BIOS live (`myos-live.img`) and
   later a 64-bit UEFI live. Almost every ELF is arch-specific; "common" on
   disk is themes, `/etc`, and scripts. No multiarch `/usr`.
-- **First 12b step.** A 64-bit kernel that stays in long mode and prints
-  hello in QEMU+OVMF. Then musl x86_64 hello. Then the x86_64 live root.
+- **First 12b step (done).** A 64-bit kernel that stays in long mode,
+  prints hello in QEMU+OVMF, and paints the GOP on a real UEFI PC
+  (MSI, framebuffer at `0x400000000`). The x86_64 live userland is
+  built (`make ARCH=x86_64 live-uefi`); the kernel cannot run it yet.
+  Next: paging / higher half, then musl x86_64 hello.
   Chromium (and maybe Cursor later) are the last line of the delta, not a
   reason to fork the tree.
 

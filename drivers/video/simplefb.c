@@ -86,9 +86,14 @@ void simplefb_init(void)
         return;
     va = ioremap_wc64(bootinfo_fb_phys(bi), bytes);
     if (!va) {
+#ifdef ARCH_X86_64
+        kprintf("simplefb: cannot map %lu bytes at %016lx\n",
+                (unsigned long)bytes, (unsigned long)bootinfo_fb_phys(bi));
+#else
         kprintf("simplefb: cannot map %lu bytes at %08lx%08lx\n",
                 (unsigned long)bytes,
                 (unsigned long)bi->fb_phys_hi, (unsigned long)bi->fb_phys);
+#endif
         return;
     }
     memset(&info, 0, sizeof info);
@@ -106,6 +111,10 @@ void simplefb_init(void)
     }
     memcpy(info.fix.id, "simplefb", 9);
     info.screen_base = va;                      /* kernel console: the real bar */
+#ifdef ARCH_X86_64
+    /* Direct map uses 64-bit PTEs; no i386 RAM shadow for GOP above 4 GiB. */
+    info.fix.smem_start = (unsigned long)bootinfo_fb_phys(bi);
+#else
     if (bootinfo_fb_phys(bi) > 0xFFFFFFFFull) {
         uint32_t pages = (bytes + 4095) / 4096;
         uint32_t pa = pmm_alloc_run(pages);
@@ -124,16 +133,24 @@ void simplefb_init(void)
     } else {
         info.fix.smem_start = (unsigned long)bi->fb_phys;
     }
+#endif
     info.fix.smem_len = bytes;
     info.fix.type = FB_TYPE_PACKED_PIXELS;
     info.fix.visual = FB_VISUAL_TRUECOLOR;
     info.fix.line_length = bi->fb_pitch;
     info.fbops = &ops;
     info.screen_size = bytes;
-    if (register_framebuffer(&info) == 0)
+    if (register_framebuffer(&info) == 0) {
+#ifdef ARCH_X86_64
+        kprintf("simplefb: %lux%lu at %016lx\n",
+                (unsigned long)bi->fb_width, (unsigned long)bi->fb_height,
+                (unsigned long)bootinfo_fb_phys(bi));
+#else
         kprintf("simplefb: %lux%lu at %08lx%08lx\n",
                 (unsigned long)bi->fb_width, (unsigned long)bi->fb_height,
                 (unsigned long)bi->fb_phys_hi, (unsigned long)bi->fb_phys);
+#endif
+    }
 }
 
 void fb_shadow_on_mmap(void)

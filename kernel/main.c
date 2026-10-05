@@ -202,7 +202,11 @@ void kernel_main(void)
     vga_text_init();        /* the console on the BIOS's 80x25 text screen */
     vt_clear();
     vt_set_color(VT_LIGHT_GREEN, VT_BLACK);
+#ifdef ARCH_X86_64
+    kprintf("Hello world from MyOS!  (long mode x86_64, UEFI loader)\n");
+#else
     kprintf("Hello world from MyOS!  (protected mode, own boot loader)\n");
+#endif
     vt_set_color(VT_LIGHT_GREY, VT_BLACK);
 
     cpu_init();             /* what can this CPU do? (stops if too old) */

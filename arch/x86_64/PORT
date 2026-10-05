@@ -6,8 +6,12 @@ copy. This directory is the CPU-specific half. Do not sprinkle
 #ifdef __x86_64__ through kernel/syscall.c.
 
 Makefile: ARCH=x86_64 selects this tree, x86_64-elf-gcc, a 64-bit
-linker script, and qemu-system-x86_64 + OVMF. Until those exist,
-`make ARCH=x86_64` refuses to link a kernel.
+linker script, and qemu-system-x86_64 + OVMF.
+
+First visible step (done): identity-mapped kernel at 1 MiB, COM1
+hello from long mode (`make ARCH=x86_64 test-uefi`), and the same
+image on a real UEFI PC (MSI Tiger Lake-H, GOP at 0x400000000).
+Portable kernel/*.c is not linked yet.
 
 Files to add here (same names as arch/i386/ unless noted):
 
@@ -31,6 +35,8 @@ exports. i386 int 0x80 stays in arch/i386. Compat (running today's
 Alpine i386 binaries on a 64-bit kernel) is later, not the first
 hello.
 
-First visible step: QEMU+OVMF prints "Hello world from MyOS!" from
-a 64-bit kernel. Then musl x86_64 hello. Then live/packages.x86_64.txt
-and a 64-bit sysroot for myos-login.
+First visible step (done): QEMU+OVMF and a real UEFI PC both show
+"Hello world from MyOS!" from a 64-bit kernel. The x86_64 live
+userland is built (`make ARCH=x86_64 live-uefi`, Chromium,
+ELF64 myos-login). The kernel cannot exec it yet. Next: our own
+page tables and a higher half, then musl x86_64 hello.

@@ -18,13 +18,14 @@
 #include <kheap.h>
 #include <kprintf.h>
 #include <mm.h>
+#include <pmm.h>
 #include <proc.h>
 #include <sched.h>
 #include <string.h>
 #include <thread.h>
 
 /* In switch.asm / isr.asm */
-void switch_context(uint32_t *save_esp, uint32_t new_esp);
+void switch_context(uintptr_t *save_esp, uintptr_t new_esp);
 void thread_trampoline(void);
 void isr_return(void);
 
@@ -48,8 +49,13 @@ void thread_load_tls(struct thread *t)
 
 void thread_set_saved_gs(struct thread *t, uint32_t gs)
 {
+#ifdef ARCH_X86_64
+    (void)t;
+    (void)gs;
+#else
     if (t && t->uregs)
         t->uregs->gs = gs;
+#endif
 }
 
 static void set_ready(struct thread *t)
@@ -152,6 +158,8 @@ static struct thread *new_thread(struct process *proc, const char *name)
 
     t->stack = kmalloc(THREAD_STACK);
     if (!t->stack) {
+        kprintf("thread: no stack for %s (%u bytes free)\n", name,
+                (unsigned)pmm_free_count());
         t->state = THREAD_UNUSED;
         return NULL;
     }
@@ -179,9 +187,9 @@ static struct thread *new_thread(struct process *proc, const char *name)
     return t;
 }
 
-static void start_thread(struct thread *t, uint32_t *sp)
+static void start_thread(struct thread *t, void *sp)
 {
-    t->esp = (uint32_t)sp;
+    t->esp = (uintptr_t)sp;
     uint32_t flags = irq_save();
     set_ready(t);
     generation++;
@@ -199,6 +207,21 @@ struct thread *thread_create_in(struct process *proc, const char *name,
        exactly as switch_context leaves one (see switch.asm). When someone
        switches to this thread, the pops load EBX = fn and ESI = arg, and
        `ret` jumps to thread_trampoline, which calls fn(arg). */
+#ifdef ARCH_X86_64
+    /* switch.asm pops r15 r14 r13 r12 rdi rsi rbx rbp, then `ret`:
+       eight registers and the return address, nine words. */
+    uint64_t *sp = (uint64_t *)((char *)t->stack + THREAD_STACK);
+    *--sp = (uint64_t)(uintptr_t)thread_trampoline;     /* RIP for `ret` */
+    *--sp = 0;                                          /* RBP */
+    *--sp = (uint64_t)(uintptr_t)fn;                    /* RBX */
+    *--sp = (uint64_t)(uintptr_t)arg;                   /* RSI */
+    *--sp = 0;                                          /* RDI */
+    *--sp = 0;                                          /* R12 */
+    *--sp = 0;                                          /* R13 */
+    *--sp = 0;                                          /* R14 */
+    *--sp = 0;                                          /* R15 */
+    start_thread(t, sp);
+#else
     uint32_t *sp = (uint32_t *)((char *)t->stack + THREAD_STACK);
     *--sp = (uint32_t)thread_trampoline;  /* EIP for `ret` */
     *--sp = 0;                            /* EBP */
@@ -206,6 +229,7 @@ struct thread *thread_create_in(struct process *proc, const char *name,
     *--sp = (uint32_t)arg;                /* ESI */
     *--sp = 0;                            /* EDI */
     start_thread(t, sp);
+#endif
     return t;
 }
 
@@ -228,14 +252,27 @@ struct thread *thread_fork(struct process *proc, const char *name,
     uint8_t *top = (uint8_t *)t->stack + THREAD_STACK;
     struct regs *child = (struct regs *)(top - sizeof *child);
     memcpy(child, frame, sizeof *child);
+#ifdef ARCH_X86_64
+    child->rax = 0;
+    uint64_t *sp = (uint64_t *)child;
+    *--sp = (uint64_t)(uintptr_t)isr_return;
+    *--sp = 0;
+    *--sp = 0;
+    *--sp = 0;
+    *--sp = 0;
+    *--sp = 0;
+    *--sp = 0;
+    *--sp = 0;
+    *--sp = 0;
+#else
     child->eax = 0;                       /* the child sees fork() == 0 */
-
     uint32_t *sp = (uint32_t *)child;
     *--sp = (uint32_t)isr_return;         /* EIP for `ret` */
     *--sp = 0;                            /* EBP */
     *--sp = 0;                            /* EBX */
     *--sp = 0;                            /* ESI */
     *--sp = 0;                            /* EDI */
+#endif
 
     /* The child continues with the parent's TLS, signal mask and FPU
        registers too. */
@@ -245,7 +282,11 @@ struct thread *thread_fork(struct process *proc, const char *name,
         fpu_save(t->fpu_state);
         t->uses_fpu = 1;
     }
+#ifdef ARCH_X86_64
     start_thread(t, sp);
+#else
+    start_thread(t, sp);
+#endif
     return t;
 }
 
@@ -266,7 +307,7 @@ void thread_switch(struct thread *next)
     /* If `next` runs a user program, entering the kernel from it must land
        on next's own kernel stack. ("main" never runs user code.) */
     if (next->stack)
-        tss_set_kernel_stack((uint32_t)next->stack + THREAD_STACK);
+        tss_set_kernel_stack((uintptr_t)next->stack + THREAD_STACK);
     /* Its process's address space. Kernel threads just keep whatever is
        loaded (the kernel half is the same everywhere): no CR3 load, no TLB
        flush when switching to them. */

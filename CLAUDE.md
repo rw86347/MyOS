@@ -70,7 +70,7 @@ ahead on throughput of big, complex workloads; don't add complexity chasing that
 
 ## Toolchain & environment
 - Host: macOS on Apple Silicon (arm64). Installed via Homebrew:
-  - `i686-elf-gcc`, `i686-elf-binutils` (cross-compiler — never use the host clang/gcc for kernel code)
+  - `i686-elf-gcc`, `i686-elf-binutils`, `x86_64-elf-gcc`, `x86_64-elf-binutils`
   - `qemu` (`qemu-system-i386`; later `qemu-system-arm`)
   - `i686-elf-grub` + `xorriso` for bootable ISOs (or use Limine), `gdb` / `lldb` for debugging
   - `nasm` for assembly (or GAS syntax via the cross toolchain — pick one and stay consistent)

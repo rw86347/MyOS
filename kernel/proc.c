@@ -136,7 +136,11 @@ static void start_user(void *arg)
 {
     struct process *p = arg;
     thread_start_fpu();                 /* programs may use floats / SSE */
+#ifdef ARCH_X86_64
+    user_enter((uint64_t)p->start_eip, (uint64_t)p->start_esp);
+#else
     user_enter(p->start_eip, p->start_esp);
+#endif
 }
 
 struct process *proc_spawn(const char *path, const char *const argv[],
@@ -237,7 +241,11 @@ static int clone_thread(uint32_t flags, uint32_t new_sp, uint32_t parent_tid,
 
     struct regs frame = *me->uregs;
     if (new_sp)
+#ifdef ARCH_X86_64
+        frame.rsp = new_sp;
+#else
         frame.user_esp = new_sp;
+#endif
     uint32_t irq = irq_save();
     if (p->exiting) {
         irq_restore(irq);
@@ -276,7 +284,11 @@ int proc_clone(uint32_t flags, uint32_t new_sp, uint32_t parent_tid, uint32_t tl
         return clone_thread(flags, new_sp, parent_tid, tls, child_tid);
     struct regs frame = *thread_current()->uregs;
     if (new_sp)
-        frame.user_esp = new_sp;        /* the child runs on its own stack */
+#ifdef ARCH_X86_64
+        frame.rsp = new_sp;
+#else
+        frame.user_esp = new_sp;
+#endif        /* the child runs on its own stack */
     struct process *child;
     int pid = proc_fork_frame(&frame, &child);
     if (pid < 0)
@@ -517,10 +529,16 @@ int proc_execve(uint32_t user_path, uint32_t user_argv, uint32_t user_envp)
     /* Return to user mode at the new program's entry, with its stack, clean
        registers and a clean FPU. */
     struct regs *r = thread_current()->uregs;
+#ifdef ARCH_X86_64
+    regs_set_ip(r, entry);
+    regs_set_sp(r, sp);
+    r->rbx = r->rcx = r->rdx = r->rsi = r->rdi = r->rbp = 0;
+#else
     r->eip = entry;
     r->user_esp = sp;
     r->ebx = r->ecx = r->edx = r->esi = r->edi = r->ebp = 0;
-    r->fs = r->gs = GDT_USER_DATA;      /* the old TLS segment is gone */
+    r->fs = r->gs = GDT_USER_DATA;
+#endif
     memset(thread_current()->tls, 0, sizeof thread_current()->tls);
     thread_load_tls(thread_current());  /* no thread-local storage yet */
     thread_start_fpu();
