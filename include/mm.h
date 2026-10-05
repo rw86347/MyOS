@@ -23,6 +23,12 @@
 #define VM_PFNMAP 0x100
 #define VM_WC     0x200
 #define VM_MAYWRITE 0x400               /* device opened read-write: mprotect may add write */
+/* Really shared (MAP_SHARED of a file in RAM, MAP_SHARED|MAP_ANONYMOUS,
+   shmat): `file`'s own pages are mapped, the same frames in every process
+   that maps them, across fork too (PTE_MAPSHARED). A write is seen by all
+   of them and by read(). VM_MAYWRITE: the file was opened read-write. */
+#define VM_SHARED 0x800
+#define VM_SHM    0x1000                /* VM_SHARED, attached by shmat (kernel/shm.c) */
 
 #define MM_AREAS_FIRST  32             /* areas a new address space has room for */
 #define MM_AREAS_MAX  1024              /* it doubles up to this (GTK programs: ~400) */
@@ -90,11 +96,14 @@ int mm_remove(struct mm *mm, uint32_t start, uint32_t end);
    0 if it was fixed (demand paging, copy-on-write), -1 if it's a real error. */
 int mm_fault(uint32_t va, uint32_t err);
 
-/* The brk and mmap system calls, on the current address space. */
+/* The brk and mmap system calls, on the current address space. fmode: the
+   file's open() flags (its O_ACCMODE decides what MAP_SHARED may do). */
 uint32_t mm_brk(uint32_t new_brk);
 int32_t  mm_mmap(uint32_t addr, uint32_t len, uint32_t prot, uint32_t flags,
-                 struct inode *file, uint32_t off);
+                 struct inode *file, uint32_t off, uint32_t fmode);
 int32_t  mm_munmap(uint32_t addr, uint32_t len);
+int32_t  mm_mremap(uint32_t old, uint32_t old_len, uint32_t new_len,
+                   uint32_t flags, uint32_t new_addr);
 
 /* mmap of a device file whose ops have .mmap (/dev/fb0). The area is
    always shared: writes reach the device, as with MAP_SHARED. */
@@ -107,5 +116,11 @@ int32_t  mm_mmap_device(uint32_t addr, uint32_t len, uint32_t prot, uint32_t fla
    -EINVAL if the vma reaches past size. */
 int vm_iomap_memory(struct vma *vma, uint32_t phys, uint32_t size);
 int32_t  mm_mprotect(uint32_t addr, uint32_t len, uint32_t prot);
+
+/* shmdt: remove the shared-memory attach that starts at addr — every area
+   of that segment in [addr, addr + its size), in the current address
+   space. Returns the segment, held (the caller vfs_puts it), or NULL if no
+   attach starts at addr. */
+struct inode *mm_shm_detach(uint32_t addr);
 
 #endif

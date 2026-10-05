@@ -277,6 +277,18 @@ int mm_fault(uint32_t va, uint32_t err)
         return vmm_map(page, v->phys + off, flags) < 0 ? -1 : 0;
     }
 
+    /* Shared memory: map the segment's own page, made on the first touch
+       by anyone. PTE_SHARED: fork doesn't make it copy-on-write, and
+       unmapping doesn't free it. */
+    if (v->flags & VM_SHARED) {
+        uint32_t page = PAGE_DOWN(va), off = v->file_off + (page - v->start);
+        uint32_t frame = off < PAGE_UP(v->file->size) ? ramfs_page(v->file, off / PAGE_SIZE) : 0;
+        if (!frame)
+            return -1;                  /* past its end, or out of memory */
+        uint32_t flags = PTE_USER | PTE_SHARED | (v->flags & VM_WRITE ? PTE_WRITABLE : 0);
+        return vmm_map(page, frame, flags) < 0 ? -1 : 0;
+    }
+
     /* Demand paging: the first touch of a page in an area creates it —
        zero-filled, or for a mapped file, a copy of that part of the file
        (straight from the initramfs, or from its RAM pages). Pages never
@@ -345,6 +357,7 @@ uint32_t mm_brk(uint32_t new_brk)
 /* --- mmap ----------------------------------------------------------------- */
 
 #define PROT_WRITE    2
+#define MAP_SHARED    0x01
 #define MAP_FIXED     0x10
 #define MAP_ANONYMOUS 0x20
 
@@ -366,7 +379,7 @@ uint32_t mm_find_gap(struct mm *mm, uint32_t len)
 }
 
 int32_t mm_mmap(uint32_t addr, uint32_t len, uint32_t prot, uint32_t flags,
-                struct inode *file, uint32_t off)
+                struct inode *file, uint32_t off, uint32_t fmode)
 {
     if (!(flags & MAP_ANONYMOUS)) {
         /* A file, mapped privately: writes change our copy, never the
@@ -375,6 +388,12 @@ int32_t mm_mmap(uint32_t addr, uint32_t len, uint32_t prot, uint32_t flags,
             return -ENODEV;
         if (off & (PAGE_SIZE - 1))
             return -EINVAL;
+        /* MAP_PRIVATE writes a copy: the dynamic linker opens every .so
+           O_RDONLY and maps its data PROT_WRITE so it can relocate. Only
+           MAP_SHARED writes would reach the file, and those need write. */
+        if ((flags & MAP_SHARED) && (prot & PROT_WRITE) &&
+            (fmode & O_ACCMODE) == O_RDONLY)
+            return -EACCES;
     } else {
         file = NULL;
     }
@@ -450,6 +469,105 @@ int32_t mm_munmap(uint32_t addr, uint32_t len)
     return mm_remove(current_mm, addr, addr + PAGE_UP(len));
 }
 
+/* mremap: grow or shrink a mapping, or move it if MREMAP_MAYMOVE.
+   Firefox's allocator and xterm both grow anonymous maps this way.
+   One whole area only: a piece of a map, MREMAP_DONTUNMAP, and a
+   FIXED move that overlaps the old range wait for a user. */
+#define MREMAP_MAYMOVE 1
+#define MREMAP_FIXED   2
+
+int32_t mm_mremap(uint32_t old, uint32_t old_len, uint32_t new_len,
+                  uint32_t flags, uint32_t new_addr)
+{
+    struct mm *mm = current_mm;
+    if ((old & (PAGE_SIZE - 1)) || old_len == 0)
+        return -EINVAL;
+    if (flags & ~(MREMAP_MAYMOVE | MREMAP_FIXED))
+        return -EINVAL;
+    if ((flags & MREMAP_FIXED) && !(flags & MREMAP_MAYMOVE))
+        return -EINVAL;
+    old_len = PAGE_UP(old_len);
+    new_len = PAGE_UP(new_len);
+    if (new_len == 0)
+        return -EINVAL;
+
+    struct vma *v = find(mm, old);
+    if (!v || v->start != old || v->end != old + old_len)
+        return -EFAULT;
+    if (v->flags & VM_PFNMAP)
+        return -EINVAL;
+
+    if (new_len == old_len && !(flags & MREMAP_FIXED))
+        return (int32_t)old;
+
+    if (new_len < old_len && !(flags & MREMAP_FIXED)) {
+        mm_remove(mm, old + new_len, old + old_len);
+        return (int32_t)old;
+    }
+
+    if (new_len > old_len && !(flags & MREMAP_FIXED)) {
+        uint32_t grow_to = old + new_len;
+        if (grow_to > KERNEL_VBASE || grow_to < old)
+            return -ENOMEM;
+        int i = (int)(v - mm->area);
+        if (i + 1 == mm->nareas || mm->area[i + 1].start >= grow_to) {
+            v->end = grow_to;
+            return (int32_t)old;
+        }
+        if (!(flags & MREMAP_MAYMOVE))
+            return -ENOMEM;
+    }
+
+    if (!(flags & MREMAP_MAYMOVE))
+        return -ENOMEM;
+
+    uint32_t dest;
+    if (flags & MREMAP_FIXED) {
+        if ((new_addr & (PAGE_SIZE - 1)) || new_addr + new_len > KERNEL_VBASE ||
+            new_addr + new_len < new_addr)
+            return -EINVAL;
+        dest = new_addr;
+        if (dest < old + old_len && dest + new_len > old)
+            return -EINVAL;             /* overlapping FIXED: later */
+        mm_remove(mm, dest, dest + new_len);
+        v = find(mm, old);              /* mm_remove can move the array */
+        if (!v || v->start != old)
+            return -EFAULT;
+    } else {
+        dest = mm_find_gap(mm, new_len);
+        if (!dest)
+            return -ENOMEM;
+        v = find(mm, old);
+        if (!v)
+            return -EFAULT;
+    }
+
+    struct vma nv = *v;
+    nv.start = dest;
+    nv.end = dest + new_len;
+    if (add_area(mm, &nv) < 0)
+        return -ENOMEM;
+
+    uint32_t copy = old_len < new_len ? old_len : new_len;
+    for (uint32_t off = 0; off < copy; off += PAGE_SIZE) {
+        uint32_t src = old + off;
+        uint32_t fl = vmm_get_flags(src);
+        if (!(fl & PTE_PRESENT))
+            continue;
+        uint32_t pa = vmm_unmap(src);
+        if (!pa)
+            continue;
+        if (vmm_map(dest + off, pa, fl) < 0) {
+            if (!(fl & PTE_SHARED))
+                pmm_free(pa);
+            mm_remove(mm, dest, dest + new_len);
+            return -ENOMEM;
+        }
+    }
+    mm_remove(mm, old, old + old_len);
+    return (int32_t)dest;
+}
+
 /* --- mprotect ---------------------------------------------------------- */
 
 /* Make sure an area boundary falls at addr (split the area around it). */
@@ -481,8 +599,9 @@ int32_t mm_mprotect(uint32_t addr, uint32_t len, uint32_t prot)
         struct vma *v = find(mm, a);
         if (!v)
             return -ENOMEM;
-        if ((v->flags & VM_PFNMAP) && (prot & PROT_WRITE) && !(v->flags & VM_MAYWRITE))
-            return -EACCES;             /* a device opened read-only */
+        if ((v->flags & (VM_PFNMAP | VM_SHARED)) && (prot & PROT_WRITE) &&
+            !(v->flags & VM_MAYWRITE))
+            return -EACCES;             /* a device opened, or a segment attached, read-only */
         a = v->end;
     }
     if (split_at(mm, addr) < 0 || split_at(mm, end) < 0)
@@ -491,8 +610,8 @@ int32_t mm_mprotect(uint32_t addr, uint32_t len, uint32_t prot)
                       (prot & 4 ? VM_EXEC : 0);
     for (int i = 0; i < mm->nareas; i++)
         if (mm->area[i].start >= addr && mm->area[i].end <= end)
-            mm->area[i].flags = vflags |
-                                (mm->area[i].flags & (VM_PFNMAP | VM_WC | VM_MAYWRITE));
+            mm->area[i].flags = vflags | (mm->area[i].flags &
+                                          (VM_PFNMAP | VM_WC | VM_MAYWRITE | VM_SHARED));
     /* Pages that exist get the new write permission (a copy-on-write page
        stays read-only: its fault handler makes it writable). */
     for (uint32_t a = addr; a < end; a += PAGE_SIZE) {
@@ -505,4 +624,29 @@ int32_t mm_mprotect(uint32_t addr, uint32_t len, uint32_t prot)
         vmm_protect(a, f);
     }
     return 0;
+}
+
+/* --- shmdt ----------------------------------------------------------------- */
+
+struct inode *mm_shm_detach(uint32_t addr)
+{
+    struct mm *mm = current_mm;
+    struct vma *v = find(mm, addr);
+    if (!v || !(v->flags & VM_SHARED) || v->start != addr || v->file_off != 0)
+        return NULL;
+    /* mprotect may have split the attach into several areas: the ones of
+       this segment whose offset says they belong to the attach at addr.
+       Anything else in the range stays — something mapped over part of
+       it, or another attach of the same segment (offset 0 again). */
+    struct inode *seg = v->file;
+    uint32_t end = addr + PAGE_UP(seg->size);
+    vfs_get(seg);
+    for (int i = first_after(mm, addr); i < mm->nareas && mm->area[i].start < end; ) {
+        struct vma *a = &mm->area[i];
+        if (a->file == seg && (a->flags & VM_SHARED) && a->file_off == a->start - addr)
+            mm_remove(mm, a->start, a->end);    /* the next area moves down to i */
+        else
+            i++;
+    }
+    return seg;
 }

@@ -13,6 +13,11 @@
 #define PTE_GLOBAL   0x100      /* kernel pages: keep in the TLB across CR3 loads */
 #define PTE_SHARED   0x200      /* OS bit: frame is shared, don't free it on unmap */
 #define PTE_COW      0x400      /* OS bit: copy-on-write (read-only until written) */
+/* OS bit: a page of a MAP_SHARED mapping (or shared memory). fork shares
+   it as it is, writable, instead of copy-on-write. Like any page, each
+   mapping of it owns one reference, so a file that drops the page while
+   it's mapped (truncate) can't free it under a process. */
+#define PTE_MAPSHARED 0x800
 
 /* Map all RAM into the kernel's direct map and remove the low identity map.
    Needs pmm_init() first. */
@@ -26,7 +31,7 @@ int vmm_map(uint32_t va, uint32_t pa, uint32_t flags);
    directory entry, no page table, one TLB entry. Only at boot, before the
    first process — process directories copy the kernel half when created.
    Returns 0, or -1 if va is in use. */
-int vmm_map_big(uint32_t va, uint32_t pa, uint32_t flags);
+int vmm_map_big(uint32_t va, uint64_t pa, uint32_t flags);
 
 /* The page table flags for a write-combining page (pat.c; uncached on a
    CPU without PAT). */

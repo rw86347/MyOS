@@ -135,14 +135,14 @@ SYSCALL_DEF(sys_ppoll64)                /* (fds, nfds, timespec64 *, sigmask *, 
 /* select(): fd_set bitmaps instead of a list. Converted to poll. */
 static int32_t do_select(uint32_t nfds, uint32_t rd, uint32_t wr, uint32_t ex, int32_t ms)
 {
-    if (nfds > FD_MAX)
-        nfds = FD_MAX;
+    if (nfds > 32)
+        nfds = 32;                      /* the fd_set we read is 32 bits */
     uint32_t in[3] = { 0, 0, 0 }, user[3] = { rd, wr, ex };
     for (int k = 0; k < 3; k++)
         if (user[k] && get_user32(&in[k], user[k]) < 0)
             return -EFAULT;
 
-    struct pollfd p[FD_MAX];
+    struct pollfd p[32];
     uint32_t n = 0;
     for (uint32_t fd = 0; fd < nfds; fd++) {
         int16_t ev = ((in[0] >> fd) & 1 ? POLLIN : 0) | ((in[1] >> fd) & 1 ? POLLOUT : 0);

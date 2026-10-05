@@ -236,6 +236,144 @@ static void test_timeout(void)
     check(r == -1 && err == ETIMEDOUT && ms >= 45 && ms < 1000, "sem_timedwait times out");
 }
 
+/* --- 7. POSIX timers: timer_create & co., sigtimedwait ------------------------ */
+
+#ifndef SIGEV_THREAD_ID
+#define SIGEV_THREAD_ID 4
+#endif
+
+static volatile int notified, notified_value;
+
+static void on_timer(union sigval v)
+{
+    notified_value = v.sival_int;
+    notified = 1;
+}
+
+static volatile int ticks_seen, ticks_ok;
+
+static void on_tick(int sig, siginfo_t *si, void *uc)
+{
+    (void)sig;
+    (void)uc;
+    ticks_seen++;
+    if (si->si_code == SI_TIMER && si->si_value.sival_int == 42)
+        ticks_ok++;
+}
+
+/* A timer that signals this thread only (so no other thread can take it). */
+static int timer_for_me(clockid_t clk, int sig, int value, timer_t *id)
+{
+    struct sigevent ev;
+    memset(&ev, 0, sizeof ev);
+    ev.sigev_notify = SIGEV_THREAD_ID;
+    ev.sigev_signo = sig;
+    ev.sigev_value.sival_int = value;
+    ev.sigev_notify_thread_id = tid();
+    return timer_create(clk, &ev, id);
+}
+
+static void test_timers(void)
+{
+    struct timespec t0;
+    timer_t id;
+
+    /* Exactly what Vim's start_timeout() does ('redrawtime', regexp
+       timeouts): SIGEV_THREAD on CLOCK_MONOTONIC. musl runs the function
+       on a helper thread that waits in sigwaitinfo for an SI_TIMER signal. */
+    struct sigevent ev;
+    memset(&ev, 0, sizeof ev);
+    ev.sigev_notify = SIGEV_THREAD;
+    ev.sigev_notify_function = on_timer;
+    ev.sigev_value.sival_int = 7;
+    int made = timer_create(CLOCK_MONOTONIC, &ev, &id) == 0;
+    struct itimerspec it = { { 0, 0 }, { 0, 20 * 1000000 } };
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    int set = made && timer_settime(id, 0, &it, NULL) == 0;
+    while (set && !notified && ms_since(&t0) < 2000)
+        usleep(1000);
+    long ms = ms_since(&t0);
+    check(made && set && notified && notified_value == 7 && ms >= 20,
+          "SIGEV_THREAD timer calls its function after 20 ms (Vim's timeout)");
+    if (made)
+        timer_delete(id);
+
+    /* Every 5 ms, to this thread, with SI_TIMER and our si_value. */
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = on_tick;
+    sa.sa_flags = SA_SIGINFO;
+    sigaction(SIGRTMIN, &sa, NULL);
+    made = timer_for_me(CLOCK_REALTIME, SIGRTMIN, 42, &id) == 0;
+    it = (struct itimerspec){ { 0, 5000000 }, { 0, 5000000 } };
+    struct itimerspec cur = { { 0, 0 }, { 0, 0 } };
+    set = made && timer_settime(id, 0, &it, NULL) == 0 && timer_gettime(id, &cur) == 0;
+    check(set && cur.it_interval.tv_sec == 0 && cur.it_interval.tv_nsec == 5000000 &&
+          cur.it_value.tv_sec == 0 && cur.it_value.tv_nsec > 0 &&
+          cur.it_value.tv_nsec <= 5000000,
+          "timer_gettime: the interval, and at most the time that was set");
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    while (set && ticks_seen < 4 && ms_since(&t0) < 2000)
+        usleep(1000);
+    check(ticks_seen >= 4 && ticks_ok == ticks_seen,
+          "periodic timer: signal with SI_TIMER and si_value, every time");
+    int deleted = made && timer_delete(id) == 0;
+    int seen = ticks_seen;
+    usleep(20000);
+    check(deleted && ticks_seen == seen, "timer_delete stops it");
+    /* (musl's timer_delete returns the raw -EINVAL; errno stays as it was) */
+    int again = timer_delete(id);
+    check(again == -EINVAL || (again == -1 && errno == EINVAL),
+          "timer_delete of a deleted timer: EINVAL");
+
+    /* sigtimedwait: a timeout, then a blocked timer signal taken with its
+       siginfo — from an absolute CLOCK_REALTIME time already past. */
+    sigset_t wait_set;
+    sigemptyset(&wait_set);
+    sigaddset(&wait_set, SIGRTMIN + 1);
+    pthread_sigmask(SIG_BLOCK, &wait_set, NULL);
+    siginfo_t si;
+    struct timespec to = { 0, 10 * 1000000 };
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    int r = sigtimedwait(&wait_set, &si, &to);
+    check(r == -1 && errno == EAGAIN && ms_since(&t0) >= 10, "sigtimedwait times out with EAGAIN");
+
+    made = timer_for_me(CLOCK_REALTIME, SIGRTMIN + 1, 99, &id) == 0;
+    struct timespec now;
+    clock_gettime(CLOCK_REALTIME, &now);
+    it = (struct itimerspec){ { 0, 0 }, { now.tv_sec - 1, 0 } };
+    set = made && timer_settime(id, TIMER_ABSTIME, &it, NULL) == 0;
+    memset(&si, 0, sizeof si);
+    to = (struct timespec){ 2, 0 };
+    r = set ? sigtimedwait(&wait_set, &si, &to) : -1;
+    check(r == SIGRTMIN + 1 && si.si_code == SI_TIMER && si.si_value.sival_int == 99 &&
+          si.si_timerid == (int)(intptr_t)id,
+          "TIMER_ABSTIME in the past fires at once; sigwaitinfo gets its siginfo");
+
+    /* Every 1 ms while the signal stays blocked: one signal, the rest counted. */
+    it = (struct itimerspec){ { 0, 1000000 }, { 0, 1000000 } };
+    set = made && timer_settime(id, 0, &it, NULL) == 0;
+    usleep(30000);
+    memset(&si, 0, sizeof si);
+    r = set ? sigtimedwait(&wait_set, &si, &to) : -1;
+    int over = made ? timer_getoverrun(id) : -1;
+    check(r == SIGRTMIN + 1 && si.si_overrun >= 10 && over >= 10,
+          "a blocked periodic timer counts overruns");
+
+    /* Deleting it takes back its pending signal: unblocking must not
+       deliver it (by default, a real-time signal ends the program). */
+    usleep(5000);
+    sigset_t pend;
+    sigpending(&pend);
+    int was = sigismember(&pend, SIGRTMIN + 1);
+    if (made)
+        timer_delete(id);
+    sigpending(&pend);
+    check(was && !sigismember(&pend, SIGRTMIN + 1),
+          "timer_delete takes back its pending signal");
+    pthread_sigmask(SIG_UNBLOCK, &wait_set, NULL);
+}
+
 /* --- 6. processes with threads: fork, exit, pthread_exit, exec ---------------- */
 
 static int child_status(pid_t pid)
@@ -347,6 +485,7 @@ int main(void)
     test_tls();
     test_signals();
     test_timeout();
+    test_timers();
     test_processes();
     printf("pthreadtest: %s\n", failures ? "FAILED" : "all ok");
     return failures ? 1 : 0;           /* (exit_group with "sleeper" asleep) */

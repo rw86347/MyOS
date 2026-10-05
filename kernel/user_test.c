@@ -203,6 +203,9 @@ void user_selftest(void)
     static const char *const race_args[] = { "racetest", NULL };
     check(run("/bin/racetest", race_args) == 0,
           "user: a copy to user space that sleeps cannot be raced (pipe, wait4, readdir)");
+    static const char *const shm_args[] = { "shmtest", NULL };
+    check(run("/bin/shmtest", shm_args) == 0,
+          "user: System V shared memory: shmget/shmat/shmdt/shmctl, fork, IPC_RMID");
     static const char *const boot_args[] = { "boottest", NULL };
     check(run("/bin/boottest", boot_args) == 0,
           "user: init's calls: sethostname, mount tmpfs, umount2, vhangup, reboot switches");

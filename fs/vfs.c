@@ -571,10 +571,20 @@ static int walk(struct inode *dir, const char *path, uint32_t len, int follow_la
                 return -ENOENT;         /* the caller has no such fd */
             if (!last || follow_last) {
                 struct inode *t = f->inode;
-                if (!t->parent && !S_ISCHR(t->mode))
+                /* Pipes and sockets aren't in the tree and can't be opened
+                   again this way. An unlinked regular file can — memfd and
+                   a deleted-but-open file — which is how Firefox makes a
+                   read-only copy of a memfd. */
+                if (S_ISFIFO(t->mode) || (t->mode & S_IFMT) == S_IFSOCK)
                     return -ENXIO;
                 next = t;
             }
+        } else if (next->flags & I_PROC_EXE) {
+            struct process *p = proc_current();
+            if (!p || !p->exe)
+                return -ENOENT;
+            if (!last || follow_last)
+                next = p->exe;
         } else if (S_ISLNK(next->mode) && (!last || follow_last)) {
             if (++*links > MAX_LINKS)
                 return -ELOOP;
@@ -820,7 +830,7 @@ int fd_install_at(int fd, struct file *f)
     struct process *p = proc_current();
     struct file *old = p->files[fd];
     p->files[fd] = f;
-    p->cloexec &= ~(1u << fd);
+    p->cloexec &= ~(1ull << fd);
     if (old)
         file_put(old);              /* dup2 closes what was there */
     return fd;
@@ -841,7 +851,7 @@ int fd_close(int fd)
         return -EBADF;
     struct process *p = proc_current();
     p->files[fd] = NULL;
-    p->cloexec &= ~(1u << fd);
+    p->cloexec &= ~(1ull << fd);
     file_put(f);
     return 0;
 }

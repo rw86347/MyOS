@@ -90,10 +90,7 @@ static void run_init(void)
     tty_set_foreground(p->pgid);        /* Ctrl-C reaches init's group */
     tty_attach_keyboard();              /* keys go to the terminal now */
     int status = proc_wait_kernel(p);
-    kprintf("\n%s exited (status %d). System halted.\n", path, status);
-    serial_flush();
-    for (;;)
-        __asm__ volatile ("cli; hlt");
+    kprintf("\n%s exited (status %d).\n", path, status);
 }
 #endif
 
@@ -178,6 +175,8 @@ static void storage_init(void)
         else
             kprintf("ext2: %s (\"%s\") is not a MyOS disk: left alone\n", d->name, label);
     }
+    if (!ndisks)
+        kprintf("storage: no disks (USB mass storage is not in this kernel yet)\n");
     if (rootdev)
         mount_root(rootdev);
     if (datadev)

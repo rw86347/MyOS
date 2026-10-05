@@ -3,7 +3,13 @@
 Decisions that shape later roadmap steps. Add open questions at the bottom of each section.
 
 ## Boot: our own BIOS/MBR bootloader (no GRUB)
-Two stages; disk layout `[ MBR | stage 2 (8 sectors) | kernel.bin | initrd.cpio ]`.
+Two stages on a BIOS disk; layout `[ MBR | stage 2 (8 sectors) | kernel.bin | initrd.cpio ]`.
+A UEFI-only PC cannot start that. `make uefi` builds a second image:
+GPT + a FAT32 EFI System Partition with `/EFI/BOOT/BOOTX64.EFI`. That 64-bit
+app (`arch/i386/boot/efi/`) loads the same 32-bit kernel to 1 MiB, fills
+BOOTINFO from `GetMemoryMap` and GOP, drops to protected mode
+(`efi_jump.asm`), and jumps to `_start`. GOP above 4 GiB uses PSE-36.
+Not the x86_64 port (roadmap 12b).
 - **Stage 1** (`arch/i386/boot/mbr.asm`, 512 bytes): the BIOS loads it at 0x7C00; it loads
   stage 2 to 0x7E00 with `int 0x13` AH=0x42 and jumps there.
 - **Stage 2** (`arch/i386/boot/stage2.asm`): reads the BIOS memory map (`int 0x15` E820),
@@ -149,6 +155,55 @@ The first driver, for the Bochs/QEMU std VGA (UTM's "VGA" display), is original 
 written from QEMU's documentation, for the same licence reason as the e1000.
 The console is a backend of `drivers/vt.c`, like Linux's fbcon: it keeps its text in
 RAM and never reads video memory back.
+
+Decided (2026-10-04): **the compositor is optional, chosen per machine at install.**
+The desktop is plain X: IceWM's windows draw straight into `/dev/fb0`, and nothing
+keeps a picture of a window that another one covers. A compositor (`picom`) keeps one
+for every window and builds the screen from them. Real window shadows, fades, and the
+window overview behind the hot corner (`docs/ui-theme.md`, like Mission Control on
+the Mac) need that. It also costs a second copy of every window's pixels and an extra
+copy on every redraw, which an old PC can't always afford. So there are three levels:
+
+| level | what runs | requirements |
+|---|---|---|
+| `none` | IceWM only | Composite, Damage, Render and XFixes in the X server (Alpine's Xorg has them; no kernel work) |
+| `xrender` | `picom --backend xrender`, always on | the `[compositor]` packages (1.1 MiB); a full-screen repaint in 16 ms or less; 512 MiB of RAM |
+| `gl` | `picom --backend glx` | a GPU with a Mesa driver, through a render node (`/dev/dri/renderD128`); Mesa's drivers (`mesa-dri-gallium` and `llvm17-libs`, 188 MiB) |
+
+- **The overview works at every level.** It is our own small X program (Alpine has no
+  Exposé clone). It reads IceWM's window list (`_NET_CLIENT_LIST`, `_NET_WM_DESKTOP`),
+  lays the windows out, and raises the one clicked (`_NET_ACTIVE_WINDOW`). It starts
+  from the hot corner or F3. Under `xrender` and `gl` it animates. Under `none` it
+  redirects the windows itself through Composite only while it is open, waits one
+  redraw, and shows still pictures with no zoom.
+- **16 ms is one frame at 60 Hz.** The overview's zoom lasts about 250 ms; a repaint
+  slower than a frame turns it into a slideshow. The CPU's name can't predict it: it
+  depends on pixman's speed on that CPU and how fast writes reach video memory over
+  that machine's bus (PCI, AGP, PCIe), and two Pentium 4s can differ several times.
+  So it is measured: `picom --backend xrender --benchmark 120` on the running X server,
+  timed, divided by 120.
+- **512 MiB:** picom keeps 4 bytes per pixel for every mapped window (ten 800×600
+  windows: 18 MiB) plus a screen-sized buffer. Both thresholds are starting values,
+  to be checked on the real machines in step 12.
+- **Who decides.** The installer (step 9c-3) runs the check from the live disk and
+  shows its choice, which the user can change. It writes `compositor=none`, `xrender`
+  or `gl` to `/etc/myos/desktop.conf`. For `none` it leaves `picom` out by
+  dependency (as `apk del picom` would), not by group label: a package sits under the
+  first group that needs it, and `dbus-libs` is filed under `[compositor]` although
+  AbiWord needs it too.
+- **The session decides again at every start.** IceWM's start-up script reads
+  `desktop.conf` and drops a level if what it names is missing (no render node after a
+  hardware change, so `xrender`; no `picom`, so `none`), so a disk moved to another
+  machine still starts a desktop. `apk add picom` and an edited line move a machine up
+  without reinstalling. IceWM's session doesn't run XDG autostart, so the
+  `picom.desktop` file the package ships starts nothing on its own.
+- **`gl` is not on the 32-bit live disk yet.** Our only display driver (Bochs/QEMU VGA)
+  has no acceleration and no render node, so no machine qualifies today. The kernel
+  side still missing: a render node with GEM buffers and dma-buf. `memfd_create`
+  exists (Firefox's shm; Mesa's DRI3 path will use it too). Passing the buffers'
+  file descriptors over AF_UNIX (`SCM_RIGHTS`)
+  and epoll already exist. First user: `amdgpu` on the Pocket 4 (step 12b), with
+  x86-64 packages.
 
 Open questions:
 - Block drivers in user space need a fast path: kernel and driver share a request ring and the

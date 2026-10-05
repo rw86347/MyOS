@@ -109,5 +109,27 @@ int32_t sys_sigreturn_impl(int rt);
 int32_t sys_kill_impl(int pid, int sig);
 int32_t sys_rt_sigsuspend_impl(uint32_t set, uint32_t size);
 int32_t sys_rt_sigpending_impl(uint32_t set, uint32_t size);
+int32_t sys_rt_sigtimedwait_impl(uint32_t set, uint32_t info, uint32_t timeout,
+                                 uint32_t size, int wide);
+
+/* --- POSIX timers (posix_timer.c) --- */
+
+#define SI_USER   0
+#define SI_TIMER (-2)
+
+/* Where a delivered signal came from: si_code, and the three words after
+   it (for SI_TIMER: the timer's id, its overrun count, its sigev_value). */
+struct sig_origin {
+    int32_t code;
+    int32_t word[3];
+};
+
+/* Signal sig was just taken from thread t's own pending set (own = 1) or its
+   process's. If a timer made it pending, fill *o and return 1. Interrupts off. */
+int  ptimer_siginfo(struct process *p, struct thread *t, int sig, int own,
+                    struct sig_origin *o);
+void ptimer_tick(uint32_t now);                         /* every 1 ms */
+void ptimer_thread_gone(struct process *p, struct thread *t);
+void ptimer_release_all(struct process *p);             /* exit and execve */
 
 #endif

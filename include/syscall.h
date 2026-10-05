@@ -51,7 +51,10 @@
 #define NR_rt_sigaction   174
 #define NR_rt_sigprocmask 175
 #define NR_rt_sigpending  176
+#define NR_rt_sigtimedwait 177
 #define NR_rt_sigsuspend  179
+#define NR_pread64     180
+#define NR_pwrite64    181
 #define NR_getcwd      183
 #define NR_vfork       190
 #define NR_mmap2       192
@@ -91,7 +94,9 @@
 #define NR_epoll_ctl   255
 #define NR_epoll_wait  256
 #define NR_epoll_pwait 319
+#define NR_eventfd2    328
 #define NR_epoll_create1 329
+#define NR_membarrier  375
 #define NR_rename       38
 #define NR_mkdir        39
 #define NR_rmdir        40
@@ -106,6 +111,7 @@
 #define NR_ftruncate    93
 #define NR_fchmod       94
 #define NR_sysinfo     116
+#define NR_ipc         117
 #define NR_fsync       118
 #define NR_socketcall  102
 #define NR_clone       120
@@ -114,7 +120,9 @@
 #define NR__newselect  142
 #define NR_fdatasync   148
 #define NR_nanosleep   162
+#define NR_mremap      163
 #define NR_poll        168
+#define NR_prctl       172
 #define NR_ugetrlimit  191
 #define NR_lchown32    198
 #define NR_getuid32    199
@@ -142,6 +150,11 @@
 #define NR_set_thread_area 243
 #define NR_get_thread_area 244
 #define NR_set_tid_address 258
+#define NR_timer_create    259
+#define NR_timer_settime   260
+#define NR_timer_gettime   261
+#define NR_timer_getoverrun 262
+#define NR_timer_delete    263
 #define NR_statfs64    268
 #define NR_fstatfs64   269
 #define NR_clock_gettime   265
@@ -161,7 +174,11 @@
 #define NR_utimensat   320
 #define NR_prlimit64   340
 #define NR_renameat2   353
+#define NR_mincore     218
+#define NR_readahead   225
+#define NR_fallocate   324
 #define NR_getrandom   355
+#define NR_memfd_create 356
 #define NR_socket      359
 #define NR_socketpair  360
 #define NR_bind        361
@@ -180,9 +197,12 @@
 #define NR_clock_gettime64 403
 #define NR_clock_getres_time64 406
 #define NR_clock_nanosleep_time64 407
+#define NR_timer_gettime64 408
+#define NR_timer_settime64 409
 #define NR_utimensat_time64 412
 #define NR_pselect6_time64 413
 #define NR_ppoll_time64 414
+#define NR_rt_sigtimedwait_time64 421
 #define NR_futex_time64 422
 
 /* Not a Linux syscall and not in a normal build: `make test` only, so that a

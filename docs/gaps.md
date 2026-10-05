@@ -20,6 +20,13 @@ when it's fixed. File references point at the comment that mentions the gap.
   initramfs; /data must be on another disk. Only ext2 disks labelled `myos-data` are
   mounted — any other (someone's Linux disk in an old PC) is left alone.
 - **E820 map holds at most 32 entries.** (`layout.inc`, `E820_MAX`)
+- **UEFI loader starts the existing 32-bit kernel** (`make uefi` / `make live-uefi`).
+  There is no `arch/x86_64` yet. GOP above 4 GiB is mapped with PSE-36
+  (`simplefb` on the MSI laptop at `0x400000000`). GPT is read only far
+  enough to find the ESP and a Linux `myos-root` (16 entries).
+- **No USB mass storage.** A live UEFI stick's `myos-root` is not mounted
+  on a machine whose only disk is the stick itself (xHCI only). The kernel
+  then runs the RAM initramfs `/init`, not the graphical login.
 
 ## Live disk userland (`live/`, 2026-10-03)
 - **Boots to the graphical login** (`make live-hd`, `make utm-live`): `myos-login`
@@ -28,18 +35,30 @@ when it's fixed. File references point at the comment that mentions the gap.
   run against the generated database (no Docker).
 - **The live user is made at build time** (`tools/fetch-live.py`, `add_live_user`):
   shadow's `useradd` and `passwd` lock `/etc/passwd` with a hard link, and the VFS has
-  none (each name is its inode). Until `link()` exists, adding users or changing a
-  password inside the running system fails.
+  none (each name is its inode). Until `link()` exists they fail. Settings' **Add User…**
+  works around it: `/usr/libexec/myos-adduser` (setuid root, `live/myos-settings/
+  myos-adduser.c`) checks an administrator's password with PAM (`/etc/pam.d/myos-admin`)
+  and writes passwd, group and shadow itself (flock, write, fsync, rename). Changing a
+  password still has no tool.
+- **Empty passwords let any password in.** The live disk's `root` and `myos` have an
+  empty password, and base-auth's `nullok` makes pam_unix accept *anything* typed for
+  such an account, at the login screen and in `su` too. `myos-adduser` refuses a
+  typed password for an account whose password is empty; the login screen doesn't
+  yet. The installer must give both real passwords (or lock root's: `root:*:`).
+- **Wi-Fi is a pane with nothing behind it.** Settings shows Wi-Fi where the Mac does,
+  off and greyed out: MyOS has no Wi-Fi driver. It reads `/proc/net/wireless`, which
+  MyOS doesn't have, so it always says "No Wi-Fi hardware found".
 - **Nothing reads the syslog socket.** `net/unix.c` has UNIX sockets now, but no
   syslog daemon runs, so login failures still go nowhere.
-- **32 fds per process** (`PROC_FILES`). bash moves its terminal to fd 255 for job
-  control and gets `EBADF`, so the login shell has no Ctrl-Z / `fg`. `cloexec` is a
-  32-bit mask; growing the table means a bitmap.
+- **64 fds per process** (`PROC_FILES`). bash still moves its terminal to fd 255 for
+  job control and gets `EBADF`, so the login shell has no Ctrl-Z / `fg`. `cloexec`
+  is a 64-bit mask; going past 63 needs a bitmap. `select()` still only sees fds
+  0–31 (Linux `fd_set` on i386 is 1024 bits; Firefox uses poll/epoll).
 - **No permission checks.** Processes have real users now (uid, groups, setuid exec),
   but `open`, `unlink`, `kill`... don't check them: user `myos` can write `/etc/shadow`.
   The scheduler also ignores nice values (`setpriority` stores them).
-- **/proc is only `/proc/self/fd`** (`fs/procfs.c`). No `/proc/<pid>`, `meminfo`,
-  `mounts`, `self/exe`; `self` is a directory, not a link to the pid. Listing
+- **/proc is `/proc/self/fd` and `/proc/self/exe`** (`fs/procfs.c`). No `/proc/<pid>`,
+  `meminfo`, `mounts`; `self` is a directory, not a link to the pid. Listing
   `/proc/self/fd` shows all 32 slots, open or not (opening or reading a closed one
   is `ENOENT`). A pipe or socket fd can't be reopened through it (`ENXIO`), so
   bash's `<(...)` can't use `/dev/fd`. A deleted file's link names just the file,
@@ -97,12 +116,16 @@ when it's fixed. File references point at the comment that mentions the gap.
   (thread stacks, buffers); small objects are O(1). (`mm/kheap.c`)
 - **Nothing above 0xFF000000 is used yet** (planned for temporary mappings etc.).
   (`memlayout.h`)
-- **Add System V shared memory** (`shmget`, `shmat`, `shmdt`, `shmctl`). Not there yet. The
-  X server's MIT-SHM extension uses it, and so do GTK, xterm's images and picom: they
-  hand pictures to X through a shared segment instead of copying them down the socket.
-  Without it they fall back to the slower copy, or fail. musl on i386 calls them through
-  the old `ipc` multiplexer (syscall 117), so that is the number to implement first; Linux
-  also has the direct calls (395-398).
+- **System V shared memory is what MIT-SHM needs, no more** (`kernel/shm.c`, 2026-10-04):
+  `shmget`, `shmat`, `shmdt`, and `shmctl`'s IPC_STAT, IPC_SET and IPC_RMID, through
+  `ipc()` (117), which is all musl calls. Not there: the direct calls (395-398), IPC_INFO,
+  SHM_INFO, SHM_STAT and `/proc/sysvipc/shm` (so `ipcs` lists nothing), SHM_LOCK (there's
+  no swap, so nothing to lock), the pre-`IPC_64` struct, and semaphores and message
+  queues (ENOSYS). At most 256 segments, and `shmget` with a key looks at all of them.
+  Their pages count against the RAM-file limit (half of RAM). A first touch past that
+  limit is SIGSEGV, where Linux gives SIGBUS.
+- **`MAP_SHARED | MAP_ANONYMOUS` is still private** after `fork`. The `VM_SHARED` areas
+  shared memory uses could carry it too, when a program needs it.
 
 ## Threads / scheduler
 - **No locks.** Preemption is on, so two threads can be inside the same code at once.
@@ -113,8 +136,8 @@ when it's fixed. File references point at the comment that mentions the gap.
   `sched_start()`). (`kernel/sched.c`)
 - **Dead threads are reaped lazily**: their slot and stack are only freed when
   `thread_create` needs the slot. (`kernel/thread.c`)
-- **Fixed tables: 64 threads, 64 processes, 32 fds and 32 memory areas per process.**
-  (`THREAD_MAX`, `PROC_MAX`, `PROC_FILES`, `MM_AREAS`)
+- **Fixed tables: 64 threads, 64 processes, 64 fds per process.**
+  (`THREAD_MAX`, `PROC_MAX`, `PROC_FILES`; memory areas grow, up to `MM_AREAS_MAX`)
 - **Threads (2026-10-03): what's missing.** `vfork` is plain fork (copy-on-write
   makes it cheap), and `clone(CLONE_VM)` *without* `CLONE_THREAD` gets a copy.
   - **Shared futexes are keyed by address space**, not by physical page, so a
@@ -124,9 +147,6 @@ when it's fixed. File references point at the comment that mentions the gap.
     (`set_robust_list` is accepted and ignored): musl and GLib don't use them;
     glibc programs would.
   - **Futex timeouts have 1 ms resolution** (the timer tick), rounded up.
-  - **`MM_AREAS` (32) limits a process to roughly 13 threads**: musl gives each
-    thread stack its own mmap plus a guard page (two areas). Raise it when a
-    real program needs more. (`include/mm.h`)
   - **execve vs. exit_group race**: if one thread calls `exit_group` while
     another is in `execve` killing its siblings, the exec wins and the exit
     status is lost (Linux fails the exec instead).
@@ -167,6 +187,15 @@ when it's fixed. File references point at the comment that mentions the gap.
 - **Time**: millisecond resolution; the CMOS clock is assumed to be UTC; no
   `settimeofday`. `alarm` and `setitimer` do ITIMER_REAL only, in whole ms; arming one
   walks the sorted list of armed processes (at most PROC_MAX), the tick checks only its head.
+- **POSIX timers** (`timer_create` & co., `kernel/posix_timer.c`): 64 in the whole
+  system, 16 per process (Linux: limited by RLIMIT_SIGPENDING); whole-ms resolution, so
+  `timer_gettime` reports intervals rounded up to a ms. Clocks REALTIME, MONOTONIC and
+  BOOTTIME only — no CPU-time clocks (EINVAL). Signals are still one bit per number, not
+  a queue: a timer's expiries while its signal is pending become its overrun count (as on
+  Linux), but a `kill()` of the same signal merges with the timer's and is reported as
+  SI_TIMER — and `timer_delete` takes the merged bit back with it. Timers aimed at a
+  thread that has ended go quiet. Signals report only `si_code` (and, for a timer, its
+  id, overrun and value): no `si_pid`/`si_uid` for `kill`.
 - **Sockets: UDP and raw ICMP only** (step 10). `SOCK_STREAM` returns
   EPROTONOSUPPORT, so `wget` does not work yet; no AF_PACKET, so no `udhcpc`; no
   AF_INET6 or AF_UNIX. Each socket queues 8 datagrams and drops the rest.
@@ -581,12 +610,13 @@ All of these are fixed; what is left is the testing gap and the capability one.
 
 ## The graphical desktop (step 11b, 2026-10-04)
 
-- **No System V shared memory** (no `shmget`/`shmat`, no `sys_ipc`). The X server
-  announces MIT-SHM anyway, and every image library believes it: Imlib2 then draws
-  nothing at all, which is why IceWM's theme and the login screen came up black. The
-  extension is switched off in `live/overlay/etc/X11/xorg.conf.d/10-myos.conf`, so
-  pictures travel down the socket instead. Every local X client pays for that in
-  copies — the first thing to measure if the desktop feels slow.
+- **MIT-SHM is still switched off** in `live/overlay/etc/X11/xorg.conf.d/10-myos.conf`,
+  so pictures travel down the socket and every local X client pays for that in copies.
+  The kernel has System V shared memory now (`kernel/shm.c`, `make test`'s `shmtest`),
+  and the X server's permission check gets the client's uid from `SO_PEERCRED`, which
+  `net/unix.c` has. Turning the extension back on needs a check on the live disk first:
+  without shared memory, Imlib2 drew nothing at all (IceWM's theme and the login screen
+  came up black), so that's where to look.
 - **`link()` is still missing**, so the X server cannot make its lock file and is
   started with `-nolock` (`live/myos-login/myos-login.c`). Two X servers on one
   display would not be noticed.
@@ -606,12 +636,128 @@ All of these are fixed; what is left is the testing gap and the capability one.
 - **`FBIOPUTCMAP` fails** (`-EINVAL`), and the fbdev driver calls it even on a
   TrueColor screen: ten "(EE) FBIOPUTCMAP: Invalid argument" lines in `Xorg.0.log`
   that mean nothing. Gamma is not adjustable.
-- **The desktop only looks right at the size it was drawn for.** IceWM's fonts are
-  fixed point sizes at 96 dpi, so on a 1920x1200 screen the menus and title text are
-  smaller, relative to everything else, than the mockup
-  (`assets/themes/golden-hour/mockup.png`). The login screen does scale: it measures
-  the screen and draws against a 768-high design. A real fix is one DPI for the whole
-  session.
-- **The mockup's programs do not exist**: no file manager, text editor, browser or
-  settings app, so there are no desktop icons and the Start menu is IceWM's own list
-  of what is installed, not the two-column menu in the picture.
+- **The desktop scale comes in five steps.** Settings >
+  Displays picks one scale for the session (100-200%, automatic: 150% at
+  1920x1200). `myos-xsettings` gives it to GTK (XSETTINGS, live) and Xft programs
+  (`Xft.dpi`), and points IceWM at the theme drawn for it (`~/.icewm/theme`):
+  `make-live-theme.py` draws IceWM's pictures and the Start menu at 100, 125, 150,
+  175 and 200% (`GoldenHour`, `GoldenHour-125`...; `/usr/share/myos/menu/<scale>/`,
+  2.3 MiB in all), and a scale between those is rounded to the nearest. IceWM's
+  own theme menu lists all five. The login screen scales by itself (it measures
+  the screen).
+- **The taskbar tray is drawn over IceWM's clock.** The mockup's tray is the
+  last 150 px of the bar: its own top-to-bottom color (`#2d7c8f` to `#16546a`),
+  a 1.5 px `#0b2346` line on its left, the network and volume icons, and the
+  time. IceWM's clock is one flat color, only as wide as the text, and it
+  stretches one taskbar picture across the whole bar, so that band can't be a
+  fixed 150 px. `myos-menu` paints the tray in a window on the taskbar. The
+  bar's own name isn't visible to `XFetchName` (IceWM sets it with
+  `XSetWMProperties`), so the window is found by climbing from the Start
+  button, or the clock, to the first wide strip. IceWM's clock stays, hidden
+  under the tray, so that width stays clear of task buttons; the icons sit
+  just to its left, and a full bar can slide a task button under them.
+- **Window corners are round; the soft shadow beside the title bar is not.**
+  The mockup's windows have 8 px corners and a shadow (blur 5 px, 35% black,
+  mostly on the left and right of the green bar). `make-live-theme.py` clips
+  IceWM's frame to that curve and draws the 1.5 px dark edge. The mask is one
+  bit, so it can leave a hole where the wallpaper shows through, and it cannot
+  darken what is behind the window. The blur waits for the compositor
+  (`docs/DESIGN.md`).
+- **The pointer's size reaches open programs only when they reopen.** Settings >
+  Mouse & Keyboard sets it (Normal to Largest, times the desktop scale; Adwaita's
+  pointers, 24-96 px, X picks the nearest). GTK programs and IceWM (restarted)
+  follow at once; xterm and other plain X programs bake their pointer in when they
+  open. The login screen always has the default size.
+- **WritePerfect's Linux window has no Touch Bar and no in-window shell.**
+  The GTK front end (`linux/gui_gtk.c` in the WritePerfect tree) now has the Mac's
+  menus, shortcuts (Command is Ctrl), the cream F-key strip, and HTML reveal
+  plugins (ZHwriter, Thesaurus, Writer, Reveal Codes) in WebKitGTK. The Mac's
+  Touch Bar F-key row and the shell pane are still Mac-only. Plugin AI calls
+  that need a remote HTTP key stay Mac-only; local stroke data (`hanzi:`) works.
+- **Win+I doesn't open Settings**: myos-menu opens the Start menu as soon as the
+  Windows key goes down and takes the keyboard, so no Windows-key combination
+  reaches IceWM. Settings is in the Start menu and on Ctrl+Alt+S
+  (`/etc/icewm/keys`); Win+I needs the menu to open on key *release*.
+- **Settings is mostly read-only.** Displays changes the scale and Mouse & Keyboard
+  the pointer's size; Network, About,
+  Storage, Date & Time and Users & Groups only show. The network page shows the
+  address the system routes from (UDP connect + getsockname) and the DNS server:
+  there are no interface ioctls (`SIOCGIF*`) to ask for more. The processor name
+  comes from `cpuid` (no `/proc/cpuinfo`). Resolution can't be changed from it:
+  X's fbdev driver can't switch modes while running.
+- **Most of the mockup's programs do not exist**: no network tool or help, so
+  there are no desktop icons and the Start menu (`live/myos-menu`) lists
+  Terminal, My Files, Web Browser (Firefox), WritePerfect, AbiWord, Preview,
+  Disks (My Files' disk view), Settings, Run..., Log off and Turn off.
+- **Firefox is on the disk but needs 1 GiB of RAM.** Alpine 3.20's 32-bit package
+  (plus codecs, 255 MiB). `make utm-live` and `make run-live` give the machine
+  1024 MiB; 256 MiB (the old default) is enough for IceWM and AbiWord and not
+  for Firefox. The session turns the content-process sandbox off
+  (`MOZ_DISABLE_CONTENT_SANDBOX`, `MOZ_DISABLE_GMP_SANDBOX`: no seccomp, no
+  user namespaces) and turns WebRender's GL path off (`MOZ_WEBRENDER=0`: no
+  render node). `/dev/shm` is a tmpfs for `shm_open`. `/proc/self/exe`,
+  `fallocate` and `memfd_create` are there (Firefox uses them to find its
+  files and size shared memory). The live VM CPU is `pentium3,+sse2`: Alpine
+  Firefox is built with SSE2, which a Pentium 4 / Pentium M has. Missing
+  `/proc` files (`cpuinfo`, `meminfo`, `/proc/<pid>/…` beyond `self/fd` and
+  `self/exe`) or other syscalls may still stop it. A GUI start dies in
+  `libxul.so` with a write to address 0 (no message, just "Segmentation
+  fault"). `firefox --version` works. Look at `~/.xsession-errors` and the
+  serial line `firefox: killed by CPU exception`.
+  Chromium is not
+  available for i386. There is no desktop icon: it is the Start menu's
+  "Web Browser".
+- **My Files (`live/myos-files`) is a first version.** It looks like the mockup but
+  the text is DejaVu Sans, not the mockup's Verdana/Trebuchet (Microsoft's licence
+  doesn't let us ship them).   The View button (right of Up) has the Mac's four
+  layouts: Icons, List, Columns, Gallery. Pictures show a thumbnail of the file
+  (cached as a hidden `._name` sidecar, the Mac's name on a disk that isn't HFS).
+  A PDF's sidecar is its first page, used as the icon and as Columns' far-right
+  preview. List does not unfold a folder in place (open it, or use Columns). Other
+  documents still use their type icon. No drag and drop, no cut/move (copy, then delete), no
+  properties window, no "Empty Recycle Bin" (the bin is the freedesktop one,
+  `~/.local/share/Trash`; open it with Ctrl+H, then `.local/share/Trash/files`).
+  Without inotify it looks at the folder and its files every 2 s; in folders of
+  more than 1000 files only the folder's own time is watched, so a file written
+  over there needs F5. Disks finds other disks by `statfs` on the folders in `/`
+  (no `/proc/mounts`).
+- **Evince draws its own title bar** (GTK's header bar), not the Golden Hour one, and
+  warns that it can't watch its settings file: there is no inotify (syscalls 291/332),
+  so GLib's file monitors fail. Nothing visible breaks.
+  Its entries come from `MENU_LEFT` / `MENU_RIGHT` in `live/theme/make-live-theme.py`;
+  "All Programs" waits for something worth listing.
+- **The Start menu is a fixed picture.** Entries are drawn at build time, so adding a
+  program means rebuilding the theme; nothing reads `.desktop` files. The user's name
+  is drawn in DejaVu Sans Bold, the rest of the menu in the theme's Trebuchet/Verdana
+  (the build machine's fonts), so the header text is a slightly different face.
+- **Log off and Turn off don't ask "are you sure?"** IceWM's own confirmation box isn't
+  drawn in the theme (`ConfirmLogout=0`); a themed one belongs in `myos-menu`.
+- **AbiWord aborts at start** ("Aborted" in a terminal, nothing in
+  `~/.xsession-errors`), though it is in the Start menu. Mostly, not always (1 start
+  in ~10 got a window). The serial log says more: `abiword: killed by CPU exception
+  14 ... at EIP 400248b2, read of 80000008`. That is musl's malloc (mallocng's
+  `get_meta`, libc offset 0x248b2) checking a block it was asked to free: the
+  block's group header says its owner is at 0x80000000, which is garbage. Once (of
+  ~12) the X server died the same way, same address. Same in every desktop scale and
+  with myos-xsettings stopped, so not the scale. 0x80000000 is what a float-to-int
+  conversion of NaN gives, and the top of user space. Not found yet (2026-10-04).
+  Two more clues: the crashing code is reached from libc offset 0x24d60 (found by
+  scanning the user stack for return addresses on the fault; the caller outside musl
+  wasn't in the first 256 bytes), and AbiWord also logs `syscall 328 not implemented`
+  (eventfd2; GLib falls back to a pipe).
+- **WritePerfect is built from outside this tree** (`WP_DIR`, default `../wp51/wp51c`),
+  so it is on the live disk only when that folder is on the build machine; MyOS's
+  own source on the disk can't rebuild it. The Start menu opens its terminal editor
+  in an xterm (`writeperfect`). `wp --gui` is its Linux ZHwriter screen, for Chinese,
+  not the full Mac window, and the pinyin there needs `node`, which isn't on the
+  disk. Its `agent.c` leaves out `<sys/select.h>`, which musl needs; the Makefile
+  adds it with `-include` rather than editing WP's tree.
+- **The hot corner only curls.** `myos-menu` draws the curl (24 px, 40 px under the
+  mouse) in a desktop-type window below all windows, but the window overview it should
+  open isn't written (ROADMAP 11b), and it grows at once instead of over 120 ms.
+- **Run... can't tell you a program doesn't exist**: it hands the line to `sh -c` and
+  the error goes to `~/.xsession-errors`.
+- **myos-menu leans on two IceWM details**: the Start button's window is named
+  "TaskBarMenu", and a taskbar button is its picture plus 5 px each way (how the
+  151x35 placeholder makes a 156x40 button). A different IceWM may need these
+  checked (`src/wmtaskbar.cc`, `YButton::updateSize`).

@@ -187,8 +187,10 @@ static int load_elf(struct inode *ino, const char *const argv[],
 
 int program_load(const char *path, const char *const argv[],
                  const char *const envp[], uint32_t *entry, uint32_t *sp,
-                 struct cred *cred)
+                 struct cred *cred, struct inode **exe_out)
 {
+    if (exe_out)
+        *exe_out = NULL;
     /* A program from the initramfs is already in memory: the loader
        reads it right where it is (no copy). */
     struct inode *ino;
@@ -207,6 +209,7 @@ int program_load(const char *path, const char *const argv[],
     } *s = kmalloc(sizeof(struct script) + (count(argv) + 4) * sizeof(char *));
     if (!s)
         return -ENOMEM;
+    struct inode *exe = ino;
     if (script_interp(ino, s->head, s->interp, s->arg)) {
         int n = 0;
         s->argv[n++] = s->interp;
@@ -216,17 +219,24 @@ int program_load(const char *path, const char *const argv[],
         for (uint32_t i = 1; argv && argv[i]; i++)
             s->argv[n++] = argv[i];
         s->argv[n] = NULL;
-        struct inode *interp;
+        struct inode *interp = NULL;
         err = vfs_lookup(s->interp, &interp);
         if (!err && (!S_ISREG(interp->mode) || (interp->ops && !interp->fs)))
             err = -EACCES;
         if (!err)                       /* (one level: no #! interpreters) */
             err = load_elf(interp, s->argv, envp, entry, sp, cred);
         kfree(s);
-        return err;
+        if (!err)
+            exe = interp;               /* /proc/self/exe is the interpreter */
+    } else {
+        kfree(s);
+        err = load_elf(ino, argv, envp, entry, sp, cred);
     }
-    kfree(s);
-    return load_elf(ino, argv, envp, entry, sp, cred);
+    if (!err && exe_out) {
+        vfs_get(exe);
+        *exe_out = exe;
+    }
+    return err;
 }
 
 static int load_elf(struct inode *ino, const char *const argv[],

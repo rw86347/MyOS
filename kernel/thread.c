@@ -46,6 +46,12 @@ void thread_load_tls(struct thread *t)
     gdt_load_tls(t->tls);
 }
 
+void thread_set_saved_gs(struct thread *t, uint32_t gs)
+{
+    if (t && t->uregs)
+        t->uregs->gs = gs;
+}
+
 static void set_ready(struct thread *t)
 {
     if (t->state == THREAD_READY)

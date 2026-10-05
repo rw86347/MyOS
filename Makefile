@@ -20,6 +20,8 @@
 #                   USB stick or run in an emulator on another computer
 #   make utm        "dist/MyOS read-write.utm": a ready-made UTM virtual machine
 #   make live-root  build/live/rootfs.tar: all the live disk's software
+#   make uefi       build/myos-uefi.img: GPT + FAT16 ESP, boots on UEFI (no CSM)
+#   make run-uefi-text  boot that image in QEMU+OVMF, serial only
 #   make clean      delete build/
 #
 # Build modes: a normal build contains no test or benchmark code at all.
@@ -136,7 +138,7 @@ QEMU_FLAGS = -m 64M -cpu pentium3 \
              -drive format=raw,file=$(DATA),index=2,media=disk \
              -netdev user,id=net0 -device e1000,netdev=net0
 
-.PHONY: diskattacks verify-disktests verify-tests attacks all dist utm utm-hd hd live-root live-hd utm-live run-live run-hd test-hd run run-full run-text debug test check-selftests test-shell bench run-bench usb clean fuzz fuzz-build fuzz-replay diskfuzz diskfuzz-replay verify-racetests
+.PHONY: diskattacks verify-disktests verify-tests attacks all dist utm utm-hd hd live-root live-extra live-theme live-hd utm-live run-live run-hd test-hd run run-full run-text debug test check-selftests test-shell bench run-bench usb clean fuzz fuzz-build fuzz-replay diskfuzz diskfuzz-replay verify-racetests uefi run-uefi-text test-uefi live-uefi test-live-uefi
 
 all: $(IMG) $(USB)
 
@@ -310,6 +312,104 @@ $(IMG): $(BUILD)/mbr.bin $(BUILD)/stage2.bin $(BUILD)/splash.bin $(BUILD)/kernel
 	@echo "Built $@ (kernel: $$(wc -c < $(BUILD)/kernel.bin | tr -d ' ') bytes," \
 	  "initramfs: $$(wc -c < $(INITRD) | tr -d ' ') bytes)"
 
+# --- UEFI disk (x64 firmware starts BOOTX64.EFI; we then enter the 32-bit kernel)
+# The EFI app is 64-bit. Apple clang can compile Windows/PE objects; we have
+# no lld, so tools/coff2efi.py links them. OVMF comes with Homebrew's qemu.
+UEFI_IMG   := $(BUILD)/myos-uefi.img
+OVMF_CODE  := /opt/homebrew/share/qemu/edk2-x86_64-code.fd
+OVMF_VARS  := /opt/homebrew/share/qemu/edk2-i386-vars.fd
+QEMU64     := qemu-system-x86_64
+CLANG_EFI  := clang -target x86_64-unknown-windows -std=c11 -ffreestanding \
+              -fno-builtin -fno-stack-protector -fno-stack-check \
+              -fno-asynchronous-unwind-tables -fno-unwind-tables -fshort-wchar \
+              -mno-red-zone -mno-stack-arg-probe -mno-mmx -mno-sse -mno-sse2 \
+              -fno-pic -fno-pie -O2 -g0 -Wall -Wextra
+
+$(BUILD)/efi/efi_jump.bin: arch/i386/boot/efi/efi_jump.asm
+	@mkdir -p $(dir $@)
+	$(NASM) -f bin $< -o $@
+
+$(BUILD)/efi/efi_jump.inc: $(BUILD)/efi/efi_jump.bin
+	python3 -c 'import sys; d=open(sys.argv[1],"rb").read(); print(",".join("0x%02x"%b for b in d))' $< > $@
+
+$(BUILD)/efi/efi_main.o: arch/i386/boot/efi/efi_main.c $(BUILD)/efi/efi_jump.inc \
+                         arch/i386/boot/efi/efi.h $(BUILD)/kernel.elf
+	@mkdir -p $(dir $@)
+	END=0x$$($(NM) $(BUILD)/kernel.elf | awk '$$3 == "__kernel_end" { print $$1 }'); \
+	LOAD=$$(( (END - 0xC0000000 + 4095) / 4096 * 4096 )); \
+	$(CLANG_EFI) -DINITRD_LOAD=$$LOAD -I$(BUILD)/efi -Iarch/i386/boot/efi \
+	  -c $< -o $@
+
+$(BUILD)/BOOTX64.EFI: $(BUILD)/efi/efi_main.o tools/coff2efi.py
+	python3 tools/coff2efi.py -o $@ $<
+
+$(UEFI_IMG): $(BUILD)/BOOTX64.EFI $(BUILD)/kernel.bin $(INITRD) \
+             arch/i386/boot/efi/vga-font.bin tools/mkuefi.py
+	python3 tools/mkuefi.py --out $@ --esp-mb 64 \
+	  --file EFI/BOOT/BOOTX64.EFI=$(BUILD)/BOOTX64.EFI \
+	  --file EFI/MYOS/KERNEL.BIN=$(BUILD)/kernel.bin \
+	  --file EFI/MYOS/INITRD.CPIO=$(INITRD) \
+	  --file EFI/MYOS/FONT.BIN=arch/i386/boot/efi/vga-font.bin
+
+uefi: $(UEFI_IMG)
+
+# OVMF is 64-bit firmware, so this is qemu-system-x86_64 (not i386 / pentium3).
+# Serial is the console we can see with -display none.
+QEMU_UEFI_FLAGS = -machine q35 -m 256M -cpu qemu64 \
+	-drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
+	-drive if=pflash,format=raw,file=$(BUILD)/ovmf-vars.fd \
+	-drive if=none,format=raw,file=$(UEFI_IMG),id=bootdisk \
+	-device ide-hd,drive=bootdisk,bootindex=0 \
+	-net none -no-reboot
+
+run-uefi-text: $(UEFI_IMG)
+	cp $(OVMF_VARS) $(BUILD)/ovmf-vars.fd
+	$(QEMU64) $(QEMU_UEFI_FLAGS) -display none -serial stdio
+
+test-uefi: $(UEFI_IMG)
+	@rm -f $(BUILD)/uefi-serial.log
+	@cp $(OVMF_VARS) $(BUILD)/ovmf-vars.fd
+	@(sleep 22; echo quit) \
+	  | $(QEMU64) $(QEMU_UEFI_FLAGS) -display none \
+	    -serial file:$(BUILD)/uefi-serial.log -monitor stdio >/dev/null || true
+	@cat $(BUILD)/uefi-serial.log; echo
+	@grep -q "Hello world from MyOS" $(BUILD)/uefi-serial.log \
+	  || { echo "FAIL: UEFI did not start the kernel"; exit 1; }
+	@grep -q "initramfs:" $(BUILD)/uefi-serial.log \
+	  || { echo "FAIL: UEFI kernel ran but initramfs missing"; exit 1; }
+	@echo "UEFI OK: OVMF started the 32-bit kernel"
+
+# Live desktop on the same GPT disk: ESP + ext2 "myos-root" from make live-hd.
+LIVE_UEFI := $(BUILD)/myos-live-uefi.img
+$(LIVE_UEFI): $(BUILD)/BOOTX64.EFI $(BUILD)/kernel.bin $(INITRD) $(BUILD)/myos-live.img \
+              arch/i386/boot/efi/vga-font.bin tools/mkuefi.py
+	python3 tools/mkuefi.py --out $@ --esp-mb 64 --root-file $(BUILD)/myos-live.img --root-from-mbr \
+	  --file EFI/BOOT/BOOTX64.EFI=$(BUILD)/BOOTX64.EFI \
+	  --file EFI/MYOS/KERNEL.BIN=$(BUILD)/kernel.bin \
+	  --file EFI/MYOS/INITRD.CPIO=$(INITRD) \
+	  --file EFI/MYOS/FONT.BIN=arch/i386/boot/efi/vga-font.bin
+live-uefi: $(LIVE_UEFI)
+
+test-live-uefi: $(LIVE_UEFI)
+	@rm -f $(BUILD)/live-uefi-serial.log
+	@cp $(OVMF_VARS) $(BUILD)/ovmf-vars.fd
+	@(sleep 50; echo quit) \
+	  | $(QEMU64) -machine q35 -m 1024M -cpu qemu64 \
+	    -drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
+	    -drive if=pflash,format=raw,file=$(BUILD)/ovmf-vars.fd \
+	    -drive if=none,format=raw,file=$(LIVE_UEFI),id=bootdisk \
+	    -device ide-hd,drive=bootdisk,bootindex=0 \
+	    -net none -no-reboot -display none \
+	    -serial file:$(BUILD)/live-uefi-serial.log -monitor stdio >/dev/null || true
+	@cat $(BUILD)/live-uefi-serial.log; echo
+	@grep -q "Hello world from MyOS" $(BUILD)/live-uefi-serial.log \
+	  || { echo "FAIL: live UEFI did not start the kernel"; exit 1; }
+	@grep -q "type 83 Linux" $(BUILD)/live-uefi-serial.log \
+	  || { echo "FAIL: GPT Linux partition not seen"; exit 1; }
+	@grep -q "mounted at /" $(BUILD)/live-uefi-serial.log \
+	  || { echo "FAIL: myos-root did not become /"; exit 1; }
+	@echo "LIVE UEFI OK: OVMF started the kernel and mounted myos-root"
+
 # --- a package to share ------------------------------------------------------
 # The normal boot image is a complete disk: written byte for byte to a USB
 # stick (dd, Rufus...), a PC's BIOS boots it. The README explains how.
@@ -366,15 +466,202 @@ hd: $(HD)
 # AbiWord, gcc/make/python3/adb...), as pinned Alpine packages
 # (live/packages.lock), plus the MyOS source, in one archive:
 # build/live/rootfs.tar. `tools/fetch-live.py --update` re-resolves the list.
-live-root:
+live-root: live-extra
 	python3 tools/fetch-live.py
+
+# What MyOS itself puts on the live disk, on top of the packages
+# (build/live/extra, copied in by tools/fetch-live.py):
+#   the Golden Hour theme    IceWM's theme and the login screen's pictures,
+#                            drawn from the palette in assets/themes
+#   myos-login               the graphical login screen (live/myos-login)
+# myos-login is a Linux program, not kernel code: it is compiled against
+# Alpine's own headers and libraries, unpacked into build/live/sysroot by
+# `tools/fetch-live.py --sysroot`, and linked the way every program on the
+# disk is -- dynamically, against musl's loader. (PAM needs that: it opens
+# its modules at run time.)
+LIVE_SYSROOT := $(BUILD)/live/sysroot
+LIVE_EXTRA   := $(BUILD)/live/extra
+LOGIN_BIN    := $(LIVE_EXTRA)/usr/bin/myos-login
+GCC_INC      := $(shell $(CC) -print-file-name=include)
+LOGIN_CFLAGS := -std=c11 -O2 -Wall -Wextra -march=i686 -D_GNU_SOURCE -nostdinc \
+                -isystem $(LIVE_SYSROOT)/usr/include \
+                -isystem $(LIVE_SYSROOT)/usr/include/freetype2 -isystem $(GCC_INC)
+LOGIN_LDLIBS := -lX11 -lXft -lImlib2 -lpam -lc -lgcc
+
+$(LIVE_SYSROOT)/.done:
+	python3 tools/fetch-live.py --sysroot
+
+$(LOGIN_BIN): live/myos-login/myos-login.c live/common/xpic.h | $(LIVE_SYSROOT)/.done
+	@mkdir -p $(dir $@) $(BUILD)/live
+	$(CC) $(LOGIN_CFLAGS) -Ilive/common -c $< -o $(BUILD)/live/myos-login.o
+	$(CC) -nostdlib -Wl,-z,noexecstack -Wl,-dynamic-linker,/lib/ld-musl-i386.so.1 \
+	  -Wl,-rpath-link,$(LIVE_SYSROOT)/usr/lib:$(LIVE_SYSROOT)/lib \
+	  $(LIVE_SYSROOT)/usr/lib/crt1.o $(LIVE_SYSROOT)/usr/lib/crti.o \
+	  $(BUILD)/live/myos-login.o -L$(LIVE_SYSROOT)/usr/lib -L$(LIVE_SYSROOT)/lib \
+	  $(LOGIN_LDLIBS) $(LIVE_SYSROOT)/usr/lib/crtn.o -o $@
+
+# The Start menu (live/myos-menu): the same libraries, less PAM.
+MENU_BIN := $(LIVE_EXTRA)/usr/bin/myos-menu
+$(MENU_BIN): live/myos-menu/myos-menu.c live/common/xpic.h | $(LIVE_SYSROOT)/.done
+	@mkdir -p $(dir $@) $(BUILD)/live
+	$(CC) $(LOGIN_CFLAGS) -Ilive/common -c $< -o $(BUILD)/live/myos-menu.o
+	$(CC) -nostdlib -Wl,-z,noexecstack -Wl,-dynamic-linker,/lib/ld-musl-i386.so.1 \
+	  -Wl,-rpath-link,$(LIVE_SYSROOT)/usr/lib:$(LIVE_SYSROOT)/lib \
+	  $(LIVE_SYSROOT)/usr/lib/crt1.o $(LIVE_SYSROOT)/usr/lib/crti.o \
+	  $(BUILD)/live/myos-menu.o -L$(LIVE_SYSROOT)/usr/lib -L$(LIVE_SYSROOT)/lib \
+	  -lX11 -lXft -lImlib2 -lc -lgcc $(LIVE_SYSROOT)/usr/lib/crtn.o -o $@
+
+# Settings (live/myos-settings): a GTK3 program, and myos-xsettings, which
+# applies the desktop's scale. GTK's headers come from packages.txt's
+# [build-only] group; its libraries are on the disk already.
+SETTINGS_BIN  := $(LIVE_EXTRA)/usr/bin/myos-settings
+XSETTINGS_BIN := $(LIVE_EXTRA)/usr/bin/myos-xsettings
+GTK_CFLAGS := $(addprefix -isystem $(LIVE_SYSROOT)/usr/include/,gtk-3.0 glib-2.0 pango-1.0 cairo \
+                gdk-pixbuf-2.0 atk-1.0 harfbuzz webkitgtk-4.1 javascriptcoregtk-4.1 libsoup-3.0) \
+                -isystem $(LIVE_SYSROOT)/usr/lib/glib-2.0/include
+LIVE_LINK = $(CC) -nostdlib -Wl,-z,noexecstack -Wl,-dynamic-linker,/lib/ld-musl-i386.so.1 \
+	  -Wl,-rpath-link,$(LIVE_SYSROOT)/usr/lib:$(LIVE_SYSROOT)/lib \
+	  $(LIVE_SYSROOT)/usr/lib/crt1.o $(LIVE_SYSROOT)/usr/lib/crti.o \
+	  $(1) -L$(LIVE_SYSROOT)/usr/lib -L$(LIVE_SYSROOT)/lib \
+	  $(2) -lc -lgcc $(LIVE_SYSROOT)/usr/lib/crtn.o -o $@
+$(SETTINGS_BIN): live/myos-settings/myos-settings.c live/myos-settings/scale.h | $(LIVE_SYSROOT)/.done
+	@mkdir -p $(dir $@) $(BUILD)/live
+	$(CC) $(LOGIN_CFLAGS) $(GTK_CFLAGS) -Wno-deprecated-declarations -c $< -o $(BUILD)/live/myos-settings.o
+	$(call LIVE_LINK,$(BUILD)/live/myos-settings.o,-lgtk-3 -lgdk-3 -lgobject-2.0 -lglib-2.0 -lcairo -lX11 -lm)
+# My Files (live/myos-files): GTK3 for the window, cairo and pango for
+# the drawing, librsvg for the theme's SVG icons.
+FILES_BIN := $(LIVE_EXTRA)/usr/bin/myos-files
+$(FILES_BIN): live/myos-files/myos-files.c live/myos-settings/scale.h | $(LIVE_SYSROOT)/.done
+	@mkdir -p $(dir $@) $(BUILD)/live
+	$(CC) $(LOGIN_CFLAGS) $(GTK_CFLAGS) -isystem $(LIVE_SYSROOT)/usr/include/librsvg-2.0 \
+	  -isystem $(LIVE_SYSROOT)/usr/include/poppler/glib \
+	  -Ilive/myos-settings -Wno-deprecated-declarations -Wno-format-truncation \
+	  -c $< -o $(BUILD)/live/myos-files.o
+	$(call LIVE_LINK,$(BUILD)/live/myos-files.o,-lgtk-3 -lgdk-3 -lgdk_pixbuf-2.0 -lpoppler-glib \
+	  -lgobject-2.0 -lglib-2.0 -lgio-2.0 -lpango-1.0 -lpangocairo-1.0 -lcairo -lrsvg-2 -lX11 -lm)
+# Preview (live/myos-preview): the Mac's Preview — PDFs through poppler
+# (qpdf, run as a program, rewrites their pages), pictures through
+# gdk-pixbuf's loaders, and TIFF, JPEG 2000, OpenEXR, Photoshop and HEIC
+# through their libraries. /usr/bin/preview is the short name.
+PREVIEW_BIN  := $(LIVE_EXTRA)/usr/bin/myos-preview
+PREVIEW_SRC  := $(wildcard live/myos-preview/*.c)
+PREVIEW_OBJS := $(PREVIEW_SRC:live/myos-preview/%.c=$(BUILD)/live/preview/%.o)
+$(BUILD)/live/preview/%.o: live/myos-preview/%.c live/myos-preview/preview.h live/myos-settings/scale.h \
+                           | $(LIVE_SYSROOT)/.done
+	@mkdir -p $(dir $@)
+	$(CC) $(LOGIN_CFLAGS) $(GTK_CFLAGS) $(addprefix -isystem $(LIVE_SYSROOT)/usr/include/,poppler/glib \
+	  openjpeg-2.5) -Wno-deprecated-declarations -c $< -o $@
+$(PREVIEW_BIN): $(PREVIEW_OBJS) live/myos-preview/preview.desktop
+	@mkdir -p $(dir $@) $(LIVE_EXTRA)/usr/share/applications
+	$(call LIVE_LINK,$(PREVIEW_OBJS),-lgtk-3 -lgdk-3 -lgdk_pixbuf-2.0 -lpoppler-glib -lgio-2.0 \
+	  -lgobject-2.0 -lglib-2.0 -lpangocairo-1.0 -lpango-1.0 -lcairo -ltiff -lopenjp2 -lheif \
+	  -lOpenEXR-3_1 -lX11 -lm)
+	ln -sf myos-preview $(dir $@)preview
+	install -m 644 live/myos-preview/preview.desktop $(LIVE_EXTRA)/usr/share/applications/
+$(XSETTINGS_BIN): live/myos-settings/myos-xsettings.c live/myos-settings/scale.h | $(LIVE_SYSROOT)/.done
+	@mkdir -p $(dir $@) $(BUILD)/live
+	$(CC) $(LOGIN_CFLAGS) -c $< -o $(BUILD)/live/myos-xsettings.o
+	$(call LIVE_LINK,$(BUILD)/live/myos-xsettings.o,-lX11)
+# Settings' "Add User…": checks an administrator's password with PAM and
+# writes the account files. Setuid root, as passwd is.
+ADDUSER_BIN := $(LIVE_EXTRA)/usr/libexec/myos-adduser
+$(ADDUSER_BIN): live/myos-settings/myos-adduser.c | $(LIVE_SYSROOT)/.done
+	@mkdir -p $(dir $@) $(BUILD)/live
+	$(CC) $(LOGIN_CFLAGS) -c $< -o $(BUILD)/live/myos-adduser.o
+	$(call LIVE_LINK,$(BUILD)/live/myos-adduser.o,-lpam)
+	chmod 4755 $@
+
+# WritePerfect: Rodger's WordPerfect 5.1 work-alike, a separate project
+# built from its own tree (WP_DIR) into /usr/lib/writeperfect, with its
+# grammar checker (languagetool-native, C++) and the checker's English
+# rules. /usr/bin/wp (live/writeperfect/wp) starts it.
+#
+# The C++ is compiled by clang, not i686-elf-g++: the bare-metal target
+# makes size_t `unsigned long`, Linux i386 `unsigned int`, and C++ puts the
+# type in every symbol's name (operator new is _Znwm there, _Znwj in
+# Alpine's libstdc++), so nothing would link. clang targets Linux exactly;
+# GNU ld from i686-elf links, with Alpine's own crtbegin/crtend and libgcc.
+WP_DIR   ?= ../wp51/wp51c
+WP_LT    := $(WP_DIR)/../languagetool-native
+WP_OUT   := $(BUILD)/live/wp
+WP_BIN   := $(LIVE_EXTRA)/usr/lib/writeperfect/wp
+WP_GCC   := $(firstword $(wildcard $(LIVE_SYSROOT)/usr/lib/gcc/i586-alpine-linux-musl/*))
+WP_CXXV  := $(notdir $(firstword $(wildcard $(LIVE_SYSROOT)/usr/include/c++/*)))
+LIVE_CLANG := clang --target=i386-alpine-linux-musl -march=i686 --sysroot=$(abspath $(LIVE_SYSROOT)) -O2 -MMD -MP
+# agent.c calls select() without <sys/select.h>; glibc brings it in through
+# other headers, musl doesn't.
+WP_CFLAGS  := -std=c11 -D_DEFAULT_SOURCE -w -include sys/select.h -I$(WP_DIR)/src -I$(WP_LT)/engine/include $(GTK_CFLAGS)
+WP_CXXFLAGS := -std=c++17 -w -nostdinc++ -isystem $(LIVE_SYSROOT)/usr/include/c++/$(WP_CXXV) \
+               -isystem $(LIVE_SYSROOT)/usr/include/c++/$(WP_CXXV)/i586-alpine-linux-musl \
+               -isystem $(LIVE_SYSROOT)/usr/include/libxml2 -I$(WP_LT)/engine/include \
+               -I$(WP_LT)/morfologik/include -DPCRE2_CODE_UNIT_WIDTH=8 \
+               '-DLT_RESOURCE_DIR="/usr/share/writeperfect/languagetool"'
+WP_C   := doc wpd view cmd files screen iofmt font agent grammar clip extra extra_cmd zh_ai main \
+          gui_gtk hanzi_stroke plugin_host
+WP_CPP := utf16 StringTools Regex ResourceDataBroker core_types Rule Language JLanguageTool \
+          WordTokenizer EnglishWordTokenizer SRXSentenceTokenizer morfologik EnglishTagger \
+          XmlRuleDisambiguator EnglishChunker EnglishSynthesizer RuleFilters rules_builtin \
+          rules_en PatternRuleLoader lt_c_api
+WP_OBJS := $(WP_C:%=$(WP_OUT)/%.o) $(WP_CPP:%=$(WP_OUT)/lt/%.o)
+-include $(WP_OBJS:.o=.d)
+
+$(WP_OUT)/%.o: $(WP_DIR)/src/%.c | $(LIVE_SYSROOT)/.done
+	@mkdir -p $(dir $@)
+	$(LIVE_CLANG) $(WP_CFLAGS) -c $< -o $@
+$(WP_OUT)/%.o: $(WP_DIR)/linux/%.c | $(LIVE_SYSROOT)/.done
+	@mkdir -p $(dir $@)
+	$(LIVE_CLANG) $(WP_CFLAGS) -c $< -o $@
+$(WP_OUT)/lt/%.o: $(WP_LT)/engine/src/%.cpp | $(LIVE_SYSROOT)/.done
+	@mkdir -p $(dir $@)
+	$(LIVE_CLANG) $(WP_CXXFLAGS) -c $< -o $@
+
+$(WP_BIN): $(WP_OBJS) live/writeperfect/wp live/writeperfect/writeperfect \
+           live/writeperfect/writeperfect.desktop
+	@mkdir -p $(dir $@) $(LIVE_EXTRA)/usr/bin $(LIVE_EXTRA)/usr/share/applications
+	$(CC) -nostdlib -s -Wl,-z,noexecstack -Wl,--eh-frame-hdr -Wl,--as-needed \
+	  -Wl,-dynamic-linker,/lib/ld-musl-i386.so.1 \
+	  -Wl,-rpath-link,$(LIVE_SYSROOT)/usr/lib:$(LIVE_SYSROOT)/lib \
+	  $(LIVE_SYSROOT)/usr/lib/crt1.o $(LIVE_SYSROOT)/usr/lib/crti.o $(WP_GCC)/crtbegin.o \
+	  $(WP_OBJS) -L$(LIVE_SYSROOT)/usr/lib -L$(LIVE_SYSROOT)/lib -L$(WP_GCC) \
+	  -lgtk-3 -lgdk-3 -lgobject-2.0 -lglib-2.0 -lgio-2.0 -lpango-1.0 -lpangocairo-1.0 -lcairo -lgdk_pixbuf-2.0 \
+	  $(if $(wildcard $(LIVE_SYSROOT)/usr/lib/libwebkit2gtk-4.1.so*),-lwebkit2gtk-4.1 -ljavascriptcoregtk-4.1,) \
+	  -lncursesw -lz -lxml2 -lpcre2-8 -licuuc -licui18n -lstdc++ -lm -lc -lgcc -lgcc_s \
+	  $(WP_GCC)/crtend.o $(LIVE_SYSROOT)/usr/lib/crtn.o -o $@
+	install -m 755 live/writeperfect/wp live/writeperfect/writeperfect $(LIVE_EXTRA)/usr/bin/
+	install -m 644 live/writeperfect/writeperfect.desktop $(LIVE_EXTRA)/usr/share/applications/
+	@mkdir -p $(LIVE_EXTRA)/usr/share/writeperfect
+	rsync -a --delete --exclude '*.class' --exclude '*.java' \
+	  $(WP_LT)/resources/ $(LIVE_EXTRA)/usr/share/writeperfect/languagetool/
+	# Help and samples: the GTK window's Help menu and Sample docs, as on the Mac.
+	rsync -a --delete --exclude 'build_*' --exclude '*.c' \
+	  $(WP_DIR)/help/ $(LIVE_EXTRA)/usr/share/writeperfect/help/
+	rsync -a --delete --exclude 'build_*' --exclude '*.c' \
+	  $(WP_DIR)/samples/ $(LIVE_EXTRA)/usr/share/writeperfect/samples/
+	# HTML reveal plugins: ZHwriter, Thesaurus, Writer, Reveal Codes.
+	rsync -a --delete --exclude '*.LICENSE' \
+	  $(WP_DIR)/plugins/ $(LIVE_EXTRA)/usr/share/writeperfect/plugins/
+
+# Built only where WP_DIR is: MyOS's own source on the live disk has no
+# WritePerfect tree, and the rest of the disk builds without it.
+ifeq ($(wildcard $(WP_DIR)/src/main.c),)
+WP_BIN :=
+endif
+
+LIVE_THEME := $(LIVE_EXTRA)/.theme
+$(LIVE_THEME): live/theme/make-live-theme.py assets/themes/golden-hour/make-theme.py \
+               live/writeperfect/writeperfect.svg live/myos-preview/preview.svg
+	python3 live/theme/make-live-theme.py
+	@touch $@
+
+live-theme: $(LIVE_THEME)
+live-extra: $(LIVE_THEME) $(LOGIN_BIN) $(MENU_BIN) $(SETTINGS_BIN) $(XSETTINGS_BIN) $(ADDUSER_BIN) $(FILES_BIN) $(PREVIEW_BIN) $(WP_BIN)
 
 # The live disk: like `make hd`, but myos-root holds the live userland
 # (tools/mklivehd.sh: owners, setuid bits and case-only names kept).
 LIVE_TAR := $(BUILD)/live/rootfs.tar
 LIVE_HD  := $(BUILD)/myos-live.img
 LIVE_MB  := 1536
-$(LIVE_TAR):
+$(LIVE_TAR): $(LIVE_THEME) $(LOGIN_BIN) $(MENU_BIN) $(SETTINGS_BIN) $(XSETTINGS_BIN) $(ADDUSER_BIN) $(FILES_BIN) $(PREVIEW_BIN) $(WP_BIN) live/packages.lock $(shell find live/overlay -type f)
 	python3 tools/fetch-live.py
 $(LIVE_HD): $(IMG) $(LIVE_TAR) tools/mklivehd.sh tools/mbr-partition.sh
 	E2FS=$(E2FS) tools/mklivehd.sh $(IMG) $(LIVE_TAR) $@ $(LIVE_MB)
@@ -384,10 +671,10 @@ live-hd: $(LIVE_HD)
 UTM_LIVE_VM := dist/MyOS live.utm
 utm-live: $(LIVE_HD)
 	@mkdir -p dist
-	tools/mkutm.sh --installed $(LIVE_HD) "$(UTM_LIVE_VM)" 5C81D2E7-0B4F-4A93-8E6D-71F3A9C2B540
+	tools/mkutm.sh --installed --replace-disk --memory 1024 $(LIVE_HD) "$(UTM_LIVE_VM)" 5C81D2E7-0B4F-4A93-8E6D-71F3A9C2B540
 
 run-live: $(LIVE_HD)
-	$(QEMU) -m 256M -cpu pentium3 -drive format=raw,file=$(LIVE_HD),index=0,media=disk \
+	$(QEMU) -m 1024M -cpu pentium3,+sse2 -drive format=raw,file=$(LIVE_HD),index=0,media=disk \
 	  $(DISPLAY_OPTS) -serial stdio
 
 run-hd: $(HD) $(USB)
@@ -513,6 +800,7 @@ check-selftests: $(IMG) $(USB)
 	  grep -q "pthreadtest: all ok" $$L || { echo "FAIL: musl pthreads (clone threads, futex)"; ok=0; }; \
 	  grep -q "racetest: all [0-9]* checks passed" $$L || { echo "FAIL: sleeping copy_to_user races"; ok=0; }; \
 	  grep -q "boottest: all ok" $$L || { echo "FAIL: init/getty syscalls (mount, sethostname, reboot)"; ok=0; }; \
+	  grep -q "shmtest: all ok" $$L || { echo "FAIL: System V shared memory (MIT-SHM)"; ok=0; }; \
 	  grep -q "pcache: second read comes from RAM" $$L || { echo "FAIL: step 9c-2 page cache"; ok=0; }; \
 	  grep -q "pcache: read-ahead filled the next page" $$L || { echo "FAIL: step 9c-2 read-ahead"; ok=0; }; \
 	  grep -q "fatvfs: HELLO.TXT read through the VFS" $$L || { echo "FAIL: step 9e FAT32 in the VFS"; ok=0; }; \

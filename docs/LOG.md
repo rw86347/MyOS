@@ -1134,3 +1134,494 @@ The test sends twice a full ring on a quiet link with interrupts off, which is
 the one arrangement where the poll cannot run and the transmit path is the
 only thing that can reclaim a slot. With the fix removed it fails "wedged after
 15 transmits" — the ring size minus one, exactly as predicted.
+
+## 2026-10-04 — the Start menu, and IceWM's two hidden rules
+
+The mockup's Start menu has two columns under a header with your name, and Log off /
+Turn off along the bottom. IceWM's is one plain list and can't be told to run anything
+else when Start is clicked. So the menu is now our own program, `live/myos-menu`
+(Xlib + Xft, Imlib2 only to decode PNGs), and IceWM keeps the taskbar, the window
+buttons and the clock.
+
+Everything you see is drawn at build time by `live/theme/make-live-theme.py`, with the
+theme's own drawing functions and fonts: the whole menu, each entry as it looks under
+the mouse (the menu drawn again with that entry lit, cut down to its rectangle), the
+Start button in three states, and the Run box. `menu.conf` beside them says where each
+entry is and what it runs. The program only adds the user's name, swaps the lit pieces
+in, and draws what you type in Run.... Opening the menu reads the screen under it once
+(so the round corners and shadow blend into whatever is there) and sends it back once;
+moving over entries copies small pixmaps made at start-up. Only working entries are
+listed: Terminal, AbiWord, Run..., Log off (`icesh logout`), Turn off
+(`doas /sbin/poweroff`).
+
+How it hooks in is the interesting part. The first try was an invisible window kept on
+top of IceWM's Start button. It worked, but the button underneath still looked wrong,
+and that turned out to be the "break in the gradient" Rodger had spotted. IceWM 3.5's
+`YButton::paint` draws a Windows-style bevel around every taskbar button in pixmap look,
+with no setting to turn it off, and next to Start sat an empty quick-launch pane (IceWM's
+default list names an xterm and a browser whose icons we don't have). Now IceWM's
+Start picture is just a plain piece of bar, and `myos-menu` puts a window of its own
+*inside* IceWM's button (found by its name, "TaskBarMenu"), the way a tray icon sits in
+a panel. As IceWM's child it moves, stacks and hides with the taskbar for free, its
+clicks come to us, and there is no fight over who is on top. A button is its picture
+plus 5 px each way, so a 151x35 placeholder makes the button exactly 156x40, and the
+bar 40 px instead of 46. An empty `/etc/icewm/toolbar` removes the empty pane. IceWM
+still showed its "Favorite Applications" tooltip; sending its button a LeaveNotify when
+the pointer enters ours cancels just that one. Ctrl+Esc and the Windows key are
+grabbed on the root window, with IceWM's `KeySysMenu` and `Win95Keys` switched off.
+
+The second hidden rule: the black patch under every window's title buttons. In pixmap
+look a title-button picture holds two buttons stacked, resting on top and pressed below,
+and IceWM shows half the picture's height. Ours held one, so the lower half of each
+button was never painted. They are now 30x60 with the theme's pressed look underneath.
+
+Checked in QEMU: Ctrl+Esc and a mouse click both open the menu, Start shows held down,
+arrow keys light the entries, Run... starts `xterm`, Log off returns to the login
+screen, Turn off powers the machine down. One bug on the way: `sscanf(line, "run %s")`
+also matches `runbox ...` (a space in a scanf format matches zero spaces), so the
+config reader now compares the first word whole.
+
+Later the same day: the window icon at the left of each title bar. The theme had no
+left title button; IceWM draws the window's icon in its window-menu button ("s"), so
+`TitleButtonsLeft="s"` with a plain title-bar background behind it. The icons are the
+theme's own, copied into the IceWM theme as `name_18x18.png` and so on (IceWM searches
+the theme before its stock icons), `/etc/icewm/winoptions` maps xterm and AbiWord to
+them, and the fallback ("icewm") is the MyOS logo. Two more IceWM details: the left
+buttons start at the width of the **J** piece (the left end), not L; and the icon
+button is as wide as the bar is high whatever its picture is, so a narrower picture
+leaves a black stripe. With J, L, S and P 1 px wide the icon sits 9 px in and the title
+about 37 (the mockup: 8 and 32).
+
+## 2026-10-04 — Settings, and one scale for the whole desktop
+
+At 1920x1200 a desktop drawn for 96 dpi is a third too small to read. Now the session
+has a scale, like the Mac's Displays pane: 100% to 200%, automatic by default (150% at
+1920x1200, 100% on the 1024x768 to 1440x900 screens of an old PC).
+
+- `live/myos-settings/myos-settings.c`: Settings, laid out like the Mac's System
+  Settings (search, the user's card, grouped panes with coloured icons, white boxes of
+  rows, back/forward). Network, General (About, Storage, Date & Time), Displays,
+  Users & Groups. GTK3, already on the disk for AbiWord. Its icons are drawn with cairo,
+  so they stay sharp at any scale.
+- Displays shows five pictures of the desktop, from "Larger Text" to "More Space",
+  with "looks like 1280 x 800" for each. Sizes that leave less than 800x600 aren't
+  offered. The choice goes to `~/.config/myos/display.conf` and the root window.
+- `live/myos-settings/myos-xsettings.c`: a 200-line XSETTINGS manager (Alpine has no
+  xsettingsd for x86). Started by `/etc/myos/xsession` before IceWM; it publishes the
+  font DPI (and a 2x window scale at 200%) to GTK, sets `Xft.dpi` for xterm and IceWM,
+  and on a change restarts IceWM. GTK windows that are open change size at once.
+- xterm gets DejaVu Sans Mono 11 pt (`/etc/myos/Xresources`): its default bitmap font
+  can't grow.
+- GTK's headers come from a new `[build-only]` group in `live/packages.txt`:
+  unpacked into the sysroot, never put on the disk, and without their dependencies
+  (`gtk+3.0-dev` with them is 261 MiB, LLVM included). The disk stays at 468.9 MiB.
+- Tested in QEMU at 1920x1200: login, 150% by default, a switch to 200% (Settings
+  and IceWM's text follow), About, Users. Settings opens with Ctrl+Alt+S for now.
+- Found on the way: AbiWord dies in musl's `free` (a group header pointing at
+  0x80000000) with or without the scale; the X server died the same way once.
+  In `docs/gaps.md`, not fixed.
+
+## 2026-10-04 — POSIX timers, so Vim's timeouts work
+
+Vim in xterm printed `E1286: Could not set timeout: Function not implemented`. Its
+'redrawtime' and regexp timeouts call `timer_create(CLOCK_MONOTONIC)` with
+SIGEV_THREAD, and the kernel had only `alarm`/`setitimer`.
+
+SIGEV_THREAD is done by musl, not the kernel, and needed more than the timer calls.
+musl starts a helper thread with the signal blocked and creates a kernel timer that
+signals that thread alone (SIGEV_THREAD_ID). The helper waits in `sigwaitinfo`, and it
+calls Vim's function only when the signal's `si_code` is SI_TIMER. So the kernel had to
+provide three things:
+
+- `timer_create`, `timer_settime`, `timer_gettime`, `timer_getoverrun` and
+  `timer_delete` (259-263, plus the time64 calls 408/409), in the new
+  `kernel/posix_timer.c`. There is one fixed table, and a timer's id is its slot.
+  Armed timers sit on one sorted list, and the tick only looks at its head, as for
+  `alarm`. They support relative and TIMER_ABSTIME times, intervals that don't drift,
+  overrun counting, and timers longer than the 32-bit ms clock (taken in steps).
+- `rt_sigtimedwait` (177/421). Before this, musl's helper thread would have spun
+  forever on ENOSYS.
+- A real siginfo for timer signals: SI_TIMER, the timer id, the overrun count and
+  si_value. These reach both SA_SIGINFO handlers and `sigwaitinfo`. Delivery tests
+  one bit (`p->timer_sigs`) first, so other signals pay a single load.
+
+Found while testing: a periodic timer deleted with its signal still pending left the
+signal behind, and unblocking it then ended the process, because the default action
+for a real-time signal is to terminate. `timer_delete` now takes its pending signal
+back, as current Linux does.
+
+`pthreadtest` gained 9 checks, starting with Vim's exact call. Three deliberate breaks
+are each caught: no `timer_create` (Vim's bug), no SI_TIMER in the siginfo (the timer
+fires but Vim's function never runs), and a delete that leaves the signal pending.
+`make test` passed 6 of 6 runs. `make bench` shows no change on the shared paths
+(`docs/performance.md`).
+
+## 2026-10-04 — WritePerfect on the live disk
+
+Rodger's WordPerfect 5.1 work-alike (`../wp51/wp51c`) is now on the live disk, in the
+Start menu with its own icon. `make live-root` builds it from its own tree, together
+with its grammar checker (`languagetool-native`, about 5,000 lines of C++) and the
+checker's English rules (19 MiB, in `/usr/share/writeperfect`). Only ICU was new on
+the disk (`icu-libs`, English data, +7 MiB); GTK, ncurses, libxml2, pcre2 and
+libstdc++ were there already.
+
+The lesson was about C++ and the ABI. `i686-elf-g++` compiled the C++ but could never
+have linked it: the bare-metal target makes `size_t` an `unsigned long`, Linux i386
+makes it an `unsigned int`, and C++ puts argument types into symbol names. So
+`operator new` is `_Znwm` in our objects and `_Znwj` in Alpine's libstdc++. C doesn't
+put types in names, which is why the C programs never noticed. The WP objects are
+compiled by clang with `--target=i386-alpine-linux-musl` (exactly Linux's types)
+and linked by our GNU ld, using Alpine's own crtbegin/crtend and libgcc.
+
+WP is a terminal program at heart, like the DOS original, so the menu opens it in an
+80x25 xterm in WP 5.1's blue (`/usr/bin/writeperfect`). Tested in QEMU: it starts from
+the menu, typing works, and the icon shows in the title bar and taskbar.
+
+Also: the hot corner's curl, top right. `make-live-theme.py` draws it with the design's
+`curl()` at both sizes; `myos-menu` shows it in a 44x44 window of type
+`_NET_WM_WINDOW_TYPE_DESKTOP`, which IceWM keeps below every window, so it is above
+the wallpaper and under windows as `docs/ui-theme.md` says. The wallpaper behind it
+is read from the pixmap icewmbg publishes (`_XROOTPMAP_ID`), not from the screen, so a
+window passing over the corner never gets baked in, and it is redrawn when that
+property changes. Checked in QEMU: 24 px at rest, 40 px with the mouse in the corner,
+hidden by a maximized window. The window overview it should open is still to come.
+
+## 2026-10-04 — a PDF viewer, and pread64/pwrite64
+
+Evince (GNOME's Document Viewer) is on the live disk and in the Start menu as
+"Document Viewer", with its own icon. It is the closest Alpine has to Apple's Preview:
+page thumbnails, search, zoom, annotations. It adds about 40 MiB.
+
+The first PDF it opened showed "PDF document is damaged", although the file had
+arrived intact (same MD5 as on the Mac). The serial log gave the reason:
+`syscall 180 not implemented (evince)`. That is `pread64`, a read at an offset that
+leaves the file's position alone, and poppler reads every PDF that way. So every read
+failed, and poppler took the empty result for a broken file.
+
+`pread64` and `pwrite64` now go through the same door as read and write (`rw_at` in
+`kernel/syscall.c`). The file systems all read at `f->pos`, so pread hands them a
+copy of the open file on the stack, positioned at the offset. The real position
+doesn't move, even if another thread uses the same open file at the time. Pipes,
+terminals and sockets give ESPIPE and directories EISDIR, as on Linux. `boottest`
+gained 5 checks. `make test` passes, and `make bench` shows read unchanged
+(`docs/performance.md`). Evince then showed the Declaration of Independence, page 1 of 4.
+
+## 2026-10-04 — the desktop's pictures follow the scale
+
+The taskbar, title bars and their buttons looked small next to the mockup. In pixels
+they were the mockup's (40, 30 and 21), but the mockup is a 1024x768 screen and the VM
+is 1920x1200, so they filled two thirds of the share of the screen they should. The
+desktop scale from Settings (automatic: 150% here) already made the fonts bigger
+through `Xft.dpi`, but IceWM's theme is pictures of a fixed size, and so is the Start
+menu.
+
+`make-live-theme.py` now draws both at 100, 125, 150, 175 and 200%. The drawings keep
+the mockup's numbers; `render()` makes the PNG K times as many pixels, and the theme
+file's sizes (title bar, borders, icon sizes) and `menu.conf`'s rectangles are scaled
+the same way. Two details: the title buttons hold two states stacked, so they are
+made exactly twice the bar's height in whole pixels (at 125% the bar is 37.5 → 38 px);
+and each menu highlight is cut at a whole pixel of the scaled menu, so it lands on the
+picture underneath. Each scale is its own IceWM theme (`GoldenHour`,
+`GoldenHour-150`...). IceWM reads `~/.icewm/theme` after `/etc/icewm/preferences`, so
+`myos-xsettings` writes the matching name there before IceWM starts and before the
+restart it already does when the scale changes. `myos-menu` reads the same root
+properties (`_MYOS_SCALE`, `_MYOS_SCALE_AUTO`), loads `/usr/share/myos/menu/<scale>/`
+and starts itself over when the scale changes. Cost: 2.3 MiB of PNGs on disk.
+
+Checked in QEMU at 1920x1200: at 150% the taskbar is 60 px (5% of the height; the
+mockup's is 5.2%), title bars 45 px, the Start button 234x60, and the Start menu grows
+with them. With `scale=100` in `~/.config/myos/display.conf`, logging in again gives
+the old sizes.
+
+## 2026-10-04 — System V shared memory
+
+`shmget`, `shmat`, `shmdt` and `shmctl` work now (`kernel/shm.c`), for the X server's
+MIT-SHM. A program puts a picture in a segment the server has attached too, and only
+says "draw from there". musl on i386 makes all four calls through the old `ipc()`
+multiplexer (117), so that's the one syscall added. The direct calls Linux gained in
+5.1 (395-398) have no caller here.
+
+Almost nothing in it is new machinery. A segment is an inode that's in no directory,
+its pages held like a RAM file's and made on first touch. An attach is a memory area
+with a new flag, `VM_SHARED`, whose fault maps the segment's own page with
+`PTE_SHARED`, the bit device memory already used. Fork then shares the page instead of
+making it copy-on-write, and unmapping doesn't free it. Because the area holds the
+inode the way a file mapping does, the inode's reference count *is* the attach count,
+and fork, exit and exec keep it right without any code in `shm.c`. IPC_RMID on a
+segment still in use marks the inode deleted, and the last detach frees it through the
+same path as a deleted file whose last user lets go. Ids name their slot, so
+everything except `shmget` by key is O(1).
+
+Two details were fixed on the way. A test child that only calls
+`setuid(1000)` keeps group 0, and 0640 lets group 0 read, so `IPC_STAT` was rightly
+allowed: Linux's rule, `ipcperms`, checks the groups too. And `shmdt` has to leave
+alone a second attach of the same segment placed right after the first; Linux tells
+them apart by offset, and so does `mm_shm_detach` now.
+
+`user/musl/shmtest.c` has 41 checks: attaches in two processes, fork, read-only
+attaches, `mprotect` splits, SHM_RND and SHM_REMAP, keys, permissions as another user,
+IPC_RMID while attached, and the RAM coming back at the last detach. It takes 36 ms.
+`make test` passes. The page-fault path has one more flag test; `make bench` has no
+page-fault benchmark, so that cost isn't measured. MIT-SHM is still switched off in
+the live disk's X config, until a check on the live disk shows Imlib2 drawing
+through it (`docs/gaps.md`).
+
+## 2026-10-04 — a bigger mouse pointer, and WritePerfect's own window
+
+The pointer was X's 16-pixel arrow at every size: X only uses a pointer theme when
+told to, and nothing told it. Adwaita's pointers were already on the disk (GTK brings
+them), drawn at 24, 32, 48, 64 and 96 pixels. `/usr/share/icons/default/index.theme`
+now makes Adwaita the theme for every X program, and Settings has a **Mouse &
+Keyboard** page: the pointer in four sizes (Normal, Large, Larger, Largest = 1, 1.5, 2
+and 3 times the normal 24 px, which itself grows with the desktop scale), and the
+keyboard shortcuts. It works like the scale: Settings writes `~/.config/myos/mouse.conf`
+and the root property `_MYOS_POINTER`; `myos-xsettings` turns that into
+`Gtk/CursorThemeSize` (XSETTINGS, GTK follows at once) and `Xcursor.size` (xrdb, for
+everything else) and restarts IceWM so the desktop and window frames follow. Checked in
+QEMU: Adwaita's arrow at 32 px at 150%; clicking Largest makes it big over Settings
+and the desktop straight away.
+
+The Start menu's WritePerfect now opens its GTK window (`wp --gui`) instead of the
+terminal editor in an xterm. WritePerfect called `gtk_init_check(NULL, NULL)`, so its
+window had no WM_CLASS name and IceWM showed its red-X fallback icon;
+`g_set_prgname("writeperfect")` in `linux/gui_gtk.c` (the WritePerfect tree) names it.
+`/etc/icewm/winoptions` now writes every entry as `instance.Class`, the form that
+matches, and gives Settings its icon too.
+
+## 2026-10-04 — My Files, the mockup's file explorer
+
+`live/myos-files/myos-files.c` is the "My Files" window from
+`assets/themes/golden-hour/mockup.png`, made to match it: menu bar, toolbar with
+Back/Forward/Up and the address box, the sand task pane with its two cards (File
+tasks, Other places), large icons in 120x100 cells with the teal selection, and the
+status line ("6 objects, 283 KB"). It is one GTK window with one drawing area; every
+pixel is drawn with cairo at the mockup's own coordinates, multiplied by the desktop
+scale, and the icons are the theme's SVGs (now installed in `/usr/share/myos/icons`,
+drawn by librsvg, so they are sharp at 150% and 200%). Menus, the right-click menu and
+the "are you sure?" box are drawn in the same style. Text is DejaVu Sans (the mockup
+uses Verdana and Trebuchet, which we can't ship).
+
+What it does: open folders and files (PDFs in Evince, `.wpd` in WritePerfect, `.doc`
+in AbiWord, text in Geany), Back/Forward/Up with history, type a path (Ctrl+L), new
+folder and rename in place (F2), copy and paste, delete to the Recycle Bin, Disks,
+a terminal in the current folder, hidden files (Ctrl+H). It is in the Start menu on
+both sides, like the mockup, with Disks under it. Checked in QEMU at 150%: the window
+side by side with the mockup has the same layout, icons and colours; new folder,
+rename, delete, Disks, Back and the menus work, and files made in a terminal appear
+within 2 s.
+
+Testing note: the helper scripts in `/tmp` now take the QEMU monitor socket from
+`$MON`, because two chats' VMs both listening on `/tmp/myos-mon.sock` sent one
+chat's clicks to the other's VM.
+
+## 2026-10-04 — rounded window corners
+
+The mockup's windows are rounded (8 px) with a 1.5 px dark edge, and a soft
+shadow that shows on the left and right of the green bar. IceWM's title pieces
+were flat strips, so every window was a sharp rectangle. `make-live-theme.py`
+now writes the frame pictures (`frameATL` and the rest, and the same for
+dialogs): a quarter-circle in each corner, transparent outside it, and solid
+strips for the edges. IceWM clips the window to that mask, which is how the
+green bar's top corners come out round, and sets the border to the 1.5 px
+edge. A maximized window drops the border, so the cut doesn't show the desktop
+in the screen's corners.
+
+The soft shadow is not in those pictures. The mask is one bit, a pixel in the
+window or a hole, and a hole does not darken the wallpaper. That blur is the
+compositor's (`docs/DESIGN.md`, `docs/gaps.md`).
+
+The bottom corners were still square. The corner pictures do round them, but
+IceWM's default is to fill the program's part of the corner back in, so only
+the thin border followed the curve and the window's contents stayed a
+rectangle. Turning that off (`ShapesProtectClientWindow`) has to be in
+`/etc/icewm/preferences`. IceWM does not read it from the theme file, which
+is where it was.
+
+## 2026-10-04 — the taskbar tray
+
+The mockup's tray, the last 150 px of the bar, is a different color from the
+rest of it (teal, top to bottom) with a dark line on its left, then the
+network and volume icons and the time. The live bar was one mixed color, and
+IceWM's clock was a flat rectangle only as wide as the text.
+
+IceWM stretches the taskbar picture across the whole bar and paints the clock
+itself, so the tray is a picture (`tray.png`, from the same Tray style as the
+mockup) and a window `myos-menu` puts at the right of the bar, above IceWM's
+clock. The clock stays underneath so task buttons still stop short of the
+time; the icons can have a button slide under them when the bar is full. The
+time is drawn each minute, with the leading zero taken off, since musl has no
+`%l`.
+
+The first cut of that window never appeared: it looked the bar up by the name
+"TaskBar", and `XFetchName` doesn't return the name IceWM set with
+`XSetWMProperties`. The Start button's name does come back (that's how the
+button is found already), so the bar is the first wide strip above that
+button, or above the clock. The tray stays raised, because IceWM puts its
+clock back on top when it restacks the bar. The picture is one pixel wider
+than the 150 px tray, so the mockup's divider — a 1.5 px stroke centered on
+the tray's left edge — darkens the bar and the tray, instead of sitting
+entirely inside the tray.
+
+## 2026-10-04 — Settings: Wi-Fi, the Mac's groups, and Add User…
+
+Settings' sidebar now has the Mac's groups in the Mac's order: **Wi-Fi** and Network;
+General and Displays; Users & Groups; Mouse & Keyboard (where the Mac has Keyboard and
+Trackpad). The Wi-Fi pane is where the Mac's is, but MyOS has no Wi-Fi driver, so it
+shows Wi-Fi off and greyed out, "No Wi-Fi hardware found", and points at Ethernet.
+Network lists Wi-Fi as "Not available".
+
+Users & Groups has an **Add User…** button. As on the Mac, it first asks for an
+administrator's name and password (members of wheel), then for the new user's full
+name, account name (filled in from the full name), password twice, and whether they
+are an administrator. shadow's `useradd` can't run on MyOS (it locks with a hard link,
+and there is no `link()`), so `/usr/libexec/myos-adduser` does the work: setuid root,
+it checks the administrator with PAM (`/etc/pam.d/myos-admin`, the login screen's
+stack), then writes shadow, group and passwd under an flock, each written whole,
+synced and renamed into place, passwd last. The home is 0700 with `/etc/skel` copied
+in; groups audio, video and input, plus wheel for administrators.
+
+Checked in QEMU on the live disk: the new sidebar, the Wi-Fi pane, and adding "Ann
+Lee": `annlee` got uid 1001, its groups, a `$6$` hash and a 0700 home with
+`.xsession`; `su annlee` takes the new password and refuses a wrong one. The check
+also found that `root` (empty password on the live disk) unlocked with any password:
+pam_unix's `nullok` accepts anything for an empty password. The helper now accepts
+only an empty password for such accounts (`docs/gaps.md`).
+
+## 2026-10-04 — Firefox on the live disk
+
+The mockup's Web Browser is now Firefox: Alpine 3.20's 32-bit package, the only
+real browser that architecture still ships. Chromium is x86_64 only. The extra
+packages are 255 MiB, almost all Firefox itself plus ffmpeg's codecs; GTK was
+already there for AbiWord.
+
+It is on the Start menu, IceWM's window icon is the theme's compass, and My Files
+opens `.html` / `.htm` with it. Two things it needs that we didn't have: `/dev/shm`
+as a tmpfs (`shm_open` is a file there, not System V `shmget`), and the content
+sandbox turned off (`MOZ_DISABLE_CONTENT_SANDBOX`, `MOZ_DISABLE_GMP_SANDBOX`)
+because this kernel has no seccomp. WebRender's GL path is off too (`MOZ_WEBRENDER=0`):
+the only display is `/dev/fb0`.
+
+It has not been started on MyOS. Missing `/proc` files or other syscalls may still
+stop it; `docs/gaps.md` says where to look (`~/.xsession-errors`).
+
+## 2026-10-04 — `/proc/self/exe`, so Firefox can find itself
+
+Booted the live disk in QEMU and typed `firefox` in an xterm. The files are
+there (`/usr/bin/firefox` is the 45-byte wrapper, `/usr/lib/firefox/firefox`
+the binary), but it exits at once with "Couldn't find the application
+directory." Firefox `readlink`s `/proc/self/exe` to find `omni.ja` next to
+itself; we only had `/proc/self/fd`.
+
+`/proc/self/exe` is now a magic link to the ELF `execve` loaded (the
+interpreter, for a `#!` script), kept as an inode on the process so a rename
+or delete still names it. `open` follows it. `boottest` checks both; `make
+test` is OK.
+
+With that, Firefox got further and died two more ways. Alpine's build uses
+SSE2, which a real Pentium 4 / Pentium M has and QEMU's plain `pentium3` does
+not: `Illegal instruction`. `make run-live` and the UTM machine now add
+`+sse2`. Then it printed `fallocate failed to set shm size` and segfaulted.
+`fallocate` (grow a file) and `memfd_create` (an anonymous RAM file) are in;
+`boottest` checks both. Firefox then tried to reopen the memfd through
+`/proc/self/fd/N` for a read-only dup; we treated any inode without a
+directory (pipes, and also a memfd) as `ENXIO`. Regular files now go
+through; pipes and sockets still don't. Sealing the memfd
+(`fcntl F_ADD_SEALS`) was `EINVAL`; that is stored now.
+
+The first UTM live machine still had 256 MiB of RAM, which is enough for IceWM and
+not for Firefox. `make utm-live` and `make run-live` now give it 1024 MiB, and
+`utm-live` replaces the disk instead of keeping the old one (your files on that
+VM were the reason it used to keep it).
+
+Then it ran out of file descriptors (`PROC_FILES` was 32) creating a
+read-only memfd, so the table is 64 and `cloexec` is 64 bits. `select()`
+still only sees fds 0–31. After that: `mremap` (grow/shrink/MAYMOVE),
+`prctl` (thread names and a few flags), `eventfd2`, and a uniprocessor
+`membarrier`. `firefox --version` prints 132.0.2. Opening a window still
+dies at once: page fault, write of NULL, in `libxul.so`. No text besides
+"Segmentation fault".
+
+## 2026-10-04 — My Files: the Mac's four layouts
+
+The toolbar has a View button to the right of Up, the way Finder does: a picture
+of the current layout and a pair of chevrons. Its menu is as Icons, as List, as
+Columns and as Gallery, with a tick on the one in use (also View in the menu bar,
+and Ctrl+1 to Ctrl+4). The choice is kept in `~/.config/myos/files.conf`.
+
+Icons is the mockup. List is Name, Date Modified, Size and Kind (narrow windows
+drop columns from the right). Columns is one folder per column with a `>` on
+folders, and a preview of a selected file. Gallery is a big preview (the picture
+itself for JPEG/PNG/…) over a strip of icons. Checked in QEMU at 150%.
+
+The status bar's bottom-right corner has two short lines at 45 degrees, the
+usual mark for a corner you can drag to resize. My Files draws that bar, so
+the lines are part of it; they sit clear of the window's round corner.
+
+## 2026-10-04 — My Files: picture icons, and why it felt slow
+
+Pictures now show a thumbnail of the file, not the generic document icon. The
+first look decodes the picture in the background (so the window does not wait)
+and writes a small PNG next to it named `._file` — the sidecar name the Mac
+uses on a disk that isn't HFS. The next visit reads that. The explorer never
+lists `._*` files. A read-only folder still shows the thumb this session.
+
+It felt slow for two reasons. The bigger one is QEMU on Apple Silicon: i386 is
+emulated (TCG), not virtualised, and the CPU is a Pentium III, so everything is
+tens of times slower than a real PC. The smaller one was us: every unknown file
+was opened to sniff whether it was text, every redraw rebuilt the column layout,
+and every 2 s we stated up to 1000 files. Those three are gone. The window will
+still feel slower in QEMU than Finder on the Mac; on the old hardware it should
+be closer.
+
+## 2026-10-04 — WritePerfect Settings scroll, and the Mac plugins
+
+The Linux Settings window grew to the height of its content (color wells at
+150% scale) and ran off the screen with no scrollbar. It now matches the Mac:
+the body is 856 px, the window is at most 80% of the screen, and it scrolls.
+
+HTML reveal plugins are on Linux too. `linux/plugin_host.c` is the Mac's
+`plugin_host.m`: it seeds ZHwriter, Thesaurus, Writer and Reveal Codes into
+`~/.config/writeperfect/plugins`, lists them in Settings and Alt+R, and loads
+the chosen page in a WebKitGTK pane over the reveal strip. The live disk
+ships the plugin files and WebKitGTK 4.1. Touch Bar and the shell pane stay
+Mac-only.
+
+## 2026-10-04 — UEFI loader: OVMF boots the 32-bit kernel
+
+A UEFI-only PC skipped the BIOS USB image. `make uefi` now builds
+`build/myos-uefi.img`: GPT + FAT16 ESP, `/EFI/BOOT/BOOTX64.EFI`. The
+loader (64-bit, `arch/i386/boot/efi/`) copies kernel + initramfs, fills
+BOOTINFO from GetMemoryMap and GOP, drops to 32-bit protected mode, jumps
+to 1 MiB. `make test-uefi` (QEMU + OVMF, serial only) reached
+"Hello world from MyOS!" and the bash prompt. Not the x86_64 port.
+How to write the stick: `docs/UEFI-USB.md`.
+
+## 2026-10-05 — Live UEFI disk, tested in OVMF first
+
+`make live-uefi` builds `build/myos-live-uefi.img` (ESP + 1536 MiB
+myos-root). The kernel now reads a GPT disk (type 0xEE) far enough to
+register the Linux partition. `make test-live-uefi` reached
+"Hello world" and `ext2: ... mounted at /`.
+
+## 2026-10-04 — My Files: PDF preview in Columns
+
+Selecting a PDF in Columns now shows its first page on the far right,
+from the same `._file` sidecar pictures use. Poppler paints page 1 into
+that PNG the first time the file is seen; later visits just read it.
+The icon in Icons / List / Gallery uses the same cache.
+
+## 2026-10-05 — Real UEFI PC: kernel and framebuffer, not the desktop
+
+An MSI Tiger Lake-H laptop (UEFI only, no CSM) started `BOOTX64.EFI` after
+the ESP was FAT32 (64 MiB), the protective MBR grew a 0xEF slice, the PE
+kept a `.reloc` directory, and `ImageBase` moved down to 256 MiB. Firmware
+that put GOP at `0x400000000` used to leave the kernel blind; PSE-36
+(`vmm_map_big` + `fb_phys_hi`) maps that bar, and `simplefb` drew
+1920×1080. `make test` on the Pentium path is still 135 passed, 0 failed.
+
+The live ext2 root on the stick is invisible: the only USB controller is
+xHCI (`8086:43ed`) and this kernel has no USB mass-storage driver. So
+process 1 is still the RAM initramfs `/init` (BusyBox), not runit /
+`myos-login`. `/init` then died with SIGSEGV (read of `0x10`); TLS GS is
+now saved on `set_thread_area` so the next stick write can tell if that
+was the canary.

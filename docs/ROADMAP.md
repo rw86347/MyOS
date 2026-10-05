@@ -47,7 +47,8 @@ Mark a step `[x]` only when its "Done when" check works.
     (`mkdir -p`, `>`, `>>`, `cp`, `mv`, `sed -i`, `rm -r`).
   - [ ] 8j: /proc (`ps`, `top`, `free`, `uptime`), `mount`/`umount`, /proc/mounts (`df`).
     Started (2026-10-03): `mount -t proc` gives `/proc/self/fd/N` (what `ttyname`
-    and `login` need); `getcwd` and those links share `vfs_path`.
+    and `login` need); `getcwd` and those links share `vfs_path`. 2026-10-04:
+    `/proc/self/exe` (what Firefox reads to find its files).
   - Later, as programs need them: job control stops (Ctrl-Z, `fg`, `bg`), named pipes,
     `alarm`/`setitimer`, `times`/`getrusage`, `reboot`, hard links.
 - [ ] **9. Disks & file systems** — native drivers (see `docs/DESIGN.md`), old PCs first.
@@ -98,6 +99,9 @@ Mark a step `[x]` only when its "Done when" check works.
       `AT_SECURE`, files owned by their creator, setgid directories.
     - [ ] Users: permission checks in the VFS and on `kill`. Until then any user
       can read and write every file, so the logins are not yet a security boundary.
+    - [ ] The installer picks the compositor level (`none`, `xrender`, `gl`) from a
+      measured repaint time, RAM and the GPU, writes `/etc/myos/desktop.conf`, and
+      leaves `picom` out where it doesn't fit. Requirements: `docs/DESIGN.md`.
   - [x] 9d (part): PCI scan + bus-master DMA (PIIX/ICH), reads and writes, PIO
     fallback. 64 KiB read: 1 250 instructions of CPU work (PIO: 41 788).
   - [x] 9d (rest): AHCI (SATA), NVMe and virtio-blk drivers, all scatter-gather DMA
@@ -195,7 +199,31 @@ Mark a step `[x]` only when its "Done when" check works.
     `user/fbtest.c` and checks a QEMU screendump (`tools/check-screen.py`).
   - [ ] VESA boot framebuffer for real hardware (Linux's `simpledrm` shape): `stage2.asm`
     picks the mode, the same DRM core drives it.
-  - [ ] `/dev/input/event*`, AF_UNIX sockets, then the X server (fbdev driver).
+  - [x] What the X server needs underneath it: `/dev/input/event0`/`event1`
+    (`drivers/evdev.c`), AF_UNIX sockets (`net/unix.c`), `epoll` (`fs/epoll.c`),
+    pseudo-terminals for `xterm` (`drivers/pty.c`, `/dev/ptmx` + `/dev/pts/N`, with
+    the line discipline moved out of the console into `struct tty`), and the one
+    thing the fbdev driver looks for in `/sys` (`fs/sysfs.c`). Alpine's X server
+    runs unmodified on the framebuffer; `user/musl/boottest.c` covers the ptys.
+  - [x] System V shared memory for MIT-SHM (`kernel/shm.c`): `shmget`, `shmat`,
+    `shmdt`, `shmctl` through `ipc()`. `make test` runs `user/musl/shmtest.c`.
+  - [ ] MIT-SHM switched back on in the live disk's X config, checked with Imlib2
+    (IceWM's theme, the login screen).
+  - [x] A graphical login (`live/myos-login/myos-login.c`): starts the X server,
+    draws the Golden Hour login screen, checks the password with PAM and runs the
+    session; runit keeps it alive. The desktop wears the same theme
+    (`live/theme/make-live-theme.py` writes IceWM's theme and the login screen's
+    pictures from the palette in `assets/themes/golden-hour`).
+  - [x] The mockup's Start menu and Start button (`live/myos-menu/myos-menu.c`),
+    on Ctrl+Esc, the Windows key or a click; lists only programs that exist.
+  - [x] Firefox on the live disk (`[browser]` in `live/packages.txt`): Alpine's
+    32-bit build, Start menu "Web Browser", HTML from My Files. Sandbox off
+    (`MOZ_DISABLE_CONTENT_SANDBOX`) and `/dev/shm` mounted. `firefox --version`
+    prints 132.0.2 on MyOS; a GUI start still dies in `libxul.so` (write to
+    NULL). See `docs/gaps.md`.
+  - [ ] The window overview (hot corner, F3) at every compositor level, and `picom`
+    started by the session where `/etc/myos/desktop.conf` allows it (`docs/DESIGN.md`).
+    `picom` 10.2 is in the live disk's `[compositor]` group.
 - [ ] **12. Real hardware** — boot from USB/CD on an old Pentium 4 / Pentium M machine.
 - [ ] **12b. GPD Pocket 4** (`docs/hardwareRequirements.md`) — `arch/x86_64`, a UEFI loader,
   ACPI, PCIe with MSI/MSI-X; then NVMe (its boot SSD, native driver) and xHCI; then the

@@ -610,7 +610,7 @@ SYSCALL_DEF(sys_socket)
         raw_list = s;
     }
     if (a2 & SOCK_CLOEXEC)
-        proc_current()->cloexec |= 1u << fd;
+        proc_current()->cloexec |= 1ull << fd;
     return fd;
 }
 

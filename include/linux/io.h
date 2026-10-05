@@ -19,6 +19,7 @@
  */
 volatile void *ioremap(uint32_t phys, uint32_t size);
 volatile void *ioremap_wc(uint32_t phys, uint32_t size);
+volatile void *ioremap_wc64(uint64_t phys, uint32_t size);
 
 static inline uint8_t readb(const volatile void *a) { return *(const volatile uint8_t *)a; }
 static inline uint16_t readw(const volatile void *a) { return *(const volatile uint16_t *)a; }

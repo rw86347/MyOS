@@ -38,9 +38,10 @@ struct sigcontext {                 /* 88 bytes */
     uint32_t oldmask, cr2;
 };
 
-struct siginfo {                    /* 128 bytes; we fill signo and code */
+struct siginfo {                    /* 128 bytes */
     int32_t si_signo, si_errno, si_code;
-    int32_t pad[29];
+    int32_t word[3];                /* SI_TIMER: timer id, overrun, si_value */
+    int32_t pad[26];
 };
 
 struct ucontext {
@@ -155,7 +156,8 @@ static void save_context(struct sigcontext *sc, const struct regs *r, uint64_t m
 
 /* Build the frame and point the program at its handler. 0, or -1 if the
    program's stack is unusable (then it dies with SIGSEGV). */
-static int setup_frame(int sig, struct k_sigaction *a, struct regs *r)
+static int setup_frame(int sig, const struct sig_origin *o, struct k_sigaction *a,
+                       struct regs *r)
 {
     struct thread *t = thread_current();
     uint64_t mask = t->sig_restore ? t->sig_saved : t->sig_blocked;
@@ -183,7 +185,8 @@ static int setup_frame(int sig, struct k_sigaction *a, struct regs *r)
         f.pinfo = sp + offsetof(struct rt_sigframe, info);
         f.puc = sp + offsetof(struct rt_sigframe, uc);
         f.info.si_signo = sig;
-        f.info.si_code = 0;             /* SI_USER */
+        f.info.si_code = o->code;
+        memcpy(f.info.word, o->word, sizeof f.info.word);
         save_context(&f.uc.uc_mcontext, r, mask, fpstate);
         f.uc.uc_sigmask = mask;
         if (copy_to_user((void *)sp, &f, sizeof f) < 0)
@@ -222,6 +225,23 @@ static int setup_frame(int sig, struct k_sigaction *a, struct regs *r)
     return 0;
 }
 
+/* Take sig off the pending sets — the thread's own first — and say where
+   it came from. Interrupts off. */
+static void take(struct thread *t, int sig, struct sig_origin *o)
+{
+    struct process *p = t->proc;
+    uint64_t bit = SIGBIT(sig);
+    int own = (t->sig_pending & bit) != 0;
+    if (own)
+        t->sig_pending &= ~bit;
+    else
+        p->sig_pending &= ~bit;
+    o->code = SI_USER;
+    o->word[0] = o->word[1] = o->word[2] = 0;
+    if (p->timer_sigs & bit)            /* one load when no timer is involved */
+        ptimer_siginfo(p, t, sig, own, o);
+}
+
 void signal_check(struct regs *r)
 {
     struct thread *t = thread_current();
@@ -242,10 +262,8 @@ void signal_check(struct regs *r)
             return;
         }
         int sig = __builtin_ctzll(ready) + 1;   /* lowest number first */
-        if (t->sig_pending & SIGBIT(sig))       /* this thread's own first */
-            t->sig_pending &= ~SIGBIT(sig);
-        else
-            p->sig_pending &= ~SIGBIT(sig);
+        struct sig_origin o;
+        take(t, sig, &o);
 
         struct k_sigaction *a = &p->sig_action[sig - 1];
         if (sig == SIGKILL || a->handler == SIG_DFL) {
@@ -255,7 +273,7 @@ void signal_check(struct regs *r)
         }
         if (a->handler == SIG_IGN)
             continue;
-        if (setup_frame(sig, a, r) < 0)
+        if (setup_frame(sig, &o, a, r) < 0)
             proc_exit(W_SIGNALED(SIGSEGV));     /* no usable stack */
         return;                                 /* one handler at a time */
     }
@@ -270,10 +288,13 @@ void signal_fork(struct process *child, struct process *parent)
     child->sig_pending = 0;             /* pending signals aren't inherited */
     child->alarm_at = child->alarm_every = 0;   /* timers aren't inherited */
     child->alarm_next = NULL;
+    child->ntimers = 0;
+    child->timer_sigs = 0;
 }
 
 void signal_exec(struct process *p)
 {
+    ptimer_release_all(p);              /* timers don't survive execve */
     /* The handlers were in the old program: gone. Ignored stays ignored. */
     for (int i = 0; i < NSIG; i++) {
         if (p->sig_action[i].handler != SIG_IGN)
@@ -466,6 +487,78 @@ int32_t sys_rt_sigpending_impl(uint32_t set, uint32_t size)
         return -EINVAL;
     uint64_t s = (t->proc->sig_pending | t->sig_pending) & t->sig_blocked;
     return copy_to_user((void *)set, &s, 8);
+}
+
+/* sigwaitinfo / sigtimedwait: take a signal from `set` — normally ones the
+   thread blocks — without running a handler, and return its number. While
+   it waits, the set is unblocked so that a sender wakes it; any other
+   signal it doesn't block ends the wait with -EINTR. musl's SIGEV_THREAD
+   timers wait here for their signal. */
+int32_t sys_rt_sigtimedwait_impl(uint32_t uset, uint32_t uinfo, uint32_t utimeout,
+                                 uint32_t size, int wide)
+{
+    struct thread *t = thread_current();
+    struct process *p = t->proc;
+    uint64_t want;
+    uint32_t deadline = 0;
+    int poll = 0;
+    if (size != 8)
+        return -EINVAL;
+    if (copy_from_user(&want, (void *)uset, 8) < 0)
+        return -EFAULT;
+    want &= ~(SIGBIT(SIGKILL) | SIGBIT(SIGSTOP));
+    if (utimeout) {
+        int64_t ts[2];
+        if (wide) {
+            if (copy_from_user(ts, (void *)utimeout, sizeof ts) < 0)
+                return -EFAULT;
+        } else {
+            int32_t ts32[2];
+            if (copy_from_user(ts32, (void *)utimeout, sizeof ts32) < 0)
+                return -EFAULT;
+            ts[0] = ts32[0];
+            ts[1] = ts32[1];
+        }
+        if (ts[0] < 0 || ts[1] < 0 || ts[1] >= 1000000000)
+            return -EINVAL;
+        if (ts[0] > 0x7FFFFFFF / 1000 - 1)
+            ts[0] = 0x7FFFFFFF / 1000 - 1;
+        uint32_t ms = (uint32_t)ts[0] * 1000 + (uint32_t)(ts[1] + 999999) / 1000000;
+        poll = ms == 0;
+        deadline = timer_ms() + ms + 1;         /* now is partway through a ms */
+        if (!deadline)
+            deadline = 1;                       /* 0 means "no limit" */
+    }
+
+    uint64_t saved = t->sig_blocked;
+    int sig = 0, timed_out = 0;
+    for (;;) {
+        uint64_t ready = (t->sig_pending | p->sig_pending) & want;
+        if (ready) {
+            sig = __builtin_ctzll(ready) + 1;
+            break;
+        }
+        if (signal_pending() || poll || timed_out)
+            break;
+        t->sig_blocked = saved & ~want;
+        timed_out = wq_sleep_until(&(struct wait_queue){ 0 }, deadline);
+        t->sig_blocked = saved;
+    }
+    if (!sig)
+        return poll || timed_out ? -EAGAIN : -EINTR;
+
+    struct sig_origin o;
+    take(t, sig, &o);
+    if (uinfo) {
+        struct siginfo si;
+        memset(&si, 0, sizeof si);
+        si.si_signo = sig;
+        si.si_code = o.code;
+        memcpy(si.word, o.word, sizeof si.word);
+        if (copy_to_user((void *)uinfo, &si, sizeof si) < 0)
+            return -EFAULT;
+    }
+    return sig;
 }
 
 /* --- alarm and setitimer(ITIMER_REAL) ------------------------------------------ */

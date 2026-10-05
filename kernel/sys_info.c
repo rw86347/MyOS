@@ -304,7 +304,7 @@ uint32_t time_now(void)
 #define TIMER_ABSTIME           1
 
 /* Nanoseconds on clock clk: realtime (since 1970) or monotonic (boot). */
-static int64_t clock_ns(uint32_t clk)
+int64_t clock_ns(uint32_t clk)
 {
     int64_t up = (int64_t)timer_ms() * 1000000;
     if (clk == CLOCK_REALTIME || clk == CLOCK_REALTIME_COARSE || clk == CLOCK_REALTIME_ALARM)
@@ -557,6 +557,9 @@ SYSCALL_DEF(sys_set_thread_area)
         return -EINVAL;
     t->tls[idx - GDT_TLS_FIRST] = gdt_tls_descriptor(d[1], d[2], d[3]);
     thread_load_tls(t);
+    /* musl loads GS itself after the syscall; also put the selector in
+       the saved frame so `pop gs` on the way out does not undo it. */
+    thread_set_saved_gs(t, (uint32_t)((idx << 3) | 3));
     return 0;
 }
 

@@ -15,6 +15,7 @@
 #define CPU_PGE   (1u << 13)    /* global pages (survive a CR3 reload) */
 #define CPU_CMOV  (1u << 15)
 #define CPU_PAT   (1u << 16)    /* page attribute table (write-combining pages) */
+#define CPU_PSE36 (1u << 17)    /* 4 MiB pages can reach physical > 4 GiB */
 #define CPU_FXSR  (1u << 24)    /* fxsave / fxrstor */
 #define CPU_SSE   (1u << 25)
 #define CPU_SSE2  (1u << 26)

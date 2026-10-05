@@ -24,7 +24,7 @@
  */
 
 #define PROC_MAX    64
-#define PROC_FILES  32                  /* open files per process (fds 0-31) */
+#define PROC_FILES  64                  /* open files per process (fds 0-63) */
 
 struct file;
 struct inode;
@@ -43,8 +43,9 @@ struct process {
     struct wait_queue thread_gone;      /* execve waits here for the others */
     struct mm *mm;
     struct file *files[PROC_FILES];     /* open files, indexed by fd */
-    uint32_t cloexec;                   /* bit n: close fd n on execve */
+    uint64_t cloexec;                   /* bit n: close fd n on execve */
     struct inode *cwd;                  /* current directory */
+    struct inode *exe;                  /* the ELF execve loaded (/proc/self/exe) */
     uint32_t umask;                     /* permission bits new files lose */
     int status;                         /* wait status, once a zombie */
     struct wait_queue child_wait;       /* sleeps here in wait4() */
@@ -68,6 +69,12 @@ struct process {
        sit on one list sorted by alarm_at, so the tick looks at its head only. */
     uint32_t alarm_at, alarm_every;
     struct process *alarm_next;
+
+    /* POSIX timers (posix_timer.c): how many it owns, and the signals one of
+       them has made pending — so delivery only looks for a timer's siginfo
+       when there can be one. */
+    int ntimers;
+    uint64_t timer_sigs;
 };
 
 /* Wait status, encoded as Linux does (what WIFEXITED & co. take apart). */

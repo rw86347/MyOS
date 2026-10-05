@@ -94,6 +94,9 @@ struct file_ops {
 #define I_MOUNTED   16              /* the root of a mounted file system */
 #define I_PROC_FD   32              /* /proc/self/fd/N (fs_ino = N): a link to
                                        whatever the caller's fd N is open on */
+#define I_PROC_EXE  64              /* /proc/self/exe: a link to the caller's
+                                       program (the ELF that execve loaded) */
+#define I_MEMFD    128              /* memfd_create: fs_ino holds F_SEAL_* */
 
 /*
  * A file system on a disk (ext2): what the VFS asks of it. The VFS keeps
@@ -337,6 +340,10 @@ extern const struct file_ops ram_ops;       /* read/write a regular file */
 int     file_copy_out(struct inode *i, uint32_t pos, void *kbuf, uint32_t n);
 int     file_truncate(struct inode *i, uint32_t size);
 void    file_free(struct inode *i);
+/* Page idx of an inode whose contents are only RAM pages (never the
+   archive): System V shared memory. Its frame, made zeroed on first use;
+   0 when memory or the RAM-file limit runs out. Freed with the inode. */
+uint32_t ramfs_page(struct inode *i, uint32_t idx);
 void    ramfs_usage(uint32_t *used_pages, uint32_t *max_pages);   /* statfs, df */
 uint32_t time_now(void);                    /* seconds since 1970 (sys_info.c) */
 
@@ -350,7 +357,7 @@ extern const struct file_ops console_ops;
 extern struct file console_file;                /* the shared open console */
 int  pipe_create(struct file **rd, struct file **wr);         /* pipe.c */
 int  fifo_open(struct inode *i, uint32_t flags, struct file **out);  /* a named pipe */
-/* procfs.c: mount -t proc, and readlink of a /proc/self/fd/N link. */
+/* procfs.c: mount -t proc, and readlink of /proc/self/fd/N or /proc/self/exe. */
 int  procfs_mount(const char *path);
 int  procfs_readlink(struct inode *link, char *buf, uint32_t size);
 /* sysfs.c: mount -t sysfs (just what Xorg checks: /sys/class/graphics/fb0). */

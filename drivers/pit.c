@@ -35,6 +35,7 @@ static void timer_irq(struct regs *r)
     cycles_tick(ticks);                 /* background calibration (cpu.c) */
     thread_timer_tick(ticks);           /* wake timed sleepers that are due */
     signal_alarm_tick(ticks);           /* SIGALRM for alarm/setitimer */
+    ptimer_tick(ticks);                 /* timer_create's timers */
     sched_tick();                       /* next time slot; may switch threads */
 }
 

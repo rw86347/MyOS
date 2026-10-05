@@ -339,6 +339,78 @@ SYSCALL_DEF(sys_ftruncate)   { return fd_truncate(a1, (int32_t)a2); }
 SYSCALL_DEF(sys_truncate64)  { return path_truncate(a1, (int64_t)(((uint64_t)a3 << 32) | a2)); }
 SYSCALL_DEF(sys_ftruncate64) { return fd_truncate(a1, (int64_t)(((uint64_t)a3 << 32) | a2)); }
 
+/* fallocate(fd, mode, offset, len): Firefox uses this to size a /dev/shm
+   file before mmap. On ramfs there is nothing to preallocate, so mode 0 is
+   "grow the file if offset+len is past the end" — the same as ftruncate —
+   and FALLOC_FL_KEEP_SIZE is a successful no-op. Other modes (punch hole,
+   collapse) wait for a user. */
+#define FALLOC_FL_KEEP_SIZE 0x01
+
+SYSCALL_DEF(sys_fallocate)
+{
+    int64_t off = (int64_t)(((uint64_t)a4 << 32) | a3);
+    int64_t len = (int64_t)(((uint64_t)a6 << 32) | a5);
+    if (off < 0 || len <= 0)
+        return -EINVAL;
+    if (a2 & ~FALLOC_FL_KEEP_SIZE)
+        return -EOPNOTSUPP;
+    struct file *f = fd_get(a1);
+    if (!f)
+        return -EBADF;
+    if ((f->flags & O_ACCMODE) == O_RDONLY)
+        return -EBADF;
+    int64_t end = off + len;
+    if (end < 0)
+        return -EFBIG;
+    if (!(a2 & FALLOC_FL_KEEP_SIZE) && end > (int64_t)f->inode->size)
+        return do_truncate(f->inode, end);
+    return 0;
+}
+
+/* memfd_create(name, flags): an anonymous RAM file, what Firefox prefers
+   over a name in /dev/shm. The name is only for /proc (we don't show it
+   yet). Sealing and huge pages are refused. */
+#define MFD_CLOEXEC       0x0001u
+#define MFD_ALLOW_SEALING 0x0002u
+
+SYSCALL_DEF(sys_memfd_create)
+{
+    char name[256];
+    if (a2 & ~(MFD_CLOEXEC | MFD_ALLOW_SEALING))
+        return -EINVAL;
+    long n = strncpy_from_user(name, (const char *)a1, sizeof name);
+    if (n < 0)
+        return n;
+    if (n == (long)sizeof name - 1)
+        return -EINVAL;                 /* Linux: NAME_MAX, no NUL in the limit */
+    struct inode *i = kmalloc(sizeof *i);
+    if (!i)
+        return -ENOMEM;
+    memset(i, 0, sizeof *i);
+    i->mode = S_IFREG | 0777;
+    i->flags = I_UNLINKED | I_MEMFD;    /* fcntl F_ADD_SEALS / F_GET_SEALS */
+    i->name = "memfd";
+    i->name_len = 5;
+    struct process *p = proc_current();
+    if (p) {
+        i->uid = p->cred.fsuid;
+        i->gid = p->cred.fsgid;
+    }
+    struct file *f = file_new(&ram_ops, i, O_RDWR);
+    if (!f) {
+        kfree(i);
+        return -ENOMEM;
+    }
+    int fd = fd_install(f);
+    if (fd < 0) {
+        file_put(f);
+        return fd;
+    }
+    if ((a2 & MFD_CLOEXEC) && p)
+        p->cloexec |= 1ull << fd;
+    return fd;
+}
+
 /* --- statfs ------------------------------------------------------------------ */
 
 /* struct statfs64, as Linux i386 lays it out (what `df` reads). */

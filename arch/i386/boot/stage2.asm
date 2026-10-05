@@ -199,6 +199,15 @@ copy_font:
     rep movsw
     pop ds
     mov dword [BOOTINFO + BOOTINFO_FONT], FONT
+    xor eax, eax                    ; no GOP on a BIOS boot
+    mov dword [BOOTINFO + BOOTINFO_FONT + 4], eax
+    mov dword [BOOTINFO + BOOTINFO_FONT + 8], eax
+    mov dword [BOOTINFO + BOOTINFO_FONT + 12], eax
+    mov dword [BOOTINFO + BOOTINFO_FONT + 16], eax
+    mov dword [BOOTINFO + BOOTINFO_FONT + 20], eax
+    mov dword [BOOTINFO + BOOTINFO_FONT + 24], eax
+    mov dword [BOOTINFO + BOOTINFO_FONT + 28], eax
+    mov dword [BOOTINFO + BOOTINFO_FONT + 32], eax   ; fb_phys_hi
     ret
 
 ; hold: ~2 seconds, so the picture is visible. QEMU finishes the disk copy

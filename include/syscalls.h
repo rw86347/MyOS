@@ -52,6 +52,19 @@ SYSCALL_DEF(sys_getrandom);
 SYSCALL_DEF(sys_set_thread_area);
 SYSCALL_DEF(sys_get_thread_area);
 SYSCALL_DEF(sys_set_tid_address);
+int64_t clock_ns(uint32_t clk);         /* ns on a clock: realtime or since boot */
+
+/* kernel/posix_timer.c */
+SYSCALL_DEF(sys_timer_create);
+SYSCALL_DEF(sys_timer_settime);
+SYSCALL_DEF(sys_timer_settime64);
+SYSCALL_DEF(sys_timer_gettime);
+SYSCALL_DEF(sys_timer_gettime64);
+SYSCALL_DEF(sys_timer_getoverrun);
+SYSCALL_DEF(sys_timer_delete);
+
+/* kernel/shm.c: System V shared memory, through ipc() */
+SYSCALL_DEF(sys_ipc);
 
 /* kernel/syscall.c: helpers for the files below */
 struct inode;
@@ -86,6 +99,8 @@ SYSCALL_DEF(sys_truncate);
 SYSCALL_DEF(sys_ftruncate);
 SYSCALL_DEF(sys_truncate64);
 SYSCALL_DEF(sys_ftruncate64);
+SYSCALL_DEF(sys_fallocate);
+SYSCALL_DEF(sys_memfd_create);
 SYSCALL_DEF(sys_statfs64);
 SYSCALL_DEF(sys_fstatfs64);
 SYSCALL_DEF(sys_mount);
@@ -97,6 +112,7 @@ SYSCALL_DEF(sys_flock);
 /* fs/poll.c */
 SYSCALL_DEF(sys_poll);
 /* fs/epoll.c */
+SYSCALL_DEF(sys_eventfd2);
 SYSCALL_DEF(sys_epoll_create);
 SYSCALL_DEF(sys_epoll_create1);
 SYSCALL_DEF(sys_epoll_ctl);

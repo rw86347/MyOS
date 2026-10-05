@@ -20,8 +20,10 @@
 #include <stddef.h>
 #include <mm.h>
 #include <proc.h>
+#include <vfs.h>
 #include <sched.h>
 #include <serial.h>
+#include <string.h>
 #include <syscall.h>
 #include <thread.h>
 
@@ -120,6 +122,23 @@ static int user_exception(struct regs *r, uint32_t cr2)
     if (r->vector == 14)
         kprintf(", %s of %08lx (%s)", r->err_code & 2 ? "write" : "read", cr2,
                 r->err_code & 1 ? "not allowed" : "not mapped");
+    kprintf(" EAX=%08lx EBX=%08lx ESP=%08lx GS=%04lx",
+            r->eax, r->ebx, r->user_esp, r->gs);
+    struct mm *mm = mm_current();
+    if (mm) {
+        kprintf(" (%d areas)", mm->nareas);
+        for (int i = 0; i < mm->nareas; i++) {
+            struct vma *v = &mm->area[i];
+            if (r->eip < v->start || r->eip >= v->end || !v->file || !v->file->name)
+                continue;
+            char n[40];
+            uint32_t len = v->file->name_len < 39 ? v->file->name_len : 39;
+            memcpy(n, v->file->name, len);
+            n[len] = '\0';
+            kprintf(" in %s+%lx", n, (unsigned long)(r->eip - v->start + v->file_off));
+            break;
+        }
+    }
     kprintf("\n");
     int sig = exception_signal(r->vector);
     struct process *p = proc_current();

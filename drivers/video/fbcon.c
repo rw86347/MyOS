@@ -38,6 +38,8 @@ static int cur_row = -1, cur_col;       /* where the cursor is drawn (-1: nowher
 static int fresh;                       /* the screen is all black (just after a mode set) */
 
 /* The 16 VGA text colors as 0x00RRGGBB (XRGB8888). */
+static int swap_rb;                     /* GOP RGBX: R and B are swapped */
+
 static const uint32_t palette[16] = {
     0x000000, 0x0000AA, 0x00AA00, 0x00AAAA, 0xAA0000, 0xAA00AA, 0xAA5500, 0xAAAAAA,
     0x555555, 0x5555FF, 0x55FF55, 0x55FFFF, 0xFF5555, 0xFF55FF, 0xFFFF55, 0xFFFFFF,
@@ -88,6 +90,10 @@ static void draw_cell(int r, int c, int cursor)
     uint16_t v = vt_grid()[r * VT_MAX_COLS + c];
     const uint8_t *g = font + (v & 0xFF) * 16;
     uint32_t fg = palette[(v >> 8) & 15], bg = palette[(v >> 12) & 15];
+    if (swap_rb) {
+        fg = (fg & 0xFF00FF00u) | ((fg & 0xFFu) << 16) | ((fg >> 16) & 0xFFu);
+        bg = (bg & 0xFF00FF00u) | ((bg & 0xFFu) << 16) | ((bg >> 16) & 0xFFu);
+    }
     uint32_t *p = pixel((uint32_t)(c * cw), ytop + (uint32_t)(r * ch));
     switch (scale) {
     case 1:  glyph(p, g, fg, bg, cursor, 1); break;
@@ -234,6 +240,7 @@ void fbcon_attach(struct fb_info *fb)
     if (fb->var.bits_per_pixel != 32)
         return;
     font = P2V(bi->font_phys);
+    swap_rb = (bi->fb_magic == BOOTINFO_FB_MAGIC && bi->fb_format == 1);
     info = fb;
     take_over();
     kprintf("fbcon: %dx%d\n", cols, rows);

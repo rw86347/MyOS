@@ -203,7 +203,7 @@ static int install(struct usock *s, uint32_t flags)
         return -EMFILE;
     }
     if (flags & SOCK_CLOEXEC)
-        proc_current()->cloexec |= 1u << fd;
+        proc_current()->cloexec |= 1ull << fd;
     return fd;
 }
 

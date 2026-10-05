@@ -630,3 +630,40 @@ branch are not where their time goes, but that is an argument and not a number. 
 record, with `tools/echo-server.py` running, after the fixes: UDP `write()` 64 B 1827
 cycles, UDP `read()` 484, UDP total per echo 3767; TCP `write()` 1910, `read()` 495, total
 per echo 5810.
+
+### POSIX timers (2026-10-04): what they add to the shared paths
+
+`timer_create` & co. touch two paths every program pays for: the 1 ms tick calls
+`ptimer_tick` (with no timer armed, one load and a compare), and every signal delivery
+tests one bit (`p->timer_sigs`) before it would look for a timer's siginfo. No speed
+change was intended; this is the check that none happened. `make bench`, deterministic:
+
+| | before | after |
+|---|---|---|
+| `null syscall, int 0x80` | 127 | 127 |
+| `null syscall, sysenter` | 155 | 155 |
+| `thread switch` | 97 | 97 |
+| `open + close` (2-part path) | 1505 | 1505 |
+| `lseek + read 4 KiB` | 1571 | 1571 |
+| `fork + exit + wait` | 51788 | 51837 |
+| `exec + exit (ELF 'true')` | 35376 | 35420 |
+
+The last two move by about 0.1%. `fork` and `exec` gained nothing on their own paths
+beyond clearing two fields and an early-out call, so this is most likely the tick's few
+instructions landing during a run that takes 50,000 cycles. Arming a timer is a sorted
+insert into the armed list (at most 64 entries); the tick looks at the head only.
+
+### pread64 / pwrite64 (2026-10-04)
+
+`read()` and `write()` now go through `rw_at()`, which takes pread's offset (or -1
+for "the file's own position"). On the plain path that's one test of a constant the
+compiler sees, so no change was expected:
+
+| | before | after |
+|---|---|---|
+| `null syscall, int 0x80` | 127 | 127 |
+| `null syscall, sysenter` | 155 | 155 |
+| `lseek + read 4 KiB` | 1571 | 1554 |
+
+The 17 cycles less is within run-to-run noise for this row; the point is that it
+didn't grow. pread itself copies the 32-byte `struct file` to the stack once per call.

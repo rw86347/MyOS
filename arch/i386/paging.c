@@ -184,12 +184,22 @@ int vmm_map(uint32_t va, uint32_t pa, uint32_t flags)
     return 0;
 }
 
-int vmm_map_big(uint32_t va, uint32_t pa, uint32_t flags)
+int vmm_map_big(uint32_t va, uint64_t pa, uint32_t flags)
 {
     uint32_t *pde = &kernel_pd[PDE_INDEX(va)];
-    if (va < KERNEL_VBASE || ((va | pa) & (BIG_PAGE - 1)) || (*pde & PTE_PRESENT))
+    uint32_t hi = (uint32_t)(pa >> 32);
+
+    if (va < KERNEL_VBASE || ((va | (uint32_t)pa) & (BIG_PAGE - 1))
+        || (pa & (BIG_PAGE - 1)) || (*pde & PTE_PRESENT))
         return -1;
-    *pde = pa | (flags & 0xFFF) | PTE_PRESENT | PTE_PS | global_bit;
+    /* PSE-36: PDE bits 20:13 hold physical bits 39:32. Same encoding as
+       the original 36-bit form (bits 16:13 = 35:32) for addresses < 64 GiB. */
+    if (hi) {
+        if (!cpu_has(CPU_PSE36) || hi > 0xFF)
+            return -1;
+    }
+    *pde = ((uint32_t)pa & ~(BIG_PAGE - 1)) | ((hi & 0xFF) << 13)
+         | (flags & 0xFFF) | PTE_PRESENT | PTE_PS | global_bit;
     invlpg(va);
     return 0;
 }
@@ -312,7 +322,7 @@ uint32_t vmm_pd_fork(void)
         for (int j = 0; j < 1024; j++) {
             uint32_t e = src[j];
             if ((e & PTE_PRESENT) && !(e & PTE_SHARED)) {
-                if (e & PTE_WRITABLE) {         /* share it until someone writes */
+                if ((e & PTE_WRITABLE) && !(e & PTE_MAPSHARED)) {   /* share it until someone writes */
                     e = (e & ~PTE_WRITABLE) | PTE_COW;
                     src[j] = e;
                 }

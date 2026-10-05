@@ -89,8 +89,52 @@ static void tmpfs(void)
     check(fd >= 0 && write(fd, "hello", 5) == 5 && lseek(fd, 0, SEEK_SET) == 0 &&
           read(fd, buf, 5) == 5 &&
           strcmp(buf, "hello") == 0, "a file in the tmpfs");
+    /* pread/pwrite (poppler reads PDFs this way): at an offset, and the
+       file's own position stays where read() left it. */
+    memset(buf, 0, sizeof buf);
+    check(pread(fd, buf, 3, 1) == 3 && strcmp(buf, "ell") == 0 &&
+          lseek(fd, 0, SEEK_CUR) == 5, "pread at an offset, position kept");
+    check(pwrite(fd, "J", 1, 0) == 1 && pread(fd, buf, 5, 0) == 5 &&
+          memcmp(buf, "Jello", 5) == 0 && lseek(fd, 0, SEEK_CUR) == 5, "pwrite at an offset");
+    check(pread(fd, buf, 5, 100) == 0, "pread past the end: 0");
+    check(fails(pread(fd, buf, 1, -1), EINVAL), "pread at -1: EINVAL");
+    int p[2];
+    check(pipe(p) == 0 && fails(pread(p[0], buf, 1, 0), ESPIPE), "pread on a pipe: ESPIPE");
+    close(p[0]);
+    close(p[1]);
     close(fd);
     check(unlink("/boottest-run/f") == 0, "remove it");
+
+    int mfd = memfd_create("boottest", MFD_CLOEXEC);
+    check(mfd >= 0 && fallocate(mfd, 0, 0, 4096) == 0, "memfd_create + fallocate");
+    check(fstat(mfd, &st) == 0 && st.st_size == 4096, "fallocate sets the size");
+    char *map = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, mfd, 0);
+    if (map != MAP_FAILED)
+        map[0] = 'Z';
+    check(map != MAP_FAILED && map[0] == 'Z', "mmap the memfd");
+    if (map != MAP_FAILED)
+        munmap(map, 4096);
+    close(mfd);
+
+    char *mp = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (mp != MAP_FAILED)
+        mp[0] = 42;
+    char *mq = mp == MAP_FAILED ? MAP_FAILED
+               : mremap(mp, 4096, 8192, MREMAP_MAYMOVE);
+    check(mq != MAP_FAILED && mq[0] == 42, "mremap grow keeps the bytes");
+    if (mq != MAP_FAILED) {
+        mq[5000] = 7;
+        check(mq[5000] == 7, "mremap new page is writable");
+        munmap(mq, 8192);
+    }
+
+    int efd = (int)syscall(SYS_eventfd2, 0, 02000000 | 04000); /* CLOEXEC|NONBLOCK */
+    uint64_t ev = 3;
+    check(efd >= 0 && write(efd, &ev, 8) == 8 && read(efd, &ev, 8) == 8 && ev == 3,
+          "eventfd2 write then read");
+    check(read(efd, &ev, 8) < 0 && errno == EAGAIN, "eventfd2 empty: EAGAIN");
+    close(efd);
 
     check(fails(mount("tmpfs", "/bin/boottest", "tmpfs", 0, NULL), ENOTDIR),
           "mount on a file: ENOTDIR");
@@ -129,6 +173,37 @@ static void procfs(void)
     close(again);
     close(fd);
     check(fails(readlink(link, buf, sizeof buf), ENOENT), "a closed fd: ENOENT");
+
+    int mfd = memfd_create("boottest", MFD_ALLOW_SEALING);
+    check(mfd >= 0 && fallocate(mfd, 0, 0, 4096) == 0, "memfd for /proc/self/fd");
+    check(fcntl(mfd, F_ADD_SEALS, F_SEAL_SHRINK) == 0 &&
+          fcntl(mfd, F_GET_SEALS) == F_SEAL_SHRINK, "memfd F_ADD_SEALS");
+    snprintf(link, sizeof link, "/proc/self/fd/%d", mfd);
+    int ro = open(link, O_RDONLY);
+    check(ro >= 0 && fstat(ro, &a) == 0 && a.st_size == 4096,
+          "open /proc/self/fd of a memfd (Firefox's read-only dup)");
+    close(ro);
+    close(mfd);
+
+    int many[40], nopen = 0, many_ok = 1;
+    for (int i = 0; i < 40; i++) {
+        many[i] = open("/bin/boottest", O_RDONLY);
+        if (many[i] < 0) {
+            many_ok = 0;
+            break;
+        }
+        nopen++;
+    }
+    check(many_ok && nopen == 40 && many[39] >= 32, "40 open files (fds past 31)");
+    while (nopen)
+        close(many[--nopen]);
+
+    n = readlink("/proc/self/exe", buf, sizeof buf - 1);
+    check(n == 13 && memcmp(buf, "/bin/boottest", 13) == 0, "readlink /proc/self/exe");
+    int exe = open("/proc/self/exe", O_RDONLY);
+    check(exe >= 0 && fstat(exe, &a) == 0 && stat("/bin/boottest", &b) == 0 &&
+          a.st_ino == b.st_ino && a.st_dev == b.st_dev, "open /proc/self/exe: the same file");
+    close(exe);
 
     int p[2];
     check(pipe(p) == 0 && (snprintf(link, sizeof link, "/proc/self/fd/%d", p[0]),
@@ -351,6 +426,22 @@ static void reboot_switch(void)
     check(reboot(RB_ENABLE_CAD) == 0, "Ctrl-Alt-Del on");
 }
 
+/* The dynamic linker opens every .so O_RDONLY and maps its data
+   PROT_WRITE|MAP_PRIVATE so it can relocate. That must not be EACCES. */
+static void file_mmap(void)
+{
+    int fd = open("/etc/hostname", O_RDONLY);
+    check(fd >= 0, "open /etc/hostname for mmap");
+    char *p = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+    check(p != MAP_FAILED, "MAP_PRIVATE write of a read-only file (the loader)");
+    if (p != MAP_FAILED)
+        munmap(p, 4096);
+    p = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    check(p == MAP_FAILED && errno == EACCES,
+          "MAP_SHARED write of a read-only file: EACCES");
+    close(fd);
+}
+
 /* 600 pages, every other one read-only: 600 areas, each its own. */
 static void many_areas(void)
 {
@@ -449,6 +540,7 @@ int main(int argc, char **argv)
     fifos();
     hangup();
     reboot_switch();
+    file_mmap();
     many_areas();
     users();
     if (failures)

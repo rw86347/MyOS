@@ -69,12 +69,21 @@ static struct process *proc_alloc(void)
     return NULL;
 }
 
+static void proc_clear_exe(struct process *p)
+{
+    if (p->exe) {
+        vfs_put(p->exe);
+        p->exe = NULL;
+    }
+}
+
 static void reap(struct process *p)
 {
     if (p->cwd) {                       /* a process that never ran */
         vfs_put(p->cwd);
         p->cwd = NULL;
     }
+    proc_clear_exe(p);
     p->state = PROC_FREE;
 }
 
@@ -107,6 +116,7 @@ static void thread_leave_proc(struct process *p, struct thread *t)
         *pp = t->proc_next;
     t->proc_next = NULL;
     p->nthreads--;
+    ptimer_thread_gone(p, t);
 }
 
 /* The name a program's thread gets: "/bin/hello" -> "hello". */
@@ -147,7 +157,8 @@ struct process *proc_spawn(const char *path, const char *const argv[],
        a moment (we're a kernel thread, so we can borrow any). */
     struct mm *old = mm_current();
     mm_switch(p->mm);
-    int err = program_load(path, argv, envp, &p->start_eip, &p->start_esp, &p->cred);
+    int err = program_load(path, argv, envp, &p->start_eip, &p->start_esp,
+                           &p->cred, &p->exe);
     mm_switch(old);
     if (err) {
         mm_destroy(p->mm);
@@ -303,6 +314,10 @@ int proc_fork_frame(const struct regs *frame, struct process **child_out)
     signal_fork(child, parent);
     child->cloexec = parent->cloexec;
     fd_copy_all(child, parent);         /* same open files, shared */
+    if (parent->exe) {
+        vfs_get(parent->exe);
+        child->exe = parent->exe;
+    }
 
     /* The child's thread starts by "returning" from this very syscall,
        with the parent's registers — except EAX = 0. Only the calling
@@ -462,7 +477,9 @@ int proc_execve(uint32_t user_path, uint32_t user_argv, uint32_t user_envp)
     mm_switch(new_mm);
     uint32_t entry, sp;
     struct cred cred = p->cred;
-    err = program_load(prog, argv, (const char *const *)a->envp, &entry, &sp, &cred);
+    struct inode *exe = NULL;
+    err = program_load(prog, argv, (const char *const *)a->envp, &entry, &sp,
+                       &cred, &exe);
     if (err) {
         mm_switch(old_mm);
         mm_destroy(new_mm);
@@ -472,6 +489,8 @@ int proc_execve(uint32_t user_path, uint32_t user_argv, uint32_t user_envp)
 
     /* 3. Only the calling thread lives on in the new program. */
     if (p->nthreads > 1 && !end_other_threads(p)) {
+        if (exe)
+            vfs_put(exe);
         mm_switch(old_mm);              /* exit_group won the race: we die */
         mm_destroy(new_mm);
         kfree(a);
@@ -486,10 +505,12 @@ int proc_execve(uint32_t user_path, uint32_t user_argv, uint32_t user_envp)
     p->cred = cred;
     mm_destroy(old_mm);
     for (int fd = 0; fd < PROC_FILES; fd++)
-        if (p->cloexec & (1u << fd))
+        if (p->cloexec & (1ull << fd))
             fd_close(fd);               /* close-on-exec files */
     p->cloexec = 0;
     signal_exec(p);                     /* handlers were in the old program */
+    proc_clear_exe(p);
+    p->exe = exe;                       /* reference from program_load */
     thread_set_name(thread_current(), base_name(prog));
     kfree(a);
 
@@ -512,10 +533,12 @@ int proc_execve(uint32_t user_path, uint32_t user_argv, uint32_t user_envp)
 static void process_end(struct process *p)
 {
     signal_alarm_cancel(p);
+    ptimer_release_all(p);
 
     fd_close_all(p);
     vfs_put(p->cwd);
     p->cwd = NULL;
+    proc_clear_exe(p);
     struct mm *mm = p->mm;
     mm_switch(mm_kernel());             /* can't free the space we stand in */
     p->mm = mm_kernel();

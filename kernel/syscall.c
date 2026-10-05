@@ -57,12 +57,23 @@ typedef int32_t (*syscall_fn)(uint32_t, uint32_t, uint32_t,
  * in the pipe, socket and TCP rings. Doing the faulting here, before the
  * implementation has looked at anything, leaves the copy unable to sleep, and
  * makes "a syscall runs to completion" true rather than nearly true.
+ *
+ * `at` is pread/pwrite's offset, or -1 for the file's own position.
  */
-static int32_t rw(uint32_t fd, uint32_t buf, uint32_t len, int writing)
+static int32_t rw_at(uint32_t fd, uint32_t buf, uint32_t len, int writing, int64_t at)
 {
     struct file *f = fd_get(fd);
     if (!f)
         return -EBADF;
+    if (at >= 0) {
+        uint32_t m = f->inode->mode;
+        if (S_ISCHR(m) || S_ISFIFO(m) || (m & S_IFMT) == S_IFSOCK)
+            return -ESPIPE;
+        if (S_ISDIR(m))
+            return -EISDIR;
+        if (at > 0xFFFFFFFFll)          /* past the end of any file we can have */
+            return writing ? -EFBIG : 0;
+    }
     if (!user_range_ok(buf, len))
         return -EFAULT;
     if (len > RW_MAX)
@@ -77,10 +88,28 @@ static int32_t rw(uint32_t fd, uint32_t buf, uint32_t len, int writing)
      * sibling's close() frees the file under the sleeper. See file_get.
      */
     file_get(f);
-    int32_t rc = writing ? f->ops->write(f, (const void *)buf, len)
-                         : f->ops->read(f, (void *)buf, len);
+    /*
+     * pread/pwrite leave the file's position alone, even while a sibling
+     * thread reads the same open file. Every file system reads and writes
+     * at f->pos, so they get a copy of the open file that starts at `at`,
+     * and the copy's position is thrown away.
+     */
+    struct file copy;
+    struct file *use = f;
+    if (at >= 0) {
+        copy = *f;
+        copy.pos = (uint32_t)at;
+        use = &copy;
+    }
+    int32_t rc = writing ? use->ops->write(use, (const void *)buf, len)
+                         : use->ops->read(use, (void *)buf, len);
     file_put(f);
     return rc;
+}
+
+static int32_t rw(uint32_t fd, uint32_t buf, uint32_t len, int writing)
+{
+    return rw_at(fd, buf, len, writing, -1);
 }
 
 /* ssize_t read(int fd, void *buf, size_t count) */
@@ -88,6 +117,21 @@ SYSCALL(sys_read) { return rw(a1, a2, a3, 0); }
 
 /* ssize_t write(int fd, const void *buf, size_t count) */
 SYSCALL(sys_write) { return rw(a1, a2, a3, 1); }
+
+/* ssize_t pread64 / pwrite64(int fd, void *buf, size_t count, u32 off_low,
+   u32 off_high): at an offset, without moving the file's position. Poppler
+   (Evince's PDF reader) reads every file this way. */
+static int64_t off64(uint32_t lo, uint32_t hi) { return (int64_t)(((uint64_t)hi << 32) | lo); }
+SYSCALL(sys_pread64)
+{
+    int64_t at = off64(a4, a5);
+    return at < 0 ? -EINVAL : rw_at(a1, a2, a3, 0, at);
+}
+SYSCALL(sys_pwrite64)
+{
+    int64_t at = off64(a4, a5);
+    return at < 0 ? -EINVAL : rw_at(a1, a2, a3, 1, at);
+}
 
 /* The directory a *at() call's dirfd means: NULL for AT_FDCWD (the
    current directory), else the open directory. 0, or -errno. */
@@ -131,7 +175,7 @@ int32_t do_open(struct inode *dir, uint32_t user_path, uint32_t flags, uint32_t 
     if (fd < 0)
         file_put(f);
     else if (flags & O_CLOEXEC)
-        proc_current()->cloexec |= 1u << fd;    /* closed by execve */
+        proc_current()->cloexec |= 1ull << fd;    /* closed by execve */
     return fd;
 }
 
@@ -289,7 +333,7 @@ static int32_t do_pipe(uint32_t user_fds, uint32_t flags)
         return fds[1] < 0 ? -EMFILE : -EFAULT;
     }
     if (flags & O_CLOEXEC)
-        proc_current()->cloexec |= (1u << fds[0]) | (1u << fds[1]);
+        proc_current()->cloexec |= (1ull << fds[0]) | (1ull << fds[1]);
     return 0;
 }
 
@@ -319,7 +363,7 @@ static int32_t do_dup2(uint32_t oldfd, uint32_t newfd, uint32_t flags)
     f->refs++;
     fd_install_at(newfd, f);            /* closes what was at newfd */
     if (flags & O_CLOEXEC)
-        proc_current()->cloexec |= 1u << newfd;
+        proc_current()->cloexec |= 1ull << newfd;
     return newfd;
 }
 
@@ -333,6 +377,9 @@ SYSCALL(sys_dup3) { return a1 == a2 ? -EINVAL : do_dup2(a1, a2, a3); }
 #define F_GETFL         3
 #define F_SETFL         4
 #define F_DUPFD_CLOEXEC 1030
+#define F_ADD_SEALS     1033            /* memfd: add F_SEAL_* bits */
+#define F_GET_SEALS     1034
+#define F_SEAL_SEAL     0x0001          /* no further seals */
 #define FD_CLOEXEC      1
 
 SYSCALL(sys_fcntl)
@@ -349,7 +396,7 @@ SYSCALL(sys_fcntl)
                 p->files[fd] = f;
                 f->refs++;
                 if (a2 == F_DUPFD_CLOEXEC)
-                    p->cloexec |= 1u << fd;
+                    p->cloexec |= 1ull << fd;
                 return fd;
             }
         }
@@ -358,15 +405,26 @@ SYSCALL(sys_fcntl)
         return (p->cloexec >> a1) & 1 ? FD_CLOEXEC : 0;
     case F_SETFD:
         if (a3 & FD_CLOEXEC)
-            p->cloexec |= 1u << a1;
+            p->cloexec |= 1ull << a1;
         else
-            p->cloexec &= ~(1u << a1);
+            p->cloexec &= ~(1ull << a1);
         return 0;
     case F_GETFL:
         return f->flags;
     case F_SETFL:                       /* only these two may change */
         f->flags = (f->flags & ~(O_APPEND | O_NONBLOCK)) | (a3 & (O_APPEND | O_NONBLOCK));
         return 0;
+    case F_ADD_SEALS:
+        if (!(f->inode->flags & I_MEMFD))
+            return -EINVAL;
+        if (f->inode->fs_ino & F_SEAL_SEAL)
+            return -EPERM;
+        f->inode->fs_ino |= a3;
+        return 0;
+    case F_GET_SEALS:
+        if (!(f->inode->flags & I_MEMFD))
+            return -EINVAL;
+        return (int32_t)f->inode->fs_ino;
     default:
         return -EINVAL;
     }
@@ -613,7 +671,7 @@ static int32_t do_readlink(struct inode *dir, uint32_t user_path, uint32_t buf, 
         return -EINVAL;
     const void *target = i->data;
     uint32_t len = i->size;
-    if (i->flags & I_PROC_FD) {
+    if (i->flags & (I_PROC_FD | I_PROC_EXE)) {
         int32_t r = procfs_readlink(i, path, sizeof path);  /* path is free now */
         if (r < 0)
             return r;
@@ -757,6 +815,8 @@ SYSCALL(sys_rt_sigreturn)   { return sys_sigreturn_impl(1); }
 SYSCALL(sys_kill)           { return sys_kill_impl((int32_t)a1, a2); }
 SYSCALL(sys_rt_sigsuspend)  { return sys_rt_sigsuspend_impl(a1, a2); }
 SYSCALL(sys_rt_sigpending)  { return sys_rt_sigpending_impl(a1, a2); }
+SYSCALL(sys_rt_sigtimedwait)   { return sys_rt_sigtimedwait_impl(a1, a2, a3, a4, 0); }
+SYSCALL(sys_rt_sigtimedwait64) { return sys_rt_sigtimedwait_impl(a1, a2, a3, a4, 1); }
 
 /* tkill(tid, sig) / tgkill(tgid, tid, sig): a signal for one thread
    (pthread_kill, raise). */
@@ -870,6 +930,7 @@ SYSCALL(sys_brk)
 SYSCALL(sys_mmap2)
 {
     struct inode *file = NULL;
+    uint32_t fmode = 0;
     if (!(a4 & 0x20)) {                 /* not MAP_ANONYMOUS */
         struct file *f = fd_get(a5);
         if (!f)
@@ -877,14 +938,89 @@ SYSCALL(sys_mmap2)
         if (f->ops && f->ops->mmap)     /* device memory (/dev/fb0) */
             return mm_mmap_device(a1, a2, a3, a4, f, a6 * 4096);
         file = f->inode;
+        fmode = f->flags;
     }
-    return mm_mmap(a1, a2, a3, a4, file, a6 * 4096);
+    return mm_mmap(a1, a2, a3, a4, file, a6 * 4096, fmode);
 }
 
 /* int munmap(void *addr, size_t len) */
 SYSCALL(sys_munmap)
 {
     return mm_munmap(a1, a2);
+}
+
+/* mremap(old, old_len, new_len, flags, new_addr) */
+SYSCALL(sys_mremap)
+{
+    return mm_mremap(a1, a2, a3, a4, a5);
+}
+
+/* membarrier: on one CPU a syscall is already a barrier. QUERY names
+   the commands we accept so musl and Firefox stop retrying ENOSYS. */
+#define MEMBARRIER_CMD_QUERY                      0
+#define MEMBARRIER_CMD_GLOBAL                     (1u << 0)
+#define MEMBARRIER_CMD_GLOBAL_EXPEDITED           (1u << 1)
+#define MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED  (1u << 2)
+#define MEMBARRIER_CMD_PRIVATE_EXPEDITED          (1u << 3)
+#define MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED (1u << 4)
+#define MEMBARRIER_CMDS (MEMBARRIER_CMD_GLOBAL | MEMBARRIER_CMD_GLOBAL_EXPEDITED | \
+                         MEMBARRIER_CMD_REGISTER_GLOBAL_EXPEDITED | \
+                         MEMBARRIER_CMD_PRIVATE_EXPEDITED | \
+                         MEMBARRIER_CMD_REGISTER_PRIVATE_EXPEDITED)
+
+SYSCALL(sys_membarrier)
+{
+    if (a1 == MEMBARRIER_CMD_QUERY)
+        return (int32_t)MEMBARRIER_CMDS;
+    if (a1 & ~MEMBARRIER_CMDS)
+        return -EINVAL;
+    return 0;
+}
+
+/* prctl: Firefox names threads and asks a few process flags. The ones
+   that need real machinery (seccomp, capability bounding) stay EINVAL. */
+#define PR_SET_PDEATHSIG     1
+#define PR_GET_PDEATHSIG     2
+#define PR_GET_DUMPABLE      3
+#define PR_SET_DUMPABLE      4
+#define PR_SET_NAME         15
+#define PR_GET_NAME         16
+#define PR_SET_NO_NEW_PRIVS 38
+#define PR_GET_NO_NEW_PRIVS 39
+
+SYSCALL(sys_prctl)
+{
+    struct thread *t = thread_current();
+    switch (a1) {
+    case PR_SET_NAME: {
+        char name[16];
+        if (copy_from_user(name, (void *)a2, sizeof name) < 0)
+            return -EFAULT;
+        name[sizeof name - 1] = '\0';
+        thread_set_name(t, name);
+        return 0;
+    }
+    case PR_GET_NAME:
+        if (copy_to_user((void *)a2, t->name, sizeof t->name) < 0)
+            return -EFAULT;
+        return 0;
+    case PR_SET_PDEATHSIG:
+    case PR_GET_PDEATHSIG:
+    case PR_GET_DUMPABLE:
+    case PR_SET_DUMPABLE:
+    case PR_SET_NO_NEW_PRIVS:
+    case PR_GET_NO_NEW_PRIVS:
+        if (a1 == PR_GET_DUMPABLE || a1 == PR_GET_NO_NEW_PRIVS)
+            return 0;                   /* "not dumpable" / "no new privs" */
+        if (a1 == PR_GET_PDEATHSIG) {
+            uint32_t zero = 0;
+            if (copy_to_user((void *)a2, &zero, 4) < 0)
+                return -EFAULT;
+        }
+        return 0;
+    default:
+        return -EINVAL;
+    }
 }
 
 /* int mprotect(void *addr, size_t len, int prot) */
@@ -936,6 +1072,7 @@ static const syscall_fn syscall_table[] = {
     [NR_ftruncate]  = sys_ftruncate,
     [NR_fchmod]     = sys_fchmod,
     [NR_sysinfo]    = sys_sysinfo,
+    [NR_ipc]        = sys_ipc,
     [NR_fsync]      = sys_fsync,
     [NR_clone]      = sys_clone,
     [NR_uname]      = sys_uname,
@@ -952,6 +1089,7 @@ static const syscall_fn syscall_table[] = {
     [NR_ugetrlimit] = sys_getrlimit,
     [NR_truncate64] = sys_truncate64,
     [NR_ftruncate64] = sys_ftruncate64,
+    [NR_fallocate]  = sys_fallocate,
     [NR_lchown32]   = sys_lchown32,
     [NR_getuid32]   = sys_getuid,
     [NR_getgid32]   = sys_getgid,
@@ -971,11 +1109,18 @@ static const syscall_fn syscall_table[] = {
     [NR_setgid32]   = sys_setgid,
     [NR_setfsuid32] = sys_setfsuid,
     [NR_setfsgid32] = sys_setfsgid,
+    [NR_mincore]    = sys_nop,
+    [NR_readahead]  = sys_nop,
     [NR_madvise]    = sys_nop,
     [NR_sched_getaffinity] = sys_getaffinity,
     [NR_set_thread_area] = sys_set_thread_area,
     [NR_get_thread_area] = sys_get_thread_area,
     [NR_set_tid_address] = sys_set_tid_address,
+    [NR_timer_create]    = sys_timer_create,
+    [NR_timer_settime]   = sys_timer_settime,
+    [NR_timer_gettime]   = sys_timer_gettime,
+    [NR_timer_getoverrun] = sys_timer_getoverrun,
+    [NR_timer_delete]    = sys_timer_delete,
     [NR_statfs64]   = sys_statfs64,
     [NR_fstatfs64]  = sys_fstatfs64,
     [NR_clock_gettime]   = sys_clock_gettime,
@@ -996,6 +1141,7 @@ static const syscall_fn syscall_table[] = {
     [NR_prlimit64]  = sys_prlimit64,
     [NR_renameat2]  = sys_renameat2,
     [NR_getrandom]  = sys_getrandom,
+    [NR_memfd_create] = sys_memfd_create,
     [NR_socketcall] = sys_socketcall,
     [NR_socket]     = sys_socket,
     [NR_socketpair] = sys_socketpair,
@@ -1015,6 +1161,8 @@ static const syscall_fn syscall_table[] = {
     [NR_clock_gettime64]  = sys_clock_gettime64,
     [NR_clock_getres_time64] = sys_clock_getres64,
     [NR_clock_nanosleep_time64] = sys_clock_nanosleep64,
+    [NR_timer_gettime64] = sys_timer_gettime64,
+    [NR_timer_settime64] = sys_timer_settime64,
     [NR_utimensat_time64] = sys_utimensat64,
     [NR_pselect6_time64] = sys_pselect64,
     [NR_ppoll_time64]    = sys_ppoll64,
@@ -1038,6 +1186,8 @@ static const syscall_fn syscall_table[] = {
     [NR_fchdir]     = sys_fchdir,
     [NR_readv]      = sys_readv,
     [NR_writev]     = sys_writev,
+    [NR_pread64]    = sys_pread64,
+    [NR_pwrite64]   = sys_pwrite64,
     [NR_getcwd]     = sys_getcwd,
     [NR_getdents64] = sys_getdents64,
     [NR_fcntl64]    = sys_fcntl,
@@ -1066,11 +1216,17 @@ static const syscall_fn syscall_table[] = {
     [NR_getitimer]  = sys_getitimer,
     [NR_rt_sigpending]  = sys_rt_sigpending,
     [NR_rt_sigsuspend]  = sys_rt_sigsuspend,
+    [NR_rt_sigtimedwait] = sys_rt_sigtimedwait,
+    [NR_rt_sigtimedwait_time64] = sys_rt_sigtimedwait64,
     [NR_tkill]      = sys_tkill,
     [NR_tgkill]     = sys_tgkill,
     [NR__llseek]    = sys_llseek,
     [NR_vfork]      = sys_fork,
     [NR_mmap2]      = sys_mmap2,
+    [NR_mremap]     = sys_mremap,
+    [NR_prctl]      = sys_prctl,
+    [NR_eventfd2]   = sys_eventfd2,
+    [NR_membarrier] = sys_membarrier,
     [NR_exit_group] = sys_exit_group,
     [NR_gettid]     = sys_gettid,
     [NR_futex]      = sys_futex,
@@ -1095,9 +1251,12 @@ int32_t syscall_dispatch(uint32_t nr, uint32_t a1, uint32_t a2, uint32_t a3,
        Many programs try a new call first and fall back to an old one, so
        -ENOSYS is often fine. */
     static uint32_t logged[512 / 32];
-    if (nr < 512 && !(logged[nr / 32] & (1u << (nr % 32)))) {
+    const char *who = thread_current()->name;
+    int again = nr < 512 && (logged[nr / 32] & (1u << (nr % 32)));
+    int watch = who[0] == 'f' && who[1] == 'i' && who[2] == 'r'; /* firefox */
+    if (nr < 512 && !again)
         logged[nr / 32] |= 1u << (nr % 32);
-        klog("syscall %lu not implemented (%s)\n", nr, thread_current()->name);
-    }
+    if (!again || watch)
+        klog("syscall %lu not implemented (%s)\n", nr, who);
     return -ENOSYS;
 }

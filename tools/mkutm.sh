@@ -11,7 +11,10 @@
 # Double-click it in Finder and UTM opens it. The machine is set up like an
 # old PC, the way MyOS expects (values checked against UTM 4.6.4's source):
 #
-#   - i440FX + PIIX chipset ("pc"), Pentium III CPU, 256 MiB, IDE disks
+#   - i440FX + PIIX chipset ("pc"), Pentium III + SSE2 (the real targets
+#     are a Pentium 4 / Pentium M, which have SSE2; Alpine Firefox needs
+#     it), 256 MiB (1024 MiB for the live disk: Firefox will not start in
+#     256), IDE disks
 #   - "VGA" display = QEMU's std VGA (Bochs, 1234:1111): MyOS's DRM driver
 #     switches it to 1920x1200 with a pixel console and /dev/fb0
 #   - USB off and the PS/2 controller on: with USB on, UTM gives the machine
@@ -43,11 +46,18 @@
 # once: running this again keeps it (delete it for a fresh one).
 set -e
 installed=0
+replace_disk=0
+memory=256
 net=Shared
 debug_port=
 while :; do
     case "$1" in
     --installed) installed=1; shift ;;
+    # Overwrite the system disk even if this VM already exists. Default for
+    # --installed is to keep it (your files). The live image is the software
+    # on the disk, so `make utm-live` always replaces it.
+    --replace-disk) replace_disk=1; shift ;;
+    --memory) memory=$2; shift 2 ;;
     # shared | emulated | bridged; see the note above. Capitalised for the
     # plist, which is how UTM writes it.
     --net) net=$(echo "$2" | tr '[:lower:]' '[:upper:]' | cut -c1)$(echo "$2" | cut -c2-); shift 2 ;;
@@ -104,7 +114,7 @@ mkdir -p "$out/Data"
 # qcow2: UTM lets QEMU guess the disk format, and qcow2 is never guessed wrong.
 # Written under another name, then renamed over the old one: a VM that is
 # running keeps the disk it opened, and its next start gets the new one.
-if [ $installed = 1 ] && [ -f "$out/Data/$DISK_UUID.qcow2" ]; then
+if [ $installed = 1 ] && [ $replace_disk = 0 ] && [ -f "$out/Data/$DISK_UUID.qcow2" ]; then
     echo "Kept the system disk in $out (your files); delete it for a fresh one"
 else
     qemu-img convert -q -f raw -O qcow2 "$img" "$out/Data/$DISK_UUID.qcow2.new"
@@ -263,7 +273,7 @@ $DATA_DRIVE
 		<key>Architecture</key>
 		<string>i386</string>
 		<key>CPU</key>
-		<string>pentium3</string>
+		<string>pentium3,+sse2</string>
 		<key>CPUCount</key>
 		<integer>1</integer>
 		<key>CPUFlagsAdd</key>
@@ -275,7 +285,7 @@ $DATA_DRIVE
 		<key>JITCacheSize</key>
 		<integer>0</integer>
 		<key>MemorySize</key>
-		<integer>256</integer>
+		<integer>$memory</integer>
 		<key>Target</key>
 		<string>pc</string>
 	</dict>

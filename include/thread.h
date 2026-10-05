@@ -160,6 +160,9 @@ int thread_ready_count(void);
    Interrupts must be off. */
 void thread_switch(struct thread *next);
 
+/* Saved user GS (set_thread_area): `pop gs` on the way back to user. */
+void thread_set_saved_gs(struct thread *t, uint32_t gs);
+
 /* Put t's thread-local storage segments into the GDT (set_thread_area). */
 void thread_load_tls(struct thread *t);
 

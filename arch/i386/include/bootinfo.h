@@ -12,6 +12,7 @@
 
 #define BOOTINFO_PHYS 0x1000
 #define E820_MAX      32
+#define BOOTINFO_FB_MAGIC 0x3242464Du   /* 'MFB2': GOP/simplefb fields are valid */
 
 /* E820 region types */
 #define E820_USABLE        1    /* normal RAM, free for us */
@@ -33,9 +34,25 @@ struct bootinfo {
     uint32_t count;                 /* number of E820 entries */
     struct e820_entry entries[E820_MAX];
     uint32_t font_phys;             /* the BIOS's 8x16 font, 4 KiB (0 = none) */
+    /* UEFI GOP (0 on a BIOS boot: stage 2 writes zeros). */
+    uint32_t fb_magic;
+    uint32_t fb_phys;
+    uint32_t fb_pitch;              /* bytes per line */
+    uint32_t fb_width;
+    uint32_t fb_height;
+    uint32_t fb_bpp;
+    uint32_t fb_format;             /* 0 = XRGB8888 (R at 16), 1 = RGBX (R at 0) */
+    uint32_t fb_phys_hi;            /* physical bits 63:32 (0 if below 4 GiB) */
 } __attribute__((packed));
+
+static inline uint64_t bootinfo_fb_phys(const struct bootinfo *bi)
+{
+    return (uint64_t)bi->fb_phys | ((uint64_t)bi->fb_phys_hi << 32);
+}
 
 _Static_assert(__builtin_offsetof(struct bootinfo, font_phys) == 12 + E820_MAX * 24,
                "BOOTINFO_FONT in layout.inc");
+_Static_assert(__builtin_offsetof(struct bootinfo, fb_magic) == 16 + E820_MAX * 24,
+               "fb_magic follows font_phys");
 
 #endif

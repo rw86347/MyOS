@@ -77,31 +77,64 @@ volatile void *ioremap(uint32_t phys, uint32_t size)
  */
 volatile void *ioremap_wc(uint32_t phys, uint32_t size)
 {
-    static uint32_t next = WC_WINDOW;
-    uint32_t off = phys & (PAGE_SIZE - 1);
-    uint32_t start = phys - off;
-    uint32_t len = (off + size + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    return ioremap_wc64(phys, size);
+}
 
-    /* Same offset inside a 4 MiB page as phys, so big pages line up. */
-    uint32_t va = (next & ~(BIG_PAGE - 1)) | (start & (BIG_PAGE - 1));
-    if (va < next)
-        va += BIG_PAGE;
-    if (!size || va < WC_WINDOW || len > WC_WINDOW_END - va)   /* wraps: room to 4 GiB */
+volatile void *ioremap_wc64(uint64_t phys, uint32_t size)
+{
+    static uint32_t next = WC_WINDOW;
+    uint32_t flags = PTE_WRITABLE | wc_flags;
+    uint32_t off, len, va, done;
+
+    if (!size)
         return NULL;
 
-    uint32_t flags = PTE_WRITABLE | wc_flags;
-    for (uint32_t done = 0; done < len; ) {
-        uint32_t v = va + done, p = start + done;
-        if (!((v | p) & (BIG_PAGE - 1)) && len - done >= BIG_PAGE) {
-            if (vmm_map_big(v, p, flags) < 0)
+    /* Above 4 GiB a 32-bit PTE cannot store the address. 4 MiB PSE-36
+       pages can (bits 39:32 live in the directory entry). */
+    if (phys > 0xFFFFFFFFull || phys + size - 1 > 0xFFFFFFFFull) {
+        uint64_t start, end;
+
+        if (!cpu_has(CPU_PSE36))
+            return NULL;
+        start = phys & ~((uint64_t)BIG_PAGE - 1);
+        end = (phys + size + BIG_PAGE - 1) & ~((uint64_t)BIG_PAGE - 1);
+        len = (uint32_t)(end - start);
+        off = (uint32_t)(phys - start);
+        va = (next & ~(BIG_PAGE - 1)) | (uint32_t)(start & (BIG_PAGE - 1));
+        if (va < next)
+            va += BIG_PAGE;
+        if (va < WC_WINDOW || len > WC_WINDOW_END - va)
+            return NULL;
+        for (done = 0; done < len; done += BIG_PAGE) {
+            if (vmm_map_big(va + done, start + done, flags) < 0)
                 return NULL;
-            done += BIG_PAGE;
-        } else {
-            if (vmm_map(v, p, flags) < 0)
-                return NULL;
-            done += PAGE_SIZE;
         }
+        next = va + len;
+        return (volatile void *)(va + off);
     }
-    next = va + len;
-    return (volatile void *)(va + off);
+
+    off = (uint32_t)phys & (PAGE_SIZE - 1);
+    {
+        uint32_t start = (uint32_t)phys - off;
+        len = (off + size + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+        va = (next & ~(BIG_PAGE - 1)) | (start & (BIG_PAGE - 1));
+        if (va < next)
+            va += BIG_PAGE;
+        if (va < WC_WINDOW || len > WC_WINDOW_END - va)
+            return NULL;
+        for (done = 0; done < len; ) {
+            uint32_t v = va + done, p = start + done;
+            if (!((v | p) & (BIG_PAGE - 1)) && len - done >= BIG_PAGE) {
+                if (vmm_map_big(v, p, flags) < 0)
+                    return NULL;
+                done += BIG_PAGE;
+            } else {
+                if (vmm_map(v, p, flags) < 0)
+                    return NULL;
+                done += PAGE_SIZE;
+            }
+        }
+        next = va + len;
+        return (volatile void *)(va + off);
+    }
 }

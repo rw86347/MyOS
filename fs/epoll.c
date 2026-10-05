@@ -167,7 +167,7 @@ static int32_t create(uint32_t flags)
         return fd;
     }
     if (flags & EPOLL_CLOEXEC)
-        proc_current()->cloexec |= 1u << fd;
+        proc_current()->cloexec |= 1ull << fd;
     return fd;
 }
 

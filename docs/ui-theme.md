@@ -21,6 +21,10 @@ generated files by hand.
 | `mockup.svg`, `mockup.png`, `mockup@2x.png` | a 1024×768 desktop built from the pieces |
 | `icon-sheet.svg`, `icon-sheet.png` | every icon with its name |
 | `ui-states.svg`, `ui-states.png` | every element in every state |
+| `login.svg`, `login.png`, `login@2x.png` | the login screen |
+| `settings.svg`, `settings.png` | Settings open on Users (create account) |
+| `settings-wifi.svg`, `settings-wifi.png` | Settings open on Wi-Fi |
+| `settings-general.svg`, `settings-general.png` | Settings open on General |
 
 The color tables under "Elements and states" are written by the script too, from the
 same table it draws with. Change a color in the script, not in this file.
@@ -56,6 +60,7 @@ The first ideas (`assets/themes/myos-xp-*.jpg`, `start-button-options.*`,
 | file view | 48 px icons on a 120×100 px grid |
 | status bar | 23 px, at the bottom of the window |
 | start menu | 390×430 px, right above the taskbar, flush with the left edge; header 56 px (logo 40 px, user name bold 18 px); left column 210 px white (40 px icons, name and one line under it); right column sand (32 px icons, teal bold names); footer 46 px (30 px round Log off and Turn off) |
+| hot corner | the top-right corner of the desktop: a 24 px page curl, as if the wallpaper's corner is folded over. Moving the mouse into the corner shows all windows side by side, like Mission Control on the Mac; the curl grows to 40 px as it starts. Always drawn above the wallpaper, below windows |
 | desktop icons | 48 px, a column at the left, 82 px apart; white 12 px labels with a dark shadow |
 
 ## Base palette
@@ -92,6 +97,58 @@ Icon colors: folders `#fff0a8` → `#ffd84d` → `#f0b22a` (back `#e9b53a` → `
 outline `#a87412`); globes `#9fd8ff` → `#1f6fd1` → `#0f3f8a` (radial); screens
 `#0d1a12` with `#5cf27a` green; disks `#4a6c8f` → `#1d3554`; paper `#ffffff` →
 `#e3e8ee` with `#7d8a96` outlines and `#6a9fd4` lines; the key `#e0a52c`.
+
+## Login screen
+
+![Login screen](../assets/themes/golden-hour/login.png)
+
+The same wallpaper as the desktop, blurred and tinted dark teal, so the desktop
+seems to come into focus when you log on.
+
+| part | size and place |
+|---|---|
+| top band | 64 px; "Welcome" in bold italic Trebuchet MS 22 px on the right |
+| bottom band | 80 px; Turn off (36 px icon, 15 px text) on the left; a two-line hint in 12 px light teal on the right |
+| golden lines | 2 px where each band meets the middle, fading out at both ends |
+| left side | the logo (108 px) and "MyOS" (bold italic 54 px), both right-aligned to x = 470; "To begin, click your user name" in 15 px light teal under them |
+| divider | a 1.5 px white line at the center (x = 511), fading out at the top and bottom |
+| user tiles | start at x = 548, 400 px wide. The selected tile is 120 px high, with a 72 px picture, the name (bold 22 px), "Type your password", a 220x26 password box (a focused text box) and a 30 px green go button. Other users: 56 px picture, name 20 px, one line under it, at 85% |
+| user pictures | 8 px corners, 2 px white border; a piece of the wallpaper, or a white silhouette on teal for users without one |
+
+The colors are in the tables below under "Login background", "Login bands" and "User tile".
+
+## Settings
+
+![Settings: Users](../assets/themes/golden-hour/settings.png)
+
+The Settings window follows the same category order as macOS System Settings,
+without Apple-only items (iCloud, Wallet, Family, and the like). **Wi-Fi is in
+the same place as on the Mac**: just under Software Update, above Bluetooth.
+The page is there even though the kernel cannot join a network yet.
+
+| part | size and place |
+|---|---|
+| window | 988×706 px, 8 px from the left and top; title "Settings" |
+| sidebar | 220 px, sand; Search box; the signed-in user; then the category list |
+| selected row | the menu-highlight teal bar |
+| group breaks | a thin `border` line, matching the Mac's spacing |
+| Users | each account is a 64 px row (picture, name, Administrator or Standard). **Create New User...** asks for the administrator password first, the same way the Mac does, then Continue opens the new-account fields (name, password, account type) |
+| Wi-Fi | an Off toggle and a note that the kernel does not support it yet; the list of networks will appear here when it does |
+| General | a list of rows (About, Software Update, Storage, Date & Time, Language, Sharing, Startup Disk, Transfer or Reset), each with a chevron, like the Mac |
+
+### Sidebar, top to bottom
+
+1. Search
+2. the signed-in user (rodger, Administrator)
+3. Software Update
+4. **Wi-Fi**, Bluetooth, Network, VPN, Battery
+5. General, Accessibility, Appearance, Desktop & Taskbar, Displays, Wallpaper, Notifications, Sound, Lock Screen, Privacy & Security, Password, **Users**
+6. Keyboard, Mouse, Printers
+
+Creating a user: only an administrator can do it. Clicking Create New User...
+opens a dialog that asks for that administrator's password. Cancel or a wrong
+password leaves the list unchanged. Continue then asks for the new name,
+password, and whether the account is Administrator or Standard.
 
 ## Elements and states
 
@@ -249,6 +306,41 @@ The little note that appears under the mouse.
 |---|---|---|---|---|
 | normal | `#fff7dd` flat | `#c9a24a` 1 px | `#1d2430` | 11 px Verdana; shadow 0/2 px, blur 2, black 25% |
 
+### Hot corner
+
+The top-right corner of the desktop: the wallpaper curls over; move the mouse into the corner to see all windows (like Mission Control on the Mac).
+
+| state | fill | border | text / glyph | notes |
+|---|---|---|---|---|
+| normal | top to bottom: `#0f5560` → `#0e2c52` | `#b9a37a` 1 px | - | fill is what shows under the curl; the flap is the back of the wallpaper, lit along the fold, `#b9a37a` edge, shadow -1/1.5 px, blur 1.5, black 35% |
+| hover | top to bottom: `#1f7f86` → `#0e2c52` | `#b9a37a` 1 px | - | the mouse is in the corner: the curl grows to 40 px in 120 ms, then the windows spread out |
+
+### Login background
+
+The middle of the login screen.
+
+| state | fill | border | text / glyph | notes |
+|---|---|---|---|---|
+| normal | top to bottom: `#0e2c52` (55% opaque) at 0% → `#0f5560` (35% opaque) at 50% → `#0e2c52` (70% opaque) at 100% | none | - | drawn over the wallpaper, which is blurred (Gaussian, 6 px) |
+
+### Login bands
+
+The bands at the top (64 px) and bottom (80 px) of the login screen.
+
+| state | fill | border | text / glyph | notes |
+|---|---|---|---|---|
+| normal | top to bottom: `#0e2c52` → `#133f63` | none | - | the bottom band runs the other way; a 2 px golden line where each band meets the middle, left to right: clear → `#ffc56b` → clear |
+
+### User tile
+
+One per user on the login screen; 380x84 px, 10 px corners.
+
+| state | fill | border | text / glyph | notes |
+|---|---|---|---|---|
+| normal | none (clear) | none | `#ffffff` | the picture at 85% |
+| hover | left to right: `#ffffff` (16% opaque) at 0% → `#ffffff` (3% opaque) at 100% | `#7fb6e6` 1 px | `#ffffff` |  |
+| selected | left to right: `#ffffff` (28% opaque) at 0% → `#ffffff` (6% opaque) at 100% | `#ffc56b` 1.5 px | `#ffffff` | the golden border is the theme's name; shows the password box (a focused text box) and the green go button |
+
 <!-- colors:end -->
 
 ## Fonts
@@ -287,6 +379,11 @@ cheaper than drawing outlines on the old PCs.
 | `minimize`, `maximize`, `close` | title-bar buttons |
 | `recycle` | Recycle, "Delete this file" |
 | `tray-network`, `tray-volume` | the tray (white, for the dark taskbar) |
+| `wifi`, `bluetooth`, `vpn`, `battery` | Settings: the network group (Wi-Fi sits where it does on the Mac) |
+| `users`, `password`, `lock`, `privacy` | Settings: Users, Password, Lock Screen, Privacy & Security |
+| `display`, `wallpaper`, `desktop`, `appearance` | Settings: Displays, Wallpaper, Desktop & Taskbar, Appearance |
+| `keyboard`, `mouse`, `printer`, `sound` | Settings: Keyboard, Mouse, Printers, Sound |
+| `accessibility`, `notifications`, `updates`, `about`, `datetime` | Settings: Accessibility, Notifications, Software Update, About, Date & Time |
 
 Icons are drawn on a 48×48 grid with a 1.2–1.6 px darker outline, so they stay
 readable on both the white and sand panels. They are rendered at the sizes the

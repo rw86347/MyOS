@@ -28,6 +28,7 @@
 #include <drm/drm_simple_kms_helper.h>
 #include <errno.h>
 #include <kheap.h>
+#include <linux/fb.h>
 #include <linux/io.h>
 #include <string.h>
 #include "drm_internal.h"
@@ -233,6 +234,8 @@ int drm_dev_register(struct drm_device *dev, unsigned long flags)
 void drm_init(void)
 {
     bochs_init();
+    if (!fb_get(0))
+        simplefb_init();            /* real UEFI hardware: no Bochs card */
 }
 
 /* --- the simple display pipe --------------------------------------------- */

@@ -28,6 +28,7 @@ void drm_blank(struct drm_device *dev, int blank);
 
 /* The display drivers' entry points, called by drm_init. */
 void bochs_init(void);
+void simplefb_init(void);           /* UEFI GOP, if the loader left one */
 
 /* Can the driver show this mode? (Checks the pipe's mode_valid.) */
 enum drm_mode_status drm_mode_check(struct drm_device *dev, const struct drm_display_mode *mode);

@@ -223,6 +223,20 @@ static int32_t ram_write(struct file *f, const void *user_buf, uint32_t n)
 
 const struct file_ops ram_ops = { .read = ram_read, .write = ram_write };
 
+uint32_t ramfs_page(struct inode *i, uint32_t idx)
+{
+    if (grow_table(i, idx + 1) < 0)
+        return 0;
+    if (!i->pages[idx]) {
+        uint32_t frame = page_new();
+        if (!frame)
+            return 0;
+        memset(P2V(frame), 0, PAGE_SIZE);
+        i->pages[idx] = frame;
+    }
+    return i->pages[idx];
+}
+
 int file_truncate(struct inode *i, uint32_t size)
 {
     int err = make_writable(i, min(size, i->size));

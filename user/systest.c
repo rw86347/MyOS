@@ -128,7 +128,7 @@ int main(int argc, char **argv)
 
     /* 9. Limits, and a directory made and removed (fstest does more). */
     unsigned long long lim[2];
-    CHECK(syscall5(SYS_prlimit64, 0, 7, 0, (long)lim, 0) == 0 && lim[0] == 32);
+    CHECK(syscall5(SYS_prlimit64, 0, 7, 0, (long)lim, 0) == 0 && lim[0] == 64);
     CHECK(syscall3(SYS_mkdir, (long)"/newdir", 0755, 0) == 0);
     CHECK(syscall3(SYS_mkdir, (long)"/newdir", 0755, 0) == -EEXIST);
     CHECK(syscall3(SYS_rmdir, (long)"/newdir", 0, 0) == 0);
