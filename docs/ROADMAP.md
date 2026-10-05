@@ -231,9 +231,16 @@ Mark a step `[x]` only when its "Done when" check works.
   Branch `dualChip` started the tree shape: `ARCH=`, `phys_addr_t`,
   `live/packages.x86_64.txt`, `arch/x86_64/PORT`.
   First visible check (done): hello on QEMU + MSI (GOP at `0x400000000`).
-  x86_64 live userland built (`make ARCH=x86_64 live-uefi`). **In progress:**
-  full kernel port — see `docs/x86_64-PORT-PLAN.md` (paging, syscall, ELF64,
-  then Golden Hour on the same stick).
+  x86_64 live userland built (`make ARCH=x86_64 live-uefi`).
+  - [x] The portable kernel runs as x86_64 on QEMU + OVMF (2026-10-05): higher half,
+    4-level paging with copy-on-write fork, `syscall`/`sysret`, ELF64, signals, a
+    BusyBox shell (`make ARCH=x86_64 test-uefi-shell`). `docs/x86_64-PORT-PLAN.md`.
+  - [x] The system calls that were missing, on both CPUs (2026-10-05): sendfile,
+    times/getrusage, pause, clock setting + adjtimex, dmesg (syslog), chroot,
+    pivot_root, inotify, fcntl record locks, System V semaphores and message
+    queues, and x86_64's own layouts (statfs, select, shm*, ...). `user/sys/systest.c`.
+  - [ ] Next: the live desktop (`myos-login`, X) on the x86_64 kernel, then the
+    GPD Pocket 4 itself (ACPI, MSI, NVMe, xHCI).
 - [ ] **13. WiFi** — pick ONE chip with open docs (e.g. Atheros AR5xxx / ath5k), port driver + firmware loading,
   802.11 + WPA2 (run `wpa_supplicant` in user space).
   Done when: connects to a WPA2 network.

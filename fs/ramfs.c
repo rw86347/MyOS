@@ -204,8 +204,8 @@ static int32_t ram_write(struct file *f, const void *user_buf, uint32_t n)
             memset(P2V(frame), 0, PAGE_SIZE);
             i->pages[idx] = frame;
         }
-        if (copy_from_user((uint8_t *)P2V(i->pages[idx]) + in,
-                           (const uint8_t *)user_buf + done, k) < 0) {
+        if (file_copy_in(f, (uint8_t *)P2V(i->pages[idx]) + in,
+                         (const uint8_t *)user_buf + done, k) < 0) {
             if (!done)
                 return -EFAULT;
             break;
@@ -221,7 +221,7 @@ static int32_t ram_write(struct file *f, const void *user_buf, uint32_t n)
     return done;
 }
 
-const struct file_ops ram_ops = { .read = ram_read, .write = ram_write };
+const struct file_ops ram_ops = { .read = ram_read, .write = ram_write, .kbuf_ok = 1 };
 
 uint32_t ramfs_page(struct inode *i, uint32_t idx)
 {

@@ -15,8 +15,10 @@
 #include <bcache.h>
 #include <futex.h>
 #include <kprintf.h>
+#include <memlayout.h>
 #include <mm.h>
 #include <pcache.h>
+#include <pmm.h>
 #include <power.h>
 #include <proc.h>
 #include <serial.h>
@@ -25,19 +27,21 @@
 #include <syscalls.h>
 #include <string.h>
 #include <syscall.h>
+#include <syscall64.h>
 #include <thread.h>
 #include <tty.h>
 #include <uaccess.h>
 #include <vfs.h>
 
-/* Every handler gets the six argument registers; most use fewer. */
+/* Every handler gets the six argument registers; most use fewer. They are
+   register-sized (syscalls.h): on i386 uintptr_t is uint32_t. */
 #define U __attribute__((unused))
 #define SYSCALL(name) \
-    static int32_t name(uint32_t a1 U, uint32_t a2 U, uint32_t a3 U, \
-                        uint32_t a4 U, uint32_t a5 U, uint32_t a6 U)
+    static intptr_t name(uintptr_t a1 U, uintptr_t a2 U, uintptr_t a3 U, \
+                         uintptr_t a4 U, uintptr_t a5 U, uintptr_t a6 U)
 
-typedef int32_t (*syscall_fn)(uint32_t, uint32_t, uint32_t,
-                              uint32_t, uint32_t, uint32_t);
+typedef intptr_t (*syscall_fn)(uintptr_t, uintptr_t, uintptr_t,
+                               uintptr_t, uintptr_t, uintptr_t);
 
 /* --- files ------------------------------------------------------------------ */
 
@@ -60,7 +64,11 @@ typedef int32_t (*syscall_fn)(uint32_t, uint32_t, uint32_t,
  *
  * `at` is pread/pwrite's offset, or -1 for the file's own position.
  */
-static int32_t rw_at(uint32_t fd, uint32_t buf, uint32_t len, int writing, int64_t at)
+/* always_inline: each caller gets its own copy with `at` and `writing`
+   known, so read() and write() don't pay for pread's checks or a call with
+   five arguments — 40 cycles a read in make bench (docs/performance.md). */
+static inline __attribute__((always_inline))
+int32_t rw_at(uint32_t fd, uintptr_t buf, uintptr_t len, int writing, int64_t at)
 {
     struct file *f = fd_get(fd);
     if (!f)
@@ -103,14 +111,13 @@ static int32_t rw_at(uint32_t fd, uint32_t buf, uint32_t len, int writing, int64
     }
     int32_t rc = writing ? use->ops->write(use, (const void *)buf, len)
                          : use->ops->read(use, (void *)buf, len);
+    if (rc > 0)
+        notify(f->inode, writing ? IN_MODIFY : IN_ACCESS);
     file_put(f);
     return rc;
 }
 
-static int32_t rw(uint32_t fd, uint32_t buf, uint32_t len, int writing)
-{
-    return rw_at(fd, buf, len, writing, -1);
-}
+#define rw(fd, buf, len, writing) rw_at(fd, buf, len, writing, -1)
 
 /* ssize_t read(int fd, void *buf, size_t count) */
 SYSCALL(sys_read) { return rw(a1, a2, a3, 0); }
@@ -133,6 +140,95 @@ SYSCALL(sys_pwrite64)
     return at < 0 ? -EINVAL : rw_at(a1, a2, a3, 1, at);
 }
 
+/*
+ * ssize_t sendfile(int out_fd, int in_fd, off_t *offset, size_t count)
+ * (sendfile64 on i386; the offset is 64-bit on both): copy from a file to
+ * another file, pipe, terminal or socket without the bytes passing through
+ * the program. They go page cache -> one kernel page -> the destination,
+ * which takes them through file_copy_in (vfs.h): one copy fewer than
+ * read() + write(), and one syscall instead of two per piece. BusyBox's cat
+ * and cp use it.
+ *
+ * Like every syscall here it does at most RW_MAX bytes per call; callers
+ * loop, as they must anyway (a short count is allowed). A destination that
+ * can't take kernel memory (kbuf_ok) is -EINVAL, which makes the C library
+ * or the program fall back to read + write — the same as on Linux for a
+ * file that doesn't support it.
+ */
+SYSCALL(sys_sendfile)
+{
+    struct file *out = fd_get(a1), *in = fd_get(a2);
+    if (!out || !in)
+        return -EBADF;
+    if ((in->flags & O_ACCMODE) == O_WRONLY || (out->flags & O_ACCMODE) == O_RDONLY)
+        return -EBADF;
+    struct inode *src = in->inode;
+    /* The source must be file data the kernel can copy out: a regular file
+       in RAM or on a disk (not a /proc file, which is made up on reading). */
+    if (!S_ISREG(src->mode) || (src->ops && !src->fs))
+        return -EINVAL;
+    if (!out->ops->write || !out->ops->kbuf_ok || (out->flags & O_APPEND))
+        return -EINVAL;                 /* (O_APPEND: as on Linux) */
+    int64_t pos = in->pos;
+    if (a3 && copy_from_user(&pos, (const void *)a3, sizeof pos) < 0)
+        return -EFAULT;
+    if (pos < 0)
+        return -EINVAL;
+    uint32_t count = a4 > RW_MAX ? RW_MAX : (uint32_t)a4;
+    uint32_t page = pmm_alloc();
+    if (!page)
+        return -ENOMEM;
+    uint8_t *buf = P2V(page);
+
+    file_get(in);                       /* both can sleep below: hold them */
+    file_get(out);
+    int32_t done = 0, err = 0;
+    while ((uint32_t)done < count) {
+        if (pos >= src->size)
+            break;                      /* end of the file */
+        uint32_t k = count - done;
+        if (k > PAGE_SIZE)
+            k = PAGE_SIZE;
+        if (k > src->size - pos)
+            k = (uint32_t)(src->size - pos);
+        err = file_copy_out(src, (uint32_t)pos, buf, k);
+        if (err < 0)
+            break;
+        /* The destination's write, on a private copy of its open file that
+           says "kernel memory". Its position is carried back (a regular
+           file); a pipe, terminal or socket has none that matters. */
+        struct file w = *out;
+        w.kbuf = 1;
+        int32_t n = out->ops->write(&w, buf, k);
+        out->pos = w.pos;
+        if (n <= 0) {
+            err = n;
+            break;
+        }
+        done += n;
+        pos += n;
+        if ((uint32_t)n < k || signal_pending())
+            break;                      /* full, or someone wants us: return */
+    }
+    if (done > 0) {
+        notify(src, IN_ACCESS);
+        notify(out->inode, IN_MODIFY);
+    }
+    file_put(out);
+    file_put(in);
+    pmm_free(page);
+
+    if (done == 0 && err < 0)
+        return err;
+    if (a3) {
+        if (copy_to_user((void *)a3, &pos, sizeof pos) < 0)
+            return -EFAULT;
+    } else {
+        in->pos = (uint32_t)pos;
+    }
+    return done;
+}
+
 /* The directory a *at() call's dirfd means: NULL for AT_FDCWD (the
    current directory), else the open directory. 0, or -errno. */
 int dir_of(uint32_t dirfd, struct inode **dir)
@@ -151,7 +247,7 @@ int dir_of(uint32_t dirfd, struct inode **dir)
 }
 
 /* Copy a path from user memory. 0, or -errno. */
-int get_path(char *dst, uint32_t user_path)
+int get_path(char *dst, uintptr_t user_path)
 {
     long n = strncpy_from_user(dst, (const char *)user_path, PATH_MAX);
     if (n < 0)
@@ -159,7 +255,7 @@ int get_path(char *dst, uint32_t user_path)
     return n == 0 ? -ENOENT : 0;    /* "" is not a file name */
 }
 
-int32_t do_open(struct inode *dir, uint32_t user_path, uint32_t flags, uint32_t mode)
+int32_t do_open(struct inode *dir, uintptr_t user_path, uint32_t flags, uint32_t mode)
 {
     char path[PATH_MAX];
     int err = get_path(path, user_path);
@@ -267,27 +363,37 @@ _Static_assert(sizeof(struct statx) == 256, "struct statx must match Linux");
 
 #define STATX_BASIC_STATS 0x7FF     /* type, mode, nlink, uid, gid, times, ino, size, blocks */
 
+/* The file a stat call is about: the open file dirfd itself (fstat, with
+   AT_EMPTY_PATH), or a path relative to dirfd. 0, or -errno. */
+static int stat_target(uintptr_t dirfd, uintptr_t user_path, uint32_t flags,
+                       struct inode **out)
+{
+    if (flags & AT_EMPTY_PATH) {
+        struct file *f = fd_get(dirfd);
+        if (!f)
+            return -EBADF;
+        *out = f->inode;
+        return 0;
+    }
+    char path[PATH_MAX];
+    struct inode *dir;
+    int err = get_path(path, user_path);
+    if (!err)
+        err = dir_of(dirfd, &dir);
+    if (!err)                       /* lstat doesn't follow a final symlink */
+        err = vfs_lookup_at(dir, path, !(flags & AT_SYMLINK_NOFOLLOW), out);
+    return err;
+}
+
 /* int statx(int dirfd, const char *path, int flags, unsigned mask,
-             struct statx *buf) — what musl's stat(), fstat() and lstat() use. */
+             struct statx *buf) — what musl's stat(), fstat() and lstat() use
+   on i386. */
 SYSCALL(sys_statx)
 {
     struct inode *i;
-    if (a3 & AT_EMPTY_PATH) {       /* fstat: the open file dirfd itself */
-        struct file *f = fd_get(a1);
-        if (!f)
-            return -EBADF;
-        i = f->inode;
-    } else {
-        char path[PATH_MAX];
-        struct inode *dir;
-        int err = get_path(path, a2);
-        if (!err)
-            err = dir_of(a1, &dir);
-        if (!err)                   /* lstat doesn't follow a final symlink */
-            err = vfs_lookup_at(dir, path, !(a3 & AT_SYMLINK_NOFOLLOW), &i);
-        if (err)
-            return err;
-    }
+    int err = stat_target(a1, a2, a3, &i);
+    if (err)
+        return err;
 
     struct statx st;
     memset(&st, 0, sizeof st);
@@ -310,7 +416,7 @@ SYSCALL(sys_statx)
 }
 
 /* int pipe(int fds[2]) / pipe2(int fds[2], int flags) */
-static int32_t do_pipe(uint32_t user_fds, uint32_t flags)
+static int32_t do_pipe(uintptr_t user_fds, uint32_t flags)
 {
     struct file *rd, *wr;
     int err = pipe_create(&rd, &wr);
@@ -425,8 +531,8 @@ SYSCALL(sys_fcntl)
         if (!(f->inode->flags & I_MEMFD))
             return -EINVAL;
         return (int32_t)f->inode->fs_ino;
-    default:
-        return -EINVAL;
+    default:                            /* record locks: fs/lock.c */
+        return lock_fcntl_cmd(a2) ? lock_fcntl(f, a2, a3) : -EINVAL;
     }
 }
 
@@ -583,6 +689,31 @@ SYSCALL(sys_chdir)
     return 0;
 }
 
+/* int chroot(const char *path): path becomes this process's "/" — and its
+   children's (fs/vfs.c stops ".." there). Root only. The current directory
+   stays where it is, as on Linux; `chroot dir prog` (BusyBox) does
+   chdir("/") itself. */
+SYSCALL(sys_chroot)
+{
+    struct process *p = proc_current();
+    if (p->cred.euid != 0)
+        return -EPERM;
+    char path[PATH_MAX];
+    struct inode *i;
+    int err = get_path(path, a1);
+    if (!err)
+        err = vfs_lookup(path, &i);
+    if (err)
+        return err;
+    if (!S_ISDIR(i->mode))
+        return -ENOTDIR;
+    vfs_get(i);
+    if (p->root)
+        vfs_put(p->root);
+    p->root = i;
+    return 0;
+}
+
 SYSCALL(sys_fchdir)
 {
     struct file *f = fd_get(a1);
@@ -626,7 +757,7 @@ SYSCALL(sys_uaccess_test)
 /* ssize_t writev / readv(int fd, const struct iovec *iov, int count):
    several buffers in one call (musl's printf writes this way). Stops at
    the first short transfer, like Linux. */
-static int32_t do_iov(uint32_t fd, uint32_t user_iov, uint32_t count, int writing)
+static int32_t do_iov(uint32_t fd, uintptr_t user_iov, uint32_t count, int writing)
 {
     if (!fd_get(fd))
         return -EBADF;
@@ -634,10 +765,12 @@ static int32_t do_iov(uint32_t fd, uint32_t user_iov, uint32_t count, int writin
         return -EINVAL;
     int32_t total = 0;
     for (uint32_t i = 0; i < count; i++) {
-        uint32_t base, len;
-        if (get_user32(&base, user_iov + i * 8) < 0 ||
-            get_user32(&len, user_iov + i * 8 + 4) < 0)
+        user_addr_t base, len;          /* struct iovec: two pointer-sized words */
+        uintptr_t at = user_iov + i * 2 * sizeof base;
+        if (get_user_word(&base, at) < 0 || get_user_word(&len, at + sizeof base) < 0)
             return total ? total : -EFAULT;
+        if (len > 0x7FFFF000)
+            len = 0x7FFFF000;           /* Linux's limit for one transfer */
         if (len == 0)
             continue;
         /* One buffer at a time through rw(), so each gets the clamp and the
@@ -658,7 +791,7 @@ SYSCALL(sys_readv)  { return do_iov(a1, a2, a3, 0); }
 
 /* ssize_t readlink(const char *path, char *buf, size_t size) — and
    readlinkat with AT_FDCWD. No NUL is added (that's how Linux does it). */
-static int32_t do_readlink(struct inode *dir, uint32_t user_path, uint32_t buf, uint32_t size)
+static int32_t do_readlink(struct inode *dir, uintptr_t user_path, uintptr_t buf, uint32_t size)
 {
     char path[PATH_MAX];
     struct inode *i;
@@ -696,7 +829,7 @@ SYSCALL(sys_readlinkat)
    with no x bit. */
 #define X_OK 1
 
-static int32_t do_access(struct inode *dir, uint32_t user_path, uint32_t mode)
+static int32_t do_access(struct inode *dir, uintptr_t user_path, uint32_t mode)
 {
     char path[PATH_MAX];
     struct inode *i;
@@ -725,6 +858,16 @@ SYSCALL(sys_nop) { return 0; }
    the same (the cache doesn't know which blocks belong to which file). */
 /* File data first (it is in the page cache), then the metadata. */
 SYSCALL(sys_sync)  { pcache_sync(); bsync(); return 0; }
+
+/* syncfs(fd): the file system fd is on — here, all of them (the caches
+   don't keep them apart). */
+SYSCALL(sys_syncfs)
+{
+    if (!fd_get(a1))
+        return -EBADF;
+    pcache_sync();
+    return bsync();
+}
 SYSCALL(sys_fsync)
 {
     struct file *f = fd_get(a1);
@@ -814,6 +957,7 @@ SYSCALL(sys_sigreturn)      { return sys_sigreturn_impl(0); }
 SYSCALL(sys_rt_sigreturn)   { return sys_sigreturn_impl(1); }
 SYSCALL(sys_kill)           { return sys_kill_impl((int32_t)a1, a2); }
 SYSCALL(sys_rt_sigsuspend)  { return sys_rt_sigsuspend_impl(a1, a2); }
+SYSCALL(sys_pause)          { return sys_pause_impl(); }
 SYSCALL(sys_rt_sigpending)  { return sys_rt_sigpending_impl(a1, a2); }
 SYSCALL(sys_rt_sigtimedwait)   { return sys_rt_sigtimedwait_impl(a1, a2, a3, a4, 0); }
 SYSCALL(sys_rt_sigtimedwait64) { return sys_rt_sigtimedwait_impl(a1, a2, a3, a4, 1); }
@@ -915,13 +1059,20 @@ SYSCALL(sys_execve)
    and the older waitpid(pid, status, options). (No rusage yet.) */
 SYSCALL(sys_wait4)
 {
-    return proc_wait4((int32_t)a1, a2, (int32_t)a3);
+    return proc_wait4((int32_t)a1, a2, (int32_t)a3, a4);
+}
+
+/* waitpid(pid, status, options): wait4 without the rusage pointer (its
+   fourth register is whatever the program left there). i386 only. */
+SYSCALL(sys_waitpid)
+{
+    return proc_wait4((int32_t)a1, a2, (int32_t)a3, 0);
 }
 
 /* void *brk(void *addr) — the raw syscall: returns the (new) break. */
 SYSCALL(sys_brk)
 {
-    return (int32_t)mm_brk(a1);
+    return (intptr_t)mm_brk(a1);
 }
 
 /* void *mmap2(addr, len, prot, flags, fd, pgoffset): anonymous memory, or
@@ -1037,9 +1188,111 @@ SYSCALL(sys_clone)
     return proc_clone(a1, a2, a3, a4, a5);
 }
 
+#ifdef ARCH_X86_64
+/* --- x86_64: where its ABI differs from i386 -------------------------------
+   Most x86_64 system calls are the i386 ones with wider registers, and the
+   table below points straight at the same handlers. These adapters cover the
+   rest: an offset in bytes instead of pages, one 64-bit register instead of
+   two 32-bit halves, a different argument order, a different struct. */
+
+/* struct stat as x86_64 Linux lays it out (144 bytes; asm/stat.h). */
+struct stat64_x86_64 {
+    uint64_t st_dev, st_ino, st_nlink;
+    uint32_t st_mode, st_uid, st_gid, pad0;
+    uint64_t st_rdev;
+    int64_t  st_size, st_blksize, st_blocks;
+    uint64_t st_atime, st_atime_nsec, st_mtime, st_mtime_nsec, st_ctime, st_ctime_nsec;
+    int64_t  unused[3];
+};
+
+/* int newfstatat(int dirfd, const char *path, struct stat *buf, int flags):
+   musl's stat(), fstat(), lstat() and fstatat() on x86_64. */
+SYSCALL(sys_newfstatat)
+{
+    struct inode *i;
+    int err = stat_target(a1, a2, a4, &i);
+    if (err)
+        return err;
+    struct stat64_x86_64 st;
+    memset(&st, 0, sizeof st);
+    st.st_dev = i->mnt ? i->mnt->dev_minor : 1;     /* major 0 (as statx) */
+    st.st_ino = i->fs ? i->fs_ino : i->ino;
+    st.st_nlink = i->nlink;
+    st.st_mode = i->mode;
+    st.st_uid = i->uid;
+    st.st_gid = i->gid;
+    st.st_rdev = i->rdev;           /* (major << 8) | minor: Linux's encoding too */
+    st.st_size = i->size;
+    st.st_blksize = 4096;
+    st.st_blocks = (i->size + 511) / 512;
+    st.st_atime = i->atime ? i->atime : i->mtime;
+    st.st_mtime = i->mtime;
+    st.st_ctime = i->ctime ? i->ctime : i->mtime;
+    return copy_to_user((void *)a3, &st, sizeof st);
+}
+SYSCALL(sys_stat_x64)  { return sys_newfstatat(AT_FDCWD, a1, a2, 0, 0, 0); }
+SYSCALL(sys_lstat_x64) { return sys_newfstatat(AT_FDCWD, a1, a2, AT_SYMLINK_NOFOLLOW, 0, 0); }
+SYSCALL(sys_fstat_x64) { return sys_newfstatat(a1, 0, a2, AT_EMPTY_PATH, 0, 0); }
+
+/* mmap(addr, len, prot, flags, fd, offset): the offset is in bytes (mmap2's
+   is in pages), and must be page aligned. Lengths and offsets are 32-bit
+   inside (mm.c, files): bigger ones are refused, not cut short. */
+SYSCALL(sys_mmap_x64)
+{
+    if (a6 & (PAGE_SIZE - 1))
+        return -EINVAL;
+    if (a2 > 0xFFFFF000)
+        return -ENOMEM;
+    if (a6 > 0xFFFFFFFF)
+        return -EOVERFLOW;
+    return sys_mmap2(a1, a2, a3, a4, a5, a6 / PAGE_SIZE);
+}
+
+/* 64-bit file offsets come in one register, not as two halves. */
+SYSCALL(sys_lseek_x64)  { return do_seek(a1, (int64_t)a2, a3); }
+SYSCALL(sys_pread_x64)  { return (int64_t)a4 < 0 ? -EINVAL : rw_at(a1, a2, a3, 0, (int64_t)a4); }
+SYSCALL(sys_pwrite_x64) { return (int64_t)a4 < 0 ? -EINVAL : rw_at(a1, a2, a3, 1, (int64_t)a4); }
+
+/* clone(flags, stack, parent_tid, child_tid, tls): i386 has tls before
+   child_tid. */
+SYSCALL(sys_clone_x64) { return sys_clone(a1, a2, a3, a5, a4, 0); }
+
+/* nanosleep(req, rem): the timespecs are 64-bit, like i386's time64 ones.
+   Linux measures it on CLOCK_MONOTONIC. */
+SYSCALL(sys_nanosleep_x64) { return sys_clock_nanosleep64(1, 0, a1, a2, 0, 0); }
+
+/* struct rlimit is two 64-bit words here: the same as prlimit64's. */
+SYSCALL(sys_getrlimit_x64) { return sys_prlimit64(0, a1, 0, a2, 0, 0); }
+SYSCALL(sys_setrlimit_x64) { return sys_prlimit64(0, a1, a2, 0, 0, 0); }
+
+SYSCALL(sys_accept_x64) { return sys_accept4(a1, a2, a3, 0, 0, 0); }
+
+/* arch_prctl(code, addr): the thread's FS base, which is thread-local
+   storage on x86_64 (musl sets it once, before main). It lives in
+   thread->tls[0] and is written to the MSR at every switch (gdt.c). */
+#define ARCH_SET_FS 0x1002
+#define ARCH_GET_FS 0x1003
+SYSCALL(sys_arch_prctl)
+{
+    struct thread *t = thread_current();
+    switch (a1) {
+    case ARCH_SET_FS:
+        if (a2 >= USER_ADDR_END)
+            return -EPERM;          /* (a non-canonical one would fault in wrmsr) */
+        t->tls[0] = a2;
+        thread_load_tls(t);
+        return 0;
+    case ARCH_GET_FS:
+        return copy_to_user((void *)a2, &t->tls[0], sizeof t->tls[0]);
+    default:
+        return -EINVAL;
+    }
+}
+#endif
+
 /* --- the table ---------------------------------------------------------------- */
 
-static const syscall_fn syscall_table[] = {
+static const syscall_fn syscall_table[] U = {     /* (x86_64: unused, dropped) */
     [NR_exit]       = sys_exit,
     [NR_fork]       = sys_fork,
     [NR_creat]      = sys_creat,
@@ -1076,6 +1329,39 @@ static const syscall_fn syscall_table[] = {
     [NR_fsync]      = sys_fsync,
     [NR_clone]      = sys_clone,
     [NR_uname]      = sys_uname,
+    [NR_times]      = sys_times,
+    [NR_syncfs]     = sys_syncfs,
+    [NR_chroot]     = sys_chroot,
+    [NR_inotify_init] = sys_inotify_init,
+    [NR_inotify_init1] = sys_inotify_init1,
+    [NR_inotify_add_watch] = sys_inotify_add_watch,
+    [NR_inotify_rm_watch] = sys_inotify_rm_watch,
+    [NR_shmget]     = sys_shmget,
+    [NR_shmctl]     = sys_shmctl,
+    [NR_shmat]      = sys_shmat,
+    [NR_shmdt]      = sys_shmdt,
+    [NR_semget]     = sys_semget,
+    [NR_semctl]     = sys_semctl,
+    [NR_semtimedop_time64] = sys_semtimedop,
+    [NR_msgget]     = sys_msgget,
+    [NR_msgsnd]     = sys_msgsnd,
+    [NR_msgrcv]     = sys_msgrcv,
+    [NR_msgctl]     = sys_msgctl,
+    [NR_fadvise64_64] = sys_fadvise64_64,
+    [NR_pivot_root] = sys_pivot_root,
+    [NR_personality] = sys_personality,
+    [NR_capget]     = sys_capget,
+    [NR_capset]     = sys_capset,
+    [NR_unshare]    = sys_unshare,
+    [NR_setns]      = sys_setns,
+    [NR_swapon]     = sys_swapon,
+    [NR_syslog]     = sys_syslog,
+    [NR_swapoff]    = sys_swapon,
+    [NR_adjtimex]   = sys_adjtimex,
+    [NR_clock_adjtime] = sys_clock_adjtime,
+    [NR_clock_adjtime64] = sys_clock_adjtime64,
+    [NR_clock_settime64] = sys_clock_settime64,
+    [NR_getrusage]  = sys_getrusage,
     [NR_mprotect]   = sys_mprotect,
     [NR__newselect] = sys_select,
     [NR_fdatasync]  = sys_fsync,
@@ -1170,7 +1456,7 @@ static const syscall_fn syscall_table[] = {
     [NR_write]      = sys_write,
     [NR_open]       = sys_open,
     [NR_close]      = sys_close,
-    [NR_waitpid]    = sys_wait4,
+    [NR_waitpid]    = sys_waitpid,
     [NR_execve]     = sys_execve,
     [NR_chdir]      = sys_chdir,
     [NR_access]     = sys_access,
@@ -1188,6 +1474,7 @@ static const syscall_fn syscall_table[] = {
     [NR_writev]     = sys_writev,
     [NR_pread64]    = sys_pread64,
     [NR_pwrite64]   = sys_pwrite64,
+    [NR_sendfile64] = sys_sendfile,
     [NR_getcwd]     = sys_getcwd,
     [NR_getdents64] = sys_getdents64,
     [NR_fcntl64]    = sys_fcntl,
@@ -1212,6 +1499,7 @@ static const syscall_fn syscall_table[] = {
     [NR_rt_sigaction]   = sys_rt_sigaction,
     [NR_rt_sigprocmask] = sys_rt_sigprocmask,
     [NR_alarm]      = sys_alarm,
+    [NR_pause]      = sys_pause,
     [NR_setitimer]  = sys_setitimer,
     [NR_getitimer]  = sys_getitimer,
     [NR_rt_sigpending]  = sys_rt_sigpending,
@@ -1238,13 +1526,234 @@ static const syscall_fn syscall_table[] = {
 #endif
 };
 
-#define NSYSCALLS (sizeof syscall_table / sizeof syscall_table[0])
+#ifdef ARCH_X86_64
+/* Linux x86_64 numbers (arch/x86/entry/syscalls/syscall_64.tbl, our
+   include/syscall64.h). A gap means "not here yet": -ENOSYS, and a line in
+   the serial log. Calls whose structs differ from i386 (statfs, sigevent,
+   itimerval, timeval, ...) stay gaps until they get an adapter: -ENOSYS is
+   better than a struct of the wrong shape. */
+static const syscall_fn syscall_table64[] = {
+    [NR64_read]         = sys_read,
+    [NR64_write]        = sys_write,
+    [NR64_open]         = sys_open,
+    [NR64_close]        = sys_close,
+    [NR64_stat]         = sys_stat_x64,
+    [NR64_fstat]        = sys_fstat_x64,
+    [NR64_lstat]        = sys_lstat_x64,
+    [NR64_poll]         = sys_poll,
+    [NR64_lseek]        = sys_lseek_x64,
+    [NR64_mmap]         = sys_mmap_x64,
+    [NR64_mprotect]     = sys_mprotect,
+    [NR64_munmap]       = sys_munmap,
+    [NR64_brk]          = sys_brk,
+    [NR64_rt_sigaction] = sys_rt_sigaction,
+    [NR64_rt_sigprocmask] = sys_rt_sigprocmask,
+    [NR64_rt_sigreturn] = sys_rt_sigreturn,
+    [NR64_ioctl]        = sys_ioctl,
+    [NR64_pread64]      = sys_pread_x64,
+    [NR64_pwrite64]     = sys_pwrite_x64,
+    [NR64_readv]        = sys_readv,
+    [NR64_writev]       = sys_writev,
+    [NR64_access]       = sys_access,
+    [NR64_pipe]         = sys_pipe,
+    [NR64_sched_yield]  = sys_sched_yield,
+    [NR64_mremap]       = sys_mremap,
+    [NR64_mincore]      = sys_nop,
+    [NR64_madvise]      = sys_nop,
+    [NR64_dup]          = sys_dup,
+    [NR64_dup2]         = sys_dup2,
+    [NR64_nanosleep]    = sys_nanosleep_x64,
+    [NR64_pause]        = sys_pause,
+    [NR64_getitimer]    = sys_getitimer,
+    [NR64_alarm]        = sys_alarm,
+    [NR64_setitimer]    = sys_setitimer,
+    [NR64_getpid]       = sys_getpid,
+    [NR64_sendfile]     = sys_sendfile,
+    [NR64_socket]       = sys_socket,
+    [NR64_connect]      = sys_connect,
+    [NR64_accept]       = sys_accept_x64,
+    [NR64_sendto]       = sys_sendto,
+    [NR64_recvfrom]     = sys_recvfrom,
+    [NR64_sendmsg]      = sys_sendmsg,
+    [NR64_recvmsg]      = sys_recvmsg,
+    [NR64_shutdown]     = sys_shutdown,
+    [NR64_bind]         = sys_bind,
+    [NR64_listen]       = sys_listen,
+    [NR64_getsockname]  = sys_getsockname,
+    [NR64_getpeername]  = sys_getpeername,
+    [NR64_socketpair]   = sys_socketpair,
+    [NR64_setsockopt]   = sys_setsockopt,
+    [NR64_getsockopt]   = sys_getsockopt,
+    [NR64_clone]        = sys_clone_x64,
+    [NR64_fork]         = sys_fork,
+    [NR64_vfork]        = sys_fork,
+    [NR64_execve]       = sys_execve,
+    [NR64_exit]         = sys_exit,
+    [NR64_wait4]        = sys_wait4,
+    [NR64_kill]         = sys_kill,
+    [NR64_uname]        = sys_uname,
+    [NR64_fcntl]        = sys_fcntl,
+    [NR64_flock]        = sys_flock,
+    [NR64_fsync]        = sys_fsync,
+    [NR64_fdatasync]    = sys_fsync,
+    [NR64_truncate]     = sys_truncate,
+    [NR64_ftruncate]    = sys_ftruncate,
+    [NR64_getcwd]       = sys_getcwd,
+    [NR64_chdir]        = sys_chdir,
+    [NR64_fchdir]       = sys_fchdir,
+    [NR64_rename]       = sys_rename,
+    [NR64_mkdir]        = sys_mkdir,
+    [NR64_rmdir]        = sys_rmdir,
+    [NR64_creat]        = sys_creat,
+    [NR64_link]         = sys_link,
+    [NR64_unlink]       = sys_unlink,
+    [NR64_symlink]      = sys_symlink,
+    [NR64_readlink]     = sys_readlink,
+    [NR64_chmod]        = sys_chmod,
+    [NR64_fchmod]       = sys_fchmod,
+    [NR64_chown]        = sys_chown32,
+    [NR64_fchown]       = sys_fchown32,
+    [NR64_lchown]       = sys_lchown32,
+    [NR64_umask]        = sys_umask,
+    [NR64_getrlimit]    = sys_getrlimit_x64,
+    [NR64_getrusage]    = sys_getrusage,
+    [NR64_times]        = sys_times,
+    [NR64_gettimeofday] = sys_gettimeofday,
+    [NR64_time]         = sys_time,
+    [NR64_clock_settime] = sys_clock_settime64,
+    [NR64_adjtimex]     = sys_adjtimex,
+    [NR64_clock_adjtime] = sys_clock_adjtime,
+    [NR64_syncfs]       = sys_syncfs,
+    [NR64_chroot]       = sys_chroot,
+    [NR64_inotify_init] = sys_inotify_init,
+    [NR64_inotify_init1] = sys_inotify_init1,
+    [NR64_inotify_add_watch] = sys_inotify_add_watch,
+    [NR64_inotify_rm_watch] = sys_inotify_rm_watch,
+    [NR64_shmget]       = sys_shmget,
+    [NR64_shmat]        = sys_shmat,
+    [NR64_shmctl]       = sys_shmctl,
+    [NR64_shmdt]        = sys_shmdt,
+    [NR64_semget]       = sys_semget,
+    [NR64_semop]        = sys_semop,
+    [NR64_semctl]       = sys_semctl,
+    [NR64_semtimedop]   = sys_semtimedop,
+    [NR64_msgget]       = sys_msgget,
+    [NR64_msgsnd]       = sys_msgsnd,
+    [NR64_msgrcv]       = sys_msgrcv,
+    [NR64_msgctl]       = sys_msgctl,
+    [NR64_fadvise64]    = sys_fadvise64,
+    [NR64_fallocate]    = sys_fallocate64,
+    [NR64_statfs]       = sys_statfs,
+    [NR64_fstatfs]      = sys_fstatfs,
+    [NR64_select]       = sys_select,
+    [NR64_pivot_root]   = sys_pivot_root,
+    [NR64_personality]  = sys_personality,
+    [NR64_capget]       = sys_capget,
+    [NR64_capset]       = sys_capset,
+    [NR64_unshare]      = sys_unshare,
+    [NR64_setns]        = sys_setns,
+    [NR64_swapon]       = sys_swapon,
+    [NR64_syslog]       = sys_syslog,
+    [NR64_swapoff]      = sys_swapon,
+    [NR64_sysinfo]      = sys_sysinfo,
+    [NR64_getuid]       = sys_getuid,
+    [NR64_getgid]       = sys_getgid,
+    [NR64_setuid]       = sys_setuid,
+    [NR64_setgid]       = sys_setgid,
+    [NR64_geteuid]      = sys_geteuid,
+    [NR64_getegid]      = sys_getegid,
+    [NR64_setpgid]      = sys_setpgid,
+    [NR64_getppid]      = sys_getppid,
+    [NR64_getpgrp]      = sys_getpgrp,
+    [NR64_setsid]       = sys_setsid,
+    [NR64_setreuid]     = sys_setreuid,
+    [NR64_setregid]     = sys_setregid,
+    [NR64_getgroups]    = sys_getgroups,
+    [NR64_setgroups]    = sys_setgroups,
+    [NR64_setresuid]    = sys_setresuid,
+    [NR64_getresuid]    = sys_getresuid,
+    [NR64_setresgid]    = sys_setresgid,
+    [NR64_getresgid]    = sys_getresgid,
+    [NR64_getpgid]      = sys_getpgid,
+    [NR64_setfsuid]     = sys_setfsuid,
+    [NR64_setfsgid]     = sys_setfsgid,
+    [NR64_getsid]       = sys_getsid,
+    [NR64_rt_sigpending] = sys_rt_sigpending,
+    [NR64_rt_sigtimedwait] = sys_rt_sigtimedwait64,
+    [NR64_rt_sigsuspend] = sys_rt_sigsuspend,
+    [NR64_mknod]        = sys_mknod,
+    [NR64_getpriority]  = sys_getpriority,
+    [NR64_setpriority]  = sys_setpriority,
+    [NR64_prctl]        = sys_prctl,
+    [NR64_arch_prctl]   = sys_arch_prctl,
+    [NR64_setrlimit]    = sys_setrlimit_x64,
+    [NR64_sync]         = sys_sync,
+    [NR64_mount]        = sys_mount,
+    [NR64_umount2]      = sys_umount2,
+    [NR64_reboot]       = sys_reboot,
+    [NR64_sethostname]  = sys_sethostname,
+    [NR64_gettid]       = sys_gettid,
+    [NR64_readahead]    = sys_nop,
+    [NR64_tkill]        = sys_tkill,
+    [NR64_futex]        = sys_futex_time64,
+    [NR64_sched_getaffinity] = sys_getaffinity,
+    [NR64_epoll_create] = sys_epoll_create,
+    [NR64_getdents64]   = sys_getdents64,
+    [NR64_set_tid_address] = sys_set_tid_address,
+    [NR64_timer_create] = sys_timer_create,
+    [NR64_timer_settime] = sys_timer_settime64,
+    [NR64_timer_gettime] = sys_timer_gettime64,
+    [NR64_timer_getoverrun] = sys_timer_getoverrun,
+    [NR64_timer_delete] = sys_timer_delete,
+    [NR64_clock_gettime] = sys_clock_gettime64,
+    [NR64_clock_getres] = sys_clock_getres64,
+    [NR64_clock_nanosleep] = sys_clock_nanosleep64,
+    [NR64_exit_group]   = sys_exit_group,
+    [NR64_epoll_wait]   = sys_epoll_wait,
+    [NR64_epoll_ctl]    = sys_epoll_ctl,
+    [NR64_tgkill]       = sys_tgkill,
+    [NR64_openat]       = sys_openat,
+    [NR64_mkdirat]      = sys_mkdirat,
+    [NR64_mknodat]      = sys_mknodat,
+    [NR64_fchownat]     = sys_fchownat,
+    [NR64_newfstatat]   = sys_newfstatat,
+    [NR64_unlinkat]     = sys_unlinkat,
+    [NR64_renameat]     = sys_renameat,
+    [NR64_linkat]       = sys_link,
+    [NR64_symlinkat]    = sys_symlinkat,
+    [NR64_readlinkat]   = sys_readlinkat,
+    [NR64_fchmodat]     = sys_fchmodat,
+    [NR64_faccessat]    = sys_faccessat,
+    [NR64_pselect6]     = sys_pselect64,
+    [NR64_ppoll]        = sys_ppoll64,
+    [NR64_set_robust_list] = sys_nop,
+    [NR64_utimensat]    = sys_utimensat64,
+    [NR64_epoll_pwait]  = sys_epoll_pwait,
+    [NR64_eventfd2]     = sys_eventfd2,
+    [NR64_epoll_create1] = sys_epoll_create1,
+    [NR64_dup3]         = sys_dup3,
+    [NR64_pipe2]        = sys_pipe2,
+    [NR64_accept4]      = sys_accept4,
+    [NR64_prlimit64]    = sys_prlimit64,
+    [NR64_renameat2]    = sys_renameat2,
+    [NR64_getrandom]    = sys_getrandom,
+    [NR64_memfd_create] = sys_memfd_create,
+    [NR64_membarrier]   = sys_membarrier,
+    [NR64_statx]        = sys_statx,
+    [NR64_faccessat2]   = sys_faccessat,
+};
+#define TABLE syscall_table64
+#else
+#define TABLE syscall_table
+#endif
 
-int32_t syscall_dispatch(uint32_t nr, uint32_t a1, uint32_t a2, uint32_t a3,
-                         uint32_t a4, uint32_t a5, uint32_t a6)
+#define NSYSCALLS (sizeof TABLE / sizeof TABLE[0])
+
+intptr_t syscall_dispatch(uint32_t nr, uintptr_t a1, uintptr_t a2, uintptr_t a3,
+                          uintptr_t a4, uintptr_t a5, uintptr_t a6)
 {
-    if (nr < NSYSCALLS && syscall_table[nr])
-        return syscall_table[nr](a1, a2, a3, a4, a5, a6);
+    if (nr < NSYSCALLS && TABLE[nr])
+        return TABLE[nr](a1, a2, a3, a4, a5, a6);
 
     /* Not implemented. Log it to serial — once per number — so running
        real programs shows us which syscalls to write next (docs/DESIGN.md).

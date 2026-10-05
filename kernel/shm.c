@@ -23,15 +23,15 @@
  * outlive them); the last detach frees it through the normal "deleted
  * file, last user gone" path, which calls shm_evict below.
  *
- * Linux i386 reaches all four through one system call, ipc() (117), and
- * that is what musl uses. Semaphores and message queues, the other two
- * kinds of System V IPC, have no user here: ipc() says ENOSYS for them.
+ * The ways in (ipc() on i386, direct calls) and the permission rules are
+ * in ipc.c, shared with semaphores (sem.c) and message queues (msg.c).
  *
  * Speed: an id names its slot (the low 8 bits), so everything but shmget
  * with a key is O(1). shmget with a key looks at every slot, at most
  * SHM_SEGS; it is called once per segment, never in a loop.
  */
 #include <errno.h>
+#include <ipc.h>
 #include <kheap.h>
 #include <memlayout.h>
 #include <mm.h>
@@ -41,14 +41,7 @@
 #include <uaccess.h>
 #include <vfs.h>
 
-/* Linux's values */
-#define IPC_PRIVATE 0
-#define IPC_CREAT   01000
-#define IPC_EXCL    02000
-#define IPC_RMID    0
-#define IPC_SET     1
-#define IPC_STAT    2
-#define IPC_64      0x100               /* shmctl: the 64-bit-ready struct (musl always) */
+/* Linux's values (the IPC_* ones are in ipc.h) */
 #define SHM_RDONLY  010000
 #define SHM_RND     020000
 #define SHM_REMAP   040000
@@ -56,38 +49,39 @@
 #define SHM_DEST    01000               /* mode bit: removed, freed at the last detach */
 #define SHMLBA      PAGE_SIZE
 
-/* ipc()'s first argument: which call */
-#define IPC_SHMAT   21
-#define IPC_SHMDT   22
-#define IPC_SHMGET  23
-#define IPC_SHMCTL  24
-
 #define SHM_SEGS    256                 /* segments at once; a slot is 48 bytes */
 #define SHM_MAX     (1u << 30)          /* biggest segment (Linux: no real limit) */
 
 /* struct shmid64_ds as Linux i386 lays it out (asm-generic/shmbuf.h). */
-struct ipc64_perm {
-    int32_t  key;
-    uint32_t uid, gid, cuid, cgid;
-    uint16_t mode, pad1;
-    uint16_t seq, pad2;
-    uint32_t unused1, unused2;
-};
 struct shmid64_ds {
-    struct ipc64_perm perm;
+    struct ipc64_perm_user perm;
     uint32_t segsz;
     uint32_t atime, atime_high, dtime, dtime_high, ctime, ctime_high;
     int32_t  cpid, lpid;
     uint32_t nattch, unused4, unused5;
 };
+
+#ifdef ARCH_X86_64
+/* ...and as Linux x86_64 does (asm/shmbuf.h): the mode is 4 bytes in the
+   perm part, and times, sizes and counts are longs. 112 bytes. */
+struct shmid_ds_x86_64 {
+    struct ipc64_perm_user perm;
+    uint64_t segsz;
+    int64_t  atime, dtime, ctime;
+    int32_t  cpid, lpid;
+    uint64_t nattch, unused4, unused5;
+};
+_Static_assert(sizeof(struct shmid_ds_x86_64) == 112, "Linux x86_64 shmid64_ds");
+
+typedef struct shmid_ds_x86_64 shmid_user;  /* what this CPU's programs read */
+#else
 _Static_assert(sizeof(struct shmid64_ds) == 84, "Linux i386 shmid64_ds");
+typedef struct shmid64_ds shmid_user;
+#endif
 
 struct shm_seg {
     struct inode *inode;                /* NULL: a free slot */
-    int32_t  key;                       /* IPC_PRIVATE once removed */
-    uint16_t seq;                       /* bumped when the slot is freed */
-    uint16_t mode;                      /* permissions, SHM_DEST */
-    uint32_t uid, gid, cuid, cgid;      /* owner, and who created it */
+    struct ipc_perm_k perm;             /* key, owner, mode (+ SHM_DEST), seq */
     uint32_t atime, dtime, ctime;       /* last attach, detach, change */
     int32_t  cpid, lpid;                /* creator, last to attach or detach */
 };
@@ -101,12 +95,12 @@ static struct shm_seg *lookup(int32_t id)
     if (id < 0)
         return NULL;
     struct shm_seg *s = &segs[id & (SHM_SEGS - 1)];
-    return s->inode && s->seq == (uint32_t)id >> 8 ? s : NULL;
+    return s->inode && s->perm.seq == (uint32_t)id >> 8 ? s : NULL;
 }
 
 static int32_t id_of(const struct shm_seg *s)
 {
-    return (int32_t)((uint32_t)s->seq << 8 | (uint32_t)(s - segs));
+    return ipc_id(&s->perm, (int)(s - segs));
 }
 
 /* The last user of a removed segment is gone (vfs.c frees the inode and
@@ -115,55 +109,21 @@ static void shm_evict(struct inode *i)
 {
     struct shm_seg *s = &segs[i->fs_ino];
     s->inode = NULL;
-    s->seq++;
+    s->perm.seq++;
 }
 
 static const struct fs_ops shm_fs = { .evict = shm_evict };
 
-static int in_group(const struct cred *c, uint32_t gid)
-{
-    if (c->fsgid == gid)
-        return 1;
-    for (uint32_t k = 0; k < c->ngroups; k++)
-        if (c->groups[k] == gid)
-            return 1;
-    return 0;
-}
-
-/* Linux's ipcperms: the owner's bits for its owner or creator, the
-   group's for their groups, else the others'. Root may do anything.
-   want: 4 read, 2 write, 1 execute. */
-static int may(const struct shm_seg *s, uint32_t want)
-{
-    const struct cred *c = &proc_current()->cred;
-    if (c->euid == 0)
-        return 1;
-    uint32_t m = s->mode;
-    if (c->euid == s->uid || c->euid == s->cuid)
-        m >>= 6;
-    else if (in_group(c, s->gid) || in_group(c, s->cgid))
-        m >>= 3;
-    return (want & ~m & 7) == 0;
-}
-
-static int is_owner(const struct shm_seg *s)
-{
-    uint32_t euid = proc_current()->cred.euid;
-    return euid == 0 || euid == s->uid || euid == s->cuid;
-}
-
-static int32_t shm_get(int32_t key, uint32_t size, uint32_t flg)
+int32_t shm_get(int32_t key, uint32_t size, uint32_t flg)
 {
     if (key != IPC_PRIVATE) {
         for (int k = 0; k < SHM_SEGS; k++) {
             struct shm_seg *s = &segs[k];
-            if (!s->inode || s->key != key)
+            if (!s->inode || s->perm.key != key)
                 continue;
-            if ((flg & IPC_CREAT) && (flg & IPC_EXCL))
-                return -EEXIST;
-            /* What the flags ask for, in every class at once (Linux). */
-            if (!may(s, (flg >> 6 | flg >> 3 | flg) & 7))
-                return -EACCES;
+            int err = ipc_check_existing(&s->perm, flg);
+            if (err)
+                return err;
             if (size > s->inode->size)
                 return -EINVAL;
             return id_of(s);
@@ -191,10 +151,7 @@ static int32_t shm_get(int32_t key, uint32_t size, uint32_t flg)
 
     const struct process *p = proc_current();
     s->inode = i;
-    s->key = key;
-    s->mode = flg & 0777;
-    s->uid = s->cuid = p->cred.euid;
-    s->gid = s->cgid = p->cred.egid;
+    ipc_perm_init(&s->perm, key, flg);
     s->atime = s->dtime = 0;
     s->ctime = i->ctime;
     s->cpid = p->pid;
@@ -202,7 +159,8 @@ static int32_t shm_get(int32_t key, uint32_t size, uint32_t flg)
     return id_of(s);
 }
 
-static int32_t shm_at(int32_t id, uint32_t addr, uint32_t flg, uint32_t result)
+/* Attach segment id at addr (0: anywhere). Returns the address, or -errno. */
+intptr_t shm_attach(int32_t id, user_addr_t addr, uint32_t flg)
 {
     struct shm_seg *s = lookup(id);
     if (!s)
@@ -215,13 +173,13 @@ static int32_t shm_at(int32_t id, uint32_t addr, uint32_t flg, uint32_t result)
     uint32_t want = flg & SHM_RDONLY ? 4 : 6;
     if (flg & SHM_EXEC)
         want |= 1;
-    if (!may(s, want))
+    if (!ipc_may(&s->perm, want))
         return -EACCES;
 
     struct mm *mm = mm_current();
     uint32_t len = (s->inode->size + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
     if (addr) {
-        if (addr + len > KERNEL_VBASE || addr + len < addr)
+        if (addr + len > USER_ADDR_END || addr + len < addr)
             return -EINVAL;
         if (flg & SHM_REMAP)
             mm_remove(mm, addr, addr + len);    /* else something there is EINVAL */
@@ -236,12 +194,10 @@ static int32_t shm_at(int32_t id, uint32_t addr, uint32_t flg, uint32_t result)
         return err;
     s->atime = time_now();
     s->lpid = proc_current()->pid;
-    /* Linux too leaves the attach in place if the address can't be
-       written back. */
-    return copy_to_user((void *)result, &addr, sizeof addr) < 0 ? -EFAULT : 0;
+    return (intptr_t)addr;
 }
 
-static int32_t shm_dt(uint32_t addr)
+int32_t shm_dt(user_addr_t addr)
 {
     if (addr & (PAGE_SIZE - 1))
         return -EINVAL;
@@ -258,8 +214,8 @@ static int32_t shm_dt(uint32_t addr)
 static void shm_rmid(struct shm_seg *s)
 {
     struct inode *i = s->inode;
-    s->mode |= SHM_DEST;
-    s->key = IPC_PRIVATE;               /* shmget can't find it any more */
+    s->perm.mode |= SHM_DEST;
+    s->perm.key = IPC_PRIVATE;          /* shmget can't find it any more */
     i->flags |= I_UNLINKED;             /* freed when the last attach goes */
     if (i->refs == 0) {
         vfs_get(i);
@@ -267,9 +223,9 @@ static void shm_rmid(struct shm_seg *s)
     }
 }
 
-static int32_t shm_ctl(int32_t id, uint32_t cmd, uint32_t buf)
+int32_t shm_ctl(int32_t id, uint32_t cmd, uintptr_t buf)
 {
-    struct shmid64_ds ds;
+    shmid_user ds;
     int v64 = cmd & IPC_64;
     cmd &= ~IPC_64;
     if ((cmd == IPC_STAT || cmd == IPC_SET) && !v64)
@@ -284,16 +240,10 @@ static int32_t shm_ctl(int32_t id, uint32_t cmd, uint32_t buf)
 
     switch (cmd) {
     case IPC_STAT:
-        if (!may(s, 4))
+        if (!ipc_may(&s->perm, 4))
             return -EACCES;
         memset(&ds, 0, sizeof ds);
-        ds.perm.key = s->key;
-        ds.perm.uid = s->uid;
-        ds.perm.gid = s->gid;
-        ds.perm.cuid = s->cuid;
-        ds.perm.cgid = s->cgid;
-        ds.perm.mode = s->mode;
-        ds.perm.seq = s->seq;
+        ipc_perm_out(&ds.perm, &s->perm);
         ds.segsz = s->inode->size;
         ds.atime = s->atime;
         ds.dtime = s->dtime;
@@ -303,34 +253,16 @@ static int32_t shm_ctl(int32_t id, uint32_t cmd, uint32_t buf)
         ds.nattch = s->inode->refs;
         return copy_to_user((void *)buf, &ds, sizeof ds) < 0 ? -EFAULT : 0;
     case IPC_SET:
-        if (!is_owner(s))
+        if (!ipc_owner(&s->perm))
             return -EPERM;
-        s->uid = ds.perm.uid;
-        s->gid = ds.perm.gid;
-        s->mode = (s->mode & ~0777) | (ds.perm.mode & 0777);
+        ipc_perm_set(&s->perm, &ds.perm);
         s->ctime = time_now();
         return 0;
     case IPC_RMID:
-        if (!is_owner(s))
+        if (!ipc_owner(&s->perm))
             return -EPERM;
         shm_rmid(s);
         return 0;
     }
     return -EINVAL;
-}
-
-/* int ipc(unsigned call, int first, unsigned long second,
-           unsigned long third, void *ptr, long fifth)
-   The low 16 bits of `call` pick the operation; the high 16 are a version
-   (1 was for iBCS2's shmat, which returned the address differently). */
-SYSCALL_DEF(sys_ipc)
-{
-    uint32_t call = a1 & 0xFFFF, version = a1 >> 16;
-    switch (call) {
-    case IPC_SHMAT:  return version == 1 ? -EINVAL : shm_at((int32_t)a2, a5, a3, a4);
-    case IPC_SHMDT:  return shm_dt(a5);
-    case IPC_SHMGET: return shm_get((int32_t)a2, a3, a4);
-    case IPC_SHMCTL: return shm_ctl((int32_t)a2, a3, a5);
-    }
-    return -ENOSYS;
 }

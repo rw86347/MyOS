@@ -1681,3 +1681,51 @@ builds the portable kernel when `ARCH=x86_64`; the UEFI loader loads
 initrd + E820; `include/user.h` adds 64-bit user addresses. `arch/x86_64/`
 still needs real paging, IDT, syscall, and ELF64 — `port_stubs.c` is
 temporary. Pentium `make test` unchanged.
+
+## 2026-10-05 — x86_64: higher half, and BusyBox runs
+
+Rodger asked for a review of the x86_64 port another AI started, and fixes
+until it runs on QEMU. It does: under OVMF the 64-bit kernel starts `/init`
+(64-bit busybox-static), which mounts, prints the motd and starts a shell;
+`ls`, pipes, `mkdir`, files, `sleep`, exit statuses all work.
+`make ARCH=x86_64 test-uefi-shell` types commands and checks the output.
+
+What it took:
+- The kernel moved to the top half, like Linux: direct map at
+  `0xFFFF800000000000`, image at -2 GiB (`-mcmodel=kernel`), user space from 0
+  (busybox is linked at 0x400000). The kernel half is two PML4 entries,
+  shared by pointer with every process. Fork is copy-on-write on 4 levels.
+- The syscall entry, `user_enter`, the GDT order (for sysret), EFER.SCE and
+  every routine in uaccess.asm had bugs; each would have crashed the first
+  program (details in docs/x86_64-PORT-PLAN.md).
+- Syscall handlers take register-sized arguments (`uintptr_t`; on i386
+  that is `uint32_t`, so nothing changes there). The x86_64 table is indexed
+  by x86_64 numbers; stat, mmap, clone, arch_prctl (TLS) have adapters.
+
+i386 `make test`, `test-shell` and `test-hd` pass. Next on x86_64: signals.
+
+## 2026-10-05 — the missing system calls, on both CPUs
+
+Rodger asked for the system calls that weren't implemented, for i386 and x86_64.
+What "missing" meant was measured, not guessed: the syscall numbers loaded before
+every `int 0x80` / `syscall` in both BusyBox binaries, minus the two tables, minus the
+legacy fallbacks DESIGN.md drops.
+
+- **Signals on x86_64** (were stubs): kernel/signal.c is shared; the frame and
+  sigreturn moved to arch/<cpu>/signal.c (x86_64: Linux's rt_sigframe). Faults are
+  signals. `pause` was missing on both (and i386's `waitpid` passed garbage as the
+  rusage pointer once wait4 learnt to fill it).
+- **New on both:** sendfile (page cache -> destination, through `file_copy_in`),
+  times / getrusage / wait4's rusage (the tick charges user or system time),
+  clock_settime / adjtimex / clock_adjtime (a settable 64-bit wall clock), syslog
+  (dmesg: a 16 KiB ring of kprintf/klog), chroot (".." stops at it), pivot_root,
+  syncfs, personality (`linux32` makes uname say i686), capget/capset,
+  unshare/setns, swapon/off (-ENOSYS: no swap by design), inotify, fcntl record locks
+  (POSIX and OFD, with deadlock detection), System V semaphores (with SEM_UNDO) and
+  message queues, fadvise; the direct shm/sem/msg calls.
+- **x86_64 layouts:** statfs, select, itimerval, sigevent, timeval, sysinfo, msghdr,
+  rlimit, shmid/semid/msqid_ds.
+- `user/sys/systest.c` (no C library, raw syscalls) checks 32 of them on each CPU,
+  in `make test-uefi-shell`. i386 `make test`, `test-shell`, `test-hd` pass.
+  `make bench`: unchanged except +40 cycles on open+close (docs/performance.md).
+

@@ -63,7 +63,7 @@
 #define RX_N         32
 #define TX_N         16
 #define BUF_SZ       2048
-#define MMIO_VA      0xF4000000u
+#define MMIO_VA      MMIO_BASE     /* the first 128 KiB of the MMIO window */
 
 struct rx_desc {
     uint64_t addr;
@@ -394,9 +394,9 @@ int e1000_init(void)
     wr(E1000_IMS, IMS_RXT0 | IMS_LSC);
 
     int err = register_netdev(&nic.dev);
-    kprintf("e1000: %02x:%02x:%02x:%02x:%02x:%02x bar %p irq %u link %s\n",
+    kprintf("e1000: %02x:%02x:%02x:%02x:%02x:%02x bar %08lx irq %u link %s\n",
             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
-            (void *)bar, pci->irq,
+            (unsigned long)bar, pci->irq,
             (rd(E1000_STATUS) & STATUS_LU) ? "up" : "down");
     return err;
 }

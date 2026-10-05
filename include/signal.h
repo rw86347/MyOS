@@ -2,6 +2,7 @@
 #define SIGNAL_H
 
 #include <stdint.h>
+#include <user.h>
 
 /*
  * Signals: how Unix interrupts a program. Ctrl-C sends SIGINT, a child's
@@ -53,11 +54,12 @@
 #define SA_NODEFER   0x40000000
 #define SA_RESETHAND 0x80000000
 
-/* struct sigaction as the i386 kernel takes it in rt_sigaction(). */
+/* struct sigaction as the kernel takes it in rt_sigaction(): 20 bytes on
+   i386, 32 on x86_64 (where flags is an unsigned long too). */
 struct k_sigaction {
-    uint32_t handler;               /* SIG_DFL, SIG_IGN or a function */
-    uint32_t flags;
-    uint32_t restorer;              /* the C library's "call sigreturn" code */
+    user_addr_t handler;            /* SIG_DFL, SIG_IGN or a function */
+    user_addr_t flags;
+    user_addr_t restorer;           /* the C library's "call sigreturn" code */
     uint64_t mask;                  /* blocked while the handler runs */
 } __attribute__((packed));
 
@@ -96,20 +98,21 @@ void signal_fork(struct process *child, struct process *parent);
 void signal_exec(struct process *p);
 
 /* The system calls. */
-int32_t sys_rt_sigaction_impl(int sig, uint32_t act, uint32_t oact, uint32_t size);
-int32_t sys_rt_sigprocmask_impl(int how, uint32_t set, uint32_t oset, uint32_t size);
+int32_t sys_rt_sigaction_impl(int sig, uintptr_t act, uintptr_t oact, uint32_t size);
+int32_t sys_rt_sigprocmask_impl(int how, uintptr_t set, uintptr_t oset, uint32_t size);
 int32_t sys_alarm_impl(uint32_t seconds);
-int32_t sys_getitimer_impl(int which, uint32_t cur);
-int32_t sys_setitimer_impl(int which, uint32_t new, uint32_t old);
+int32_t sys_getitimer_impl(int which, uintptr_t cur);
+int32_t sys_setitimer_impl(int which, uintptr_t new, uintptr_t old);
 
 /* Timer tick: send SIGALRM to processes whose alarm is due. */
 void signal_alarm_tick(uint32_t now);
 void signal_alarm_cancel(struct process *p);   /* on exit */
-int32_t sys_sigreturn_impl(int rt);
+intptr_t sys_sigreturn_impl(int rt);            /* (arch/<cpu>/signal.c) */
 int32_t sys_kill_impl(int pid, int sig);
-int32_t sys_rt_sigsuspend_impl(uint32_t set, uint32_t size);
-int32_t sys_rt_sigpending_impl(uint32_t set, uint32_t size);
-int32_t sys_rt_sigtimedwait_impl(uint32_t set, uint32_t info, uint32_t timeout,
+int32_t sys_rt_sigsuspend_impl(uintptr_t set, uint32_t size);
+int32_t sys_pause_impl(void);
+int32_t sys_rt_sigpending_impl(uintptr_t set, uint32_t size);
+int32_t sys_rt_sigtimedwait_impl(uintptr_t set, uintptr_t info, uintptr_t timeout,
                                  uint32_t size, int wide);
 
 /* --- POSIX timers (posix_timer.c) --- */
@@ -117,12 +120,26 @@ int32_t sys_rt_sigtimedwait_impl(uint32_t set, uint32_t info, uint32_t timeout,
 #define SI_USER   0
 #define SI_TIMER (-2)
 
-/* Where a delivered signal came from: si_code, and the three words after
-   it (for SI_TIMER: the timer's id, its overrun count, its sigev_value). */
+/* Where a delivered signal came from: si_code, and for SI_TIMER the timer's
+   id, its overrun count and its sigev_value (a pointer-sized word). */
 struct sig_origin {
     int32_t code;
-    int32_t word[3];
+    int32_t timer_id, overrun;
+    user_addr_t value;
 };
+
+/* --- the CPU-specific part (arch/<cpu>/signal.c) --- */
+
+/* Build the signal frame for handler a on the program's stack, as Linux lays
+   it out on this CPU (the C library's code depends on it), and point the
+   registers r at the handler. `mask` is what sigreturn will restore. 0, or -1
+   if the frame can't be written (the program then dies with SIGSEGV). */
+int  arch_signal_frame(int sig, const struct sig_origin *o, const struct k_sigaction *a,
+                       uint64_t mask, struct regs *r);
+
+/* A siginfo_t (128 bytes) as this CPU's programs read it (sigtimedwait). */
+#define SIGINFO_SIZE 128
+void arch_siginfo(void *si, int sig, const struct sig_origin *o);
 
 /* Signal sig was just taken from thread t's own pending set (own = 1) or its
    process's. If a timer made it pending, fill *o and return 1. Interrupts off. */

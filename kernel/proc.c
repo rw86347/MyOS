@@ -14,6 +14,7 @@
 #include <interrupts.h>
 #include <kheap.h>
 #include <kprintf.h>
+#include <ipc.h>
 #include <mm.h>
 #include <proc.h>
 #include <string.h>
@@ -83,6 +84,10 @@ static void reap(struct process *p)
         vfs_put(p->cwd);
         p->cwd = NULL;
     }
+    if (p->root) {
+        vfs_put(p->root);
+        p->root = NULL;
+    }
     proc_clear_exe(p);
     p->state = PROC_FREE;
 }
@@ -116,6 +121,8 @@ static void thread_leave_proc(struct process *p, struct thread *t)
         *pp = t->proc_next;
     t->proc_next = NULL;
     p->nthreads--;
+    p->utime += t->utime;               /* its CPU time stays the process's */
+    p->stime += t->stime;
     ptimer_thread_gone(p, t);
 }
 
@@ -197,6 +204,21 @@ int proc_wait_kernel(struct process *p)
     return status;
 }
 
+/* Is pgid a live process group in session sid? TIOCSPGRP has to know, because
+   the foreground group is who gets the keyboard and SIGINT: handing the
+   terminal to a group in someone else's session lets any process take the
+   keyboard away from the shell that owns it. A scan of the table, which is
+   fine for an ioctl a shell calls once per job. */
+int proc_pgid_in_session(int pgid, int sid)
+{
+    for (int i = 0; i < PROC_MAX; i++) {
+        struct process *p = proc_at(i);
+        if (p->state == PROC_ALIVE && p->pgid == pgid && p->sid == sid)
+            return 1;
+    }
+    return 0;
+}
+
 /* --- fork ----------------------------------------------------------------- */
 
 int proc_fork(void)
@@ -212,23 +234,32 @@ int proc_fork(void)
 #define CLONE_CHILD_CLEARTID 0x00200000
 #define CLONE_CHILD_SETTID   0x01000000
 
-/* CLONE_SETTLS: the argument is a user_desc, as for set_thread_area.
-   Returns the TLS slot (0..GDT_TLS_ENTRIES-1) and the descriptor, or -1. */
-static int read_tls(uint32_t tls, uint64_t *desc)
+/* CLONE_SETTLS: on i386 the argument is a user_desc, as for
+   set_thread_area; on x86_64 it is the new thread's FS base itself (see
+   sys_arch_prctl). Returns the TLS slot (0..GDT_TLS_ENTRIES-1) and the
+   value for thread->tls[slot], or -1. */
+static int read_tls(uintptr_t tls, uint64_t *desc)
 {
+#ifdef ARCH_X86_64
+    if (tls >= USER_ADDR_END)
+        return -1;                      /* (a non-canonical one would fault in wrmsr) */
+    *desc = tls;
+    return 0;
+#else
     uint32_t d[4];
     if (copy_from_user(d, (void *)tls, sizeof d) < 0 ||
         d[0] < GDT_TLS_FIRST || d[0] >= GDT_TLS_FIRST + GDT_TLS_ENTRIES)
         return -1;
     *desc = gdt_tls_descriptor(d[1], d[2], d[3]);
     return d[0] - GDT_TLS_FIRST;
+#endif
 }
 
 /* A new thread in this process (pthread_create). It starts by "returning"
    from clone with EAX = 0 on the stack it was given, where musl has put
    the function to run. */
-static int clone_thread(uint32_t flags, uint32_t new_sp, uint32_t parent_tid,
-                        uint32_t tls, uint32_t child_tid)
+static int clone_thread(uint32_t flags, uintptr_t new_sp, uintptr_t parent_tid,
+                        uintptr_t tls, uintptr_t child_tid)
 {
     if ((flags & (CLONE_VM | CLONE_SIGHAND)) != (CLONE_VM | CLONE_SIGHAND))
         return -EINVAL;                 /* Linux insists on these too */
@@ -277,8 +308,8 @@ static int clone_thread(uint32_t flags, uint32_t new_sp, uint32_t parent_tid,
     return tid;
 }
 
-int proc_clone(uint32_t flags, uint32_t new_sp, uint32_t parent_tid, uint32_t tls,
-               uint32_t child_tid)
+int proc_clone(uint32_t flags, uintptr_t new_sp, uintptr_t parent_tid, uintptr_t tls,
+               uintptr_t child_tid)
 {
     if (flags & CLONE_THREAD)
         return clone_thread(flags, new_sp, parent_tid, tls, child_tid);
@@ -319,7 +350,12 @@ int proc_fork_frame(const struct regs *frame, struct process **child_out)
     }
     child->parent = parent;
     proc_set_cwd(child, parent->cwd);
+    if (parent->root) {                 /* a chroot is inherited */
+        vfs_get(parent->root);
+        child->root = parent->root;
+    }
     child->umask = parent->umask;
+    child->persona = parent->persona;
     child->cred = parent->cred;         /* same users and groups */
     child->pgid = parent->pgid;         /* same job, same session */
     child->sid = parent->sid;
@@ -375,7 +411,7 @@ struct exec_args {
  * by subtraction, and a negative one would make the `n == room` test below
  * unreachable (n is never negative) and the loop unbounded.
  */
-static int copy_strings(struct exec_args *a, char **out, int room, uint32_t user_vec)
+static int copy_strings(struct exec_args *a, char **out, int room, uintptr_t user_vec)
 {
     if (room < 0)
         return -E2BIG;
@@ -391,8 +427,8 @@ static int copy_strings(struct exec_args *a, char **out, int room, uint32_t user
         return 0;
     }
     for (int n = 0; ; n++) {
-        uint32_t ptr;
-        if (get_user32(&ptr, user_vec + n * 4) < 0)
+        user_addr_t ptr;                /* a pointer of the program's size */
+        if (get_user_word(&ptr, user_vec + n * sizeof ptr) < 0)
             return -EFAULT;
         if (!ptr) {
             out[n] = NULL;
@@ -400,7 +436,7 @@ static int copy_strings(struct exec_args *a, char **out, int room, uint32_t user
         }
         if (n == room)
             return -E2BIG;
-        long len = strncpy_from_user(a->str + a->used, (const char *)ptr,
+        long len = strncpy_from_user(a->str + a->used, (const char *)(uintptr_t)ptr,
                                      EXEC_STR_SPACE - a->used);
         if (len == -ENAMETOOLONG)
             return -E2BIG;
@@ -439,7 +475,7 @@ static int end_other_threads(struct process *p)
     return 1;
 }
 
-int proc_execve(uint32_t user_path, uint32_t user_argv, uint32_t user_envp)
+int proc_execve(uintptr_t user_path, uintptr_t user_argv, uintptr_t user_envp)
 {
     struct process *p = proc_current();
     struct exec_args *a = kmalloc(sizeof *a);
@@ -487,7 +523,7 @@ int proc_execve(uint32_t user_path, uint32_t user_argv, uint32_t user_envp)
     }
     struct mm *old_mm = p->mm;
     mm_switch(new_mm);
-    uint32_t entry, sp;
+    user_addr_t entry, sp;
     struct cred cred = p->cred;
     struct inode *exe = NULL;
     err = program_load(prog, argv, (const char *const *)a->envp, &entry, &sp,
@@ -533,6 +569,8 @@ int proc_execve(uint32_t user_path, uint32_t user_argv, uint32_t user_envp)
     regs_set_ip(r, entry);
     regs_set_sp(r, sp);
     r->rbx = r->rcx = r->rdx = r->rsi = r->rdi = r->rbp = 0;
+    r->r8 = r->r9 = r->r10 = r->r11 = r->r12 = r->r13 = r->r14 = r->r15 = 0;
+    r->rflags = 0x202;                  /* IF on, nothing else (no stray DF) */
 #else
     r->eip = entry;
     r->user_esp = sp;
@@ -552,10 +590,16 @@ static void process_end(struct process *p)
 {
     signal_alarm_cancel(p);
     ptimer_release_all(p);
+    sem_exit(p);                        /* SEM_UNDO: give back what it held */
+    lock_exit(p);                       /* its POSIX record locks */
 
     fd_close_all(p);
     vfs_put(p->cwd);
     p->cwd = NULL;
+    if (p->root) {
+        vfs_put(p->root);
+        p->root = NULL;
+    }
     proc_clear_exe(p);
     struct mm *mm = p->mm;
     mm_switch(mm_kernel());             /* can't free the space we stand in */
@@ -640,7 +684,7 @@ void proc_thread_exit(int status)
 
 #define WNOHANG 1
 
-int proc_wait4(int pid, uint32_t user_status, int options)
+int proc_wait4(int pid, uintptr_t user_status, int options, uintptr_t user_rusage)
 {
     struct process *me = proc_current();
     for (;;) {
@@ -663,8 +707,13 @@ int proc_wait4(int pid, uint32_t user_status, int options)
                    read. The status is lost if the copy fails, which is what
                    Linux does with a bad wait4 pointer as well. */
                 int id = c->pid, status = c->status;
+                uint32_t cu = c->utime + c->cutime, cs = c->stime + c->cstime;
+                me->cutime += cu;       /* times(): children's, with theirs */
+                me->cstime += cs;
                 reap(c);
                 if (user_status && copy_to_user((void *)user_status, &status, 4) < 0)
+                    return -EFAULT;
+                if (user_rusage && rusage_to_user(user_rusage, cu, cs) < 0)
                     return -EFAULT;
                 return id;
             }

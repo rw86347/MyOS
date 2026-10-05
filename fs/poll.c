@@ -73,7 +73,7 @@ static int32_t do_poll(struct pollfd *p, uint32_t n, int32_t timeout_ms)
 
 #define POLL_MAX 64
 
-static int32_t poll_user(uint32_t user_fds, uint32_t n, int32_t timeout_ms)
+static int32_t poll_user(uintptr_t user_fds, uint32_t n, int32_t timeout_ms)
 {
     struct pollfd p[POLL_MAX];
     if (n > POLL_MAX)
@@ -92,7 +92,7 @@ SYSCALL_DEF(sys_poll)                   /* (fds, nfds, timeout_ms) */
 }
 
 /* timespec64 -> ms (-1 for NULL: no limit) */
-static int32_t ts64_ms(uint32_t user_ts, int *err)
+static int32_t ts64_ms(uintptr_t user_ts, int *err)
 {
     if (!user_ts)
         return -1;
@@ -106,7 +106,7 @@ static int32_t ts64_ms(uint32_t user_ts, int *err)
 }
 
 /* timespec32 -> ms (-1 for NULL: no limit) */
-static int32_t ts32_ms(uint32_t user_ts, int *err)
+static int32_t ts32_ms(uintptr_t user_ts, int *err)
 {
     if (!user_ts)
         return -1;
@@ -133,11 +133,12 @@ SYSCALL_DEF(sys_ppoll64)                /* (fds, nfds, timespec64 *, sigmask *, 
 }
 
 /* select(): fd_set bitmaps instead of a list. Converted to poll. */
-static int32_t do_select(uint32_t nfds, uint32_t rd, uint32_t wr, uint32_t ex, int32_t ms)
+static int32_t do_select(uint32_t nfds, uintptr_t rd, uintptr_t wr, uintptr_t ex, int32_t ms)
 {
     if (nfds > 32)
         nfds = 32;                      /* the fd_set we read is 32 bits */
-    uint32_t in[3] = { 0, 0, 0 }, user[3] = { rd, wr, ex };
+    uint32_t in[3] = { 0, 0, 0 };
+    uintptr_t user[3] = { rd, wr, ex };
     for (int k = 0; k < 3; k++)
         if (user[k] && get_user32(&in[k], user[k]) < 0)
             return -EFAULT;
@@ -170,14 +171,18 @@ static int32_t do_select(uint32_t nfds, uint32_t rd, uint32_t wr, uint32_t ex, i
     return count;
 }
 
-SYSCALL_DEF(sys_select)                 /* (nfds, rd, wr, ex, struct timeval32 *) */
+SYSCALL_DEF(sys_select)                 /* (nfds, rd, wr, ex, struct timeval *) */
 {
     int32_t ms = -1;
     if (a5) {
-        int32_t tv[2];
+        long tv[2];                     /* two longs: 32 bits on i386, 64 on x86_64 */
         if (copy_from_user(tv, (void *)a5, sizeof tv) < 0)
             return -EFAULT;
-        ms = tv[0] * 1000 + (tv[1] + 999) / 1000;
+        if (tv[0] < 0 || tv[1] < 0 || tv[1] >= 1000000)
+            return -EINVAL;
+        if (tv[0] > 0x7FFFFFFF / 1000 - 1)
+            tv[0] = 0x7FFFFFFF / 1000 - 1;
+        ms = (int32_t)(tv[0] * 1000 + (tv[1] + 999) / 1000);
     }
     return do_select(a1, a2, a3, a4, ms);
 }

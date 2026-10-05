@@ -61,5 +61,9 @@
 #define ENOTCONN 107    /* not connected */
 #define ETIMEDOUT 110   /* timed out */
 #define ECONNREFUSED 111 /* nothing was listening */
+#define EDEADLK  35     /* a lock wait would deadlock */
+#define ENOLCK   37     /* no locks left */
+#define ENOMSG   42     /* no message of the wanted type */
+#define EIDRM    43     /* removed while we waited (System V IPC) */
 
 #endif

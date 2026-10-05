@@ -37,7 +37,9 @@
 #include <socket.h>
 #include <string.h>
 #include <thread.h>
+#include <stddef.h>
 #include <uaccess.h>
+#include <user.h>
 #include <vfs.h>
 
 #define SOCK_STREAM    1
@@ -316,7 +318,7 @@ static uint32_t unix_poll(struct file *f)
     return r;
 }
 
-static int32_t unix_ioctl(struct file *f, uint32_t cmd, uint32_t arg)
+static int32_t unix_ioctl(struct file *f, uint32_t cmd, uintptr_t arg)
 {
     struct usock *s = f->priv;
     if (cmd == FIONREAD) {
@@ -350,7 +352,7 @@ static const struct file_ops unix_ops = {
 
 /* struct sockaddr_un { sa_family_t family; char sun_path[108]; } from user
    space: the name's bytes and length. A path stops at its NUL. */
-static int read_name(uint32_t uaddr, uint32_t alen, uint8_t *name, uint32_t *len)
+static int read_name(uintptr_t uaddr, uint32_t alen, uint8_t *name, uint32_t *len)
 {
     uint8_t sa[2 + PATH_UN];
     if (alen < 2 || alen > sizeof sa)
@@ -373,7 +375,7 @@ static int read_name(uint32_t uaddr, uint32_t alen, uint8_t *name, uint32_t *len
     return 0;
 }
 
-static int write_name(uint32_t uaddr, uint32_t ulenp, const uint8_t *name, uint32_t len)
+static int write_name(uintptr_t uaddr, uintptr_t ulenp, const uint8_t *name, uint32_t len)
 {
     if (!uaddr || !ulenp)
         return 0;
@@ -615,18 +617,14 @@ SYSCALL_DEF(unix_recvfrom)
     return r;
 }
 
-struct msghdr32 {
-    uint32_t name, namelen, iov, iovlen, control, controllen;
-    int32_t flags;
-};
-
-static int read_msg(uint32_t umsg, struct msghdr32 *m, uint32_t *iov)
+static int read_msg(uintptr_t umsg, struct user_msghdr *m, struct user_iovec *iov)
 {
     if (copy_from_user(m, (const void *)umsg, sizeof *m) < 0)
         return -EFAULT;
     if (m->iovlen > IOV_MAX_K)
         return -EMSGSIZE;
-    if (m->iovlen && copy_from_user(iov, (const void *)m->iov, m->iovlen * 8) < 0)
+    if (m->iovlen && copy_from_user(iov, (const void *)(uintptr_t)m->iov,
+                                    m->iovlen * sizeof *iov) < 0)
         return -EFAULT;
     return 0;
 }
@@ -635,16 +633,16 @@ SYSCALL_DEF(unix_sendmsg)
 {
     struct file *f;
     struct usock *s = usock_of(a1, &f);
-    struct msghdr32 m;
-    uint32_t iov[IOV_MAX_K * 2];
+    struct user_msghdr m;
+    struct user_iovec iov[IOV_MAX_K];
     int err = read_msg(a2, &m, iov);
     if (err)
         return err;
-    if (m.controllen >= 12) {
-        int32_t cm[3];              /* struct cmsghdr: len, level, type */
-        if (copy_from_user(cm, (const void *)m.control, sizeof cm) < 0)
+    if (m.controllen >= sizeof(struct user_cmsghdr)) {
+        struct user_cmsghdr cm;
+        if (copy_from_user(&cm, (const void *)(uintptr_t)m.control, sizeof cm) < 0)
             return -EFAULT;
-        if (cm[1] == SOL_SOCKET && cm[2] == SCM_RIGHTS)
+        if (cm.level == SOL_SOCKET && cm.type == SCM_RIGHTS)
             return -EOPNOTSUPP;     /* passing fds: not yet */
     }
     if (s->type != SOCK_STREAM)
@@ -652,14 +650,14 @@ SYSCALL_DEF(unix_sendmsg)
     int nonblock = (f->flags & O_NONBLOCK) || (a3 & MSG_DONTWAIT);
     int32_t done = 0;
     for (uint32_t i = 0; i < m.iovlen; i++) {
-        if (!iov[2 * i + 1])
+        if (!iov[i].len)
             continue;
-        int32_t r = usock_write(s, (const uint8_t *)iov[2 * i], iov[2 * i + 1],
+        int32_t r = usock_write(s, (const uint8_t *)(uintptr_t)iov[i].base, iov[i].len,
                                 nonblock || done, a3 & MSG_NOSIGNAL);
         if (r < 0)
             return done ? done : r;
         done += r;
-        if ((uint32_t)r < iov[2 * i + 1])
+        if ((uint32_t)r < iov[i].len)
             break;
     }
     return done;
@@ -669,28 +667,31 @@ SYSCALL_DEF(unix_recvmsg)
 {
     struct file *f;
     struct usock *s = usock_of(a1, &f);
-    struct msghdr32 m;
-    uint32_t iov[IOV_MAX_K * 2];
+    struct user_msghdr m;
+    struct user_iovec iov[IOV_MAX_K];
     int err = read_msg(a2, &m, iov);
     if (err)
         return err;
     int nonblock = (f->flags & O_NONBLOCK) || (a3 & MSG_DONTWAIT);
     int32_t done = 0;
     for (uint32_t i = 0; i < m.iovlen; i++) {
-        if (!iov[2 * i + 1])
+        if (!iov[i].len)
             continue;
-        int32_t r = usock_read(s, (uint8_t *)iov[2 * i], iov[2 * i + 1],
+        int32_t r = usock_read(s, (uint8_t *)(uintptr_t)iov[i].base, iov[i].len,
                                nonblock || done, a3 & MSG_PEEK);
         if (r < 0)
             return done ? done : r;
         done += r;
-        if ((uint32_t)r < iov[2 * i + 1] || (a3 & MSG_PEEK))
+        if ((uint32_t)r < iov[i].len || (a3 & MSG_PEEK))
             break;
     }
     uint32_t zero = 0;
-    if ((m.name && copy_to_user((void *)(a2 + 4), &zero, 4) < 0) ||   /* msg_namelen */
-        copy_to_user((void *)(a2 + 20), &zero, 4) < 0 ||               /* msg_controllen */
-        copy_to_user((void *)(a2 + 24), &zero, 4) < 0)                 /* msg_flags */
+    user_addr_t none = 0;
+    if ((m.name && copy_to_user((void *)(a2 + offsetof(struct user_msghdr, namelen)),
+                                &zero, 4) < 0) ||
+        copy_to_user((void *)(a2 + offsetof(struct user_msghdr, controllen)),
+                     &none, sizeof none) < 0 ||
+        copy_to_user((void *)(a2 + offsetof(struct user_msghdr, flags)), &zero, 4) < 0)
         return -EFAULT;
     return done;
 }
@@ -754,7 +755,7 @@ SYSCALL_DEF(unix_shutdown)
 }
 
 /* socketpair(AF_UNIX, type, 0, int sv[2]) */
-int32_t unix_socketpair(uint32_t type, uint32_t protocol, uint32_t usv)
+int32_t unix_socketpair(uint32_t type, uint32_t protocol, uintptr_t usv)
 {
     uint32_t t = type & SOCK_TYPE_MASK;
     if (type & ~(SOCK_TYPE_MASK | SOCK_NONBLOCK | SOCK_CLOEXEC))

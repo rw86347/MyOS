@@ -260,13 +260,13 @@ static void ev_release(struct file *f)
 
 /* Copy a bitmap or string to the caller: at most len bytes. Returns the
    count, as Linux does. */
-static int32_t give(uint32_t arg, const void *src, uint32_t have, uint32_t len)
+static int32_t give(uintptr_t arg, const void *src, uint32_t have, uint32_t len)
 {
     uint32_t n = have < len ? have : len;
     return copy_to_user((void *)arg, src, n) < 0 ? -EFAULT : (int32_t)n;
 }
 
-static int32_t ev_ioctl(struct file *f, uint32_t cmd, uint32_t arg)
+static int32_t ev_ioctl(struct file *f, uint32_t cmd, uintptr_t arg)
 {
     struct reader *r = reader_of(f);
     if (!r)

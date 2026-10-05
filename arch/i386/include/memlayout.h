@@ -31,8 +31,11 @@
 #define PAGE_SIZE        4096
 #define KERNEL_VBASE     0xC0000000u    /* virtual address of physical 0 */
 #define DIRECTMAP_LIMIT  0x30000000u    /* 768 MiB of physical RAM direct-mapped */
+#define DIRECTMAP_BASE   KERNEL_VBASE   /* same thing here: the kernel is in the direct map */
 #define KHEAP_START      0xF0000000u
 #define KHEAP_END        0xF4000000u
+#define MMIO_BASE        0xF4000000u    /* e1000 first, then pci_map_mmio */
+#define MMIO_END         0xF8000000u
 
 #ifndef __ASSEMBLER__
 #include <stdint.h>

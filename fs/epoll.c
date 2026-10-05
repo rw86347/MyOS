@@ -237,7 +237,7 @@ SYSCALL_DEF(sys_epoll_ctl)
     return 0;
 }
 
-static int32_t do_wait(uint32_t epfd, uint32_t uevents, int32_t max, int32_t timeout_ms)
+static int32_t do_wait(uint32_t epfd, uintptr_t uevents, int32_t max, int32_t timeout_ms)
 {
     int err = 0;
     struct epoll *ep = epoll_of(epfd, &err);

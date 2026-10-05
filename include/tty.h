@@ -22,7 +22,7 @@ int tty_reader_waiting(void);
 
 /* The console's file operations use these. */
 int32_t tty_read(struct file *f, void *user_buf, uint32_t n);
-int32_t tty_ioctl(struct file *f, uint32_t cmd, uint32_t arg);
+int32_t tty_ioctl(struct file *f, uint32_t cmd, uintptr_t arg);
 uint32_t tty_poll(struct file *f);
 
 /* The foreground process group: the one Ctrl-C signals (0 = none). */
@@ -42,7 +42,7 @@ struct tty *tty_new(tty_out_fn out, void *owner);  /* echo goes to out */
 void     tty_free(struct tty *t);
 void     tty_feed(struct tty *t, const char *bytes, uint32_t n);    /* typing */
 int32_t  tty_read_from(struct tty *t, struct file *f, void *user_buf, uint32_t n);
-int32_t  tty_ioctl_on(struct tty *t, uint32_t cmd, uint32_t arg); /* termios, size, pgrp */
+int32_t  tty_ioctl_on(struct tty *t, uint32_t cmd, uintptr_t arg); /* termios, size, pgrp */
 int      tty_readable(struct tty *t);
 uint32_t tty_space(struct tty *t);          /* bytes tty_feed takes without dropping */
 void     tty_wait_space(struct tty *t);     /* sleep until a read makes room */

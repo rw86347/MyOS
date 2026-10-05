@@ -35,7 +35,7 @@ struct thread {
     struct thread *proc_next;         /* the next thread of the same process */
     int tid;                          /* what gettid() says; the first thread's
                                          tid is its process's pid */
-    uint32_t clear_tid;               /* on exit: write 0 here and futex-wake
+    uintptr_t clear_tid;              /* on exit: write 0 here and futex-wake
                                          it (pthread_join waits on it) */
     /* Signals aimed at this thread (tgkill, a fault it caused) and the ones
        it blocks. Signals for the whole process wait in proc->sig_pending
@@ -51,7 +51,7 @@ struct thread {
     /* futex wait: the word it sleeps on (address space + user address).
        futex_woken says a FUTEX_WAKE ended the sleep (not a signal/timeout). */
     struct mm *futex_mm;
-    uint32_t futex_addr;
+    uintptr_t futex_addr;
     uint8_t futex_woken;
     struct mm *mm;                    /* the address space it's using now
                                          (NULL: its process's; a kernel
@@ -63,6 +63,10 @@ struct thread {
     struct thread *rq_next, *rq_prev; /* the run queue: all READY threads */
     uint8_t owns_slot;                /* has slots in the slot table (sched.c) */
     uint8_t is_idle;                  /* the idle thread */
+    /* CPU time used, in ms: the timer tick charges whoever it interrupts —
+       to utime if it was in user mode, else to stime. Sampled like Linux's
+       tick accounting: exact on average, not per call. (times, getrusage) */
+    uint32_t utime, stime;
     int uses_fpu;                     /* user thread: save/restore FPU+SSE */
     uint64_t tls[3];                  /* its thread-local storage segments
                                          (GDT entries 6-8; set_thread_area) */

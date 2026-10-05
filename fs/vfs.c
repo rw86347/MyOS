@@ -31,6 +31,14 @@ static uint32_t next_ino = 2;
 
 struct inode *vfs_root(void) { return root; }
 
+/* The calling process's "/": the real root, or what it chroot()ed to. */
+static struct inode *proc_root(void)
+{
+    struct process *p = proc_current();
+    return (p && p->root) ? p->root : root;
+}
+
+
 /* FNV-1a over the name, mixed with the directory's address. */
 static uint32_t hash_of(const struct inode *dir, const char *name, uint32_t len)
 {
@@ -82,19 +90,32 @@ int vfs_path(struct inode *i, char *buf, uint32_t size)
         memcpy(buf + lp + n, post, lq + 1);
         return lp + n + lq;
     }
-    if (i == root)
+    /* Relative to the caller's "/" (a chroot); a directory outside it is
+       "(unreachable)/...", as on Linux. */
+    struct inode *top = proc_root();
+    int outside = 0;
+    if (i == top)
         tmp[--at] = '/';
-    while (i != root) {
+    while (i != top) {
         while (i->covers)
             i = i->covers;
-        if (i == root || i->parent == i)
+        if (i == root || i->parent == i) {
+            outside = top != root;
             break;                      /* "/", or a root nobody can reach */
+        }
         if (i->name_len + 1 > at)
             return -ENAMETOOLONG;
         at -= i->name_len;
         memcpy(tmp + at, i->name, i->name_len);
         tmp[--at] = '/';
         i = i->parent;
+    }
+    if (outside) {
+        static const char unreach[] = "(unreachable)";
+        if (at < sizeof unreach - 1)
+            return -ENAMETOOLONG;
+        at -= sizeof unreach - 1;
+        memcpy(tmp + at, unreach, sizeof unreach - 1);
     }
     uint32_t len = PATH_MAX - at;
     if (len > size)
@@ -255,6 +276,7 @@ static int commit_node(struct inode *dir, struct inode *i, struct inode **out)
         }
     }
     dir->mtime = dir->ctime = i->mtime;
+    notify_entry(dir, i, IN_CREATE, 0, i->name, i->name_len);
     if (out)
         *out = i;
     return 0;
@@ -299,21 +321,26 @@ int vfs_unlink(struct inode *i)
         if (err)
             return err;
     }
+    notify_entry(i->parent, i, IN_DELETE, 0, i->name, i->name_len);
+    fsnotify_deleted(i);                /* its own watches end */
     detach(i);
     return 0;
 }
 
 int vfs_truncate(struct inode *i, uint32_t size)
 {
-    if (i->fs)
-        return i->fs->truncate(i, size);
-    if (i->ops)
+    if (i->ops && !i->fs)
         return -EINVAL;                 /* a device */
-    return file_truncate(i, size);
+    int err = i->fs ? i->fs->truncate(i, size) : file_truncate(i, size);
+    if (!err)
+        notify(i, IN_MODIFY);
+    return err;
 }
 
+/* An inode's mode, owner or times changed (chmod, chown, utimensat). */
 int vfs_setattr(struct inode *i)
 {
+    notify(i, IN_ATTRIB);
     return i->fs ? i->fs->setattr(i) : 0;
 }
 
@@ -378,9 +405,13 @@ int vfs_rename(struct inode *i, struct inode *new_dir, const char *name, uint32_
         }
     }
 
-    if (old)
+    if (old) {
+        fsnotify_deleted(old);
         detach(old);                    /* the replaced file */
+    }
     struct inode *old_dir = i->parent;
+    uint32_t cookie = ((old_dir->flags | new_dir->flags) & I_WATCHED) ? fsnotify_cookie() : 0;
+    notify_entry(old_dir, i, IN_MOVED_FROM, cookie, i->name, i->name_len);
     tree_remove(i);
     if (i->flags & I_NAME_OWNED)
         kfree((void *)i->name);
@@ -394,6 +425,9 @@ int vfs_rename(struct inode *i, struct inode *new_dir, const char *name, uint32_
     }
     uint32_t now = time_now();
     old_dir->mtime = old_dir->ctime = new_dir->mtime = new_dir->ctime = i->ctime = now;
+    notify_entry(new_dir, i, IN_MOVED_TO, cookie, i->name, i->name_len);
+    if (i->flags & I_WATCHED)
+        fsnotify(i, IN_MOVE_SELF);
     return 0;
 }
 
@@ -476,6 +510,58 @@ int vfs_mount(const char *path, struct mount *m, uint32_t root_ino, uint32_t mod
     return 0;
 }
 
+/*
+ * pivot_root(new_root, put_old): the file system mounted at new_root becomes
+ * "/", and the old root is mounted on put_old, a directory inside it — how a
+ * system moves from its first root (a RAM disk) onto the real one and keeps
+ * the old one reachable until it lets go. Processes whose current directory
+ * was the old root move to the new one, as on Linux. The caller has checked
+ * it is root and not in a chroot.
+ */
+int vfs_pivot_root(const char *new_path, const char *old_path)
+{
+    struct inode *nr, *po;
+    int err = vfs_lookup(new_path, &nr);
+    if (!err)
+        err = vfs_lookup(old_path, &po);
+    if (err)
+        return err;
+    if (!S_ISDIR(nr->mode) || !S_ISDIR(po->mode))
+        return -ENOTDIR;
+    if (nr == root || !nr->covers)
+        return -EINVAL;                 /* must be a mount, other than "/" */
+    if (po == nr || po->mounted)
+        return -EBUSY;
+    for (struct inode *i = po; i != nr; ) {     /* put_old must be under new_root */
+        if (i->covers) {
+            i = i->covers;
+            continue;
+        }
+        if (i == root || i->parent == i)
+            return -EINVAL;
+        i = i->parent;
+    }
+
+    struct inode *old = root, *d = nr->covers;
+    d->mounted = NULL;                  /* new_root leaves where it was mounted */
+    d->flags &= ~I_MOUNTED;
+    nr->covers = NULL;
+    nr->parent = nr;                    /* ...and is "/" */
+    nr->name = "";
+    nr->name_len = 0;
+    root = nr;
+    old->name = po->name;               /* the old root, on put_old */
+    old->name_len = po->name_len;
+    old->parent = po->parent;
+    cover(po, old);
+    for (int k = 0; k < PROC_MAX; k++) {
+        struct process *p = proc_at(k);
+        if (p->state == PROC_ALIVE && p->cwd == old)
+            proc_set_cwd(p, nr);
+    }
+    return 0;
+}
+
 int vfs_mount_tree(const char *path, struct inode *tree)
 {
     struct inode *old;
@@ -520,7 +606,10 @@ int vfs_mount_ram(const char *path, uint32_t mode)
 static int walk(struct inode *dir, const char *path, uint32_t len, int follow_last,
                 int *links, struct inode **out)
 {
-    struct inode *cur = (len && path[0] == '/') ? root : dir;
+    /* ".." stops at the process's "/" (no way out of a chroot). Looked up
+       only when a path needs it: most are relative and have no "..". */
+    struct inode *top = NULL;
+    struct inode *cur = (len && path[0] == '/') ? (top = proc_root()) : dir;
     uint32_t pos = 0;
 
     for (;;) {
@@ -547,7 +636,9 @@ static int walk(struct inode *dir, const char *path, uint32_t len, int follow_la
         if (cur->flags & I_UNLINKED)
             return -ENOENT;         /* a deleted directory is empty, even of ".." */
         if (n == 2 && name[0] == '.' && name[1] == '.') {
-            if (cur != root) {
+            if (!top)
+                top = proc_root();
+            if (cur != root && cur != top) {
                 while (cur->covers)
                     cur = cur->covers;  /* out of a mounted file system */
                 cur = cur->parent;
@@ -737,6 +828,7 @@ struct file *file_new(const struct file_ops *ops, struct inode *i, uint32_t flag
     f->refs = 1;
     f->priv = NULL;
     f->flock = 0;
+    f->kbuf = 0;
     static uint32_t next_serial = 1;    /* 0 means "no file" to a holder */
     f->serial = next_serial++;
     if (i)
@@ -789,6 +881,7 @@ int vfs_open_at(struct inode *dir, const char *path, uint32_t flags, uint32_t mo
         kfree(f);
         return err;
     }
+    notify(i, IN_OPEN);
     *out = f;
     return 0;
 }
@@ -796,6 +889,9 @@ int vfs_open_at(struct inode *dir, const char *path, uint32_t flags, uint32_t mo
 void file_put(struct file *f)
 {
     if (--f->refs == 0) {
+        lock_file_gone(f);
+        notify(f->inode, (f->flags & O_ACCMODE) != O_RDONLY ? IN_CLOSE_WRITE
+                                                           : IN_CLOSE_NOWRITE);
         if (f->flock)
             flock_release(f);
         if (f->ops->release)
@@ -831,8 +927,10 @@ int fd_install_at(int fd, struct file *f)
     struct file *old = p->files[fd];
     p->files[fd] = f;
     p->cloexec &= ~(1ull << fd);
-    if (old)
+    if (old) {
+        lock_close(p, old->inode);
         file_put(old);              /* dup2 closes what was there */
+    }
     return fd;
 }
 
@@ -852,6 +950,7 @@ int fd_close(int fd)
     struct process *p = proc_current();
     p->files[fd] = NULL;
     p->cloexec &= ~(1ull << fd);
+    lock_close(p, f->inode);            /* POSIX: any close drops its record locks */
     file_put(f);
     return 0;
 }

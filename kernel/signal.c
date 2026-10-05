@@ -16,8 +16,6 @@
  *      frame back and the program continues where it was interrupted.
  */
 #include <errno.h>
-#include <fpu.h>
-#include <gdt.h>
 #include <interrupts.h>
 #include <kprintf.h>
 #include <proc.h>
@@ -27,48 +25,6 @@
 #include <thread.h>
 #include <timer.h>
 #include <uaccess.h>
-
-/* --- Linux's i386 signal frame -------------------------------------------- */
-
-struct sigcontext {                 /* 88 bytes */
-    uint32_t gs, fs, es, ds;
-    uint32_t edi, esi, ebp, esp, ebx, edx, ecx, eax;
-    uint32_t trapno, err, eip, cs, eflags, esp_at_signal, ss;
-    uint32_t fpstate;               /* user address of the FPU state */
-    uint32_t oldmask, cr2;
-};
-
-struct siginfo {                    /* 128 bytes */
-    int32_t si_signo, si_errno, si_code;
-    int32_t word[3];                /* SI_TIMER: timer id, overrun, si_value */
-    int32_t pad[26];
-};
-
-struct ucontext {
-    uint32_t uc_flags, uc_link;
-    uint32_t ss_sp, ss_flags, ss_size;
-    struct sigcontext uc_mcontext;
-    uint64_t uc_sigmask;
-};
-
-struct sigframe {                   /* without SA_SIGINFO: handler(sig) */
-    uint32_t pretcode;
-    int32_t sig;
-    struct sigcontext sc;
-    uint32_t extramask;             /* the high half of the blocked mask */
-};
-
-struct rt_sigframe {                /* with SA_SIGINFO: handler(sig, info, uc) */
-    uint32_t pretcode;
-    int32_t sig;
-    uint32_t pinfo, puc;
-    struct siginfo info;
-    struct ucontext uc;
-};
-
-/* EFLAGS bits a program may change through sigreturn (the rest — IOPL,
-   VM, interrupt flag... — must stay as the kernel says). */
-#define FLAGS_USER 0x00040DD5
 
 /* Signals whose default action is to do nothing. */
 static int default_ignored(int sig)
@@ -83,7 +39,7 @@ static int default_ignored(int sig)
 /* Would this signal be ignored anyway? Then it's dropped when sent. */
 static int ignored(struct process *p, int sig)
 {
-    uint32_t h = p->sig_action[sig - 1].handler;
+    user_addr_t h = p->sig_action[sig - 1].handler;
     return sig != SIGKILL && (h == SIG_IGN || (h == SIG_DFL && default_ignored(sig)));
 }
 
@@ -136,84 +92,18 @@ int signal_pending(void)
 
 /* --- delivering --------------------------------------------------------------- */
 
-static void save_context(struct sigcontext *sc, const struct regs *r, uint64_t mask,
-                         uint32_t fpstate)
-{
-    sc->gs = r->gs;   sc->fs = r->fs;   sc->es = r->es;   sc->ds = r->ds;
-    sc->edi = r->edi; sc->esi = r->esi; sc->ebp = r->ebp; sc->esp = r->user_esp;
-    sc->ebx = r->ebx; sc->edx = r->edx; sc->ecx = r->ecx; sc->eax = r->eax;
-    sc->trapno = r->vector;
-    sc->err = r->err_code;
-    sc->eip = r->eip;
-    sc->cs = r->cs;
-    sc->eflags = r->eflags;
-    sc->esp_at_signal = r->user_esp;
-    sc->ss = r->user_ss;
-    sc->fpstate = fpstate;
-    sc->oldmask = (uint32_t)mask;
-    sc->cr2 = 0;
-}
-
-/* Build the frame and point the program at its handler. 0, or -1 if the
-   program's stack is unusable (then it dies with SIGSEGV). */
+/* Run handler a for sig: the CPU's code builds the frame (arch/<cpu>/signal.c),
+   then the handler's mask applies. 0, or -1 if the frame can't be written. */
 static int setup_frame(int sig, const struct sig_origin *o, struct k_sigaction *a,
                        struct regs *r)
 {
     struct thread *t = thread_current();
+    /* sigsuspend: the mask to restore after the handler is the one from
+       before the call, not the one it waited with. */
     uint64_t mask = t->sig_restore ? t->sig_saved : t->sig_blocked;
     t->sig_restore = 0;
-
-    /* The FPU registers: save them below the frame (16-byte aligned for
-       fxsave), and give the handler a clean FPU. */
-    uint32_t sp = (r->user_esp - FPU_STATE_SIZE) & ~0xFu;
-    uint32_t fpstate = 0;
-    if (t->uses_fpu) {
-        fpu_save(t->fpu_state);
-        if (copy_to_user((void *)sp, t->fpu_state, FPU_STATE_SIZE) < 0)
-            return -1;
-        fpstate = sp;
-    }
-
-    if (a->flags & SA_SIGINFO) {
-        struct rt_sigframe f;
-        memset(&f, 0, sizeof f);
-        /* At the handler's first instruction, (esp + 4) must be 16-byte
-           aligned, as after a normal `call`. */
-        sp = ((sp - sizeof f + 4) & ~0xFu) - 4;
-        f.pretcode = a->restorer;
-        f.sig = sig;
-        f.pinfo = sp + offsetof(struct rt_sigframe, info);
-        f.puc = sp + offsetof(struct rt_sigframe, uc);
-        f.info.si_signo = sig;
-        f.info.si_code = o->code;
-        memcpy(f.info.word, o->word, sizeof f.info.word);
-        save_context(&f.uc.uc_mcontext, r, mask, fpstate);
-        f.uc.uc_sigmask = mask;
-        if (copy_to_user((void *)sp, &f, sizeof f) < 0)
-            return -1;
-        r->edx = f.pinfo;               /* (also in registers, as Linux does) */
-        r->ecx = f.puc;
-    } else {
-        struct sigframe f;
-        memset(&f, 0, sizeof f);
-        sp = ((sp - sizeof f + 4) & ~0xFu) - 4;
-        f.pretcode = a->restorer;
-        f.sig = sig;
-        save_context(&f.sc, r, mask, fpstate);
-        f.extramask = (uint32_t)(mask >> 32);
-        if (copy_to_user((void *)sp, &f, sizeof f) < 0)
-            return -1;
-        r->edx = r->ecx = 0;
-    }
-
-    r->user_esp = sp;
-    r->eip = a->handler;
-    r->eax = sig;
-    r->eflags &= ~(0x100 | 0x400);      /* no single-step, direction up */
-    if (t->uses_fpu) {
-        fpu_clean_state(t->fpu_state);
-        fpu_restore(t->fpu_state);
-    }
+    if (arch_signal_frame(sig, o, a, mask, r) < 0)
+        return -1;
 
     /* While the handler runs, its mask (and the signal itself) are blocked. */
     t->sig_blocked |= a->mask;
@@ -237,7 +127,8 @@ static void take(struct thread *t, int sig, struct sig_origin *o)
     else
         p->sig_pending &= ~bit;
     o->code = SI_USER;
-    o->word[0] = o->word[1] = o->word[2] = 0;
+    o->timer_id = o->overrun = 0;
+    o->value = 0;
     if (p->timer_sigs & bit)            /* one load when no timer is involved */
         ptimer_siginfo(p, t, sig, own, o);
 }
@@ -306,7 +197,7 @@ void signal_exec(struct process *p)
 
 /* --- system calls --------------------------------------------------------------- */
 
-int32_t sys_rt_sigaction_impl(int sig, uint32_t act, uint32_t oact, uint32_t size)
+int32_t sys_rt_sigaction_impl(int sig, uintptr_t act, uintptr_t oact, uint32_t size)
 {
     struct process *p = proc_current();
     if (sig < 1 || sig > NSIG || size != 8)
@@ -335,7 +226,7 @@ int32_t sys_rt_sigaction_impl(int sig, uint32_t act, uint32_t oact, uint32_t siz
 #define SIG_UNBLOCK 1
 #define SIG_SETMASK 2
 
-int32_t sys_rt_sigprocmask_impl(int how, uint32_t set, uint32_t oset, uint32_t size)
+int32_t sys_rt_sigprocmask_impl(int how, uintptr_t set, uintptr_t oset, uint32_t size)
 {
     struct thread *t = thread_current();
     if (size != 8)
@@ -358,57 +249,6 @@ int32_t sys_rt_sigprocmask_impl(int how, uint32_t set, uint32_t oset, uint32_t s
     if (oset && copy_to_user((void *)oset, &old, 8) < 0)
         return -EFAULT;
     return 0;
-}
-
-int32_t sys_sigreturn_impl(int rt)
-{
-    struct thread *t = thread_current();
-    struct regs *r = t->uregs;
-    struct sigcontext sc;
-    uint64_t mask;
-
-    /* The handler's `ret` popped pretcode; the restorer may have popped
-       sig too (non-rt). That tells us where the frame starts. */
-    if (rt) {
-        uint32_t frame = r->user_esp - 4;
-        if (copy_from_user(&sc, (void *)(frame + offsetof(struct rt_sigframe, uc.uc_mcontext)),
-                           sizeof sc) < 0 ||
-            copy_from_user(&mask, (void *)(frame + offsetof(struct rt_sigframe, uc.uc_sigmask)),
-                           8) < 0)
-            proc_exit(W_SIGNALED(SIGSEGV));
-    } else {
-        uint32_t frame = r->user_esp - 8, high;
-        if (copy_from_user(&sc, (void *)(frame + offsetof(struct sigframe, sc)), sizeof sc) < 0 ||
-            copy_from_user(&high, (void *)(frame + offsetof(struct sigframe, extramask)), 4) < 0)
-            proc_exit(W_SIGNALED(SIGSEGV));
-        mask = ((uint64_t)high << 32) | sc.oldmask;
-    }
-
-    /* Put the registers back — but never let a program choose its own
-       privilege level (segments) or system flags. */
-    r->edi = sc.edi; r->esi = sc.esi; r->ebp = sc.ebp; r->ebx = sc.ebx;
-    r->edx = sc.edx; r->ecx = sc.ecx; r->eax = sc.eax;
-    r->eip = sc.eip;
-    r->user_esp = sc.esp;
-    r->eflags = (r->eflags & ~FLAGS_USER) | (sc.eflags & FLAGS_USER);
-    r->cs = GDT_USER_CODE;
-    r->user_ss = GDT_USER_DATA;
-    /* TLS segments. The ring-3 bits are not enough on their own: the frame is
-       the program's to write, and a selector that cannot be loaded faults in
-       the kernel's own return path, which is fatal. */
-    r->gs = gdt_user_seg_ok(sc.gs) ? sc.gs : GDT_USER_DATA;
-    r->fs = gdt_user_seg_ok(sc.fs) ? sc.fs : GDT_USER_DATA;
-    r->ds = r->es = GDT_USER_DATA;
-    t->sig_blocked = mask & ~(SIGBIT(SIGKILL) | SIGBIT(SIGSTOP));
-
-    if (sc.fpstate && t->uses_fpu) {
-        if (copy_from_user(t->fpu_state, (void *)sc.fpstate, FPU_STATE_SIZE) < 0)
-            proc_exit(W_SIGNALED(SIGSEGV));
-        uint32_t *mxcsr = (uint32_t *)(t->fpu_state + 24);
-        *mxcsr &= 0xFFBF;           /* reserved bits would make fxrstor fault */
-        fpu_restore(t->fpu_state);
-    }
-    return (int32_t)r->eax;         /* the syscall's result = the old EAX */
 }
 
 int32_t sys_kill_impl(int pid, int sig)
@@ -448,22 +288,7 @@ void signal_send_group(int pgid, int sig)
     }
 }
 
-/* Is pgid a live process group in session sid? TIOCSPGRP has to know, because
-   the foreground group is who gets the keyboard and SIGINT: handing the
-   terminal to a group in someone else's session lets any process take the
-   keyboard away from the shell that owns it. A scan of the table, which is
-   fine for an ioctl a shell calls once per job. */
-int proc_pgid_in_session(int pgid, int sid)
-{
-    for (int i = 0; i < PROC_MAX; i++) {
-        struct process *p = proc_at(i);
-        if (p->state == PROC_ALIVE && p->pgid == pgid && p->sid == sid)
-            return 1;
-    }
-    return 0;
-}
-
-int32_t sys_rt_sigsuspend_impl(uint32_t set, uint32_t size)
+int32_t sys_rt_sigsuspend_impl(uintptr_t set, uint32_t size)
 {
     struct thread *t = thread_current();
     uint64_t s;
@@ -480,7 +305,17 @@ int32_t sys_rt_sigsuspend_impl(uint32_t set, uint32_t size)
     return -EINTR;
 }
 
-int32_t sys_rt_sigpending_impl(uint32_t set, uint32_t size)
+/* pause(): sleep until a signal comes that isn't blocked or ignored. Its
+   handler runs on the way out, then pause returns -EINTR, as on Linux. */
+int32_t sys_pause_impl(void)
+{
+    struct wait_queue never = { 0 };    /* only a signal ends this sleep */
+    while (!signal_pending())
+        wq_sleep(&never);
+    return -EINTR;
+}
+
+int32_t sys_rt_sigpending_impl(uintptr_t set, uint32_t size)
 {
     struct thread *t = thread_current();
     if (size != 8)
@@ -494,7 +329,7 @@ int32_t sys_rt_sigpending_impl(uint32_t set, uint32_t size)
    it waits, the set is unblocked so that a sender wakes it; any other
    signal it doesn't block ends the wait with -EINTR. musl's SIGEV_THREAD
    timers wait here for their signal. */
-int32_t sys_rt_sigtimedwait_impl(uint32_t uset, uint32_t uinfo, uint32_t utimeout,
+int32_t sys_rt_sigtimedwait_impl(uintptr_t uset, uintptr_t uinfo, uintptr_t utimeout,
                                  uint32_t size, int wide)
 {
     struct thread *t = thread_current();
@@ -550,12 +385,9 @@ int32_t sys_rt_sigtimedwait_impl(uint32_t uset, uint32_t uinfo, uint32_t utimeou
     struct sig_origin o;
     take(t, sig, &o);
     if (uinfo) {
-        struct siginfo si;
-        memset(&si, 0, sizeof si);
-        si.si_signo = sig;
-        si.si_code = o.code;
-        memcpy(si.word, o.word, sizeof si.word);
-        if (copy_to_user((void *)uinfo, &si, sizeof si) < 0)
+        uint8_t si[SIGINFO_SIZE];
+        arch_siginfo(si, sig, &o);
+        if (copy_to_user((void *)uinfo, si, sizeof si) < 0)
             return -EFAULT;
     }
     return sig;
@@ -641,20 +473,21 @@ int32_t sys_alarm_impl(uint32_t seconds)
     return (int32_t)((left + 999) / 1000);
 }
 
-/* struct itimerval on i386: { interval {sec, usec}, value {sec, usec} } */
-struct itimerval32 { int32_t i_sec, i_usec, v_sec, v_usec; };
+/* struct itimerval: { interval {sec, usec}, value {sec, usec} }, longs as in
+   Linux: 32 bits on i386, 64 on x86_64. */
+struct itimerval_k { long i_sec, i_usec, v_sec, v_usec; };
 
-static int tv_to_ms(int32_t sec, int32_t usec, uint32_t *ms)
+static int tv_to_ms(long sec, long usec, uint32_t *ms)
 {
     if (sec < 0 || usec < 0 || usec >= 1000000)
         return -EINVAL;
-    if ((uint32_t)sec > 0x7FFFFFFFu / 1000 - 1)
+    if ((unsigned long)sec > 0x7FFFFFFFu / 1000 - 1)
         sec = 0x7FFFFFFF / 1000 - 1;
     *ms = (uint32_t)sec * 1000 + (uint32_t)(usec + 999) / 1000;  /* round up */
     return 0;
 }
 
-static void get_itimer(struct process *p, struct itimerval32 *v)
+static void get_itimer(struct process *p, struct itimerval_k *v)
 {
     uint32_t flags = irq_save();
     uint32_t left = 0;
@@ -669,19 +502,19 @@ static void get_itimer(struct process *p, struct itimerval32 *v)
     irq_restore(flags);
 }
 
-int32_t sys_getitimer_impl(int which, uint32_t cur)
+int32_t sys_getitimer_impl(int which, uintptr_t cur)
 {
     if (which != 0)                     /* ITIMER_REAL only */
         return -EINVAL;
-    struct itimerval32 v;
+    struct itimerval_k v;
     get_itimer(proc_current(), &v);
     return copy_to_user((void *)cur, &v, sizeof v);
 }
 
-int32_t sys_setitimer_impl(int which, uint32_t new, uint32_t old)
+int32_t sys_setitimer_impl(int which, uintptr_t new, uintptr_t old)
 {
     struct process *p = proc_current();
-    struct itimerval32 v, o;
+    struct itimerval_k v, o;
     uint32_t value_ms, every_ms;
     if (which != 0)
         return -EINVAL;

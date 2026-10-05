@@ -19,7 +19,7 @@
  *     which class it belongs to — that's how kfree knows the size.
  *   Linux's slab/SLUB allocators work on the same idea.
  *
- * BIG (over 1 KiB: thread stacks, buffers) — first fit, at 0xF0000000.
+ * BIG (over 1 KiB: thread stacks, buffers) — first fit, at KHEAP_START.
  *   - A virtual range that grows upward; physically scattered frames look
  *     contiguous through paging.
  *   - A row of blocks, each with a header, linked both ways:
@@ -139,7 +139,7 @@ struct block {
 };                                      /* 16 bytes, so data stays aligned */
 
 static struct block *first, *last;
-static uint32_t heap_end = KHEAP_START;  /* first unmapped address */
+static uintptr_t heap_end = KHEAP_START; /* first unmapped address */
 
 static int  is_free(const struct block *b) { return b->magic & 1; }
 static int  is_block(const struct block *b) { return (b->magic & ~1u) == BLOCK_MAGIC; }
@@ -153,7 +153,7 @@ static uint32_t round_up(uint32_t n, uint32_t to)
    add the space to the last block (or start a new one). */
 static int grow(uint32_t bytes)
 {
-    uint32_t start = heap_end;
+    uintptr_t start = heap_end;
     uint32_t pages = round_up(bytes, PAGE_SIZE) / PAGE_SIZE;
 
     if (pages > (KHEAP_END - heap_end) / PAGE_SIZE)
@@ -171,7 +171,7 @@ static int grow(uint32_t bytes)
     if (heap_end == start)
         return -1;
 
-    uint32_t added = heap_end - start;
+    uint32_t added = (uint32_t)(heap_end - start);
     if (last && is_free(last)) {
         last->size += added;            /* extend the free block at the end */
     } else {
@@ -304,7 +304,7 @@ void kheap_stats(uint32_t *used, uint32_t *free_bytes, uint32_t *mapped)
         else
             *used += b->size;
     }
-    *mapped = heap_end - KHEAP_START;
+    *mapped = (uint32_t)(heap_end - KHEAP_START);
 }
 
 uint32_t kheap_pages(void)

@@ -171,6 +171,7 @@ static struct thread *new_thread(struct process *proc, const char *name)
     t->sig_pending = t->sig_blocked = t->sig_saved = 0;
     t->sig_restore = 0;
     t->sig_check = 0;
+    t->utime = t->stime = 0;
     t->futex_mm = NULL;
     t->futex_addr = 0;
     t->futex_woken = 0;

@@ -4,6 +4,7 @@
  */
 #include <errno.h>
 #include <gdt.h>
+#include <interrupts.h>
 #include <kprintf.h>
 #include <mm.h>
 #include <pmm.h>
@@ -27,11 +28,27 @@
    release string says what it really is. The second field, the host's
    name, is set by sethostname() (from /etc/hostname at boot). */
 static char uts[6][65] = {
+#ifdef ARCH_X86_64
+    "Linux", "myos", "6.1.0-MyOS", "#1 MyOS", "x86_64", "(none)",
+#else
     "Linux", "myos", "6.1.0-MyOS", "#1 MyOS", "i686", "(none)",
+#endif
 };
+
+#define PER_LINUX32 0x0008
 
 SYSCALL_DEF(sys_uname)
 {
+#ifdef ARCH_X86_64
+    /* `linux32 prog` (personality PER_LINUX32): a 64-bit system that says
+       it is a 32-bit one, so a build or installer picks i686. */
+    if ((proc_current()->persona & 0xFF) == PER_LINUX32) {
+        char u[6][65];
+        memcpy(u, uts, sizeof u);
+        memcpy(u[4], "i686", 5);
+        return copy_to_user((void *)a1, u, sizeof u);
+    }
+#endif
     return copy_to_user((void *)a1, uts, sizeof uts);
 }
 
@@ -173,7 +190,7 @@ SYSCALL_DEF(sys_setfsgid)
 }
 
 /* getresuid(&r, &e, &s) / getresgid */
-static int32_t get_res(uint32_t r, uint32_t e, uint32_t s, uint32_t ur, uint32_t ue, uint32_t us)
+static int32_t get_res(uint32_t r, uint32_t e, uint32_t s, uintptr_t ur, uintptr_t ue, uintptr_t us)
 {
     if (copy_to_user((void *)ur, &r, 4) < 0 || copy_to_user((void *)ue, &e, 4) < 0 ||
         copy_to_user((void *)us, &s, 4) < 0)
@@ -284,18 +301,36 @@ SYSCALL_DEF(sys_setgroups)
 
 /* --- time ------------------------------------------------------------------------ */
 
-/* The wall clock: the CMOS clock's time at boot, plus the 1 ms timer.
-   (Millisecond resolution for now; a vDSO with nanoseconds is step 11.) */
-static uint32_t boot_epoch;
+/* The wall clock: what it said at boot (ns since 1970: the CMOS clock, moved
+   by clock_settime and adjtimex), plus the 1 ms timer since. (Millisecond
+   resolution for now; a vDSO with nanoseconds is step 11.) Read and written
+   with interrupts off: on i386 a 64-bit value is two stores. */
+static int64_t boot_realtime_ns;
 
 void time_init(void)
 {
-    boot_epoch = rtc_read_epoch();
+    boot_realtime_ns = (int64_t)rtc_read_epoch() * 1000000000;
+}
+
+static int64_t realtime_ns(void)
+{
+    uint32_t flags = irq_save();
+    int64_t ns = boot_realtime_ns + (int64_t)timer_ms() * 1000000;
+    irq_restore(flags);
+    return ns;
+}
+
+/* Set the wall clock to ns (since 1970). Monotonic time doesn't move. */
+static void set_realtime_ns(int64_t ns)
+{
+    uint32_t flags = irq_save();
+    boot_realtime_ns = ns - (int64_t)timer_ms() * 1000000;
+    irq_restore(flags);
 }
 
 uint32_t time_now(void)
 {
-    return boot_epoch + timer_ms() / 1000;
+    return (uint32_t)(realtime_ns() / 1000000000);
 }
 
 #define CLOCK_REALTIME          0
@@ -306,24 +341,25 @@ uint32_t time_now(void)
 /* Nanoseconds on clock clk: realtime (since 1970) or monotonic (boot). */
 int64_t clock_ns(uint32_t clk)
 {
-    int64_t up = (int64_t)timer_ms() * 1000000;
     if (clk == CLOCK_REALTIME || clk == CLOCK_REALTIME_COARSE || clk == CLOCK_REALTIME_ALARM)
-        return (int64_t)boot_epoch * 1000000000 + up;
-    return up;                          /* monotonic, boottime, cputime... */
+        return realtime_ns();
+    return (int64_t)timer_ms() * 1000000;   /* monotonic, boottime, cputime... */
 }
 
+/* time_t time(time_t *t): a long, 32 bits on i386, 64 on x86_64. */
 SYSCALL_DEF(sys_time)
 {
-    int32_t t = (int32_t)(clock_ns(CLOCK_REALTIME) / 1000000000);
-    if (a1 && copy_to_user((void *)a1, &t, 4) < 0)
+    long t = (long)(clock_ns(CLOCK_REALTIME) / 1000000000);
+    if (a1 && copy_to_user((void *)a1, &t, sizeof t) < 0)
         return -EFAULT;
     return t;
 }
 
+/* gettimeofday(struct timeval *, struct timezone *): timeval is two longs. */
 SYSCALL_DEF(sys_gettimeofday)
 {
     int64_t ns = clock_ns(CLOCK_REALTIME);
-    int32_t tv[2] = { (int32_t)(ns / 1000000000), (int32_t)(ns % 1000000000 / 1000) };
+    long tv[2] = { (long)(ns / 1000000000), (long)(ns % 1000000000 / 1000) };
     if (a1 && copy_to_user((void *)a1, tv, sizeof tv) < 0)
         return -EFAULT;
     if (a2) {
@@ -348,6 +384,25 @@ SYSCALL_DEF(sys_clock_gettime64)
     int64_t ns = clock_ns(a1);
     int64_t ts[2] = { ns / 1000000000, ns % 1000000000 };
     return copy_to_user((void *)a2, ts, sizeof ts);
+}
+
+/* clock_settime(clock, const struct timespec *) with 64-bit seconds (musl
+   uses this one on i386; on x86_64 it is the only one): set the wall clock.
+   Only root; only CLOCK_REALTIME (the others can't be set, as on Linux).
+   `date -s`, `hwclock -s` and ntpd's steps come here. */
+SYSCALL_DEF(sys_clock_settime64)
+{
+    int64_t ts[2];
+    if (a1 != CLOCK_REALTIME)
+        return -EINVAL;
+    if (!is_root())
+        return -EPERM;
+    if (copy_from_user(ts, (void *)a2, sizeof ts) < 0)
+        return -EFAULT;
+    if (ts[0] < 0 || ts[1] < 0 || ts[1] >= 1000000000)
+        return -EINVAL;
+    set_realtime_ns(ts[0] * 1000000000 + ts[1]);
+    return 0;
 }
 
 SYSCALL_DEF(sys_clock_getres)
@@ -381,7 +436,7 @@ static int sleep_ns(int64_t ns, int64_t *left_ns)
     return 0;
 }
 
-static int32_t nanosleep_common(int64_t ns, uint32_t user_rem, int wide)
+static int32_t nanosleep_common(int64_t ns, uintptr_t user_rem, int wide)
 {
     int64_t left = 0;
     int err = sleep_ns(ns, &left);
@@ -471,18 +526,371 @@ SYSCALL_DEF(sys_prlimit64)              /* (pid, resource, new64 *, old64 *) */
 
 /* --- system information ------------------------------------------------------------- */
 
+/* --- personality, capabilities, namespaces, swap ------------------------------- */
+
+/* personality(persona): which Unix the program wants the kernel to be. Only
+   Linux's own; the flag bits (ADDR_NO_RANDOMIZE, ...) are kept — MyOS has no
+   address randomisation to turn off anyway — and PER_LINUX32 changes uname
+   on x86_64. 0xffffffff only asks. Returns the old one. */
+SYSCALL_DEF(sys_personality)
+{
+    struct process *p = proc_current();
+    uint32_t old = p->persona;
+    if ((uint32_t)a1 != 0xFFFFFFFF) {
+        uint32_t kind = (uint32_t)a1 & 0xFF;
+        if (kind != 0 && kind != PER_LINUX32)
+            return -EINVAL;
+        p->persona = (uint32_t)a1;
+    }
+    return old;
+}
+
+/*
+ * capget / capset. Linux splits root's power into capabilities; MyOS keeps
+ * the classic rule (euid 0 may do everything), so root has all of them and
+ * everyone else none — which is what capget reports, version 3 layout. A
+ * capset that would DROP capabilities is refused (EPERM): the kernel could
+ * not enforce it, and a program that drops privileges and then trusts that
+ * they are gone must not be told they are. Setting what is already true is
+ * allowed (and changes nothing).
+ */
+#define CAP_V1 0x19980330
+#define CAP_V2 0x20071026
+#define CAP_V3 0x20080522
+#define CAP_LAST 40                     /* CAP_CHECKPOINT_RESTORE */
+
+static int cap_header(uintptr_t uhdr, int *words)
+{
+    uint32_t hdr[2];                    /* version, pid */
+    if (copy_from_user(hdr, (void *)uhdr, sizeof hdr) < 0)
+        return -EFAULT;
+    if (hdr[0] != CAP_V1 && hdr[0] != CAP_V2 && hdr[0] != CAP_V3) {
+        uint32_t v = CAP_V3;            /* tell the caller what we speak */
+        if (copy_to_user((void *)uhdr, &v, 4) < 0)
+            return -EFAULT;
+        return -EINVAL;
+    }
+    if ((int32_t)hdr[1] < 0)
+        return -EINVAL;
+    if (hdr[1] && !proc_find(hdr[1]))
+        return -ESRCH;
+    *words = hdr[0] == CAP_V1 ? 1 : 2;
+    return (int32_t)hdr[1];
+}
+
+/* What a process has: all for root, nothing otherwise. (Other processes:
+   by their effective user id.) */
+static void caps_of(int pid, uint32_t data[6])
+{
+    struct process *p = pid ? proc_find(pid) : proc_current();
+    uint32_t all0 = 0xFFFFFFFF, all1 = (1u << (CAP_LAST - 31)) - 1;
+    int root = p && p->cred.euid == 0;
+    for (int w = 0; w < 2; w++) {
+        uint32_t v = root ? (w ? all1 : all0) : 0;
+        data[w * 3 + 0] = v;            /* effective */
+        data[w * 3 + 1] = v;            /* permitted */
+        data[w * 3 + 2] = 0;            /* inheritable */
+    }
+}
+
+SYSCALL_DEF(sys_capget)
+{
+    int words, pid = cap_header(a1, &words);
+    if (pid < 0)
+        return a2 || pid != -EINVAL ? pid : 0;  /* NULL data: just the version */
+    if (!a2)
+        return 0;
+    uint32_t data[6];
+    caps_of(pid, data);
+    return copy_to_user((void *)a2, data, words * 3 * sizeof(uint32_t));
+}
+
+SYSCALL_DEF(sys_capset)
+{
+    int words, pid = cap_header(a1, &words);
+    if (pid < 0)
+        return pid;
+    if (pid && pid != proc_current()->pid)
+        return -EPERM;                  /* only one's own, as on Linux */
+    uint32_t want[6], have[6];
+    if (copy_from_user(want, (void *)a2, words * 3 * sizeof(uint32_t)) < 0)
+        return -EFAULT;
+    caps_of(0, have);
+    for (int i = 0; i < words * 3; i++)
+        if (want[i] != have[i])
+            return -EPERM;              /* a change we could not keep */
+    return 0;
+}
+
+/* unshare(flags): Linux's namespaces aren't here (like a Linux built without
+   them: CLONE_NEW* is EINVAL). What is left to unshare — the files table,
+   cwd and umask, SysV semaphore undo — is already this process's own unless
+   it has other threads. */
+#define CLONE_FS       0x00000200
+#define CLONE_FILES    0x00000400
+#define CLONE_SYSVSEM  0x00040000
+SYSCALL_DEF(sys_unshare)
+{
+    if (a1 & ~(uintptr_t)(CLONE_FS | CLONE_FILES | CLONE_SYSVSEM))
+        return -EINVAL;
+    if ((a1 & (CLONE_FS | CLONE_FILES)) && proc_current()->nthreads > 1)
+        return -EINVAL;                 /* threads share them: can't split yet */
+    return 0;
+}
+
+/* setns(fd, type): no namespaces, so no namespace file to join. */
+SYSCALL_DEF(sys_setns)
+{
+    return fd_get(a1) ? -EINVAL : -EBADF;
+}
+
+/* swapon / swapoff: MyOS has no swap, by design — a page fault never waits
+   for the disk to make room, which keeps latency predictable. This is the
+   answer of a Linux built without swap (CONFIG_SWAP=n). */
+SYSCALL_DEF(sys_swapon)  { return is_root() ? -ENOSYS : -EPERM; }
+
+/* --- adjtimex / clock_adjtime ------------------------------------------------- */
+/*
+ * What ntpd and `adjtimex` read and set. Linux runs a phase-locked loop that
+ * slews the clock a little each tick; MyOS has none (its clock is the 1 ms
+ * timer), so: an offset to correct (ADJ_OFFSET, adjtime's one-shot,
+ * ADJ_SETOFFSET) is applied at once as a step, and the frequency, status,
+ * error estimates and so on are kept and read back but steer nothing. Reading
+ * is for anyone; any change is root's.
+ */
+#define USER_HZ 100                     /* clock_t ticks per second, as on Linux */
+
+#define ADJ_OFFSET          0x0001
+#define ADJ_FREQUENCY       0x0002
+#define ADJ_MAXERROR        0x0004
+#define ADJ_ESTERROR        0x0008
+#define ADJ_STATUS          0x0010
+#define ADJ_TIMECONST       0x0020
+#define ADJ_TAI             0x0080
+#define ADJ_SETOFFSET       0x0100
+#define ADJ_MICRO           0x1000
+#define ADJ_NANO            0x2000
+#define ADJ_TICK            0x4000
+#define ADJ_OFFSET_SINGLESHOT 0x8001    /* adjtime() */
+#define ADJ_OFFSET_SS_READ  0xa001      /* adjtime() just asking */
+#define STA_UNSYNC          0x0040
+#define STA_NANO            0x2000
+#define TIME_OK             0
+#define TIME_ERROR          5
+
+/* One struct timex, with every field 64-bit; converted from and to the two
+   layouts programs use. */
+struct ktimex {
+    uint32_t modes;
+    int32_t status, shift, tai;
+    int64_t offset, freq, maxerror, esterror, constant, precision, tolerance;
+    int64_t sec, frac;                  /* time: frac in us, or ns with STA_NANO */
+    int64_t tick, ppsfreq, jitter, stabil, jitcnt, calcnt, errcnt, stbcnt;
+};
+
+static struct {
+    int32_t status, tai;
+    int64_t freq, maxerror, esterror, constant, tick;
+} ntp = { STA_UNSYNC, 0, 0, 16000000, 16000000, 2, 1000000 / USER_HZ };
+
+static int do_adjtimex(struct ktimex *t)
+{
+    uint32_t m = t->modes;
+    if (m == ADJ_OFFSET_SS_READ)
+        m = 0;
+    if (m && !is_root())
+        return -EPERM;
+    int nano = (ntp.status & STA_NANO) != 0;
+    if (m & ADJ_SETOFFSET) {            /* step by the time field */
+        int64_t frac = t->frac;
+        int ns = (m & ADJ_NANO) != 0;
+        if (frac < 0 || frac >= (ns ? 1000000000 : 1000000))
+            return -EINVAL;
+        set_realtime_ns(realtime_ns() + t->sec * 1000000000 + (ns ? frac : frac * 1000));
+    }
+    if ((m & ADJ_OFFSET) == ADJ_OFFSET) {   /* also adjtime(): step, don't slew */
+        int64_t off = t->offset;
+        int ns = (m != ADJ_OFFSET_SINGLESHOT) && nano;
+        set_realtime_ns(realtime_ns() + (ns ? off : off * 1000));
+    }
+    if (m & ADJ_FREQUENCY)
+        ntp.freq = t->freq;
+    if (m & ADJ_MAXERROR)
+        ntp.maxerror = t->maxerror;
+    if (m & ADJ_ESTERROR)
+        ntp.esterror = t->esterror;
+    if (m & ADJ_STATUS)
+        ntp.status = (ntp.status & STA_NANO) | (t->status & ~STA_NANO);
+    if (m & ADJ_TIMECONST)
+        ntp.constant = t->constant;
+    if (m & ADJ_TAI)
+        ntp.tai = (int32_t)t->constant;    /* (as Linux: the value comes in constant) */
+    if (m & ADJ_TICK)
+        ntp.tick = t->tick;
+    if (m & ADJ_NANO)
+        ntp.status |= STA_NANO;
+    if (m & ADJ_MICRO)
+        ntp.status &= ~STA_NANO;
+
+    nano = (ntp.status & STA_NANO) != 0;
+    int64_t now = realtime_ns();
+    memset(t, 0, sizeof *t);
+    t->modes = m;
+    t->status = ntp.status;
+    t->tai = ntp.tai;
+    t->freq = ntp.freq;
+    t->maxerror = ntp.maxerror;
+    t->esterror = ntp.esterror;
+    t->constant = ntp.constant;
+    t->precision = 1000;                /* us: the clock moves in 1 ms steps */
+    t->tolerance = 500ll << 16;         /* 500 ppm, as Linux reports */
+    t->tick = ntp.tick;
+    t->sec = now / 1000000000;
+    t->frac = nano ? now % 1000000000 : now % 1000000000 / 1000;
+    return (ntp.status & STA_UNSYNC) ? TIME_ERROR : TIME_OK;
+}
+
+/* struct timex with longs: adjtimex and clock_adjtime on x86_64, and the old
+   ones on i386. The compiler pads it as Linux does on both. */
+struct timex_long {
+    uint32_t modes;
+    long offset, freq, maxerror, esterror;
+    int32_t status;
+    long constant, precision, tolerance, sec, frac, tick, ppsfreq, jitter;
+    int32_t shift;
+    long stabil, jitcnt, calcnt, errcnt, stbcnt;
+    int32_t tai;
+    int32_t reserved[11];
+};
+
+/* The 64-bit-time one (i386 clock_adjtime64): x86_64's layout, spelled out. */
+struct timex_64 {
+    uint32_t modes;
+    int32_t pad0;
+    int64_t offset, freq, maxerror, esterror;
+    int32_t status, pad1;
+    int64_t constant, precision, tolerance, sec, frac, tick, ppsfreq, jitter;
+    int32_t shift, pad2;
+    int64_t stabil, jitcnt, calcnt, errcnt, stbcnt;
+    int32_t tai;
+    int32_t reserved[11];
+};
+
+/* Copy the fields named in both layouts (a macro: the two structs differ
+   only in field widths). */
+#define TIMEX_FIELDS(X) X(modes) X(offset) X(freq) X(maxerror) X(esterror) X(status) \
+    X(constant) X(precision) X(tolerance) X(sec) X(frac) X(tick) X(ppsfreq) X(jitter) \
+    X(shift) X(stabil) X(jitcnt) X(calcnt) X(errcnt) X(stbcnt) X(tai)
+
+static intptr_t adjtimex_user(uintptr_t user, int wide)
+{
+    struct ktimex k;
+    int rc;
+    if (wide) {
+        struct timex_64 u;
+        if (copy_from_user(&u, (void *)user, sizeof u) < 0)
+            return -EFAULT;
+#define IN(f) k.f = u.f;
+#define OUT(f) u.f = k.f;
+        TIMEX_FIELDS(IN)
+        if ((rc = do_adjtimex(&k)) < 0)
+            return rc;
+        TIMEX_FIELDS(OUT)
+        return copy_to_user((void *)user, &u, sizeof u) < 0 ? -EFAULT : rc;
+    }
+    struct timex_long u;
+    if (copy_from_user(&u, (void *)user, sizeof u) < 0)
+        return -EFAULT;
+    TIMEX_FIELDS(IN)
+    if ((rc = do_adjtimex(&k)) < 0)
+        return rc;
+    TIMEX_FIELDS(OUT)
+#undef IN
+#undef OUT
+    return copy_to_user((void *)user, &u, sizeof u) < 0 ? -EFAULT : rc;
+}
+
+SYSCALL_DEF(sys_adjtimex)       { return adjtimex_user(a1, 0); }
+SYSCALL_DEF(sys_clock_adjtime)  { return a1 == CLOCK_REALTIME ? adjtimex_user(a2, 0) : -EOPNOTSUPP; }
+SYSCALL_DEF(sys_clock_adjtime64){ return a1 == CLOCK_REALTIME ? adjtimex_user(a2, 1) : -EOPNOTSUPP; }
+
+/* --- CPU time: times, getrusage --------------------------------------------- */
+
+
+/* A process's own CPU time in ms: its ended threads' and its live ones'. */
+static void self_times(struct process *p, uint32_t *user, uint32_t *sys)
+{
+    uint32_t flags = irq_save();
+    *user = p->utime;
+    *sys = p->stime;
+    for (struct thread *t = p->threads; t; t = t->proc_next) {
+        *user += t->utime;
+        *sys += t->stime;
+    }
+    irq_restore(flags);
+}
+
+/* clock_t times(struct tms *buf): the process's and its waited-for children's
+   CPU time in clock ticks; returns ticks since boot. struct tms is four
+   longs: 32 bits on i386, 64 on x86_64, as the C library expects. */
+SYSCALL_DEF(sys_times)
+{
+    struct process *p = proc_current();
+    uint32_t user, sys;
+    self_times(p, &user, &sys);
+    long tms[4] = { (long)(user / (1000 / USER_HZ)), (long)(sys / (1000 / USER_HZ)),
+                    (long)(p->cutime / (1000 / USER_HZ)), (long)(p->cstime / (1000 / USER_HZ)) };
+    if (a1 && copy_to_user((void *)a1, tms, sizeof tms) < 0)
+        return -EFAULT;
+    return (long)(timer_ms() / (1000 / USER_HZ));
+}
+
+/* struct rusage: user and system time (struct timevals: two longs each),
+   then 14 long counters, which stay 0 here (maxrss, page faults, context
+   switches... nothing counts them yet). */
+int rusage_to_user(uintptr_t user, uint32_t user_ms, uint32_t sys_ms)
+{
+    long ru[18];
+    memset(ru, 0, sizeof ru);
+    ru[0] = (long)(user_ms / 1000);
+    ru[1] = (long)(user_ms % 1000) * 1000;
+    ru[2] = (long)(sys_ms / 1000);
+    ru[3] = (long)(sys_ms % 1000) * 1000;
+    return copy_to_user((void *)user, ru, sizeof ru);
+}
+
+#define RUSAGE_SELF      0
+#define RUSAGE_CHILDREN (-1)
+#define RUSAGE_THREAD    1
+
+/* int getrusage(int who, struct rusage *ru) */
+SYSCALL_DEF(sys_getrusage)
+{
+    struct process *p = proc_current();
+    struct thread *t = thread_current();
+    uint32_t user, sys;
+    switch ((int32_t)a1) {
+    case RUSAGE_SELF:     self_times(p, &user, &sys); break;
+    case RUSAGE_CHILDREN: user = p->cutime; sys = p->cstime; break;
+    case RUSAGE_THREAD:   user = t->utime; sys = t->stime; break;
+    default:              return -EINVAL;
+    }
+    return rusage_to_user(a2, user, sys);
+}
+
 SYSCALL_DEF(sys_sysinfo)
 {
-    struct {
-        int32_t uptime;
-        uint32_t loads[3];
-        uint32_t totalram, freeram, sharedram, bufferram, totalswap, freeswap;
+    struct {                            /* Linux's: longs are 32 or 64 bits */
+        long uptime;
+        unsigned long loads[3];
+        unsigned long totalram, freeram, sharedram, bufferram, totalswap, freeswap;
         uint16_t procs, pad;
-        uint32_t totalhigh, freehigh, mem_unit;
-        char reserved[8];
+        unsigned long totalhigh, freehigh;
+        uint32_t mem_unit;
+        char reserved[20 - 2 * sizeof(long) - sizeof(uint32_t)];   /* (none on x86_64) */
     } si;
     memset(&si, 0, sizeof si);
-    si.uptime = (int32_t)(timer_ms() / 1000);
+    si.uptime = (long)(timer_ms() / 1000);
     si.totalram = pmm_usable_count();
     si.freeram = pmm_free_count();
     si.mem_unit = PAGE_SIZE;            /* counts are in pages */

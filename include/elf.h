@@ -2,6 +2,7 @@
 #define ELF_H
 
 #include <stdint.h>
+#include <user.h>       /* user_addr_t: 32 or 64 bits, by CPU */
 
 /*
  * ELF (Executable and Linkable Format) — the file format of Linux programs.
@@ -59,7 +60,7 @@ struct elf32_phdr {
 #define PT_PHDR      6
 
 #define ELF_MAX_PHDRS 16
-#define ELF_DYN_BASE  0x00400000u   /* where a position-independent program goes */
+/* ELF_DYN_BASE, where a position-independent program goes: user.h */
 
 #define PF_X         1
 #define PF_W         2
@@ -67,11 +68,11 @@ struct elf32_phdr {
 
 /* Result of loading an ELF file into the current address space. */
 struct elf_info {
-    uint32_t entry;             /* where to start */
-    uint32_t phdr;              /* address of the program headers in memory */
+    user_addr_t entry;          /* where to start */
+    user_addr_t phdr;           /* address of the program headers in memory */
     uint32_t phnum;
-    uint32_t brk_start;         /* first page after the segments: the heap */
-    uint32_t base;              /* how far it was shifted (position independent) */
+    user_addr_t brk_start;      /* first page after the segments: the heap */
+    user_addr_t base;           /* how far it was shifted (position independent) */
     const char *interp;         /* PT_INTERP: the dynamic linker it wants, or NULL */
 };
 
@@ -80,7 +81,7 @@ struct elf_info {
    ELF_BASE_ANY, to the first free place in the mmap area.
    Returns 0, or a negative errno (-ENOEXEC: not a usable i386 executable). */
 #define ELF_BASE_ANY 0
-int elf_load(const void *image, uint32_t size, uint32_t dyn_base, struct elf_info *info);
+int elf_load(const void *image, uint32_t size, user_addr_t dyn_base, struct elf_info *info);
 
 struct inode;
 
@@ -88,7 +89,7 @@ struct inode;
    page. The rest is filled on first touch (and the next page is read
    ahead). `interp`, when the file names a dynamic linker, receives that
    path; info->interp then points at `interp`. */
-int elf_map(struct inode *ino, uint32_t dyn_base, struct elf_info *info,
+int elf_map(struct inode *ino, user_addr_t dyn_base, struct elf_info *info,
             char *interp, uint32_t interp_cap);
 
 #endif

@@ -21,11 +21,11 @@ when it's fixed. File references point at the comment that mentions the gap.
   mounted — any other (someone's Linux disk in an old PC) is left alone.
 - **E820 map holds at most 32 entries.** (`layout.inc`, `E820_MAX`)
 - **UEFI loader starts the existing 32-bit kernel** (`make uefi` / `make live-uefi`).
-  The x86_64 kernel is a long-mode hello at physical 1 MiB (no paging.c,
-  no portable `kernel/` yet). It paints GOP as a 64-bit pointer (MSI
-  at `0x400000000` worked). `make ARCH=x86_64 live-uefi` builds the
-  userland disk; the kernel does not load the initrd or exec
-  myos-login. GOP above 4 GiB on i386 is mapped with PSE-36
+  The x86_64 kernel (2026-10-05) is the portable kernel in the higher half;
+  it runs 64-bit BusyBox from the initramfs (`make ARCH=x86_64
+  test-uefi-shell`, with signals) but not yet the live disk's myos-login.
+  Lengths inside mm.c are 32-bit (a 4 GiB+ mmap is refused). The list is
+  in docs/x86_64-PORT-PLAN.md. GOP above 4 GiB on i386 is mapped with PSE-36
   for the kernel console (32-bit virtual address, 36-bit physical in
   the PDE). User `mmap` of `/dev/fb0` cannot name that address (32-bit
   PTEs), so `simplefb` keeps an 8 MiB RAM shadow and, on the first mmap,
@@ -422,12 +422,22 @@ when it's fixed. File references point at the comment that mentions the gap.
   latency varies, and most of the time it is fast enough. If it recurs, the method that works is a probe image
   that writes its results to its own disk and is read back with `debugfs` —
   there is no usable serial console under UTM. See `docs/utm.md`.
-- **`sendfile64` (syscall 239) is not implemented.** BusyBox's `cp` and `cat`
-  try it whenever the destination can take it, fall back to read/write
-  correctly, and leave one `syscall 239 not implemented` line in every boot
-  log. Harmless but it is a real syscall that real programs use, and doing it
-  properly (straight out of the page cache) would make file copies faster
-  rather than merely quieter.
+- **`sendfile` takes kernel memory only where a destination says so**
+  (`file_ops.kbuf_ok`: RAM and ext2 files, pipes, terminals, ptys, /dev/null,
+  TCP/UDP sockets). Anything else (a Unix socket, a FAT file) is -EINVAL, and
+  the C library or program falls back to read + write. At most RW_MAX
+  (256 KiB) per call, like read.
+- **System calls answered as a Linux without the feature would:** swapon/swapoff
+  (-ENOSYS: no swap, by design), unshare/setns with namespaces (-EINVAL), capset
+  that would drop capabilities (-EPERM: MyOS has no capabilities to enforce, and
+  saying yes would be a false security promise). adjtimex steps the clock for an
+  offset instead of slewing it, and keeps the frequency without applying it.
+  semctl/msgctl IPC_INFO and *_STAT (what `ipcs` lists with) are -EINVAL. Legacy
+  fallbacks (stat64, fstat64, utimes, futimesat, 32-bit clock_settime) stay out
+  (docs/DESIGN.md): musl uses them only after -ENOSYS from the modern calls.
+- **inotify** has no IN_UNMOUNT (nothing unmounts), and its queue is 1024 events
+  (then one IN_Q_OVERFLOW). An event goes to the watches on the file and on the
+  one directory the VFS knows as its parent.
 
 ## Drivers
 

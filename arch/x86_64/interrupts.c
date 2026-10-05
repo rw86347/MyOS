@@ -6,14 +6,13 @@
 #include <proc.h>
 #include <sched.h>
 #include <serial.h>
+#include <signal.h>
 #include <string.h>
 #include <sched.h>
-#include <syscall64.h>
+#include <syscall.h>
 #include <thread.h>
 #include <uaccess.h>
 
-extern int32_t syscall_dispatch(uint32_t nr, uint32_t a1, uint32_t a2, uint32_t a3,
-                                uint32_t a4, uint32_t a5, uint32_t a6);
 
 struct idt_gate64 {
     uint16_t offset_low;
@@ -76,14 +75,14 @@ static const char *const exception_names[32] = {
     "Reserved",
 };
 
-struct ex_entry { uint32_t insn, fixup; };
+struct ex_entry { uint64_t insn, fixup; };      /* uaccess.asm EX_ENTRY */
 extern const struct ex_entry __start_ex_table[], __stop_ex_table[];
 
 static int fixup_user_access(struct regs *r)
 {
-    uint32_t eip = (uint32_t)regs_ip(r);
+    uint64_t rip = regs_ip(r);
     for (const struct ex_entry *e = __start_ex_table; e < __stop_ex_table; e++) {
-        if (e->insn == eip) {
+        if (e->insn == rip) {
             regs_set_ip(r, e->fixup);
             return 1;
         }
@@ -91,39 +90,79 @@ static int fixup_user_access(struct regs *r)
     return 0;
 }
 
+/* Which Linux signal a CPU exception becomes in a user program. */
+static int exception_signal(uint64_t vector)
+{
+    switch (vector) {
+    case 0: case 16: case 19: return SIGFPE;    /* divide, FPU, SSE error */
+    case 3:                   return SIGTRAP;   /* breakpoint */
+    case 6:                   return SIGILL;    /* invalid opcode */
+    default:                  return SIGSEGV;
+    }
+}
+
+/* A fault in a user program. If it handles the signal, the handler runs on
+   the way out (like Linux); otherwise the program dies, and the kernel log
+   says where. */
+static void user_exception(struct regs *r, uint64_t cr2)
+{
+    struct thread *t = thread_current();
+    int sig = exception_signal(r->vector);
+    user_addr_t h = t->proc->sig_action[sig - 1].handler;
+    if (h != SIG_DFL && h != SIG_IGN && !(t->sig_blocked & SIGBIT(sig))) {
+        t->sig_pending |= SIGBIT(sig);
+        t->sig_check = 1;
+        return;
+    }
+    kprintf("%s: killed by CPU exception %lu (%s) at RIP %lx", t->name, r->vector,
+            exception_names[r->vector < 32 ? r->vector : 0], regs_ip(r));
+    if (r->vector == 14)
+        kprintf(", %s of %lx (%s)", r->err_code & 2 ? "write" : "read", cr2,
+                r->err_code & 1 ? "not allowed" : "not mapped");
+    kprintf("\n");
+    proc_exit(W_SIGNALED(sig));
+}
+
 static void exception(struct regs *r)
 {
     uint64_t cr2;
     __asm__ volatile ("mov %%cr2, %0" : "=r"(cr2));
-    if (r->vector == 14 && mm_fault((uint32_t)cr2, (uint32_t)r->err_code) == 0)
+    if (r->vector == 14 && mm_fault(cr2, (uint32_t)r->err_code) == 0)
         return;
     if (regs_user_mode(r)) {
-        kprintf("user fault %lu at %lx\n", r->vector, regs_ip(r));
-        proc_exit(128 + 11);
+        user_exception(r, cr2);
         return;
     }
     if (r->vector == 14 && fixup_user_access(r))
         return;
     kprintf("\n*** CPU EXCEPTION %lu: %s ***\n", r->vector,
             exception_names[r->vector < 32 ? r->vector : 0]);
-    kprintf("RIP=%016lx CR2=%016lx\n", regs_ip(r), cr2);
+    kprintf("RIP=%016lx CR2=%016lx error code %lx\n", regs_ip(r), cr2, r->err_code);
     serial_flush();
     for (;;)
         __asm__ volatile ("cli; hlt");
 }
 
+/* From syscall_entry.asm. Linux x86_64 convention: the number in RAX,
+   arguments in RDI, RSI, RDX, R10, R8, R9 (R10, not RCX: `syscall` uses RCX
+   for the return address); the result goes back in RAX. */
 void syscall_entry_c(struct regs *r)
 {
-    thread_current()->uregs = r;
-    regs_set_ax(r, syscall_dispatch_x86_64(r->rax, r->rdi, r->rsi, r->rdx, r->r10,
-                                           r->r8, r->r9));
-    sched_preempt_check();
+    thread_current()->uregs = r;        /* fork/execve need the registers */
+    uint64_t nr = r->rax;
+    r->rax = nr <= 0xFFFFFFFF ? syscall_dispatch((uint32_t)nr, r->rdi, r->rsi, r->rdx,
+                                                 r->r10, r->r8, r->r9)
+                              : -ENOSYS;
+    sched_preempt_check();              /* the slot may have ended meanwhile */
+    SIGNAL_CHECK(r);                    /* back to user mode: deliver signals */
 }
 
 void interrupt_dispatch(struct regs *r)
 {
     if (r->vector < 32) {
         exception(r);
+        if (regs_user_mode(r))
+            SIGNAL_CHECK(r);            /* e.g. a handled SIGSEGV */
         return;
     }
     int irq = (int)r->vector - PIC_IRQ_BASE;
@@ -134,4 +173,6 @@ void interrupt_dispatch(struct regs *r)
         irq_handlers[irq][k](r);
     pic_send_eoi(irq);
     sched_preempt_check();
+    if (regs_user_mode(r))
+        SIGNAL_CHECK(r);                /* e.g. Ctrl-C for a busy program */
 }

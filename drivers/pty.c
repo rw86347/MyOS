@@ -167,7 +167,7 @@ static int32_t master_write(struct file *f, const void *user_buf, uint32_t n)
     pget(p);
     while (done < n) {
         uint32_t k = n - done < sizeof chunk ? n - done : sizeof chunk;
-        if (copy_from_user(chunk, (const char *)user_buf + done, k) < 0) {
+        if (file_copy_in(f, chunk, (const char *)user_buf + done, k) < 0) {
             err = -EFAULT;
             break;
         }
@@ -200,7 +200,7 @@ static uint32_t master_poll(struct file *f)
     return ev;
 }
 
-static int32_t master_ioctl(struct file *f, uint32_t cmd, uint32_t arg)
+static int32_t master_ioctl(struct file *f, uint32_t cmd, uintptr_t arg)
 {
     struct pty *p = f->priv;
     switch (cmd) {
@@ -247,7 +247,7 @@ static void master_release(struct file *f)
 static int master_open(struct file *f);
 
 static const struct file_ops master_ops = {
-    .read = master_read, .write = master_write, .ioctl = master_ioctl,
+    .read = master_read, .write = master_write, .ioctl = master_ioctl, .kbuf_ok = 1,
     .poll = master_poll, .release = master_release, .open = master_open,
 };
 
@@ -273,7 +273,7 @@ static int32_t slave_write(struct file *f, const void *user_buf, uint32_t n)
     pget(p);
     while (done < n) {
         uint32_t k = n - done < sizeof chunk ? n - done : sizeof chunk;
-        if (copy_from_user(chunk, (const char *)user_buf + done, k) < 0) {
+        if (file_copy_in(f, chunk, (const char *)user_buf + done, k) < 0) {
             err = -EFAULT;
             break;
         }
@@ -330,7 +330,7 @@ static int make_ctty(struct pty *p)
     return 0;
 }
 
-static int32_t slave_ioctl(struct file *f, uint32_t cmd, uint32_t arg)
+static int32_t slave_ioctl(struct file *f, uint32_t cmd, uintptr_t arg)
 {
     struct pty *p = f->priv;
     switch (cmd) {
@@ -378,7 +378,7 @@ static int slave_open(struct file *f)
 }
 
 static const struct file_ops slave_ops = {
-    .read = slave_read, .write = slave_write, .ioctl = slave_ioctl,
+    .read = slave_read, .write = slave_write, .ioctl = slave_ioctl, .kbuf_ok = 1,
     .poll = slave_poll, .release = slave_release, .open = slave_open,
 };
 

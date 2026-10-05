@@ -112,18 +112,19 @@ struct pci_dev *pci_dev_at(int index)
 }
 
 /* Device registers live in a window of kernel addresses after the e1000's
-   (0xF4000000, 128 KiB). Mappings are made once, at boot, and never undone. */
-#define MMIO_WINDOW     0xF4100000u
-#define MMIO_WINDOW_END 0xF8000000u
+   (MMIO_BASE, 128 KiB; memlayout.h). Mappings are made once, at boot, and
+   never undone. */
+#define MMIO_WINDOW     (MMIO_BASE + 0x100000)
+#define MMIO_WINDOW_END MMIO_END
 
 volatile void *pci_map_mmio(uint32_t phys, uint32_t bytes)
 {
-    static uint32_t next = MMIO_WINDOW;
+    static uintptr_t next = MMIO_WINDOW;
     uint32_t off = phys & (PAGE_SIZE - 1);
     uint32_t pages = (off + bytes + PAGE_SIZE - 1) / PAGE_SIZE;
     if (!bytes || pages > (MMIO_WINDOW_END - next) / PAGE_SIZE)
         return NULL;
-    uint32_t va = next;
+    uintptr_t va = next;
     for (uint32_t i = 0; i < pages; i++)
         if (vmm_map(va + i * PAGE_SIZE, (phys - off) + i * PAGE_SIZE,
                     PTE_WRITABLE | PTE_PCD) < 0)

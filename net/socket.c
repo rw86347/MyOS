@@ -25,7 +25,9 @@
 #include <socket.h>
 #include <string.h>
 #include <thread.h>
+#include <stddef.h>
 #include <uaccess.h>
+#include <user.h>
 #include <tcp.h>
 #include <udp.h>
 #include <vfs.h>
@@ -70,14 +72,6 @@ struct sockaddr_in {
     uint8_t zero[8];
 };
 
-struct iovec32 { uint32_t base, len; };
-
-struct msghdr32 {
-    uint32_t name, namelen;
-    uint32_t iov, iovlen;
-    uint32_t control, controllen;
-    int32_t flags;
-};
 
 struct dgram {
     uint32_t src;                   /* host order */
@@ -228,22 +222,22 @@ static int32_t bad_fd(uint32_t fd)
  * message header, which is below the noise in `make bench`.
  */
 #define SOCK_SYSCALL(name)                                                     \
-    static int32_t name##_held(uint32_t, uint32_t, uint32_t,                   \
-                               uint32_t, uint32_t, uint32_t);                  \
+    static intptr_t name##_held(uintptr_t, uintptr_t, uintptr_t,              \
+                                uintptr_t, uintptr_t, uintptr_t);              \
     SYSCALL_DEF(name)                                                          \
     {                                                                          \
         struct file *f = fd_get((int)a1);                                      \
         if (f)                                                                 \
             file_get(f);                                                       \
-        int32_t rc = name##_held(a1, a2, a3, a4, a5, a6);                      \
+        intptr_t rc = name##_held(a1, a2, a3, a4, a5, a6);                     \
         if (f)                                                                 \
             file_put(f);                                                       \
         return rc;                                                             \
     }                                                                          \
-    static int32_t name##_held(SYSCALL_ARG a1, SYSCALL_ARG a2, SYSCALL_ARG a3, \
-                               SYSCALL_ARG a4, SYSCALL_ARG a5, SYSCALL_ARG a6)
+    static intptr_t name##_held(SYSCALL_ARG a1, SYSCALL_ARG a2, SYSCALL_ARG a3, \
+                                SYSCALL_ARG a4, SYSCALL_ARG a5, SYSCALL_ARG a6)
 
-static int read_addr(uint32_t uaddr, uint32_t alen, uint32_t *ip, uint16_t *port, int *unspec)
+static int read_addr(uintptr_t uaddr, uint32_t alen, uint32_t *ip, uint16_t *port, int *unspec)
 {
     struct sockaddr_in sa;
     if (alen < 2 || !uaddr)
@@ -265,7 +259,7 @@ static int read_addr(uint32_t uaddr, uint32_t alen, uint32_t *ip, uint16_t *port
 }
 
 /* Write an address back: copy min(*len, 16) bytes, then *len = 16. */
-static int write_addr(uint32_t uaddr, uint32_t ulenp, uint32_t ip, uint16_t port)
+static int write_addr(uintptr_t uaddr, uintptr_t ulenp, uint32_t ip, uint16_t port)
 {
     if (!uaddr || !ulenp)
         return 0;
@@ -370,7 +364,7 @@ static uint32_t move_max(struct sock *s)
  *
  * `write` is the kernel's direction: 1 for a receive.
  */
-static int fault_in_iov(const struct iovec32 *iov, uint32_t n, uint32_t cap, int write)
+static int fault_in_iov(const struct user_iovec *iov, uint32_t n, uint32_t cap, int write)
 {
     for (uint32_t i = 0; i < n && cap; i++) {
         uint32_t len = iov[i].len < cap ? iov[i].len : cap;
@@ -382,7 +376,7 @@ static int fault_in_iov(const struct iovec32 *iov, uint32_t n, uint32_t cap, int
 }
 
 /* A stream write to a closed connection also raises SIGPIPE (Linux). */
-static int32_t stream_send(struct sock *s, uint32_t ubuf, uint32_t len,
+static int32_t stream_send(struct sock *s, uintptr_t ubuf, uint32_t len,
                            int nonblock, uint32_t flags)
 {
     int rc = tcp_write(s->tcp, (const void *)ubuf, len, 1, nonblock);
@@ -391,8 +385,8 @@ static int32_t stream_send(struct sock *s, uint32_t ubuf, uint32_t len,
     return rc;
 }
 
-static int32_t do_send(struct sock *s, uint32_t ubuf, uint32_t len,
-                       uint32_t uaddr, uint32_t alen, int nonblock, uint32_t flags)
+static int32_t do_send(struct sock *s, uintptr_t ubuf, uint32_t len,
+                       uintptr_t uaddr, uint32_t alen, int nonblock, uint32_t flags)
 {
     if (s->type == SOCK_STREAM)
         return stream_send(s, ubuf, len, nonblock, flags);
@@ -418,8 +412,8 @@ static int32_t do_send(struct sock *s, uint32_t ubuf, uint32_t len,
 
 /* Copy the next datagram out. iov: n user buffers. Returns bytes copied
    (or the full length with MSG_TRUNC), or -errno. */
-static int32_t do_recv(struct sock *s, struct file *f, const struct iovec32 *iov,
-                       uint32_t niov, uint32_t flags, uint32_t uaddr, uint32_t ulenp,
+static int32_t do_recv(struct sock *s, struct file *f, const struct user_iovec *iov,
+                       uint32_t niov, uint32_t flags, uintptr_t uaddr, uintptr_t ulenp,
                        int32_t *msg_flags)
 {
     int nonblock = (f->flags & O_NONBLOCK) || (flags & MSG_DONTWAIT);
@@ -484,13 +478,32 @@ out:
 
 static int32_t sock_read(struct file *f, void *ubuf, uint32_t n)
 {
-    struct iovec32 v = { (uint32_t)ubuf, n };
+    struct user_iovec v = { (uintptr_t)ubuf, n };
     return do_recv(f->priv, f, &v, 1, 0, 0, 0, 0);
+}
+
+/* sendfile into a socket: what write() does, with the bytes already in
+   kernel memory (file data from the page cache). */
+static int32_t send_kernel(struct sock *s, const void *k, uint32_t len, int nonblock)
+{
+    if (s->type == SOCK_STREAM) {
+        int rc = tcp_write(s->tcp, k, len, 0, nonblock);
+        if (rc == -EPIPE)
+            signal_send(proc_current(), SIGPIPE);
+        return rc;
+    }
+    if (!s->connected)
+        return -EDESTADDRREQ;
+    if (len > max_len(s))
+        return -EMSGSIZE;
+    return send_k(s, k, len, s->raddr, s->rport);
 }
 
 static int32_t sock_write(struct file *f, const void *ubuf, uint32_t n)
 {
-    return do_send(f->priv, (uint32_t)ubuf, n, 0, 0, f->flags & O_NONBLOCK, 0);
+    if (f->kbuf)
+        return send_kernel(f->priv, ubuf, n, f->flags & O_NONBLOCK);
+    return do_send(f->priv, (uintptr_t)ubuf, n, 0, 0, f->flags & O_NONBLOCK, 0);
 }
 
 static uint32_t sock_poll(struct file *f)
@@ -509,7 +522,7 @@ static uint32_t sock_poll(struct file *f)
     return (s->count ? POLLIN : 0) | POLLOUT;
 }
 
-static int32_t sock_ioctl(struct file *f, uint32_t cmd, uint32_t arg)
+static int32_t sock_ioctl(struct file *f, uint32_t cmd, uintptr_t arg)
 {
     struct sock *s = f->priv;
     if (cmd == FIONREAD) {
@@ -555,6 +568,7 @@ static const struct file_ops sock_ops = {
     .release = sock_release,
     .ioctl = sock_ioctl,
     .poll = sock_poll,
+    .kbuf_ok = 1,
 };
 
 /* --- the syscalls -------------------------------------------------------- */
@@ -724,7 +738,7 @@ SOCK_SYSCALL(sys_sendto)
     struct sock *s = sock_of(a1, &f);
     if (!s)
         return bad_fd(a1);
-    struct iovec32 v = { a2, a3 };
+    struct user_iovec v = { a2, a3 };
     if (fault_in_iov(&v, 1, move_max(s), 0) < 0)
         return -EFAULT;
     return do_send(s, a2, a3, a5, a6, (f->flags & O_NONBLOCK) || (a4 & MSG_DONTWAIT), a4);
@@ -739,7 +753,7 @@ SOCK_SYSCALL(sys_recvfrom)
     struct sock *s = sock_of(a1, &f);
     if (!s)
         return bad_fd(a1);
-    struct iovec32 v = { a2, a3 };
+    struct user_iovec v = { a2, a3 };
     if (fault_in_iov(&v, 1, move_max(s), 1) < 0)
         return -EFAULT;
     return do_recv(s, f, &v, 1, a4, a5, a6, 0);
@@ -747,7 +761,7 @@ SOCK_SYSCALL(sys_recvfrom)
 
 #define IOV_MAX_K 16
 
-static int read_msg(uint32_t umsg, struct msghdr32 *m, struct iovec32 *iov)
+static int read_msg(uintptr_t umsg, struct user_msghdr *m, struct user_iovec *iov)
 {
     if (copy_from_user(m, (const void *)umsg, sizeof *m) < 0)
         return -EFAULT;
@@ -766,8 +780,8 @@ SOCK_SYSCALL(sys_sendmsg)
     struct sock *s = sock_of(a1, &f);
     if (!s)
         return bad_fd(a1);
-    struct msghdr32 m;
-    struct iovec32 iov[IOV_MAX_K];
+    struct user_msghdr m;
+    struct user_iovec iov[IOV_MAX_K];
     int rc = read_msg(a2, &m, iov);
     if (rc < 0)
         return rc;
@@ -827,21 +841,22 @@ SOCK_SYSCALL(sys_recvmsg)
     struct sock *s = sock_of(a1, &f);
     if (!s)
         return bad_fd(a1);
-    struct msghdr32 m;
-    struct iovec32 iov[IOV_MAX_K];
+    struct user_msghdr m;
+    struct user_iovec iov[IOV_MAX_K];
     int rc = read_msg(a2, &m, iov);
     if (rc < 0)
         return rc;
     if (fault_in_iov(iov, m.iovlen, move_max(s), 1) < 0)
         return -EFAULT;
     int32_t mflags = 0;
-    uint32_t namelen_at = a2 + 4;   /* &msg->msg_namelen */
+    uintptr_t namelen_at = a2 + offsetof(struct user_msghdr, namelen);
     int32_t r = do_recv(s, f, iov, m.iovlen, a3, m.name, m.name ? namelen_at : 0, &mflags);
     if (r < 0)
         return r;
-    uint32_t zero = 0;
-    if (copy_to_user((void *)(a2 + 20), &zero, 4) < 0 ||        /* msg_controllen */
-        copy_to_user((void *)(a2 + 24), &mflags, 4) < 0)        /* msg_flags */
+    user_addr_t zero = 0;           /* no control messages: msg_controllen = 0 */
+    if (copy_to_user((void *)(a2 + offsetof(struct user_msghdr, controllen)), &zero,
+                     sizeof zero) < 0 ||
+        copy_to_user((void *)(a2 + offsetof(struct user_msghdr, flags)), &mflags, 4) < 0)
         return -EFAULT;
     return r;
 }

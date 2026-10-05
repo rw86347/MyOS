@@ -30,8 +30,14 @@ static volatile uint32_t ticks;
 
 static void timer_irq(struct regs *r)
 {
-    (void)r;
     ticks++;
+    struct thread *t = thread_current();    /* (NULL until thread_init) */
+    if (t && !t->is_idle) {             /* CPU time: whoever this tick interrupted */
+        if ((r->cs & 3) == 3)
+            t->utime++;
+        else
+            t->stime++;
+    }
     cycles_tick(ticks);                 /* background calibration (cpu.c) */
     thread_timer_tick(ticks);           /* wake timed sleepers that are due */
     signal_alarm_tick(ticks);           /* SIGALRM for alarm/setitimer */

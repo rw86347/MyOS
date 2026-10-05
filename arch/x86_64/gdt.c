@@ -1,9 +1,28 @@
 /*
  * gdt.c — x86_64 GDT + 64-bit TSS (RSP0 for syscall/interrupt from ring 3)
+ *
+ * In long mode segments do almost nothing (base 0, no limit), but the CPU
+ * still needs code/data descriptors for the privilege level, and a TSS for
+ * the kernel stack to use when user code is interrupted.
+ *
+ * The order is fixed by syscall/sysret, which do not read the GDT: they
+ * compute the selectors from MSR STAR (syscall.c). For sysret back to
+ * 64-bit code the CPU takes SS = base + 8 and CS = base + 16. So user data
+ * must come right before user code, with a spare slot before both:
+ *
+ *   0x00 null   0x08 kernel code   0x10 kernel data
+ *   0x18 (sysret's base: a 32-bit user code segment, which we never use)
+ *   0x20 user data (0x23 with RPL 3)   0x28 user code (0x2B)
+ *   0x30 TSS (16 bytes: two slots)
+ *
+ * Linux has the same shape (its user code is 0x33).
  */
+#include <cpu.h>
 #include <gdt.h>
 #include <stdint.h>
 #include <string.h>
+
+#define MSR_FS_BASE 0xC0000100
 
 struct gdt_entry {
     uint16_t limit_low;
@@ -31,7 +50,7 @@ struct tss64 {
     uint16_t iomap_base;
 } __attribute__((packed));
 
-static struct gdt_entry gdt[7];
+static struct gdt_entry gdt[8];
 struct tss64 kernel_tss;
 
 static void set_entry(int i, uint32_t base, uint32_t limit, uint8_t access, uint8_t flags)
@@ -70,13 +89,14 @@ static void set_tss(int i, uint64_t base, uint32_t limit)
 void gdt_init(void)
 {
     set_entry(0, 0, 0, 0, 0);
-    set_entry(1, 0, 0, 0x9A, 0xA);   /* 64-bit code, L=1 in flags nibble */
-    set_entry(2, 0, 0, 0x92, 0xA);   /* data */
-    set_entry(3, 0, 0, 0xFA, 0xA);     /* user code RPL 3 */
-    set_entry(4, 0, 0, 0xF2, 0xA);     /* user data RPL 3 */
+    set_entry(1, 0, 0, 0x9A, 0xA);          /* kernel code: 64-bit (L flag) */
+    set_entry(2, 0, 0, 0x92, 0xA);          /* kernel data */
+    set_entry(3, 0, 0xFFFFF, 0xFA, 0xC);    /* user code, 32-bit: never loaded */
+    set_entry(4, 0, 0, 0xF2, 0xA);          /* user data, DPL 3 */
+    set_entry(5, 0, 0, 0xFA, 0xA);          /* user code, 64-bit, DPL 3 */
 
-    kernel_tss.iomap_base = sizeof kernel_tss;
-    set_tss(5, (uint64_t)(uintptr_t)&kernel_tss, sizeof kernel_tss - 1);
+    kernel_tss.iomap_base = sizeof kernel_tss;  /* no I/O permission map */
+    set_tss(6, (uint64_t)(uintptr_t)&kernel_tss, sizeof kernel_tss - 1);
 
     struct gdt_ptr ptr = { sizeof gdt - 1, (uint64_t)(uintptr_t)gdt };
     __asm__ volatile ("lgdt %0" : : "m"(ptr) : "memory");
@@ -88,9 +108,12 @@ void tss_set_kernel_stack(uint64_t rsp0)
     kernel_tss.rsp0 = rsp0;
 }
 
+/* A thread's thread-local storage: tls[0] is its FS base (arch_prctl).
+   The value was checked to be a user address when it was set: writing a
+   non-canonical one would fault in the kernel. */
 void gdt_load_tls(const uint64_t tls[GDT_TLS_ENTRIES])
 {
-    (void)tls;
+    wrmsr(MSR_FS_BASE, tls[0]);
 }
 
 uint64_t gdt_tls_descriptor(uint32_t base, uint32_t limit, uint32_t flags)

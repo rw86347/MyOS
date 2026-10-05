@@ -1,11 +1,34 @@
 ; entry.asm — first 64-bit kernel code
 ;
-; The UEFI loader left us in long mode with an identity map and jumped
-; here at physical 1 MiB. We load our own GDT (firmware's CS is fine for
-; a jump, but C and later interrupt return need a known layout), clear
-; .bss, switch to our stack, and call kernel_main.
+; The UEFI loader copied kernel.bin to physical 1 MiB and jumped here, in
+; long mode, on the firmware's page tables (an identity map: virtual ==
+; physical). But the kernel is LINKED to run at the top of memory
+; (KERNEL_VBASE, -2 GiB; memlayout.h), so that programs get the bottom half
+; from address 0, as on Linux.
+;
+; Until we jump up there, only RIP-relative code works: [rel x] means "x's
+; distance from this instruction", and that distance is the same at both
+; addresses. So, still at 1 MiB:
+;
+;   1. clear .bss — the boot page tables below live in it
+;   2. build boot page tables: ONE page directory of 2 MiB pages covering
+;      the first 1 GiB of RAM, hung in three places:
+;        PML4[0]   identity          0 .. 1 GiB  (we are running here now)
+;        PML4[256] direct map        DIRECTMAP_BASE + (0 .. 1 GiB)  (P2V)
+;        PML4[511] kernel image      KERNEL_VBASE   + (0 .. 1 GiB)
+;   3. load CR3, and jump to the high address of the next instruction
+;
+; Then our GDT, our stack, and kernel_main. vmm_init (paging.c) replaces
+; these tables with the real ones, which no longer have the identity map.
 
 [bits 64]
+default rel
+
+KERNEL_VBASE equ 0xFFFFFFFF80000000
+PG_P         equ 1 << 0                 ; present
+PG_W         equ 1 << 1                 ; writable
+PG_PS        equ 1 << 7                 ; (in a page directory) a 2 MiB page
+CR4_PGE      equ 1 << 7
 
 section .text.entry
 global _start
@@ -14,33 +37,73 @@ extern __bss_start, __bss_end
 
 _start:
     cli
-    lea rax, [rel gdt]
-    mov [rel gdt_ptr + 2], rax
-    lgdt [rel gdt_ptr]
-
-    push 0x08
-    lea rax, [rel reload_cs]
-    push rax
-    retfq
-
-reload_cs:
-    mov ax, 0x10
-    mov ds, ax
-    mov es, ax
-    mov ss, ax
-    mov fs, ax
-    mov gs, ax
-
     cld
-    lea rdi, [rel __bss_start]
-    lea rcx, [rel __bss_end]
+
+    ; 1. Clear .bss.
+    lea rdi, [__bss_start]
+    lea rcx, [__bss_end]
     sub rcx, rdi
     xor eax, eax
     rep stosb
 
-    lea rsp, [rel boot_stack_top]
-    and rsp, ~15
-    xor rbp, rbp
+    ; 2. The page directory: entry i maps physical i * 2 MiB.
+    lea rdi, [boot_pd]
+    mov eax, PG_P | PG_W | PG_PS
+    mov ecx, 512
+.fill:
+    mov [rdi], rax
+    add rax, 0x200000
+    add rdi, 8
+    dec ecx
+    jnz .fill
+
+    ; One PDPT entry covers 1 GiB. Entry 0 of boot_pdpt_low is 0..1 GiB of
+    ; whichever PML4 slot points at it (identity and direct map share it);
+    ; entry 510 of boot_pdpt_high is -2 GiB (bits 38:30 of KERNEL_VBASE).
+    lea rax, [boot_pd]
+    or rax, PG_P | PG_W
+    mov [boot_pdpt_low], rax
+    mov [boot_pdpt_high + 510 * 8], rax
+    lea rax, [boot_pdpt_low]
+    or rax, PG_P | PG_W
+    mov [boot_pml4], rax
+    mov [boot_pml4 + 256 * 8], rax
+    lea rax, [boot_pdpt_high]
+    or rax, PG_P | PG_W
+    mov [boot_pml4 + 511 * 8], rax
+
+    ; Global pages off: switching CR4.PGE off empties the whole TLB, so no
+    ; stale firmware entry for a low address survives into user space.
+    ; vmm_init turns it back on for our own kernel pages.
+    mov rax, cr4
+    and rax, ~CR4_PGE
+    mov cr4, rax
+
+    ; 3. Our tables, then up. (`mov rax, imm64` is an absolute address:
+    ; the high one the linker gave .high.)
+    lea rax, [boot_pml4]
+    mov cr3, rax
+    mov rax, .high
+    jmp rax
+
+.high:
+    lgdt [gdt_ptr]                      ; (gdt.c installs the real one soon)
+    push 0x08
+    lea rax, [.reload_cs]
+    push rax
+    retfq
+
+.reload_cs:
+    mov ax, 0x10
+    mov ds, ax
+    mov es, ax
+    mov ss, ax
+    xor eax, eax                ; FS, GS null: their bases are MSRs (a
+    mov fs, ax                  ; program's thread-local storage), and a null
+    mov gs, ax                  ; selector is one iretq leaves alone
+
+    lea rsp, [boot_stack_top]
+    xor ebp, ebp
     call kernel_main
 
 .hang:
@@ -48,6 +111,7 @@ reload_cs:
     hlt
     jmp .hang
 
+section .rodata
 align 16
 gdt:
     dq 0
@@ -57,10 +121,14 @@ gdt_end:
 
 gdt_ptr:
     dw gdt_end - gdt - 1
-    dq 0                            ; filled at run time (relocatable)
+    dq gdt                          ; its high address
 
-section .bss
-align 16
+section .bss nobits alloc noexec write align=4096
+boot_pml4:      resb 4096
+boot_pdpt_low:  resb 4096
+boot_pdpt_high: resb 4096
+boot_pd:        resb 4096
+alignb 16
 boot_stack:
     resb 16384
 boot_stack_top:

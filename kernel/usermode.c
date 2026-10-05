@@ -78,27 +78,36 @@ static uint32_t strings_size(const char *const v[], uint32_t n)
 
 /* Copy n strings to `at` and up, one after another, and their addresses
    into addr[]. Returns where the next one would go. */
-static uint32_t put_strings(uint32_t at, const char *const v[], uint32_t n,
-                            uint32_t *addr)
+static user_addr_t put_strings(user_addr_t at, const char *const v[], uint32_t n,
+                               user_addr_t *addr)
 {
     for (uint32_t i = 0; i < n; i++) {
         uint32_t len = strlen(v[i]) + 1;
-        memcpy((void *)at, v[i], len);
+        memcpy((void *)(uintptr_t)at, v[i], len);
         addr[i] = at;
         at += len;
     }
     return at;
 }
 
-/* Build the start-up stack described at the top; returns the initial ESP.
-   The kernel writes straight into the new program's stack: its pages
-   appear on first touch (demand paging), like the program's own would. */
-static uint32_t build_stack(const char *const argv[], const char *const envp[],
-                            const struct elf_info *info, uint32_t sysinfo,
-                            uint32_t interp_base, const struct cred *c)
+/* The size of one program header, for AT_PHENT. */
+#ifdef ARCH_X86_64
+#define PHENT_SIZE 56                   /* Elf64_Phdr */
+#else
+#define PHENT_SIZE sizeof(struct elf32_phdr)
+#endif
+
+/* Build the start-up stack described at the top; returns the initial stack
+   pointer. Every entry of the table is one machine word (user_addr_t): 4
+   bytes on i386, 8 on x86_64. The kernel writes straight into the new
+   program's stack: its pages appear on first touch (demand paging), like
+   the program's own would. */
+static user_addr_t build_stack(const char *const argv[], const char *const envp[],
+                               const struct elf_info *info, user_addr_t sysinfo,
+                               user_addr_t interp_base, const struct cred *c)
 {
     uint32_t argc = count(argv), envc = count(envp);
-    uint32_t sp = USER_STACK_TOP;
+    user_addr_t sp = USER_STACK_TOP;
 
     /* 1. 16 random bytes for AT_RANDOM. musl uses these to pick its stack
        guard value and to seed its hash tables, so a predictable 16 bytes
@@ -107,12 +116,12 @@ static uint32_t build_stack(const char *const argv[], const char *const envp[],
     uint32_t rnd[4];
     random_bytes(rnd, sizeof rnd);
     sp -= sizeof rnd;
-    memcpy((void *)sp, rnd, sizeof rnd);
-    uint32_t random_addr = sp;
+    memcpy((void *)(uintptr_t)sp, rnd, sizeof rnd);
+    user_addr_t random_addr = sp;
 
-    uint32_t auxv[] = {
+    user_addr_t auxv[] = {
         AT_PHDR,   info->phdr,
-        AT_PHENT,  sizeof(struct elf32_phdr),
+        AT_PHENT,  PHENT_SIZE,
         AT_PHNUM,  info->phnum,
         AT_PAGESZ, PAGE_SIZE,
         AT_BASE,   interp_base,         /* where the dynamic linker is (0: none) */
@@ -129,16 +138,17 @@ static uint32_t build_stack(const char *const argv[], const char *const envp[],
     /* 2. The table: argc, argv..., 0, envp..., 0, auxv. It sits below the
        space the strings may use; the i386 ABI wants ESP 16-byte aligned at
        the program's entry. */
-    uint32_t words = 1 + argc + 1 + envc + 1 + sizeof auxv / 4;
-    uint32_t *table = (uint32_t *)((sp - ARG_SPACE - words * 4) & ~0xFu);
+    uint32_t words = 1 + argc + 1 + envc + 1 + sizeof auxv / sizeof auxv[0];
+    user_addr_t *table = (user_addr_t *)(uintptr_t)
+        ((sp - ARG_SPACE - words * sizeof(user_addr_t)) & ~(user_addr_t)0xF);
 
     /* The strings in Linux's order: argv[0] lowest, then the rest of argv,
        then the environment, all in one run. Programs that rewrite their
        name for `ps` (util-linux's login, sendmail) treat argv[0] through
        the end of the last environment string as one buffer to overwrite. */
-    uint32_t *p = table;
+    user_addr_t *p = table;
     *p++ = argc;
-    uint32_t at = sp - strings_size(argv, argc) - strings_size(envp, envc);
+    user_addr_t at = sp - strings_size(argv, argc) - strings_size(envp, envc);
     at = put_strings(at, argv, argc, p);
     p += argc;
     *p++ = 0;                           /* end of argv */
@@ -146,7 +156,7 @@ static uint32_t build_stack(const char *const argv[], const char *const envp[],
     p += envc;
     *p++ = 0;                           /* end of envp */
     memcpy(p, auxv, sizeof auxv);
-    return (uint32_t)table;
+    return (user_addr_t)(uintptr_t)table;
 }
 
 /* "#!/bin/sh -x" at the top of a file: run the interpreter instead, with
@@ -182,11 +192,11 @@ static int script_interp(struct inode *ino, char *head, char *interp, char *arg)
 }
 
 static int load_elf(struct inode *ino, const char *const argv[],
-                    const char *const envp[], uint32_t *entry, uint32_t *sp,
+                    const char *const envp[], user_addr_t *entry, user_addr_t *sp,
                     struct cred *cred);
 
 int program_load(const char *path, const char *const argv[],
-                 const char *const envp[], uint32_t *entry, uint32_t *sp,
+                 const char *const envp[], user_addr_t *entry, user_addr_t *sp,
                  struct cred *cred, struct inode **exe_out)
 {
     if (exe_out)
@@ -240,7 +250,7 @@ int program_load(const char *path, const char *const argv[],
 }
 
 static int load_elf(struct inode *ino, const char *const argv[],
-                    const char *const envp[], uint32_t *entry, uint32_t *sp,
+                    const char *const envp[], user_addr_t *entry, user_addr_t *sp,
                     struct cred *cred)
 {
     int err;
@@ -260,7 +270,7 @@ static int load_elf(struct inode *ino, const char *const argv[],
        and start THAT: it reads the auxiliary vector to find the program
        (AT_PHDR, AT_ENTRY), loads the shared libraries, and jumps to the
        program's entry. */
-    uint32_t start = info.entry, interp_base = 0;
+    user_addr_t start = info.entry, interp_base = 0;
     if (info.interp) {
         struct inode *ld;
         err = vfs_lookup(info.interp, &ld);
@@ -291,7 +301,7 @@ static int load_elf(struct inode *ino, const char *const argv[],
     cred->suid = cred->fsuid = cred->euid;
     cred->sgid = cred->fsgid = cred->egid;
 
-    uint32_t sysinfo = vsyscall_map();  /* 0: CPU has no sysenter */
+    user_addr_t sysinfo = vsyscall_map();   /* 0: CPU has no sysenter */
     *entry = start;
     *sp = build_stack(argv, envp, &info, sysinfo, interp_base, cred);
     return 0;

@@ -1,89 +1,126 @@
+; =============================================================================
+; uaccess.asm — touching user memory safely and quickly (x86_64)
+; =============================================================================
+; The twin of arch/i386/uaccess.asm; read that file's header first. Every
+; instruction that touches user memory is in the EXCEPTION TABLE (section
+; __ex_table) with a "fixup" address. On a kernel page fault, interrupts.c
+; looks the faulting RIP up there and, if found, continues at the fixup,
+; which returns -EFAULT instead of crashing the kernel. The C wrappers in
+; uaccess.h have already checked the range lies in user space.
+;
+; The entries are 64-bit addresses (dq): the kernel is at -2 GiB, which a
+; 32-bit `dd` cannot hold. The label must be ON the instruction that can
+; fault (the `rep movs`, the load), not on one before it.
+;
+; System V calling convention: arguments in rdi, rsi, rdx, rcx; result in
+; rax; rdi, rsi, rcx, rdx, r8-r11 may be clobbered (no saving needed).
+; =============================================================================
+
 [bits 64]
+default rel
 EFAULT equ 14
 
-%macro EX_ENTRY 2
-  section __ex_table progbits alloc noexec nowrite align=4
-    dd %1, %2
+%macro EX_ENTRY 2               ; instruction that may fault, where to go then
+  section __ex_table progbits alloc noexec nowrite align=8
+    dq %1, %2
   section .text
 %endmacro
 
 section .text
 
+; int __copy_user(void *dst, const void *src, uint64_t n)
+;   Copy n bytes; either side may be user memory. 0, or -EFAULT.
 global __copy_user
 __copy_user:
-    mov rcx, rdx
-    mov rdx, rsi
-    mov rsi, rdi
-    mov rdi, rdx
-    mov rdx, rcx
-    test rdx, rdx
-    jz .out
-.wq:
-    mov rcx, rdx
+    mov rcx, rdx                ; rdi = dst, rsi = src already: what movs wants
     shr rcx, 3
-    jz .wb
-    rep movsq
-.wb:
-    mov rcx, rdx
-    and rcx, 7
-    jz .out
-    rep movsb
+.qwords:
+    rep movsq                   ; bulk, 8 bytes per step
+    mov ecx, edx
+    and ecx, 7
+.bytes:
+    rep movsb                   ; the last 0-7 bytes
     xor eax, eax
-.out:
     ret
 .fault:
     mov eax, -EFAULT
     ret
-EX_ENTRY __copy_user.wq, __copy_user.fault
-EX_ENTRY __copy_user.wb, __copy_user.fault
+EX_ENTRY __copy_user.qwords, __copy_user.fault
+EX_ENTRY __copy_user.bytes, __copy_user.fault
 
+; int __get_user32(uint32_t *dst, uint64_t user_addr)
+;   Read one 32-bit word from user memory. 0, or -EFAULT.
 global __get_user32
 __get_user32:
+.load:
     mov eax, [rsi]
     mov [rdi], eax
     xor eax, eax
     ret
-.gf:
+.fault:
     mov eax, -EFAULT
     ret
-EX_ENTRY __get_user32, __get_user32.gf
+EX_ENTRY __get_user32.load, __get_user32.fault
 
+; int __get_user64(uint64_t *dst, uint64_t user_addr)
+;   Read one 64-bit word (a pointer in an argv array, an iovec). 0, or -EFAULT.
+global __get_user64
+__get_user64:
+.load:
+    mov rax, [rsi]
+    mov [rdi], rax
+    xor eax, eax
+    ret
+.fault:
+    mov eax, -EFAULT
+    ret
+EX_ENTRY __get_user64.load, __get_user64.fault
+
+; int __fault_in_user(uint64_t addr, uint64_t n, int write)
+;   Touch one byte of every page in the range so that a later copy of it
+;   cannot fault, and so cannot sleep. 0, or -EFAULT. (Why, and why the
+;   write probe is `or [x], 0`: arch/i386/uaccess.asm.)
 global __fault_in_user
 __fault_in_user:
     test rsi, rsi
-    jz .ok
-    mov rcx, rsi
-    add rcx, rdi
-    cmp qword [rsp + 8], 0
+    jz .ok                      ; nothing to touch
+    add rsi, rdi                ; one past the end; the caller range-checked,
+    test edx, edx               ; so this cannot wrap
     jnz .wloop
 .rloop:
-    mov al, [rdi]
+.rprobe:
+    mov al, [rdi]               ; may fault: handled, or the fixup below
     and rdi, ~0xFFF
-    add rdi, 4096
-    cmp rdi, rcx
+    add rdi, 0x1000             ; the next page
+    cmp rdi, rsi
     jb .rloop
 .ok:
     xor eax, eax
     ret
 .wloop:
-    or byte [rdi], 0
+.wprobe:
+    or byte [rdi], 0            ; same, but takes the *write* fault
     and rdi, ~0xFFF
-    add rdi, 4096
-    cmp rdi, rcx
+    add rdi, 0x1000
+    cmp rdi, rsi
     jb .wloop
     jmp .ok
-.wf:
+.fault:
     mov eax, -EFAULT
     ret
-EX_ENTRY __fault_in_user.rloop, __fault_in_user.wf
-EX_ENTRY __fault_in_user.wloop, __fault_in_user.wf
+EX_ENTRY __fault_in_user.rprobe, __fault_in_user.fault
+EX_ENTRY __fault_in_user.wprobe, __fault_in_user.fault
 
+; long __strncpy_user(char *dst, const char *user_src, long max)
+;   Copy a NUL-terminated string of at most max bytes (including the NUL).
+;   Returns its length without the NUL, max if no NUL was found, or -EFAULT.
 global __strncpy_user
 __strncpy_user:
-    xor rax, rax
+    xor eax, eax                ; rax = length so far
 .next:
     cmp rax, rdx
-    jae .done
+    jae .done                   ; max reached without a NUL
+.load:
     mov cl, [rsi + rax]
     mov [rdi + rax], cl
     test cl, cl
@@ -92,7 +129,7 @@ __strncpy_user:
     jmp .next
 .done:
     ret
-.sf:
+.fault:
     mov rax, -EFAULT
     ret
-EX_ENTRY __strncpy_user.next, __strncpy_user.sf
+EX_ENTRY __strncpy_user.load, __strncpy_user.fault

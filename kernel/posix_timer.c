@@ -53,7 +53,7 @@ struct ptimer {
     uint8_t state, notify, signo, clock;
     uint8_t queued;                     /* its signal is pending, not yet taken */
     struct thread *target;              /* SIGEV_THREAD_ID (NULL once it's gone) */
-    uint32_t value;                     /* sigev_value, back in si_value */
+    user_addr_t value;                  /* sigev_value, back in si_value */
     uint32_t expires;                   /* timer_ms() of the next step (0: disarmed) */
     uint64_t extra_ms;                  /* left to wait after that step */
     uint64_t interval_ms;               /* then again every this long (0: once) */
@@ -159,9 +159,9 @@ int ptimer_siginfo(struct process *p, struct thread *t, int sig, int own,
         pt->overrun_last = pt->overrun;
         pt->overrun = 0;
         o->code = SI_TIMER;
-        o->word[0] = i;
-        o->word[1] = pt->overrun_last;
-        o->word[2] = (int32_t)pt->value;
+        o->timer_id = i;
+        o->overrun = pt->overrun_last;
+        o->value = pt->value;
         found = 1;
     }
     if (!more)
@@ -225,9 +225,10 @@ static struct ptimer *lookup(uint32_t id)
 
 /* --- the system calls ---------------------------------------------------------- */
 
-/* struct sigevent, the part Linux reads (musl passes only these 16 bytes). */
+/* struct sigevent, the part Linux reads (musl passes only this much: 16 bytes
+   on i386, 24 on x86_64, where sigev_value is a pointer-sized union). */
 struct ksigevent {
-    uint32_t value;
+    user_addr_t value;
     int32_t signo, notify, tid;
 };
 
@@ -268,7 +269,7 @@ SYSCALL_DEF(sys_timer_create)           /* (clock, sigevent, timer id out) */
     struct ptimer *t = &ptimers[id];
     *t = (struct ptimer){ .owner = p, .state = PT_NEW, .notify = (uint8_t)ev.notify,
                           .signo = (uint8_t)ev.signo, .clock = (uint8_t)a1,
-                          .target = target, .value = a2 ? ev.value : (uint32_t)id };
+                          .target = target, .value = a2 ? ev.value : (user_addr_t)id };
     p->ntimers++;
     irq_restore(flags);
 

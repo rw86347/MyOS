@@ -35,12 +35,7 @@
 
 #define MSR_PAT    0x277
 #define PAT_WC     0x01                 /* memory type numbers, as in Intel's manual */
-#define BIG_PAGE   0x200000u   /* 2 MiB huge pages (see paging.c map_2mb) */
-
-/* Kernel addresses for write-combined device memory: 128 MiB, the top of
-   the address space. Enough for a 64 MiB VRAM bar and more. */
-#define WC_WINDOW     0xF8000000u
-#define WC_WINDOW_END 0x00000000u       /* wraps: the end of the 4 GiB space */
+#define BIG_PAGE   0x200000ull          /* a 2 MiB page (paging.c map_2mb) */
 
 static uint32_t wc_flags = PTE_PCD;     /* uncached until pat_init */
 
@@ -68,12 +63,15 @@ volatile void *ioremap(uint32_t phys, uint32_t size)
 }
 
 /*
- * Map [phys, phys + size) write-combined. Whole 4 MiB pieces get 4 MiB
- * pages (one TLB entry covers 4 MiB of screen — a 1920x1200 picture is
- * 9 MiB, so 3 entries instead of 2250), the rest 4 KiB pages. We never
- * round a big page past the end of the range: memory after it may be
- * another device's registers, and WC allows the CPU to read ahead
- * speculatively.
+ * Map [phys, phys + size) write-combined, in the window from WC_BASE
+ * (memlayout.h) to the end of memory. The virtual address is chosen with
+ * the same offset inside a 2 MiB page as the physical one, so every whole,
+ * aligned 2 MiB piece gets a 2 MiB page (one TLB entry covers 2 MiB of
+ * screen — a 1920x1200 picture is 9 MiB, so 5 entries instead of 2250); the
+ * ragged ends get 4 KiB pages. We never round a big page past the end of
+ * the range: memory after it may be another device's registers, and WC
+ * lets the CPU read ahead speculatively. Any physical address works: a
+ * page-table entry holds 52 bits.
  */
 volatile void *ioremap_wc(uint32_t phys, uint32_t size)
 {
@@ -82,52 +80,28 @@ volatile void *ioremap_wc(uint32_t phys, uint32_t size)
 
 volatile void *ioremap_wc64(uint64_t phys, uint32_t size)
 {
-    static uint32_t next = WC_WINDOW;
+    static uintptr_t next = WC_BASE;
     uint32_t flags = PTE_WRITABLE | wc_flags;
-    uint32_t off, len, va, done;
 
     if (!size)
         return NULL;
+    uint64_t start = phys & ~(uint64_t)(PAGE_SIZE - 1);
+    uint64_t end = (phys + size + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
+    uintptr_t va = (next & ~(BIG_PAGE - 1)) | (start & (BIG_PAGE - 1));
+    if (va < next)
+        va += BIG_PAGE;
+    if (end - start > 0 - (uint64_t)va)     /* past the top of memory */
+        return NULL;
 
-    /* Above 4 GiB a 32-bit PTE cannot store the address. 4 MiB PSE-36
-       pages can (bits 39:32 live in the directory entry). */
-    if (phys > 0xFFFFFFFFull || phys + size - 1 > 0xFFFFFFFFull) {
-        uint64_t start, end;
-
-        if (!cpu_has(CPU_PSE36))
+    uint64_t pa = start;
+    uintptr_t v = va;
+    while (pa < end) {
+        int big = !(pa & (BIG_PAGE - 1)) && end - pa >= BIG_PAGE;
+        if (big ? vmm_map_big(v, pa, flags) : vmm_map(v, pa, flags))
             return NULL;
-        start = phys & ~((uint64_t)BIG_PAGE - 1);
-        end = (phys + size + BIG_PAGE - 1) & ~((uint64_t)BIG_PAGE - 1);
-        len = (uint32_t)(end - start);
-        off = (uint32_t)(phys - start);
-        va = (next & ~(BIG_PAGE - 1)) | (uint32_t)(start & (BIG_PAGE - 1));
-        if (va < next)
-            va += BIG_PAGE;
-        if (va < WC_WINDOW || len > WC_WINDOW_END - va)
-            return NULL;
-        for (done = 0; done < len; done += BIG_PAGE) {
-            if (vmm_map_big(va + done, start + done, flags) < 0)
-                return NULL;
-        }
-        next = va + len;
-        return (volatile void *)(va + off);
+        pa += big ? BIG_PAGE : PAGE_SIZE;
+        v += big ? BIG_PAGE : PAGE_SIZE;
     }
-
-    off = (uint32_t)phys & (PAGE_SIZE - 1);
-    {
-        uint32_t start = (uint32_t)phys - off;
-        len = (off + size + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
-        va = (next & ~(BIG_PAGE - 1)) | (start & (BIG_PAGE - 1));
-        if (va < next)
-            va += BIG_PAGE;
-        if (va < WC_WINDOW || len > WC_WINDOW_END - va)
-            return NULL;
-        /* 4 KiB only: map_2mb steps left gaps when mixed with 4 MiB logic. */
-        for (done = 0; done < len; done += PAGE_SIZE) {
-            if (vmm_map(va + done, start + done, flags) < 0)
-                return NULL;
-        }
-        next = va + len;
-        return (volatile void *)(va + off);
-    }
+    next = v;
+    return (volatile void *)(va + (phys - start));
 }

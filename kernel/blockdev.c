@@ -65,7 +65,7 @@ int blockdev_map(const void *buf, uint32_t bytes, struct bio_vec *v, int max)
         uint32_t piece = PAGE_SIZE - (va & (PAGE_SIZE - 1)), pa;
         if (piece > bytes)
             piece = bytes;
-        if (va >= KERNEL_VBASE && va - KERNEL_VBASE < DIRECTMAP_LIMIT)
+        if (va >= DIRECTMAP_BASE && va - DIRECTMAP_BASE < DIRECTMAP_LIMIT)
             pa = V2P(va);
         else if ((pa = vmm_translate(va & ~(PAGE_SIZE - 1))) != 0)
             pa |= va & (PAGE_SIZE - 1);

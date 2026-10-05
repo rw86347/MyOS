@@ -49,8 +49,10 @@ ifeq ($(filter $(ARCH),i386 x86_64),)
 endif
 ifeq ($(ARCH),i386)
   ALPINE_ARCH := x86
+  UNAME_M     := i686
 else
   ALPINE_ARCH := x86_64
+  UNAME_M     := x86_64
 endif
 
 ifeq ($(ARCH),x86_64)
@@ -146,7 +148,7 @@ NASM_FMT := elf32
 X86_64_KERNEL ?= full
 ifeq ($(ARCH),x86_64)
   CFLAGS  := -std=c11 -ffreestanding -O2 -Wall -Wextra -g \
-             -m64 -mno-red-zone -mcmodel=small -mgeneral-regs-only \
+             -m64 -mno-red-zone -mcmodel=kernel -mgeneral-regs-only \
              -fno-tree-loop-distribute-patterns -DARCH_X86_64 \
              -Iinclude -Iarch/x86_64/include $(MODE_FLAGS)
   LDFLAGS := -T arch/x86_64/linker.ld -nostdlib -ffreestanding -O2 \
@@ -154,7 +156,7 @@ ifeq ($(ARCH),x86_64)
   LINKER_SCRIPT := arch/x86_64/linker.ld
   NASM_FMT := elf64
   ifeq ($(X86_64_KERNEL),full)
-    C_SRCS  := $(filter-out $(TEST_SRCS) $(BENCH_SRCS) arch/x86_64/early.c kernel/elf.c kernel/signal.c, \
+    C_SRCS  := $(filter-out $(TEST_SRCS) $(BENCH_SRCS) arch/x86_64/early.c kernel/elf.c, \
                $(wildcard arch/x86_64/*.c kernel/*.c drivers/*.c fs/*.c mm/*.c net/*.c \
                           drivers/gpu/drm/*.c drivers/gpu/drm/tiny/*.c drivers/video/*.c))
     ifeq ($(MODE),test)
@@ -208,7 +210,7 @@ QEMU_FLAGS = -m 64M -cpu pentium3 \
              -drive format=raw,file=$(DATA),index=2,media=disk \
              -netdev user,id=net0 -device e1000,netdev=net0
 
-.PHONY: diskattacks verify-disktests verify-tests attacks all dist utm utm-hd hd live-root live-extra live-theme live-hd utm-live run-live run-hd test-hd run run-full run-text debug test check-selftests test-shell bench run-bench usb clean fuzz fuzz-build fuzz-replay diskfuzz diskfuzz-replay verify-racetests uefi run-uefi-text test-uefi live-uefi test-live-uefi live-login-initrd test-uefi-login
+.PHONY: run-uefi test-uefi-shell diskattacks verify-disktests verify-tests attacks all dist utm utm-hd hd live-root live-extra live-theme live-hd utm-live run-live run-hd test-hd run run-full run-text debug test check-selftests test-shell bench run-bench usb clean fuzz fuzz-build fuzz-replay diskfuzz diskfuzz-replay verify-racetests uefi run-uefi-text test-uefi live-uefi test-live-uefi live-login-initrd test-uefi-login
 
 ifeq ($(ARCH),x86_64)
 all: uefi
@@ -430,7 +432,7 @@ ifeq ($(ARCH),x86_64)
 $(BUILD)/efi/efi_main.o: arch/x86_64/boot/efi/efi_main.c arch/i386/boot/efi/efi.h \
                          arch/x86_64/include/bootinfo.h $(BUILD)/kernel.elf
 	@mkdir -p $(dir $@)
-	END=0x$$($(NM) $(BUILD)/kernel.elf | awk '$$3 == "__kernel_end" { print $$1 }'); \
+	END=0x$$($(NM) $(BUILD)/kernel.elf | awk '$$3 == "__kernel_end_phys" { print $$1 }'); \
 	LOAD=$$(( (END + 4095) / 4096 * 4096 )); \
 	$(CLANG_EFI) -DKERNEL_LOAD=0x100000 -DKERNEL_END=$$END -DINITRD_LOAD=$$LOAD \
 	  -Iinclude -Iarch/i386/boot/efi -Iarch/x86_64/include -c $< -o $@
@@ -467,12 +469,18 @@ uefi: $(UEFI_IMG)
 
 # OVMF is 64-bit firmware, so this is qemu-system-x86_64 (not i386 / pentium3).
 # Serial is the console we can see with -display none.
+QEMU_UEFI_DISK = $(UEFI_IMG)
 QEMU_UEFI_FLAGS = -machine q35 -m 256M -cpu qemu64 \
 	-drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
 	-drive if=pflash,format=raw,file=$(BUILD)/ovmf-vars.fd \
-	-drive if=none,format=raw,file=$(UEFI_IMG),id=bootdisk \
+	-drive if=none,format=raw,file=$(QEMU_UEFI_DISK),id=bootdisk \
 	-device ide-hd,drive=bootdisk,bootindex=0 \
 	-net none -no-reboot
+
+# In a window: type at the shell there; kernel messages also go to this terminal.
+run-uefi: $(UEFI_IMG)
+	cp $(OVMF_VARS) $(BUILD)/ovmf-vars.fd
+	$(QEMU64) $(QEMU_UEFI_FLAGS) -serial stdio
 
 run-uefi-text: $(UEFI_IMG)
 	cp $(OVMF_VARS) $(BUILD)/ovmf-vars.fd
@@ -496,6 +504,82 @@ else
 	  || { echo "FAIL: 64-bit kernel did not say long mode"; exit 1; }
 	@echo "UEFI OK: OVMF started the 64-bit kernel"
 endif
+
+# user/sys/systest.c: the system call layer checked from a program's side,
+# with raw syscalls (no C library), for whichever CPU ARCH is. It goes only
+# into a test copy of the initramfs and UEFI image, never the normal ones.
+SYSTEST      := $(BUILD)/user/sys/systest
+TEST_INITRD  := $(BUILD)/initrd-test.cpio
+UEFI_TEST_IMG := $(BUILD)/myos-uefi-test.img
+ifeq ($(ARCH),x86_64)
+  SYSTEST_FLAGS := -m64
+else
+  SYSTEST_FLAGS := -march=i686
+endif
+
+$(SYSTEST): user/sys/systest.c
+	@mkdir -p $(dir $@)
+	$(CC) -std=c11 -ffreestanding -nostdlib -static -O2 -Wall -Wextra -fno-pic -fno-pie \
+	  $(SYSTEST_FLAGS) $< -o $@ -lgcc
+
+$(TEST_INITRD): $(INITRD) $(SYSTEST)
+	@rm -rf $(BUILD)/initramfs-test
+	cp -R $(BUILD)/initramfs $(BUILD)/initramfs-test
+	cp $(SYSTEST) $(BUILD)/initramfs-test/bin/systest
+	cd $(BUILD)/initramfs-test && find . -mindepth 1 ! -name .DS_Store | sort \
+	  | cpio -o -H newc -R 0:0 --quiet > ../$(notdir $(TEST_INITRD))
+
+$(UEFI_TEST_IMG): $(BUILD)/BOOTX64.EFI $(BUILD)/kernel.bin $(TEST_INITRD) \
+                  arch/i386/boot/efi/vga-font.bin tools/mkuefi.py
+	python3 tools/mkuefi.py --out $@ --esp-mb 64 \
+	  --file EFI/BOOT/BOOTX64.EFI=$(BUILD)/BOOTX64.EFI \
+	  --file EFI/MYOS/KERNEL.BIN=$(BUILD)/kernel.bin \
+	  --file EFI/MYOS/INITRD.CPIO=$(TEST_INITRD) \
+	  --file EFI/MYOS/FONT.BIN=arch/i386/boot/efi/vga-font.bin
+
+# The kernel's user space under UEFI: /init and a BusyBox shell, with commands
+# typed at the PS/2 keyboard as in test-shell. The x86_64 milestone (64-bit
+# programs on the 64-bit kernel); the i386 image passes it too.
+UEFI_SHELL_CMDS := "uname -m" "echo hello from user space" "ls /" "echo hi | wc -c" \
+                   "mkdir /tmp/x && echo data > /tmp/x/f && cat /tmp/x/f" \
+                   "sh -c 'exit 3'; echo status \$$?" \
+                   "yes | head -2 | wc -l" \
+                   "trap 'echo caught usr1' USR1; kill -USR1 \$$\$$; echo after trap" \
+                   "sh -c 'kill -SEGV \$$\$$'; echo killed \$$?" \
+                   "awk 'BEGIN { print 1.5 * 3 }'"
+test-uefi-shell: QEMU_UEFI_DISK = $(UEFI_TEST_IMG)
+test-uefi-shell: $(UEFI_TEST_IMG)
+	@rm -f $(BUILD)/uefi-shell.log
+	@cp $(OVMF_VARS) $(BUILD)/ovmf-vars.fd
+	@(sleep 15; tools/qemu-type.sh systest | while read k; do echo "$$k"; sleep 0.05; done; \
+	  sleep 8; for c in $(UEFI_SHELL_CMDS); do \
+	    tools/qemu-type.sh "$$c" | while read k; do echo "$$k"; sleep 0.05; done; sleep 2; \
+	  done; \
+	  tools/qemu-type.sh "sleep 30" | while read k; do echo "$$k"; sleep 0.05; done; sleep 1; \
+	  echo "sendkey ctrl-c"; sleep 1; \
+	  tools/qemu-type.sh "echo after ctrl-c" | while read k; do echo "$$k"; sleep 0.05; done; \
+	  sleep 2; echo quit) \
+	  | $(QEMU64) $(QEMU_UEFI_FLAGS) -display none \
+	    -serial file:$(BUILD)/uefi-shell.log -monitor stdio >/dev/null || true
+	@perl -pe 's/\e\[[0-9;?]*[A-Za-z]//g; s/\r//g' $(BUILD)/uefi-shell.log > $(BUILD)/uefi-shell.txt
+	@sed -n '/Welcome/,$$p' $(BUILD)/uefi-shell.txt; echo
+	@L=$(BUILD)/uefi-shell.txt; ok=1; \
+	  grep -q "^Welcome\|Welcome to MyOS" $$L || { echo "FAIL: /init did not run"; ok=0; }; \
+	  grep -q "^systest: all ok" $$L || { echo "FAIL: systest (the syscall checks)"; ok=0; }; \
+	  grep -q "^$(UNAME_M)[[:space:]]*$$" $$L || { echo "FAIL: uname -m"; ok=0; }; \
+	  grep -q "^hello from user space" $$L || { echo "FAIL: echo"; ok=0; }; \
+	  grep -q "README.txt" $$L || { echo "FAIL: ls"; ok=0; }; \
+	  grep -q "^3[[:space:]]*$$" $$L || { echo "FAIL: echo | wc -c"; ok=0; }; \
+	  grep -q "^data[[:space:]]*$$" $$L || { echo "FAIL: write + read a file"; ok=0; }; \
+	  grep -q "^status 3" $$L || { echo "FAIL: exit status"; ok=0; }; \
+	  grep -q "^2[[:space:]]*$$" $$L || { echo "FAIL: SIGPIPE (yes | head)"; ok=0; }; \
+	  ! grep -q "Broken pipe" $$L || { echo "FAIL: SIGPIPE not delivered"; ok=0; }; \
+	  grep -q "^caught usr1" $$L || { echo "FAIL: signal handler"; ok=0; }; \
+	  grep -q "^after trap" $$L || { echo "FAIL: sigreturn"; ok=0; }; \
+	  grep -q "^killed 139" $$L || { echo "FAIL: death by signal"; ok=0; }; \
+	  grep -q "^4.5" $$L || { echo "FAIL: floating point"; ok=0; }; \
+	  grep -q "^after ctrl-c" $$L || { echo "FAIL: Ctrl-C"; ok=0; }; \
+	  [ $$ok = 1 ] && echo "UEFI SHELL TEST OK ($(ARCH))" || exit 1
 
 # Login-only initramfs (rules sit with live-hd: they need LOGIN_BIN).
 # x86_64 paths match tools/fetch-live.py --arch x86_64 (not build/x86_64/live).

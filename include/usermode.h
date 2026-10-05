@@ -3,6 +3,7 @@
 
 #include <cred.h>
 #include <stdint.h>
+#include <user.h>
 
 struct inode;
 
@@ -16,7 +17,7 @@ struct inode;
    the ELF that was loaded — the interpreter for a #! script — with a
    reference the caller must vfs_put. That is /proc/self/exe. */
 int program_load(const char *path, const char *const argv[],
-                 const char *const envp[], uint32_t *entry, uint32_t *sp,
+                 const char *const envp[], user_addr_t *entry, user_addr_t *sp,
                  struct cred *cred, struct inode **exe_out);
 
 /* Jump to user mode at eip with stack esp (usermode.asm). Never returns. */

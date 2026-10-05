@@ -77,7 +77,7 @@ int fb_set_var(struct fb_info *info, struct fb_var_screeninfo *var)
 
 /* --- the device file ---------------------------------------------------------- */
 
-static int32_t fb_ioctl(struct file *f, uint32_t cmd, uint32_t arg)
+static int32_t fb_ioctl(struct file *f, uint32_t cmd, uintptr_t arg)
 {
     (void)f;
     struct fb_info *info = registered_fb[0];

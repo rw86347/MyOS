@@ -99,7 +99,7 @@ void mm_destroy(struct mm *mm)
 }
 
 /* The area containing addr, or NULL. */
-static struct vma *find(struct mm *mm, uint32_t addr)
+static struct vma *find(struct mm *mm, user_addr_t addr)
 {
     int lo = 0, hi = mm->nareas;        /* the answer is in [lo, hi) */
     while (lo < hi) {
@@ -117,7 +117,7 @@ static struct vma *find(struct mm *mm, uint32_t addr)
 
 /* The first area that ends after addr (so it contains addr or is the
    next one up), as an index; nareas if none. */
-static int first_after(struct mm *mm, uint32_t addr)
+static int first_after(struct mm *mm, user_addr_t addr)
 {
     int lo = 0, hi = mm->nareas;
     while (lo < hi) {
@@ -130,7 +130,7 @@ static int first_after(struct mm *mm, uint32_t addr)
     return lo;
 }
 
-static int overlaps(struct mm *mm, uint32_t start, uint32_t end)
+static int overlaps(struct mm *mm, user_addr_t start, user_addr_t end)
 {
     int i = first_after(mm, start);
     return i < mm->nareas && mm->area[i].start < end;
@@ -155,7 +155,7 @@ static int room_for_one(struct mm *mm)
     return 0;
 }
 
-int mm_add(struct mm *mm, uint32_t start, uint32_t end, uint32_t flags)
+int mm_add(struct mm *mm, user_addr_t start, user_addr_t end, uint32_t flags)
 {
     return mm_add_file(mm, start, end, flags, NULL, 0, 0);
 }
@@ -163,9 +163,9 @@ int mm_add(struct mm *mm, uint32_t start, uint32_t end, uint32_t flags)
 /* Add area *n ([n->start, n->end), its flags and file part). */
 static int add_area(struct mm *mm, const struct vma *n)
 {
-    uint32_t start = n->start, end = n->end, flags = n->flags;
+    user_addr_t start = n->start, end = n->end, flags = n->flags;
     struct inode *file = n->file;
-    if (start >= end || end > KERNEL_VBASE || overlaps(mm, start, end))
+    if (start >= end || end > USER_ADDR_END || overlaps(mm, start, end))
         return -EINVAL;
 
     /* Grow a neighbour instead of adding an area, if it touches and has the
@@ -203,7 +203,7 @@ static int add_area(struct mm *mm, const struct vma *n)
     return 0;
 }
 
-int mm_add_file(struct mm *mm, uint32_t start, uint32_t end, uint32_t flags,
+int mm_add_file(struct mm *mm, user_addr_t start, user_addr_t end, uint32_t flags,
                 struct inode *file, uint32_t file_off, uint32_t file_end)
 {
     struct vma n = { .start = start, .end = end, .flags = flags, .file = file,
@@ -211,7 +211,7 @@ int mm_add_file(struct mm *mm, uint32_t start, uint32_t end, uint32_t flags,
     return add_area(mm, &n);
 }
 
-int mm_remove(struct mm *mm, uint32_t start, uint32_t end)
+int mm_remove(struct mm *mm, user_addr_t start, user_addr_t end)
 {
     for (int i = 0; i < mm->nareas; i++) {
         struct vma *v = &mm->area[i];
@@ -250,9 +250,9 @@ int mm_remove(struct mm *mm, uint32_t start, uint32_t end)
     return 0;
 }
 
-int mm_fault(uint32_t va, uint32_t err)
+int mm_fault(user_addr_t va, uint32_t err)
 {
-    if (va >= KERNEL_VBASE)
+    if (va >= USER_ADDR_END)
         return -1;
     struct vma *v = find(current_mm, va);
     if (!v)
@@ -269,7 +269,7 @@ int mm_fault(uint32_t va, uint32_t err)
 
     /* Device memory: map the device's page. Nothing to allocate or copy. */
     if (v->flags & VM_PFNMAP) {
-        uint32_t page = PAGE_DOWN(va), off = v->file_off + (page - v->start);
+        user_addr_t page = PAGE_DOWN(va), off = v->file_off + (page - v->start);
         if (off >= v->file_end)
             return -1;                  /* past the device: SIGSEGV (Linux: SIGBUS) */
         uint32_t flags = PTE_USER | PTE_SHARED | (v->flags & VM_WRITE ? PTE_WRITABLE : 0) |
@@ -281,7 +281,7 @@ int mm_fault(uint32_t va, uint32_t err)
        by anyone. PTE_SHARED: fork doesn't make it copy-on-write, and
        unmapping doesn't free it. */
     if (v->flags & VM_SHARED) {
-        uint32_t page = PAGE_DOWN(va), off = v->file_off + (page - v->start);
+        user_addr_t page = PAGE_DOWN(va), off = v->file_off + (page - v->start);
         uint32_t frame = off < PAGE_UP(v->file->size) ? ramfs_page(v->file, off / PAGE_SIZE) : 0;
         if (!frame)
             return -1;                  /* past its end, or out of memory */
@@ -296,7 +296,7 @@ int mm_fault(uint32_t va, uint32_t err)
     uint32_t frame = pmm_alloc();
     if (!frame)
         return -1;                      /* out of memory: the program dies */
-    uint32_t page = PAGE_DOWN(va), n = 0;
+    user_addr_t page = PAGE_DOWN(va), n = 0;
     if (v->file) {
         uint32_t off = v->file_off + (page - v->start);
         /* ~0: mmap of the whole file. An ELF segment stops at file_end so
@@ -337,13 +337,13 @@ int mm_fault(uint32_t va, uint32_t err)
 
 /* --- brk ------------------------------------------------------------------ */
 
-uint32_t mm_brk(uint32_t new_brk)
+user_addr_t mm_brk(user_addr_t new_brk)
 {
     struct mm *mm = current_mm;
     if (new_brk < mm->brk_start)
         return mm->brk;                 /* brk(0) etc.: just report it */
 
-    uint32_t old_end = PAGE_UP(mm->brk), new_end = PAGE_UP(new_brk);
+    user_addr_t old_end = PAGE_UP(mm->brk), new_end = PAGE_UP(new_brk);
     if (new_end > old_end) {
         if (mm_add(mm, old_end, new_end, VM_READ | VM_WRITE) < 0)
             return mm->brk;             /* would hit another area: refuse */
@@ -362,9 +362,9 @@ uint32_t mm_brk(uint32_t new_brk)
 #define MAP_ANONYMOUS 0x20
 
 /* The lowest gap of len bytes at or above MMAP_BASE, below the stack. */
-uint32_t mm_find_gap(struct mm *mm, uint32_t len)
+user_addr_t mm_find_gap(struct mm *mm, uint32_t len)
 {
-    uint32_t addr = MMAP_BASE;
+    user_addr_t addr = MMAP_BASE;
     for (int i = 0; i < mm->nareas; i++) {
         struct vma *v = &mm->area[i];
         if (v->end <= addr)
@@ -378,7 +378,7 @@ uint32_t mm_find_gap(struct mm *mm, uint32_t len)
     return addr;
 }
 
-int32_t mm_mmap(uint32_t addr, uint32_t len, uint32_t prot, uint32_t flags,
+intptr_t mm_mmap(user_addr_t addr, uint32_t len, uint32_t prot, uint32_t flags,
                 struct inode *file, uint32_t off, uint32_t fmode)
 {
     if (!(flags & MAP_ANONYMOUS)) {
@@ -403,7 +403,7 @@ int32_t mm_mmap(uint32_t addr, uint32_t len, uint32_t prot, uint32_t flags,
     uint32_t vflags = VM_READ | (prot & PROT_WRITE ? VM_WRITE : 0);
 
     if (flags & MAP_FIXED) {
-        if (addr + len > KERNEL_VBASE || addr + len < addr)
+        if (addr + len > USER_ADDR_END || addr + len < addr)
             return -EINVAL;
         mm_remove(current_mm, addr, addr + len);    /* replaces what was there */
     } else {
@@ -412,7 +412,7 @@ int32_t mm_mmap(uint32_t addr, uint32_t len, uint32_t prot, uint32_t flags,
             return -ENOMEM;
     }
     int err = mm_add_file(current_mm, addr, addr + len, vflags, file, off, ~0u);
-    return err ? err : (int32_t)addr;
+    return err ? err : (intptr_t)addr;
 }
 
 int vm_iomap_memory(struct vma *vma, uint32_t phys, uint32_t size)
@@ -426,7 +426,7 @@ int vm_iomap_memory(struct vma *vma, uint32_t phys, uint32_t size)
     return 0;
 }
 
-int32_t mm_mmap_device(uint32_t addr, uint32_t len, uint32_t prot, uint32_t flags,
+intptr_t mm_mmap_device(user_addr_t addr, uint32_t len, uint32_t prot, uint32_t flags,
                        struct file *f, uint32_t off)
 {
     if (len == 0 || ((addr | off) & (PAGE_SIZE - 1)))
@@ -448,7 +448,7 @@ int32_t mm_mmap_device(uint32_t addr, uint32_t len, uint32_t prot, uint32_t flag
         return -ENODEV;
 
     if (flags & MAP_FIXED) {
-        if (addr + len > KERNEL_VBASE || addr + len < addr)
+        if (addr + len > USER_ADDR_END || addr + len < addr)
             return -EINVAL;
         mm_remove(current_mm, addr, addr + len);
     } else {
@@ -459,12 +459,12 @@ int32_t mm_mmap_device(uint32_t addr, uint32_t len, uint32_t prot, uint32_t flag
     n.start = addr;
     n.end = addr + len;
     err = add_area(current_mm, &n);
-    return err ? err : (int32_t)addr;
+    return err ? err : (intptr_t)addr;
 }
 
-int32_t mm_munmap(uint32_t addr, uint32_t len)
+int32_t mm_munmap(user_addr_t addr, uint32_t len)
 {
-    if ((addr & (PAGE_SIZE - 1)) || len == 0 || addr + len > KERNEL_VBASE)
+    if ((addr & (PAGE_SIZE - 1)) || len == 0 || addr + len > USER_ADDR_END)
         return -EINVAL;
     return mm_remove(current_mm, addr, addr + PAGE_UP(len));
 }
@@ -476,8 +476,8 @@ int32_t mm_munmap(uint32_t addr, uint32_t len)
 #define MREMAP_MAYMOVE 1
 #define MREMAP_FIXED   2
 
-int32_t mm_mremap(uint32_t old, uint32_t old_len, uint32_t new_len,
-                  uint32_t flags, uint32_t new_addr)
+intptr_t mm_mremap(user_addr_t old, uint32_t old_len, uint32_t new_len,
+                  uint32_t flags, user_addr_t new_addr)
 {
     struct mm *mm = current_mm;
     if ((old & (PAGE_SIZE - 1)) || old_len == 0)
@@ -498,21 +498,21 @@ int32_t mm_mremap(uint32_t old, uint32_t old_len, uint32_t new_len,
         return -EINVAL;
 
     if (new_len == old_len && !(flags & MREMAP_FIXED))
-        return (int32_t)old;
+        return (intptr_t)old;
 
     if (new_len < old_len && !(flags & MREMAP_FIXED)) {
         mm_remove(mm, old + new_len, old + old_len);
-        return (int32_t)old;
+        return (intptr_t)old;
     }
 
     if (new_len > old_len && !(flags & MREMAP_FIXED)) {
-        uint32_t grow_to = old + new_len;
-        if (grow_to > KERNEL_VBASE || grow_to < old)
+        user_addr_t grow_to = old + new_len;
+        if (grow_to > USER_ADDR_END || grow_to < old)
             return -ENOMEM;
         int i = (int)(v - mm->area);
         if (i + 1 == mm->nareas || mm->area[i + 1].start >= grow_to) {
             v->end = grow_to;
-            return (int32_t)old;
+            return (intptr_t)old;
         }
         if (!(flags & MREMAP_MAYMOVE))
             return -ENOMEM;
@@ -521,9 +521,9 @@ int32_t mm_mremap(uint32_t old, uint32_t old_len, uint32_t new_len,
     if (!(flags & MREMAP_MAYMOVE))
         return -ENOMEM;
 
-    uint32_t dest;
+    user_addr_t dest;
     if (flags & MREMAP_FIXED) {
-        if ((new_addr & (PAGE_SIZE - 1)) || new_addr + new_len > KERNEL_VBASE ||
+        if ((new_addr & (PAGE_SIZE - 1)) || new_addr + new_len > USER_ADDR_END ||
             new_addr + new_len < new_addr)
             return -EINVAL;
         dest = new_addr;
@@ -550,7 +550,7 @@ int32_t mm_mremap(uint32_t old, uint32_t old_len, uint32_t new_len,
 
     uint32_t copy = old_len < new_len ? old_len : new_len;
     for (uint32_t off = 0; off < copy; off += PAGE_SIZE) {
-        uint32_t src = old + off;
+        user_addr_t src = old + off;
         uint32_t fl = vmm_get_flags(src);
         if (!(fl & PTE_PRESENT))
             continue;
@@ -565,13 +565,13 @@ int32_t mm_mremap(uint32_t old, uint32_t old_len, uint32_t new_len,
         }
     }
     mm_remove(mm, old, old + old_len);
-    return (int32_t)dest;
+    return (intptr_t)dest;
 }
 
 /* --- mprotect ---------------------------------------------------------- */
 
 /* Make sure an area boundary falls at addr (split the area around it). */
-static int split_at(struct mm *mm, uint32_t addr)
+static int split_at(struct mm *mm, user_addr_t addr)
 {
     struct vma *v = find(mm, addr);
     if (!v || v->start == addr)
@@ -589,13 +589,13 @@ static int split_at(struct mm *mm, uint32_t addr)
     return 0;
 }
 
-int32_t mm_mprotect(uint32_t addr, uint32_t len, uint32_t prot)
+int32_t mm_mprotect(user_addr_t addr, uint32_t len, uint32_t prot)
 {
     struct mm *mm = current_mm;
     if ((addr & (PAGE_SIZE - 1)) || addr + len < addr)
         return -EINVAL;
-    uint32_t end = PAGE_UP(addr + len);
-    for (uint32_t a = addr; a < end; ) {        /* all of it must be mapped */
+    user_addr_t end = PAGE_UP(addr + len);
+    for (user_addr_t a = addr; a < end; ) {        /* all of it must be mapped */
         struct vma *v = find(mm, a);
         if (!v)
             return -ENOMEM;
@@ -614,7 +614,7 @@ int32_t mm_mprotect(uint32_t addr, uint32_t len, uint32_t prot)
                                           (VM_PFNMAP | VM_WC | VM_MAYWRITE | VM_SHARED));
     /* Pages that exist get the new write permission (a copy-on-write page
        stays read-only: its fault handler makes it writable). */
-    for (uint32_t a = addr; a < end; a += PAGE_SIZE) {
+    for (user_addr_t a = addr; a < end; a += PAGE_SIZE) {
         uint32_t f = vmm_get_flags(a);
         if (!(f & PTE_PRESENT))
             continue;
@@ -628,7 +628,7 @@ int32_t mm_mprotect(uint32_t addr, uint32_t len, uint32_t prot)
 
 /* --- shmdt ----------------------------------------------------------------- */
 
-struct inode *mm_shm_detach(uint32_t addr)
+struct inode *mm_shm_detach(user_addr_t addr)
 {
     struct mm *mm = current_mm;
     struct vma *v = find(mm, addr);
@@ -639,7 +639,7 @@ struct inode *mm_shm_detach(uint32_t addr)
        Anything else in the range stays — something mapped over part of
        it, or another attach of the same segment (offset 0 again). */
     struct inode *seg = v->file;
-    uint32_t end = addr + PAGE_UP(seg->size);
+    user_addr_t end = addr + PAGE_UP(seg->size);
     vfs_get(seg);
     for (int i = first_after(mm, addr); i < mm->nareas && mm->area[i].start < end; ) {
         struct vma *a = &mm->area[i];

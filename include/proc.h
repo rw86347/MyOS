@@ -4,6 +4,7 @@
 #include <cred.h>
 #include <signal.h>
 #include <stdint.h>
+#include <user.h>
 #include <thread.h>
 
 /*
@@ -45,11 +46,18 @@ struct process {
     struct file *files[PROC_FILES];     /* open files, indexed by fd */
     uint64_t cloexec;                   /* bit n: close fd n on execve */
     struct inode *cwd;                  /* current directory */
+    struct inode *root;                 /* chroot(): its "/" (NULL: the real one) */
     struct inode *exe;                  /* the ELF execve loaded (/proc/self/exe) */
     uint32_t umask;                     /* permission bits new files lose */
     int status;                         /* wait status, once a zombie */
+    /* CPU time in ms (see thread.h): of its threads that have ended, and
+       of its children it has waited for (with theirs). */
+    uint32_t utime, stime, cutime, cstime;
+    uint32_t persona;                   /* personality(): 0 = PER_LINUX */
+    void *sem_undo;                     /* SEM_UNDO records (sem.c): given back at exit */
+    const void *lock_wait;              /* F_SETLKW: whose lock it sleeps for (lock.c) */
     struct wait_queue child_wait;       /* sleeps here in wait4() */
-    uint32_t start_eip, start_esp;      /* where its program begins */
+    user_addr_t start_eip, start_esp;   /* where its program begins */
 
     /* Process groups and sessions: a shell puts each job (a pipeline) in
        its own group, so Ctrl-C reaches exactly that job. */
@@ -101,12 +109,14 @@ void proc_set_init(struct process *p);
 /* --- the system calls --- */
 int  proc_fork(void);
 int  proc_fork_frame(const struct regs *frame, struct process **child);
-int  proc_clone(uint32_t flags, uint32_t new_sp, uint32_t parent_tid, uint32_t tls,
-                uint32_t child_tid);
-int  proc_execve(uint32_t user_path, uint32_t user_argv, uint32_t user_envp);
+int  proc_clone(uint32_t flags, uintptr_t new_sp, uintptr_t parent_tid, uintptr_t tls,
+                 uintptr_t child_tid);
+int  proc_execve(uintptr_t user_path, uintptr_t user_argv, uintptr_t user_envp);
 void proc_exit(int status) __attribute__((noreturn));        /* exit_group */
 void proc_thread_exit(int status) __attribute__((noreturn)); /* exit */
-int  proc_wait4(int pid, uint32_t user_status, int options);
+int  proc_wait4(int pid, uintptr_t user_status, int options, uintptr_t user_rusage);
+/* Write a struct rusage with these CPU times (ms) to user memory. (sys_info.c) */
+int  rusage_to_user(uintptr_t user, uint32_t user_ms, uint32_t sys_ms);
 int  proc_setpgid(int pid, int pgid);
 int  proc_setsid(void);
 int  proc_pgid_in_session(int pgid, int sid);   /* for TIOCSPGRP */

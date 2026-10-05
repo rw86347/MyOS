@@ -22,6 +22,7 @@
 #define NR_getpid       20
 #define NR_access       33
 #define NR_alarm        27
+#define NR_pause        29
 #define NR_kill         37
 #define NR_dup          41
 #define NR_pipe         42
@@ -56,7 +57,42 @@
 #define NR_pread64     180
 #define NR_pwrite64    181
 #define NR_getcwd      183
+#define NR_times       43
+#define NR_getrusage   77
+/* (more, 2026-10-05: time setting, capabilities, namespaces, swap) */
+#define NR_chroot          61
+#define NR_inotify_init    291
+#define NR_inotify_add_watch 292
+#define NR_inotify_rm_watch 293
+#define NR_inotify_init1   332
+#define NR_semget          393
+#define NR_semctl          394
+#define NR_shmget          395
+#define NR_shmctl          396
+#define NR_shmat           397
+#define NR_shmdt           398
+#define NR_msgget          399
+#define NR_msgsnd          400
+#define NR_msgrcv          401
+#define NR_msgctl          402
+#define NR_semtimedop_time64 420
+#define NR_fadvise64_64    272
+#define NR_pivot_root      217
+#define NR_syslog          103
+#define NR_swapon          87
+#define NR_adjtimex        124
+#define NR_personality     136
+#define NR_capget          184
+#define NR_capset          185
+#define NR_swapoff         115
+#define NR_unshare         310
+#define NR_clock_adjtime   343
+#define NR_syncfs          344
+#define NR_setns           346
+#define NR_clock_settime64 404
+#define NR_clock_adjtime64 405
 #define NR_vfork       190
+#define NR_sendfile64  239
 #define NR_mmap2       192
 #define NR_getdents64  220
 #define NR_fcntl64     221
@@ -218,9 +254,10 @@
 #define SEEK_CUR 1
 #define SEEK_END 2
 
-/* Run system call `nr` with up to 6 arguments; returns the result for EAX.
-   Called by the int 0x80 handler (interrupts.c). */
-int32_t syscall_dispatch(uint32_t nr, uint32_t a1, uint32_t a2, uint32_t a3,
-                         uint32_t a4, uint32_t a5, uint32_t a6);
+/* Run system call `nr` (the architecture's Linux number) with up to 6
+   register-sized arguments; returns the result for EAX / RAX. Called by
+   the int 0x80, sysenter and syscall entry code. */
+intptr_t syscall_dispatch(uint32_t nr, uintptr_t a1, uintptr_t a2, uintptr_t a3,
+                          uintptr_t a4, uintptr_t a5, uintptr_t a6);
 
 #endif

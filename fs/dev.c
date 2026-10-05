@@ -40,7 +40,6 @@
    again). So the syscall always finishes quickly. */
 static int32_t console_write_user(struct file *f, const void *user_buf, uint32_t count)
 {
-    (void)f;
     char chunk[256];                /* copy in pieces via the stack */
     uint32_t done = 0;
     while (done < count) {
@@ -50,7 +49,7 @@ static int32_t console_write_user(struct file *f, const void *user_buf, uint32_t
             n = room;
         if (n == 0)
             break;                              /* queue full: short write */
-        if (copy_from_user(chunk, (const char *)user_buf + done, n) < 0)
+        if (file_copy_in(f, chunk, (const char *)user_buf + done, n) < 0)
             return done ? (int32_t)done : -EFAULT;
         console_write(chunk, n);
         done += n;
@@ -61,6 +60,7 @@ static int32_t console_write_user(struct file *f, const void *user_buf, uint32_t
 /* Reading goes through the terminal's line editing (tty.c). */
 const struct file_ops console_ops = {
     .read = tty_read, .write = console_write_user, .ioctl = tty_ioctl, .poll = tty_poll,
+    .kbuf_ok = 1,
 };
 
 /* /dev/tty: "my terminal". In a terminal window that's the window's pty
@@ -73,6 +73,7 @@ static int devtty_open(struct file *f)
 
 static const struct file_ops devtty_ops = {
     .read = tty_read, .write = console_write_user, .ioctl = tty_ioctl, .poll = tty_poll,
+    .kbuf_ok = 1,
     .open = devtty_open,
 };
 
@@ -120,8 +121,8 @@ static int32_t zero_read(struct file *f, void *user_buf, uint32_t n)
     return done;
 }
 
-static const struct file_ops null_ops = { .read = null_read, .write = sink_write };
-static const struct file_ops zero_ops = { .read = zero_read, .write = sink_write };
+static const struct file_ops null_ops = { .read = null_read, .write = sink_write, .kbuf_ok = 1 };
+static const struct file_ops zero_ops = { .read = zero_read, .write = sink_write, .kbuf_ok = 1 };
 
 /* --- device nodes ---------------------------------------------------------------- */
 

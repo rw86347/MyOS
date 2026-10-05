@@ -367,7 +367,6 @@
 #define NR64_futex_waitv        449
 #define NR64_set_mempolicy_home_node 450
 
-int32_t syscall_dispatch_x86_64(uint64_t nr, uint64_t a1, uint64_t a2, uint64_t a3,
-                                uint64_t a4, uint64_t a5, uint64_t a6);
+
 
 #endif

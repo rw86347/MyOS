@@ -39,15 +39,12 @@
      0xB7FFF000   the stack area: 8 MiB, the stack grows down from the top
      0xBFFFF000   the vsyscall page (arch/i386/sysenter.h)
      0xC0000000   the kernel */
-#define USER_STACK_TOP    0xBFFFF000u
-#define USER_STACK_MAX    (8u << 20)
-#define USER_STACK_BOTTOM (USER_STACK_TOP - USER_STACK_MAX)
-#define MMAP_BASE         0x40000000u
+#include <user.h>      /* USER_STACK_TOP, MMAP_BASE, ... for this CPU */
 
 struct inode;
 
 struct vma {
-    uint32_t start, end;                /* [start, end), page aligned */
+    user_addr_t start, end;             /* [start, end), page aligned */
     uint32_t flags;                     /* VM_READ / VM_WRITE / VM_EXEC */
     struct inode *file;                 /* mmap'd file (NULL: zero-filled) */
     uint32_t file_off;                  /* file offset of `start` */
@@ -64,7 +61,7 @@ struct mm {
     uint32_t pd;                        /* page directory (physical) */
     struct vma *area;                   /* sorted by start, no overlaps */
     int nareas, cap;                    /* in use, room for */
-    uint32_t brk_start, brk;            /* the heap: [brk_start, brk) */
+    user_addr_t brk_start, brk;         /* the heap: [brk_start, brk) */
 };
 
 void mm_init(void);                     /* after vmm_init() */
@@ -78,49 +75,49 @@ struct mm *mm_kernel(void);             /* no user space at all */
 void mm_switch(struct mm *mm);          /* load its page directory */
 
 /* Add an area (demand-zero pages). 0, or -errno (overlap, too many). */
-int mm_add(struct mm *mm, uint32_t start, uint32_t end, uint32_t flags);
+int mm_add(struct mm *mm, user_addr_t start, user_addr_t end, uint32_t flags);
 
 /* Add an area whose pages come from a file (copied in on first touch).
    file_end is the exclusive file offset of real bytes, or ~0u for the
    whole file. */
-int mm_add_file(struct mm *mm, uint32_t start, uint32_t end, uint32_t flags,
+int mm_add_file(struct mm *mm, user_addr_t start, user_addr_t end, uint32_t flags,
                 struct inode *file, uint32_t file_off, uint32_t file_end);
 
 /* The lowest free stretch of len bytes from MMAP_BASE up, or 0. */
-uint32_t mm_find_gap(struct mm *mm, uint32_t len);
+user_addr_t mm_find_gap(struct mm *mm, uint32_t len);
 
 /* Remove [start, end) from the areas and unmap its pages. */
-int mm_remove(struct mm *mm, uint32_t start, uint32_t end);
+int mm_remove(struct mm *mm, user_addr_t start, user_addr_t end);
 
 /* A page fault at va (CPU error code err) in the current address space:
    0 if it was fixed (demand paging, copy-on-write), -1 if it's a real error. */
-int mm_fault(uint32_t va, uint32_t err);
+int mm_fault(user_addr_t va, uint32_t err);
 
 /* The brk and mmap system calls, on the current address space. fmode: the
    file's open() flags (its O_ACCMODE decides what MAP_SHARED may do). */
-uint32_t mm_brk(uint32_t new_brk);
-int32_t  mm_mmap(uint32_t addr, uint32_t len, uint32_t prot, uint32_t flags,
+user_addr_t mm_brk(user_addr_t new_brk);
+intptr_t mm_mmap(user_addr_t addr, uint32_t len, uint32_t prot, uint32_t flags,
                  struct inode *file, uint32_t off, uint32_t fmode);
-int32_t  mm_munmap(uint32_t addr, uint32_t len);
-int32_t  mm_mremap(uint32_t old, uint32_t old_len, uint32_t new_len,
-                   uint32_t flags, uint32_t new_addr);
+int32_t  mm_munmap(user_addr_t addr, uint32_t len);
+intptr_t mm_mremap(user_addr_t old, uint32_t old_len, uint32_t new_len,
+                   uint32_t flags, user_addr_t new_addr);
 
 /* mmap of a device file whose ops have .mmap (/dev/fb0). The area is
    always shared: writes reach the device, as with MAP_SHARED. */
 struct file;
-int32_t  mm_mmap_device(uint32_t addr, uint32_t len, uint32_t prot, uint32_t flags,
+intptr_t mm_mmap_device(user_addr_t addr, uint32_t len, uint32_t prot, uint32_t flags,
                         struct file *f, uint32_t off);
 
 /* For a device's .mmap: make vma map physical [phys, phys + size),
    starting at the vma's file offset (Linux: vm_iomap_memory). 0, or
    -EINVAL if the vma reaches past size. */
 int vm_iomap_memory(struct vma *vma, uint32_t phys, uint32_t size);
-int32_t  mm_mprotect(uint32_t addr, uint32_t len, uint32_t prot);
+int32_t  mm_mprotect(user_addr_t addr, uint32_t len, uint32_t prot);
 
 /* shmdt: remove the shared-memory attach that starts at addr — every area
    of that segment in [addr, addr + its size), in the current address
    space. Returns the segment, held (the caller vfs_puts it), or NULL if no
    attach starts at addr. */
-struct inode *mm_shm_detach(uint32_t addr);
+struct inode *mm_shm_detach(user_addr_t addr);
 
 #endif

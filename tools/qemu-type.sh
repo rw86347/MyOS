@@ -22,6 +22,7 @@ while [ $i -lt ${#text} ]; do
         '(')  k=shift-9 ;;      ')')  k=shift-0 ;;      '!')  k=shift-1 ;;
         '?')  k=shift-slash ;;  '+')  k=shift-equal ;;  '~')  k=shift-grave_accent ;;
         '#')  k=shift-3 ;;      '@')  k=shift-2 ;;      '%')  k=shift-5 ;;
+        '{')  k=shift-bracket_left ;; '}') k=shift-bracket_right ;; '^') k=shift-6 ;;
         *)    k=spc ;;
     esac
     echo "sendkey $k"

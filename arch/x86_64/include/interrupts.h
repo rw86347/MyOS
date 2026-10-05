@@ -44,7 +44,7 @@ static inline void regs_set_ip(struct regs *r, uint64_t ip) { r->rip = ip; }
 static inline uint64_t regs_ip(const struct regs *r) { return r->rip; }
 static inline void regs_set_sp(struct regs *r, uint64_t sp) { r->rsp = sp; }
 static inline uint64_t regs_sp(const struct regs *r) { return r->rsp; }
-static inline void regs_set_ax(struct regs *r, int32_t v) { r->rax = (uint64_t)(int64_t)v; }
+static inline void regs_set_ax(struct regs *r, int64_t v) { r->rax = (uint64_t)v; }
 static inline int regs_user_mode(const struct regs *r) { return (r->cs & 3) == 3; }
 
 #endif

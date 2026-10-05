@@ -1,23 +1,24 @@
 /*
- * paging.c — x86_64 four-level page tables (phase B bootstrap)
+ * paging.c — x86_64 four-level page tables
  *
- * UEFI leaves long mode with *firmware* page tables (usually identity). This
- * file builds *our* tables and loads CR3 before user processes or a higher-half
- * kernel layout.
+ * A virtual address is split into four 9-bit table indexes and a 12-bit
+ * offset (Intel SDM vol. 3, 4.5):
  *
- * REVIEW checklist (for later Claude pass):
- *   - Move kernel to upper canonical (KERNEL_VBASE) and drop low identity map.
- *   - Split vmm_pd_create() so user PML4 entries don't share leaf tables with
- *     the kernel direct map (today KERNEL_VBASE==0 forces a shared low half).
- *   - 1 GiB pages for direct map where RAM is aligned (fewer TLB entries).
- *   - vmm_map_big() for GOP above 4 GiB without i386 PSE-36 tricks.
+ *   CR3 -> PML4[47:39] -> PDPT[38:30] -> PD[29:21] -> PT[20:12] -> 4 KiB page
  *
- * 4-level walk (Intel SDM):
- *   CR3 -> PML4[47:39] -> PDPT[38:30] -> PD[29:21] -> PT[20:12] -> 4 KiB frame
- *   PD entry with PTE_PS -> 2 MiB "huge" page (what we use for the direct map).
+ * A PD entry with PTE_PS set is a 2 MiB page instead (no PT): that is what
+ * the direct map and the kernel image use — 512 small pages' worth of RAM
+ * in one TLB entry.
  *
- * Editing tables: every table is a physical frame from pmm_alloc(); with the
- * bootstrap identity map, P2V(pa) reaches it until we relocate the kernel.
+ * Kernel and user (memlayout.h): user space is PML4 entries 0-255, the
+ * kernel 256-511. The kernel uses only 256 (direct map) and 511 (image,
+ * heap, MMIO, framebuffers); both are made in vmm_init and never change.
+ * A new process's PML4 copies those two entries, so it points at the very
+ * same lower tables — a kernel mapping made later (kmalloc growing, a
+ * device mapped) is in every address space at once. Nothing to sync.
+ *
+ * Every table is a physical frame from pmm_alloc(), edited through the
+ * direct map (P2V).
  */
 #include <cpu.h>
 #include <kprintf.h>
@@ -26,25 +27,25 @@
 #include <pmm.h>
 #include <string.h>
 #include <types.h>
+#include <user.h>
 
 #define PTE_ADDR(e)   ((uint64_t)(e) & 0x000FFFFFFFFFF000ull)
 #define PTE_FLAGS(e)  ((uint32_t)(e) & 0xFFFu)
 #define HUGE_2MB      0x200000ull
+#define ENTRIES       512
 
 #define PML4_INDEX(va)  (((uint64_t)(va) >> 39) & 0x1FFu)
 #define PDPT_INDEX(va)  (((uint64_t)(va) >> 30) & 0x1FFu)
 #define PD_INDEX(va)    (((uint64_t)(va) >> 21) & 0x1FFu)
 #define PT_INDEX(va)    (((uint64_t)(va) >> 12) & 0x1FFu)
+#define USER_PML4ES     256             /* entries 0-255: user space */
+
+extern char __kernel_end[];
 
 static uint64_t *kernel_pml4;
 static uint64_t *cur_pml4;
 static phys_addr_t cur_pml4_phys;
 static uint32_t global_bit;
-
-static inline int is_huge_pd(uint64_t pd_entry)
-{
-    return (pd_entry & (PTE_PRESENT | PTE_PS)) == (PTE_PRESENT | PTE_PS);
-}
 
 static void invlpg(uintptr_t va)
 {
@@ -56,208 +57,163 @@ static void flush_tlb(void)
     __asm__ volatile ("mov %%cr3, %%rax\n\tmov %%rax, %%cr3" ::: "rax", "memory");
 }
 
-/* Which PML4 to edit: after higher-half, kernel VAs use the upper half only. */
-static uint64_t *pml4_for(uint32_t va)
-{
-    if (KERNEL_VBASE != 0 && (uint64_t)va >= KERNEL_VBASE)
-        return kernel_pml4;
-    return cur_pml4;
-}
-
 static uint64_t *table_at(phys_addr_t phys)
 {
     return (uint64_t *)P2V(phys);
 }
 
-/* Ensure PML4 -> PDPT -> PD exist; return pointer to PD entry for `va`. */
-static uint64_t *get_pd(uint32_t va, int create, uint32_t flags)
+/* A new, empty table, linked into *entry. Tables in user space are marked
+   user and writable; the last level (the page itself) decides. */
+static uint64_t *new_table(uint64_t *entry, uintptr_t va)
 {
-    uint64_t *pml4 = pml4_for(va);
-    uint64_t *pml4e = &pml4[PML4_INDEX(va)];
-
-    if (!(*pml4e & PTE_PRESENT)) {
-        if (!create)
-            return NULL;
-        phys_addr_t pdpt_phys = pmm_alloc();
-        if (!pdpt_phys)
-            return NULL;
-        memset(P2V(pdpt_phys), 0, PAGE_SIZE);
-        *pml4e = pdpt_phys | PTE_PRESENT | PTE_WRITABLE | (flags & PTE_USER);
-    }
-
-    uint64_t *pdpt = table_at(PTE_ADDR(*pml4e));
-    uint64_t *pdpte = &pdpt[PDPT_INDEX(va)];
-
-    if (!(*pdpte & PTE_PRESENT)) {
-        if (!create)
-            return NULL;
-        phys_addr_t pd_phys = pmm_alloc();
-        if (!pd_phys)
-            return NULL;
-        memset(P2V(pd_phys), 0, PAGE_SIZE);
-        *pdpte = pd_phys | PTE_PRESENT | PTE_WRITABLE | (flags & PTE_USER);
-    }
-
-    return &table_at(PTE_ADDR(*pdpte))[PD_INDEX(va)];
+    phys_addr_t phys = pmm_alloc();
+    if (!phys)
+        return NULL;
+    memset(P2V(phys), 0, PAGE_SIZE);
+    *entry = phys | PTE_PRESENT | PTE_WRITABLE | (va < USER_ADDR_END ? PTE_USER : 0);
+    return table_at(phys);
 }
 
-static uint64_t *get_pte(uint32_t va, int create, uint32_t flags)
+/* The PD entry for `va` (its 2 MiB slot), making the PDPT and PD on the
+   way if `create`. Kernel addresses are looked up in the kernel's own PML4,
+   whose two entries every process shares. */
+static uint64_t *get_pde(uintptr_t va, int create)
 {
-    uint64_t *pde = get_pd(va, create, flags);
-    if (!pde)
-        return NULL;
-    if (is_huge_pd(*pde))
+    uint64_t *pml4e = va >= KERNEL_SPACE_START ? &kernel_pml4[PML4_INDEX(va)]
+                                               : &cur_pml4[PML4_INDEX(va)];
+    uint64_t *pdpt;
+    if (*pml4e & PTE_PRESENT)
+        pdpt = table_at(PTE_ADDR(*pml4e));
+    else if (!create || va >= KERNEL_SPACE_START)
+        return NULL;    /* a new kernel PML4 entry would not reach other processes */
+    else if (!(pdpt = new_table(pml4e, va)))
         return NULL;
 
-    if (!(*pde & PTE_PRESENT)) {
-        if (!create)
-            return NULL;
-        phys_addr_t pt_phys = pmm_alloc();
-        if (!pt_phys)
-            return NULL;
-        memset(P2V(pt_phys), 0, PAGE_SIZE);
-        *pde = pt_phys | PTE_PRESENT | PTE_WRITABLE | (flags & PTE_USER);
-    }
+    uint64_t *pdpte = &pdpt[PDPT_INDEX(va)];
+    uint64_t *pd;
+    if (*pdpte & PTE_PRESENT)
+        pd = table_at(PTE_ADDR(*pdpte));
+    else if (!create || !(pd = new_table(pdpte, va)))
+        return NULL;
+    return &pd[PD_INDEX(va)];
+}
 
-    uint64_t *pt = table_at(PTE_ADDR(*pde));
+/* The page-table entry for `va`; NULL if there is none (or `va` is inside
+   a 2 MiB page). */
+static uint64_t *get_pte(uintptr_t va, int create)
+{
+    uint64_t *pde = get_pde(va, create);
+    if (!pde || (*pde & PTE_PS))
+        return NULL;
+    uint64_t *pt;
+    if (*pde & PTE_PRESENT)
+        pt = table_at(PTE_ADDR(*pde));
+    else if (!create || !(pt = new_table(pde, va)))
+        return NULL;
     return &pt[PT_INDEX(va)];
 }
 
-/* Identity VA==PA: kmalloc lives in [KHEAP_START,KHEAP_END); it grows with
-   vmm_map (4 KiB). A 2 MiB huge mapping there would block that. */
-static int direct_map_uses_4k(uint64_t pa)
+/* Kernel pages are global: they stay in the TLB when CR3 changes. Never a
+   user page — it would stay visible to the next process. */
+static uint32_t global_for(uintptr_t va)
 {
-    uint64_t end = pa + HUGE_2MB;
-    if (pa == 0)
-        return 1;
-    return pa < (uint64_t)KHEAP_END && end > (uint64_t)KHEAP_START;
+    return va >= KERNEL_SPACE_START ? global_bit : 0;
 }
 
-/* Identity 4 KiB map, but leave [KHEAP_START,KHEAP_END) unmapped for kmalloc. */
-static void map_identity_4k_range(uint64_t start, uint64_t end)
+static int map_2mb(uintptr_t va, uint64_t pa, uint32_t flags)
 {
-    for (uint64_t page = start; page < end; page += PAGE_SIZE) {
-        if (page >= (uint64_t)KHEAP_START && page < (uint64_t)KHEAP_END)
-            continue;
-        vmm_map((uint32_t)page, (uint32_t)page, PTE_WRITABLE);
-    }
-}
-
-static int map_2mb(uint32_t va, uint64_t pa, uint32_t flags)
-{
-    if (((uint64_t)va | pa) & (HUGE_2MB - 1))
+    if ((va | pa) & (HUGE_2MB - 1))
         return -1;
-    uint64_t *pde = get_pd(va, 1, flags);
+    uint64_t *pde = get_pde(va, 1);
     if (!pde || (*pde & PTE_PRESENT))
         return -1;
-    if (va >= (uint32_t)KERNEL_VBASE || KERNEL_VBASE == 0)
-        flags |= global_bit;
-    *pde = (pa & 0x000FFFFFFFFFF000ull) | PTE_PRESENT | PTE_WRITABLE
-         | PTE_PS | (flags & 0xFFF);
+    *pde = pa | PTE_PRESENT | PTE_PS | global_for(va) | (flags & 0xFFF);
     invlpg(va);
     return 0;
 }
 
+/* One of the kernel's two PML4 entries, with an empty PDPT. */
+static void kernel_pml4_entry(uintptr_t va)
+{
+    if (!new_table(&kernel_pml4[PML4_INDEX(va)], va))
+        kprintf("vmm: out of memory for the kernel's tables\n");
+}
+
+/*
+ * Build the kernel's page tables and switch to them. Until now we ran on
+ * entry.asm's boot tables (identity + direct map + image, the first 1 GiB);
+ * the new ones have no identity map, so the bottom half is free for user
+ * space. The frames used here come from the bottom of RAM, inside that
+ * first 1 GiB, which the boot tables reach.
+ */
 void vmm_init(void)
 {
+    /* Global pages first, so the mappings below get the bit. */
+    global_bit = 0;
+    if (cpu_has(CPU_PGE)) {
+        uint64_t cr4;
+        __asm__ volatile ("mov %%cr4, %0" : "=r"(cr4));
+        __asm__ volatile ("mov %0, %%cr4" : : "r"(cr4 | (1u << 7)) : "memory");
+        global_bit = PTE_GLOBAL;
+    }
+
     phys_addr_t pml4_phys = pmm_alloc();
     if (!pml4_phys) {
         kprintf("vmm: out of memory for PML4\n");
         return;
     }
     kernel_pml4 = table_at(pml4_phys);
-    cur_pml4 = kernel_pml4;
-    cur_pml4_phys = pml4_phys;
     memset(kernel_pml4, 0, PAGE_SIZE);
+    kernel_pml4_entry(DIRECTMAP_BASE);
+    kernel_pml4_entry(KERNEL_VBASE);
 
+    /* The direct map: all RAM, 2 MiB pages (a ragged end in 4 KiB ones). */
     uint64_t ram_end = pmm_end();
     if (ram_end > DIRECTMAP_LIMIT)
         ram_end = DIRECTMAP_LIMIT;
+    uint64_t pa = 0;
+    for (; pa + HUGE_2MB <= ram_end; pa += HUGE_2MB)
+        map_2mb(DIRECTMAP_BASE + pa, pa, PTE_WRITABLE);
+    for (; pa < ram_end; pa += PAGE_SIZE)
+        vmm_map(DIRECTMAP_BASE + pa, pa, PTE_WRITABLE);
 
-    /* Identity direct map: VA == PA for [0, ram_end), mostly 2 MiB pages.
-       The first 2 MiB uses 4 KiB pages: vmm_unmap(0) must drop only the NULL
-       page, not a 2 MiB huge mapping that covers the kernel at 1 MiB. */
-    for (uint64_t pa = 0; pa < ram_end; pa += HUGE_2MB) {
-        if (direct_map_uses_4k(pa)) {
-            uint64_t end = pa + HUGE_2MB;
-            if (end > ram_end)
-                end = ram_end;
-            map_identity_4k_range(pa, end);
-            continue;
-        }
-        if (pa + HUGE_2MB <= ram_end) {
-            if (map_2mb((uint32_t)pa, pa, PTE_WRITABLE) < 0)
-                kprintf("vmm: direct map 2 MiB @ %llx failed\n", (unsigned long long)pa);
-        } else {
-            /* Tail smaller than 2 MiB: 4 KiB pages. */
-            map_identity_4k_range(pa, ram_end);
-        }
-    }
-
-    /* NULL must not be mapped (bootinfo lives at 0x1000, still mapped). */
-    vmm_unmap(0);
+    /* The kernel image (code, data, .bss): 2 MiB pages from physical 0. */
+    uint64_t image_end = V2P(__kernel_end);
+    for (pa = 0; pa < image_end; pa += HUGE_2MB)
+        map_2mb(KERNEL_VBASE + pa, pa, PTE_WRITABLE);
 
     __asm__ volatile ("mov %0, %%cr3" : : "r"(pml4_phys) : "memory");
+    cur_pml4 = kernel_pml4;
+    cur_pml4_phys = pml4_phys;
 
+    /* CR0.WP: the kernel, too, faults on writing a read-only page — how a
+       copy_to_user into a copy-on-write page gets its own copy. */
     uint64_t cr0;
     __asm__ volatile ("mov %%cr0, %0" : "=r"(cr0));
-    __asm__ volatile ("mov %0, %%cr0" : : "r"(cr0 | (1ull << 16)) : "memory"); /* CR0.WP */
-
-    global_bit = 0;
-    if (cpu_has(CPU_PGE)) {
-        global_bit = PTE_GLOBAL;
-        uint64_t cr4;
-        __asm__ volatile ("mov %%cr4, %0" : "=r"(cr4));
-        cr4 |= 1 << 7;
-        __asm__ volatile ("mov %0, %%cr4" : : "r"(cr4) : "memory");
-    }
-
-    /* Pre-create 4 KiB tables for kmalloc heap (same idea as i386). */
-    for (uint32_t va = (uint32_t)KHEAP_START; va < (uint32_t)KHEAP_END; va += (uint32_t)HUGE_2MB) {
-        uint64_t *pde = get_pd(va, 1, PTE_WRITABLE);
-        if (!pde || (*pde & PTE_PRESENT))
-            continue;
-        phys_addr_t pt = pmm_alloc();
-        if (!pt)
-            break;
-        memset(P2V(pt), 0, PAGE_SIZE);
-        *pde = pt | PTE_PRESENT | PTE_WRITABLE | global_bit;
-    }
+    __asm__ volatile ("mov %0, %%cr0" : : "r"(cr0 | (1ull << 16)) : "memory");
 }
 
-int vmm_map(uint32_t va, uint32_t pa, uint32_t flags)
+int vmm_map(uintptr_t va, uint64_t pa, uint32_t flags)
 {
-    uint64_t *pte = get_pte(va, 1, flags);
+    uint64_t *pte = get_pte(va, 1);
     if (!pte || (*pte & PTE_PRESENT))
         return -1;
-    if (KERNEL_VBASE == 0 || va >= (uint32_t)KERNEL_VBASE)
-        flags |= global_bit;
-    *pte = ((uint64_t)pa & 0x000FFFFFFFFFF000ull) | (flags & 0xFFF) | PTE_PRESENT;
+    *pte = (pa & 0x000FFFFFFFFFF000ull) | PTE_PRESENT | global_for(va) | (flags & 0xFFF);
     invlpg(va);
     return 0;
 }
 
-int vmm_map_big(uint32_t va, uint64_t pa, uint32_t flags)
+/* A 2 MiB kernel page (framebuffers: pat.c). */
+int vmm_map_big(uintptr_t va, uint64_t pa, uint32_t flags)
 {
-    if (va < (uint32_t)KERNEL_VBASE && KERNEL_VBASE != 0)
-        return -1;
+    if (va < KERNEL_SPACE_START)
+        return -1;                      /* big pages are the kernel's only */
     return map_2mb(va, pa, flags);
 }
 
-uint32_t vmm_unmap(uint32_t va)
+uint32_t vmm_unmap(uintptr_t va)
 {
-    uint64_t *pde = get_pd(va, 0, 0);
-    if (!pde)
-        return 0;
-    if (is_huge_pd(*pde)) {
-        if (PML4_INDEX(va) != PML4_INDEX((uint32_t)(va + 1)))
-            return 0;
-        uint32_t pa = (uint32_t)PTE_ADDR(*pde);
-        *pde = 0;
-        invlpg(va);
-        return pa;
-    }
-    uint64_t *pte = get_pte(va, 0, 0);
+    uint64_t *pte = get_pte(va, 0);
     if (!pte || !(*pte & PTE_PRESENT))
         return 0;
     uint32_t pa = (uint32_t)PTE_ADDR(*pte);
@@ -266,64 +222,74 @@ uint32_t vmm_unmap(uint32_t va)
     return pa;
 }
 
-uint32_t vmm_translate(uint32_t va)
+uint32_t vmm_translate(uintptr_t va)
 {
-    uint64_t *pde = get_pd(va, 0, 0);
+    uint64_t *pde = get_pde(va, 0);
     if (!pde || !(*pde & PTE_PRESENT))
         return 0;
-    if (is_huge_pd(*pde))
-        return (uint32_t)(PTE_ADDR(*pde) | (va & (HUGE_2MB - 1)));
-
-    uint64_t *pte = get_pte(va, 0, 0);
-    if (!pte || !(*pte & PTE_PRESENT))
+    if (*pde & PTE_PS)
+        return (uint32_t)(PTE_ADDR(*pde) + (va & (HUGE_2MB - 1)));
+    uint64_t pte = table_at(PTE_ADDR(*pde))[PT_INDEX(va)];
+    if (!(pte & PTE_PRESENT))
         return 0;
-    return (uint32_t)(PTE_ADDR(*pte) | (va & 0xFFF));
+    return (uint32_t)(PTE_ADDR(pte) | (va & 0xFFF));
 }
 
-uint32_t vmm_get_flags(uint32_t va)
+uint32_t vmm_get_flags(uintptr_t va)
 {
-    uint64_t *pte = get_pte(va, 0, 0);
-    if (!pte)
-        return 0;
-    if (is_huge_pd(*pte))
-        return PTE_FLAGS(*pte);
-    return (*pte & PTE_PRESENT) ? PTE_FLAGS(*pte) : 0;
+    uint64_t *pte = get_pte(va, 0);
+    return pte && (*pte & PTE_PRESENT) ? PTE_FLAGS(*pte) : 0;
 }
 
-int vmm_protect(uint32_t va, uint32_t flags)
+int vmm_protect(uintptr_t va, uint32_t flags)
 {
-    uint64_t *pte = get_pte(va, 0, 0);
+    uint64_t *pte = get_pte(va, 0);
     if (!pte || !(*pte & PTE_PRESENT))
         return -1;
-    *pte = PTE_ADDR(*pte) | (flags & 0xFFF) | PTE_PRESENT;
+    *pte = PTE_ADDR(*pte) | PTE_PRESENT | global_for(va) | (flags & 0xFFF);
     invlpg(va);
     return 0;
 }
 
-void vmm_unmap_range(uint32_t start, uint32_t end)
+/* Unmap user pages in [start, end) and drop our hold on their frames. Where
+   a whole page table is missing, skip its 2 MiB at once: unmapping a big,
+   mostly empty range costs the tables that exist, not the pages it spans. */
+void vmm_unmap_range(uintptr_t start, uintptr_t end)
 {
-    for (uint32_t va = start & ~0xFFFu; va < end; va += PAGE_SIZE) {
-        uint64_t *pte = get_pte(va, 0, 0);
-        if (!pte || !(*pte & PTE_PRESENT))
+    uintptr_t va = start & ~(uintptr_t)0xFFF;
+    while (va < end) {
+        uint64_t *pde = get_pde(va, 0);
+        if (!pde || !(*pde & PTE_PRESENT) || (*pde & PTE_PS)) {
+            uintptr_t next = (va | (HUGE_2MB - 1)) + 1;     /* the next 2 MiB slot */
+            if (next <= va)
+                break;
+            va = next;
             continue;
-        if (!(*pte & PTE_SHARED))
-            pmm_free((uint32_t)PTE_ADDR(*pte));
-        *pte = 0;
-        invlpg(va);
+        }
+        uint64_t *pt = table_at(PTE_ADDR(*pde));
+        for (uint32_t i = PT_INDEX(va); i < ENTRIES && va < end; i++, va += PAGE_SIZE) {
+            uint64_t e = pt[i];
+            if (!(e & PTE_PRESENT))
+                continue;
+            if (!(e & PTE_SHARED))
+                pmm_free((uint32_t)PTE_ADDR(e));
+            pt[i] = 0;
+            invlpg(va);
+        }
     }
 }
 
-/*
- * Address spaces (phase E): with KERNEL_VBASE==0 we clone the whole PML4 so
- * mm_create() gets a distinct CR3. Leaf tables are still shared — REVIEW before fork.
- */
+/* --- address spaces ------------------------------------------------------ */
+
 uint32_t vmm_pd_create(void)
 {
     phys_addr_t phys = pmm_alloc();
     if (!phys)
         return 0;
-    uint64_t *child = table_at(phys);
-    memcpy(child, cur_pml4, PAGE_SIZE);
+    uint64_t *pml4 = table_at(phys);
+    memset(pml4, 0, USER_PML4ES * 8);                       /* user: empty */
+    memcpy(pml4 + USER_PML4ES, kernel_pml4 + USER_PML4ES,   /* kernel: shared */
+           (ENTRIES - USER_PML4ES) * 8);
     return (uint32_t)phys;
 }
 
@@ -335,28 +301,109 @@ uint32_t vmm_pd_current(void)
 void vmm_pd_switch(uint32_t phys)
 {
     if ((phys_addr_t)phys == cur_pml4_phys)
-        return;
+        return;                 /* same address space: keep the TLB */
     __asm__ volatile ("mov %0, %%cr3" : : "r"((phys_addr_t)phys) : "memory");
     cur_pml4 = table_at(phys);
     cur_pml4_phys = phys;
 }
 
+/* Free a user table and everything under it: `level` 3 = PDPT, 2 = PD,
+   1 = PT. A page in a PT loses one owner (it may be shared copy-on-write). */
+static void free_tree(phys_addr_t table, int level)
+{
+    uint64_t *t = table_at(table);
+    for (int i = 0; i < ENTRIES; i++) {
+        uint64_t e = t[i];
+        if (!(e & PTE_PRESENT))
+            continue;
+        if (level > 1)
+            free_tree(PTE_ADDR(e), level - 1);
+        else if (!(e & PTE_SHARED))
+            pmm_free((uint32_t)PTE_ADDR(e));
+    }
+    pmm_free((uint32_t)table);
+}
+
 void vmm_pd_destroy(uint32_t phys)
 {
-    if ((phys_addr_t)phys == cur_pml4_phys)
-        return;
-    /* REVIEW: walk and free user leaf tables only. */
+    uint64_t *pml4 = table_at(phys);
+    for (int i = 0; i < USER_PML4ES; i++)
+        if (pml4[i] & PTE_PRESENT)
+            free_tree(PTE_ADDR(pml4[i]), 3);
     pmm_free(phys);
+}
+
+/* Copy the user table `src` (`level` as in free_tree) for fork, into a new
+   table hung in *dst_entry. In a PT, private writable pages become
+   read-only + PTE_COW in BOTH copies and gain an owner; the first write by
+   either side makes its own copy (vmm_cow_fault). On -1 (out of memory)
+   the part built so far is linked in, so vmm_pd_destroy frees it. */
+static int fork_tree(uint64_t *src, uint64_t *dst_entry, uint64_t src_entry, int level)
+{
+    phys_addr_t phys = pmm_alloc();
+    if (!phys)
+        return -1;
+    uint64_t *dst = table_at(phys);
+    memset(dst, 0, PAGE_SIZE);
+    *dst_entry = phys | PTE_FLAGS(src_entry);
+    for (int i = 0; i < ENTRIES; i++) {
+        uint64_t e = src[i];
+        if (!(e & PTE_PRESENT))
+            continue;
+        if (level > 1) {
+            if (fork_tree(table_at(PTE_ADDR(e)), &dst[i], e, level - 1) < 0)
+                return -1;
+            continue;
+        }
+        if (!(e & PTE_SHARED)) {
+            if ((e & PTE_WRITABLE) && !(e & PTE_MAPSHARED)) {   /* share it until someone writes */
+                e = (e & ~(uint64_t)PTE_WRITABLE) | PTE_COW;
+                src[i] = e;
+            }
+            pmm_ref((uint32_t)PTE_ADDR(e));             /* one more owner */
+        }
+        dst[i] = e;
+    }
+    return 0;
 }
 
 uint32_t vmm_pd_fork(void)
 {
-    /* REVIEW: copy-on-write like arch/i386/paging.c once user AS is split. */
-    return vmm_pd_create();
+    uint32_t child_phys = vmm_pd_create();
+    if (!child_phys)
+        return 0;
+    uint64_t *child = table_at(child_phys);
+    for (int i = 0; i < USER_PML4ES; i++) {
+        if (!(cur_pml4[i] & PTE_PRESENT))
+            continue;
+        if (fork_tree(table_at(PTE_ADDR(cur_pml4[i])), &child[i], cur_pml4[i], 3) < 0) {
+            flush_tlb();
+            vmm_pd_destroy(child_phys);
+            return 0;
+        }
+    }
+    flush_tlb();                /* we took write access away in our own tables */
+    return child_phys;
 }
 
-int vmm_cow_fault(uint32_t va)
+int vmm_cow_fault(uintptr_t va)
 {
-    (void)va;
-    return -1;
+    uint64_t *pte = get_pte(va, 0);
+    if (!pte || !(*pte & PTE_PRESENT) || !(*pte & PTE_COW))
+        return -1;
+    uint32_t old = (uint32_t)PTE_ADDR(*pte);
+    uint64_t flags = (PTE_FLAGS(*pte) & ~(uint64_t)PTE_COW) | PTE_WRITABLE;
+    if (pmm_shared(old)) {
+        /* Others still use the page: make our own copy. */
+        uint32_t copy = pmm_alloc();
+        if (!copy)
+            return -1;
+        memcpy(P2V(copy), P2V(old), PAGE_SIZE);
+        *pte = copy | flags;
+        pmm_free(old);                          /* one owner less */
+    } else {
+        *pte = old | flags;                     /* last owner: just take it */
+    }
+    invlpg(va & ~(uintptr_t)0xFFF);
+    return 0;
 }

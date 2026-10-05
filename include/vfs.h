@@ -3,6 +3,8 @@
 
 #include <proc.h>
 #include <stdint.h>
+#include <string.h>
+#include <uaccess.h>
 
 /*
  * The VFS ("virtual file system"): files and directories, whatever they're
@@ -74,7 +76,7 @@ struct file_ops {
     int32_t (*read)(struct file *f, void *user_buf, uint32_t n);
     int32_t (*write)(struct file *f, const void *user_buf, uint32_t n);
     void (*release)(struct file *f);        /* last close (may be NULL) */
-    int32_t (*ioctl)(struct file *f, uint32_t cmd, uint32_t arg);   /* or NULL */
+    int32_t (*ioctl)(struct file *f, uint32_t cmd, uintptr_t arg);   /* or NULL */
     uint32_t (*poll)(struct file *f);       /* POLLIN/POLLOUT/... now (NULL: both) */
     /* Devices whose memory programs can map (/dev/fb0): describe it in vma
        with vm_iomap_memory (mm.h). vma->start is 0 here, end the length.
@@ -84,7 +86,11 @@ struct file_ops {
        another device's (/dev/tty -> the caller's terminal). -errno fails
        the open. NULL: nothing to do. */
     int (*open)(struct file *f);
+    /* 1: write() fetches its bytes with file_copy_in, so sendfile can hand
+       it kernel memory (file data straight from the page cache). */
+    uint8_t kbuf_ok;
 };
+
 
 /* inode flags */
 #define I_NAME_OWNED 1              /* name is our kmalloc'd copy */
@@ -97,6 +103,7 @@ struct file_ops {
 #define I_PROC_EXE  64              /* /proc/self/exe: a link to the caller's
                                        program (the ELF that execve loaded) */
 #define I_MEMFD    128              /* memfd_create: fs_ino holds F_SEAL_* */
+#define I_WATCHED  256              /* inotify watches it (fs/inotify.c) */
 
 /*
  * A file system on a disk (ext2): what the VFS asks of it. The VFS keeps
@@ -203,7 +210,11 @@ struct file {
     uint32_t flags;                 /* the open() flags (O_APPEND, O_NONBLOCK...) */
     uint32_t refs;                  /* fds pointing at it */
     void *priv;                     /* pipe: the pipe; directory: its cursor */
-    uint32_t flock;                 /* the flock() it holds: 0, LOCK_SH or LOCK_EX */
+    uint16_t flock;                 /* the flock() it holds: 0, LOCK_SH or LOCK_EX */
+    /* 1 only in sendfile's private copy of an open file (on its stack, never
+       in an fd table): write()'s buffer is then kernel memory. See
+       file_copy_in. A program cannot set it. */
+    uint8_t kbuf;
     /* Which open this is, counted from boot. Anything that remembers a
        struct file without holding a reference — epoll's interest list — needs
        to tell "still the file I was given" from "a different file that landed
@@ -220,6 +231,18 @@ struct file {
        is polling the wrong file, not touching freed memory. */
     uint32_t serial;
 };
+
+/* What a write() that sendfile can use fetches the caller's bytes with:
+   user memory as usual, or, for sendfile's private copy of the file,
+   kernel memory. */
+static inline int file_copy_in(const struct file *f, void *dst, const void *src, uint32_t n)
+{
+    if (f->kbuf) {
+        memcpy(dst, src, n);
+        return 0;
+    }
+    return copy_from_user(dst, src, n);
+}
 
 /* --- the tree ---------------------------------------------------------- */
 struct inode *vfs_root(void);
@@ -317,6 +340,7 @@ int  vfs_mount_tree(const char *path, struct inode *tree);
 /* Mount a new, empty RAM directory on the existing directory at path
    (mount -t tmpfs). Its files share the RAM file system's pages. */
 int  vfs_mount_ram(const char *path, uint32_t mode);
+int  vfs_pivot_root(const char *new_root, const char *put_old);
 int  vfs_mount_count(void);
 struct mount *vfs_mount_at(int index);
 /* Move i to new_dir under a new name, replacing what's there (rename()
@@ -346,6 +370,73 @@ void    file_free(struct inode *i);
 uint32_t ramfs_page(struct inode *i, uint32_t idx);
 void    ramfs_usage(uint32_t *used_pages, uint32_t *max_pages);   /* statfs, df */
 uint32_t time_now(void);                    /* seconds since 1970 (sys_info.c) */
+
+/* --- inotify (fs/inotify.c) ------------------------------------------------
+   The VFS calls these where files change. They cost a flag test or two
+   unless someone watches the file or its directory. */
+#define IN_ACCESS        0x001
+#define IN_MODIFY        0x002
+#define IN_ATTRIB        0x004
+#define IN_CLOSE_WRITE   0x008
+#define IN_CLOSE_NOWRITE 0x010
+#define IN_OPEN          0x020
+#define IN_MOVED_FROM    0x040
+#define IN_MOVED_TO      0x080
+#define IN_CREATE        0x100
+#define IN_DELETE        0x200
+#define IN_DELETE_SELF   0x400
+#define IN_MOVE_SELF     0x800
+#define IN_ISDIR         0x40000000     /* (in an event: it's about a directory) */
+
+/* --- record locks (fs/lock.c) --- */
+int32_t lock_fcntl(struct file *f, uint32_t cmd, uintptr_t arg);   /* F_*LK* */
+int     lock_fcntl_cmd(uint32_t cmd);   /* is cmd one of those? */
+void    lock_release(const void *owner, const struct inode *i) __attribute__((cold));
+void    lock_exit(struct process *p);
+extern uint32_t nlocks;                 /* record locks in the system: usually 0 */
+
+/* close(): process p's POSIX locks on i go. (One test when nobody locks.) */
+static inline void lock_close(struct process *p, struct inode *i)
+{
+    if (__builtin_expect(nlocks != 0, 0) && i)
+        lock_release(p, i);
+}
+
+/* The last close of an open file: its OFD locks go. */
+static inline void lock_file_gone(struct file *f)
+{
+    if (__builtin_expect(nlocks != 0, 0))
+        lock_release(f, NULL);
+}
+
+/* (cold: tells GCC to keep the callers' common path straight — measured:
+   without it the check alone cost `read` 38 cycles, docs/performance.md) */
+void     fsnotify(struct inode *i, uint32_t mask) __attribute__((cold));
+void     fsnotify_entry(struct inode *dir, struct inode *child, uint32_t mask,
+                        uint32_t cookie, const char *name, uint32_t len)
+                        __attribute__((cold));
+void     fsnotify_deleted(struct inode *i);
+uint32_t fsnotify_cookie(void);         /* pairs IN_MOVED_FROM with IN_MOVED_TO */
+
+extern uint32_t inotify_watches;        /* watches in the system: usually 0 */
+
+/* Something happened to i itself (opened, read, written, closed, attributes):
+   to its watchers and its directory's. With no watches anywhere — the normal
+   case — one load and a branch: this is on every open, read and write. */
+static inline void notify(struct inode *i, uint32_t mask)
+{
+    if (__builtin_expect(inotify_watches != 0, 0) && i &&
+        ((i->flags & I_WATCHED) || (i->parent && (i->parent->flags & I_WATCHED))))
+        fsnotify(i, mask);
+}
+
+/* Something happened to the entry `name` in dir (created, deleted, moved). */
+static inline void notify_entry(struct inode *dir, struct inode *child, uint32_t mask,
+                                uint32_t cookie, const char *name, uint32_t len)
+{
+    if (__builtin_expect(inotify_watches != 0, 0) && (dir->flags & I_WATCHED))
+        fsnotify_entry(dir, child, mask, cookie, name, len);
+}
 
 /* --- file systems ------------------------------------------------------- */
 void initramfs_load(const uint8_t *archive, uint32_t size);   /* initramfs.c */

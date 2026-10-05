@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <memlayout.h>
 #include <stdint.h>
+#include <user.h>
 
 /*
  * The only ways the kernel touches user memory (see uaccess.asm for how
@@ -99,6 +100,13 @@ static inline int get_user32(uint32_t *dst, uint32_t user_addr)
     if (!user_range_ok(user_addr, 4))
         return -EFAULT;
     return __get_user32(dst, user_addr);
+}
+
+/* One user word the size of a pointer: an entry of argv, a field of an
+   iovec. 4 bytes here, 8 on x86_64. */
+static inline int get_user_word(user_addr_t *dst, uintptr_t user_addr)
+{
+    return get_user32(dst, user_addr);
 }
 
 /* Copy a user string (e.g. a file name) into dst[max]. Returns its length,

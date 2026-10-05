@@ -1360,7 +1360,7 @@ static int32_t ext2_write(struct file *f, const void *user_buf, uint32_t n)
         if (need_old && old_end < PAGE_SIZE)
             memset(data + old_end, 0, PAGE_SIZE - old_end);    /* past the old end */
         err = alloc_page_blocks(fs, i, p, p + k);
-        if (!err && copy_from_user(data + in, (const uint8_t *)user_buf + done, k) < 0)
+        if (!err && file_copy_in(f, data + in, (const uint8_t *)user_buf + done, k) < 0)
             err = -EFAULT;
         pcache_put_write(i, pg, !err);
         if (err)
@@ -1388,7 +1388,8 @@ static int32_t ext2_write(struct file *f, const void *user_buf, uint32_t n)
     return done ? (int32_t)done : err;
 }
 
-static const struct file_ops ext2_file_ops = { .read = ext2_read, .write = ext2_write };
+static const struct file_ops ext2_file_ops = { .read = ext2_read, .write = ext2_write,
+                                               .kbuf_ok = 1 };
 
 static const struct fs_ops ext2_ops = {
     .load_dir = ext2_load_dir,

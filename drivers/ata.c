@@ -280,7 +280,7 @@ static int pio_read(struct ata_drive *d, uint32_t lba, uint32_t count, uint8_t *
 
 static uint32_t phys_of(uintptr_t va)
 {
-    if (va >= KERNEL_VBASE && va - KERNEL_VBASE < DIRECTMAP_LIMIT)
+    if (va >= DIRECTMAP_BASE && va - DIRECTMAP_BASE < DIRECTMAP_LIMIT)
         return V2P(va);
     uint32_t pa = vmm_translate(va & ~(PAGE_SIZE - 1));
     return pa ? pa | (va & (PAGE_SIZE - 1)) : 0;

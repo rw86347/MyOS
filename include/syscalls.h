@@ -5,13 +5,15 @@
 
 /*
  * System call handlers that live outside syscall.c. Every handler gets the
- * six argument registers (EBX, ECX, EDX, ESI, EDI, EBP) and returns the
- * value for EAX: a result, or -errno.
+ * six argument registers (i386: EBX, ECX, EDX, ESI, EDI, EBP; x86_64: RDI,
+ * RSI, RDX, R10, R8, R9) and returns the value for EAX / RAX: a result, or
+ * -errno. They are register-sized — uintptr_t / intptr_t, which on i386 is
+ * exactly uint32_t / int32_t — so a 64-bit pointer arrives whole.
  */
-#define SYSCALL_ARG __attribute__((unused)) uint32_t
+#define SYSCALL_ARG __attribute__((unused)) uintptr_t
 #define SYSCALL_DEF(name) \
-    int32_t name(SYSCALL_ARG a1, SYSCALL_ARG a2, SYSCALL_ARG a3, \
-                 SYSCALL_ARG a4, SYSCALL_ARG a5, SYSCALL_ARG a6)
+    intptr_t name(SYSCALL_ARG a1, SYSCALL_ARG a2, SYSCALL_ARG a3, \
+                  SYSCALL_ARG a4, SYSCALL_ARG a5, SYSCALL_ARG a6)
 
 /* kernel/sys_info.c */
 void time_init(void);                   /* read the CMOS clock */
@@ -39,6 +41,10 @@ SYSCALL_DEF(sys_time);
 SYSCALL_DEF(sys_gettimeofday);
 SYSCALL_DEF(sys_clock_gettime);
 SYSCALL_DEF(sys_clock_gettime64);
+SYSCALL_DEF(sys_clock_settime64);
+SYSCALL_DEF(sys_adjtimex);
+SYSCALL_DEF(sys_clock_adjtime);
+SYSCALL_DEF(sys_clock_adjtime64);
 SYSCALL_DEF(sys_clock_getres);
 SYSCALL_DEF(sys_clock_getres64);
 SYSCALL_DEF(sys_nanosleep);
@@ -48,6 +54,15 @@ SYSCALL_DEF(sys_getrlimit);
 SYSCALL_DEF(sys_setrlimit);
 SYSCALL_DEF(sys_prlimit64);
 SYSCALL_DEF(sys_sysinfo);
+SYSCALL_DEF(sys_personality);
+SYSCALL_DEF(sys_capget);
+SYSCALL_DEF(sys_capset);
+SYSCALL_DEF(sys_unshare);
+SYSCALL_DEF(sys_setns);
+SYSCALL_DEF(sys_swapon);
+SYSCALL_DEF(sys_syslog);                 /* kprintf.c: dmesg */
+SYSCALL_DEF(sys_times);
+SYSCALL_DEF(sys_getrusage);
 SYSCALL_DEF(sys_getrandom);
 SYSCALL_DEF(sys_set_thread_area);
 SYSCALL_DEF(sys_get_thread_area);
@@ -65,12 +80,24 @@ SYSCALL_DEF(sys_timer_delete);
 
 /* kernel/shm.c: System V shared memory, through ipc() */
 SYSCALL_DEF(sys_ipc);
+SYSCALL_DEF(sys_shmget);
+SYSCALL_DEF(sys_shmat);
+SYSCALL_DEF(sys_shmdt);
+SYSCALL_DEF(sys_shmctl);
+SYSCALL_DEF(sys_semget);
+SYSCALL_DEF(sys_semop);
+SYSCALL_DEF(sys_semtimedop);
+SYSCALL_DEF(sys_semctl);
+SYSCALL_DEF(sys_msgget);
+SYSCALL_DEF(sys_msgsnd);
+SYSCALL_DEF(sys_msgrcv);
+SYSCALL_DEF(sys_msgctl);
 
 /* kernel/syscall.c: helpers for the files below */
 struct inode;
-int get_path(char *dst, uint32_t user_path);    /* copy a path in: 0 or -errno */
+int get_path(char *dst, uintptr_t user_path);   /* copy a path in: 0 or -errno */
 int dir_of(uint32_t dirfd, struct inode **dir); /* *at() dirfd -> NULL (cwd) or dir */
-int32_t do_open(struct inode *dir, uint32_t user_path, uint32_t flags, uint32_t mode);
+int32_t do_open(struct inode *dir, uintptr_t user_path, uint32_t flags, uint32_t mode);
 
 /* kernel/sys_fs.c */
 SYSCALL_DEF(sys_mkdir);
@@ -100,11 +127,23 @@ SYSCALL_DEF(sys_ftruncate);
 SYSCALL_DEF(sys_truncate64);
 SYSCALL_DEF(sys_ftruncate64);
 SYSCALL_DEF(sys_fallocate);
+SYSCALL_DEF(sys_fallocate64);
+SYSCALL_DEF(sys_fadvise64);
+SYSCALL_DEF(sys_fadvise64_64);
+SYSCALL_DEF(sys_statfs);
+SYSCALL_DEF(sys_fstatfs);
 SYSCALL_DEF(sys_memfd_create);
 SYSCALL_DEF(sys_statfs64);
 SYSCALL_DEF(sys_fstatfs64);
 SYSCALL_DEF(sys_mount);
 SYSCALL_DEF(sys_umount2);
+SYSCALL_DEF(sys_pivot_root);
+
+/* fs/inotify.c */
+SYSCALL_DEF(sys_inotify_init);
+SYSCALL_DEF(sys_inotify_init1);
+SYSCALL_DEF(sys_inotify_add_watch);
+SYSCALL_DEF(sys_inotify_rm_watch);
 
 /* fs/flock.c */
 SYSCALL_DEF(sys_flock);

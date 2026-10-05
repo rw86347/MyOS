@@ -41,19 +41,19 @@
 #define FUTEX_BUCKETS 64            /* power of two */
 static struct wait_queue buckets[FUTEX_BUCKETS];
 
-static struct wait_queue *bucket(struct mm *mm, uint32_t addr)
+static struct wait_queue *bucket(struct mm *mm, uintptr_t addr)
 {
-    uint32_t h = (addr >> 2) ^ ((uint32_t)mm >> 6);
+    uint32_t h = (uint32_t)((addr >> 2) ^ ((uintptr_t)mm >> 6));
     h ^= h >> 11;
     return &buckets[h & (FUTEX_BUCKETS - 1)];
 }
 
-static int is_waiter(const struct thread *t, struct mm *mm, uint32_t addr)
+static int is_waiter(const struct thread *t, struct mm *mm, uintptr_t addr)
 {
     return t->futex_mm == mm && t->futex_addr == addr;
 }
 
-int futex_wake(struct mm *mm, uint32_t uaddr, int n)
+int futex_wake(struct mm *mm, uintptr_t uaddr, int n)
 {
     struct wait_queue *q = bucket(mm, uaddr);
     int woken = 0;
@@ -78,7 +78,7 @@ int futex_wake(struct mm *mm, uint32_t uaddr, int n)
 /* Move up to n sleepers from uaddr to uaddr2 without waking them
    (pthread_cond_broadcast: waking them all just to have them pile up on the
    mutex would be wasted work). */
-static int requeue(struct mm *mm, uint32_t uaddr, uint32_t uaddr2, int n)
+static int requeue(struct mm *mm, uintptr_t uaddr, uintptr_t uaddr2, int n)
 {
     struct wait_queue *from = bucket(mm, uaddr), *to = bucket(mm, uaddr2);
     int moved = 0;
@@ -105,7 +105,7 @@ static int requeue(struct mm *mm, uint32_t uaddr, uint32_t uaddr2, int n)
 
 /* A relative timeout -> the timer_ms() value to wake at (rounded up, so
    the sleep is never shorter than asked). 0 in *deadline: no timeout. */
-static int read_timeout(uint32_t utime, int time64, uint32_t *deadline, int *zero)
+static int read_timeout(uintptr_t utime, int time64, uint32_t *deadline, int *zero)
 {
     int64_t sec, nsec;
     if (time64) {
@@ -133,8 +133,8 @@ static int read_timeout(uint32_t utime, int time64, uint32_t *deadline, int *zer
     return 0;
 }
 
-static int32_t futex_wait(struct mm *mm, uint32_t uaddr, uint32_t val,
-                          uint32_t utime, int time64)
+static int32_t futex_wait(struct mm *mm, uintptr_t uaddr, uint32_t val,
+                          uintptr_t utime, int time64)
 {
     uint32_t deadline = 0;
     int zero = 0;
@@ -166,8 +166,8 @@ static int32_t futex_wait(struct mm *mm, uint32_t uaddr, uint32_t val,
     return -EINTR;                      /* a signal (or exit_group) */
 }
 
-int32_t sys_futex_impl(uint32_t uaddr, uint32_t op, uint32_t val, uint32_t timeout,
-                       uint32_t uaddr2, uint32_t val3, int time64)
+int32_t sys_futex_impl(uintptr_t uaddr, uint32_t op, uint32_t val, uintptr_t timeout,
+                       uintptr_t uaddr2, uint32_t val3, int time64)
 {
     if (uaddr & 3)
         return -EINVAL;

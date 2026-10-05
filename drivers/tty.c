@@ -491,7 +491,7 @@ static int tty_config_allowed(void)
 
 /* The ioctls every terminal has; -ENOIOCTLCMD for the rest. */
 #define ENOIOCTLCMD 515
-static int32_t common_ioctl(struct tty *t, uint32_t cmd, uint32_t arg)
+static int32_t common_ioctl(struct tty *t, uint32_t cmd, uintptr_t arg)
 {
     switch (cmd) {
     case TCGETS:
@@ -561,13 +561,13 @@ static int32_t common_ioctl(struct tty *t, uint32_t cmd, uint32_t arg)
     }
 }
 
-int32_t tty_ioctl_on(struct tty *t, uint32_t cmd, uint32_t arg)
+int32_t tty_ioctl_on(struct tty *t, uint32_t cmd, uintptr_t arg)
 {
     int32_t r = common_ioctl(t, cmd, arg);
     return r == -ENOIOCTLCMD ? -EINVAL : r;
 }
 
-int32_t tty_ioctl(struct file *f, uint32_t cmd, uint32_t arg)
+int32_t tty_ioctl(struct file *f, uint32_t cmd, uintptr_t arg)
 {
     (void)f;
     int32_t r = common_ioctl(&console, cmd, arg);

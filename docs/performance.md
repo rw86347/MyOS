@@ -667,3 +667,37 @@ compiler sees, so no change was expected:
 
 The 17 cycles less is within run-to-run noise for this row; the point is that it
 didn't grow. pread itself copies the 32-byte `struct file` to the stack once per call.
+
+### The missing system calls (2026-10-05): what they add to the shared paths
+
+inotify, record locks, chroot and CPU-time accounting each put a check on paths every
+program pays for: open, close, read, write, path lookup, the 1 ms tick. All are written
+to cost one load and a branch when the feature is unused (a global count of watches /
+locks is 0; a chroot is looked up only for absolute paths and ".."). `make bench`
+(deterministic, i386), against the last commit (b3dc5f0):
+
+| | before | first try | after |
+|---|---|---|---|
+| `null syscall, int 0x80` | 127 | 127 | 127 |
+| `null syscall, sysenter` | 155 | 155 | 155 |
+| `thread switch` | 97 | 97 | 97 |
+| `open + close` (2-part path) | 1523 | 1587 | 1563 |
+| `lseek + read 4 KiB` | 1554 | 1596 | 1558 |
+| `stat (statx)` | 1306 | 1320 | 1322 |
+| `fork + exit + wait` | 52328 | 52362 | 52356 |
+| `exec + exit (ELF 'true')` | 35697 | 35734 | 35716 |
+
+Two lessons in the "first try" column. The inotify and lock checks first tested the
+inode's flags (two or three loads, the parent's too); a global count in front of them
+took `open + close` from 1587 to 1563. And `read` gained 42 cycles from a check that is
+five instructions: the check made `rw_at` big enough that GCC stopped inlining it into
+`sys_read`/`sys_write`, where it had been specialising it (offset -1 folds pread's
+work away). `__attribute__((always_inline))` gave that back (1558); marking the slow
+path cold did nothing. Removing the check also gave 1552, which is how the cause was
+found.
+
+What stays: 40 cycles on `open + close` (2.6%) — the chroot lookup for an absolute
+path, the IN_OPEN / IN_CLOSE checks and the record-lock check at close — and 16 on
+`statx` (the lookup refactored into `stat_target`, shared with x86_64's
+`newfstatat`). `disk read 64 KiB, CPU work` moved between runs of the SAME build
+(1299, 1550, 1582 before; 2018, 1313 after), so that row is noise here.

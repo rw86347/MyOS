@@ -125,8 +125,8 @@ static int32_t pipe_write(struct file *f, const void *user_buf, uint32_t n)
            attacker-chosen data as it liked. */
         p->head += k;
         uint32_t claimed = p->head;
-        if (copy_from_user(p->buf + at, src, first) < 0 ||
-            copy_from_user(p->buf, src + first, k - first) < 0) {
+        if (file_copy_in(f, p->buf + at, src, first) < 0 ||
+            file_copy_in(f, p->buf, src + first, k - first) < 0) {
             if (p->head == claimed)
                 p->head -= k;       /* nobody else claimed after us: take it back */
             else {
@@ -183,6 +183,7 @@ static uint32_t pipe_poll(struct file *f)
 
 static const struct file_ops pipe_ops = {
     .read = pipe_read, .write = pipe_write, .release = pipe_release, .poll = pipe_poll,
+    .kbuf_ok = 1,
 };
 
 /* An empty pipe with no ends open, or NULL. */

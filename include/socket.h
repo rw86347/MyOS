@@ -36,7 +36,7 @@ SYSCALL_DEF(sys_socketcall);
 #define AF_UNIX 1
 int unix_fd(uint32_t fd);
 int32_t unix_socket(uint32_t type, uint32_t protocol);
-int32_t unix_socketpair(uint32_t type, uint32_t protocol, uint32_t usv);
+int32_t unix_socketpair(uint32_t type, uint32_t protocol, uintptr_t usv);
 SYSCALL_DEF(unix_bind);
 SYSCALL_DEF(unix_listen);
 SYSCALL_DEF(unix_connect);

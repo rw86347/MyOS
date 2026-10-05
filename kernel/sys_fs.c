@@ -28,7 +28,7 @@
 #define UTIME_OMIT       ((1 << 30) - 2)
 
 /* Where a new name goes: the directory (found) and the last name. */
-static int parent_of(uint32_t dirfd, uint32_t user_path, char *path,
+static int parent_of(uint32_t dirfd, uintptr_t user_path, char *path,
                      struct inode **dir, const char **name, uint32_t *len)
 {
     struct inode *start;
@@ -42,7 +42,7 @@ static int parent_of(uint32_t dirfd, uint32_t user_path, char *path,
 
 /* The file a path names. With AT_EMPTY_PATH, an empty path means the
    dirfd itself (that's how fchownat & co. reach an open file). */
-static int target_of(uint32_t dirfd, uint32_t user_path, uint32_t flags,
+static int target_of(uint32_t dirfd, uintptr_t user_path, uint32_t flags,
                      struct inode **out)
 {
     char path[PATH_MAX];
@@ -70,7 +70,7 @@ static uint32_t umasked(uint32_t mode)
 /* --- new names ------------------------------------------------------------- */
 
 /* int mkdir(path, mode) / mkdirat(dirfd, path, mode) */
-static int32_t do_mkdir(uint32_t dirfd, uint32_t user_path, uint32_t mode)
+static int32_t do_mkdir(uint32_t dirfd, uintptr_t user_path, uint32_t mode)
 {
     char path[PATH_MAX];
     struct inode *dir, *i;
@@ -86,7 +86,7 @@ SYSCALL_DEF(sys_mkdirat) { return do_mkdir(a1, a2, a3); }
 /* int mknod(path, mode, dev) / mknodat(dirfd, path, mode, dev): an empty
    file, a named pipe (mkfifo), or a device node (`mknod /dev/null c 1 3`).
    Block devices come later (docs/gaps.md). */
-static int32_t do_mknod(uint32_t dirfd, uint32_t user_path, uint32_t mode, uint32_t dev)
+static int32_t do_mknod(uint32_t dirfd, uintptr_t user_path, uint32_t mode, uint32_t dev)
 {
     uint32_t type = mode & S_IFMT ? mode & S_IFMT : S_IFREG;
     if (type != S_IFREG && type != S_IFCHR && type != S_IFIFO)
@@ -109,7 +109,7 @@ SYSCALL_DEF(sys_mknodat) { return do_mknod(a1, a2, a3, a4); }
 
 /* int symlink(target, path) / symlinkat(target, dirfd, path). The target
    is just text: it doesn't have to exist. */
-static int32_t do_symlink(uint32_t user_target, uint32_t dirfd, uint32_t user_path)
+static int32_t do_symlink(uintptr_t user_target, uint32_t dirfd, uintptr_t user_path)
 {
     char target[PATH_MAX], path[PATH_MAX];
     struct inode *dir;
@@ -132,7 +132,7 @@ SYSCALL_DEF(sys_link) { return -EPERM; }
 /* --- removing and moving names ---------------------------------------------- */
 
 /* unlink(path) / rmdir(path) / unlinkat(dirfd, path, flags) */
-static int32_t do_remove(uint32_t dirfd, uint32_t user_path, int rmdir)
+static int32_t do_remove(uint32_t dirfd, uintptr_t user_path, int rmdir)
 {
     char path[PATH_MAX];
     struct inode *dir;
@@ -173,8 +173,8 @@ SYSCALL_DEF(sys_unlinkat)
 /* rename(old, new) / renameat(olddir, old, newdir, new) / renameat2(...,
    flags): move a name, replacing what's at the new one — in one step, so
    no program ever sees neither or both. */
-static int32_t do_rename(uint32_t olddirfd, uint32_t oldpath, uint32_t newdirfd,
-                         uint32_t newpath, uint32_t flags)
+static int32_t do_rename(uint32_t olddirfd, uintptr_t oldpath, uint32_t newdirfd,
+                         uintptr_t newpath, uint32_t flags)
 {
     if (flags & ~RENAME_NOREPLACE)
         return -EINVAL;
@@ -241,7 +241,7 @@ static int set_owner(struct inode *i, uint32_t uid, uint32_t gid)
     return vfs_setattr(i);
 }
 
-static int32_t do_chown(uint32_t dirfd, uint32_t user_path, uint32_t uid, uint32_t gid,
+static int32_t do_chown(uint32_t dirfd, uintptr_t user_path, uint32_t uid, uint32_t gid,
                         uint32_t flags)
 {
     struct inode *i;
@@ -262,7 +262,7 @@ SYSCALL_DEF(sys_fchown32)
    times (`touch`). No times: both "now". A path of NULL means the dirfd
    itself (futimens). Each nanosecond field may say UTIME_NOW or
    UTIME_OMIT instead. */
-static int32_t set_times(uint32_t dirfd, uint32_t user_path, uint32_t flags, int given,
+static int32_t set_times(uint32_t dirfd, uintptr_t user_path, uint32_t flags, int given,
                          int64_t s0, int32_t ns0, int64_t s1, int32_t ns1)
 {
     struct inode *i;
@@ -315,7 +315,7 @@ static int32_t do_truncate(struct inode *i, int64_t size)
     return vfs_truncate(i, (uint32_t)size);
 }
 
-static int32_t path_truncate(uint32_t user_path, int64_t size)
+static int32_t path_truncate(uintptr_t user_path, int64_t size)
 {
     struct inode *i;
     int err = target_of(AT_FDCWD, user_path, 0, &i);
@@ -345,6 +345,42 @@ SYSCALL_DEF(sys_ftruncate64) { return fd_truncate(a1, (int64_t)(((uint64_t)a3 <<
    and FALLOC_FL_KEEP_SIZE is a successful no-op. Other modes (punch hole,
    collapse) wait for a user. */
 #define FALLOC_FL_KEEP_SIZE 0x01
+
+/* posix_fadvise(fd, offset, len, advice): a hint about how the file will
+   be read. Checked, then nothing to do: read-ahead here is fixed, and pages
+   are dropped only when memory runs short. (i386 fadvise64_64 passes the
+   64-bit numbers in halves; x86_64 fadvise64 whole.) */
+#define POSIX_FADV_NOREUSE 5
+static int32_t do_fadvise(uint32_t fd, int64_t off, int64_t len, uint32_t advice)
+{
+    struct file *f = fd_get(fd);
+    if (!f)
+        return -EBADF;
+    if (S_ISFIFO(f->inode->mode))
+        return -ESPIPE;
+    if (advice > POSIX_FADV_NOREUSE || off < 0 || len < 0)
+        return -EINVAL;
+    return 0;
+}
+
+SYSCALL_DEF(sys_fadvise64_64)
+{
+    return do_fadvise(a1, (int64_t)(((uint64_t)a3 << 32) | a2),
+                      (int64_t)(((uint64_t)a5 << 32) | a4), a6);
+}
+
+SYSCALL_DEF(sys_fadvise64)              /* x86_64 */
+{
+    return do_fadvise(a1, (int64_t)a2, (int64_t)a3, a4);
+}
+
+/* fallocate(fd, mode, offset, len) on x86_64: the 64-bit numbers whole. */
+SYSCALL_DEF(sys_fallocate64)
+{
+    uint64_t off = a3, len = a4;
+    return sys_fallocate(a1, a2, (uint32_t)off, (uint32_t)(off >> 32),
+                         (uint32_t)len, (uint32_t)(len >> 32));
+}
 
 SYSCALL_DEF(sys_fallocate)
 {
@@ -426,10 +462,8 @@ _Static_assert(sizeof(struct statfs64) == 84, "struct statfs64 must match Linux"
 #define EXT2_MAGIC  0xEF53
 
 /* The numbers for the file system i is on: the RAM one, or a disk. */
-static int32_t fill_statfs(struct inode *i, uint32_t size, uint32_t user_buf)
+static int32_t get_statfs(struct inode *i, struct statfs64 *out)
 {
-    if (size != sizeof(struct statfs64) && size != 88)  /* 88: padded variant */
-        return -EINVAL;
     struct statfs64 st;
     memset(&st, 0, sizeof st);
     st.f_namelen = NAME_MAX;
@@ -454,7 +488,55 @@ static int32_t fill_statfs(struct inode *i, uint32_t size, uint32_t user_buf)
         st.f_bfree = st.f_bavail = max > used ? max - used : 0;
         st.f_fsid[0] = 1;
     }
-    return copy_to_user((void *)user_buf, &st, sizeof st);
+    *out = st;
+    return 0;
+}
+
+/* statfs64 / fstatfs64 (i386): the struct's size is an argument. */
+static int32_t fill_statfs(struct inode *i, uint32_t size, uintptr_t user_buf)
+{
+    if (size != sizeof(struct statfs64) && size != 88)  /* 88: padded variant */
+        return -EINVAL;
+    struct statfs64 st;
+    int32_t err = get_statfs(i, &st);
+    return err ? err : copy_to_user((void *)user_buf, &st, sizeof st);
+}
+
+/* statfs / fstatfs with Linux's struct statfs of longs (x86_64: 120 bytes;
+   on i386 musl uses the 64 calls above). */
+struct statfs_long {
+    long f_type, f_bsize, f_blocks, f_bfree, f_bavail, f_files, f_ffree;
+    int32_t f_fsid[2];
+    long f_namelen, f_frsize, f_flags, f_spare[4];
+};
+
+static int32_t fill_statfs_long(struct inode *i, uintptr_t user_buf)
+{
+    struct statfs64 st;
+    int32_t err = get_statfs(i, &st);
+    if (err)
+        return err;
+    struct statfs_long out = {
+        .f_type = st.f_type, .f_bsize = st.f_bsize, .f_blocks = (long)st.f_blocks,
+        .f_bfree = (long)st.f_bfree, .f_bavail = (long)st.f_bavail,
+        .f_files = (long)st.f_files, .f_ffree = (long)st.f_ffree,
+        .f_fsid = { st.f_fsid[0], st.f_fsid[1] },
+        .f_namelen = st.f_namelen, .f_frsize = st.f_frsize, .f_flags = st.f_flags,
+    };
+    return copy_to_user((void *)user_buf, &out, sizeof out);
+}
+
+SYSCALL_DEF(sys_statfs)
+{
+    struct inode *i;
+    int err = target_of(AT_FDCWD, a1, 0, &i);
+    return err ? err : fill_statfs_long(i, a2);
+}
+
+SYSCALL_DEF(sys_fstatfs)
+{
+    struct file *f = fd_get(a1);
+    return f ? fill_statfs_long(f->inode, a2) : -EBADF;
 }
 
 /* statfs64(path, size, buf) / fstatfs64(fd, size, buf) */
@@ -496,7 +578,7 @@ static int is_mount_root(struct inode *i)
 
 /* The "mode=1777" option of a tmpfs, from the comma-separated data
    string; Linux's default when it's missing. */
-static uint32_t tmpfs_mode(uint32_t user_data)
+static uint32_t tmpfs_mode(uintptr_t user_data)
 {
     char opt[128];
     uint32_t mode = 01777;
@@ -556,6 +638,22 @@ SYSCALL_DEF(sys_mount)
     if (strcmp(type, "ext2") == 0 || strcmp(type, "vfat") == 0)
         return -ENOTBLK;                /* no block device files to name */
     return -ENODEV;
+}
+
+/* pivot_root(new_root, put_old): see vfs_pivot_root. Root only, and not from
+   inside a chroot (whose "/" is not the one being moved). */
+SYSCALL_DEF(sys_pivot_root)
+{
+    char new_root[PATH_MAX], put_old[PATH_MAX];
+    struct process *p = proc_current();
+    if (p->cred.euid != 0)
+        return -EPERM;
+    if (p->root)
+        return -EINVAL;
+    int err = get_path(new_root, a1);
+    if (!err)
+        err = get_path(put_old, a2);
+    return err ? err : vfs_pivot_root(new_root, put_old);
 }
 
 /* umount2(target, flags). Taking a file system off the tree needs to know
