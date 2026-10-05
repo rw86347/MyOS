@@ -1,0 +1,36 @@
+x86_64 port — twins of arch/i386, not a second kernel tree
+==========================================================
+
+The portable code (kernel/, mm/, fs/, net/, most drivers/) stays one
+copy. This directory is the CPU-specific half. Do not sprinkle
+#ifdef __x86_64__ through kernel/syscall.c.
+
+Makefile: ARCH=x86_64 selects this tree, x86_64-elf-gcc, a 64-bit
+linker script, and qemu-system-x86_64 + OVMF. Until those exist,
+`make ARCH=x86_64` refuses to link a kernel.
+
+Files to add here (same names as arch/i386/ unless noted):
+
+  boot/efi/efi_main.c     stay in long mode; load a 64-bit ELF kernel
+  boot/efi/efi_jump.asm   no 64→32 trampoline
+  entry.asm               long mode, 4-level pages, _start
+  linker.ld               higher-half, 4 KiB or 2 MiB pages
+  gdt.c / isr.asm / interrupts.c
+  paging.c                PML4, phys_addr_t in every PTE
+  switch.asm              64-bit context switch
+  sysentry.asm            syscall (not sysenter / int 0x80)
+  uaccess.asm             copy_*_user for 64-bit canonical addresses
+  include/memlayout.h     KERNEL_VBASE, direct map
+  include/paging.h        64-bit PTE bits
+  include/bootinfo.h      can keep the same BOOTINFO layout
+
+User ABI is Linux x86_64 (syscall numbers from
+arch/x86/entry/syscalls/syscall_64.tbl). That is a new table in
+kernel/syscall.c keyed by the arch, or a table this directory
+exports. i386 int 0x80 stays in arch/i386. Compat (running today's
+Alpine i386 binaries on a 64-bit kernel) is later, not the first
+hello.
+
+First visible step: QEMU+OVMF prints "Hello world from MyOS!" from
+a 64-bit kernel. Then musl x86_64 hello. Then live/packages.x86_64.txt
+and a 64-bit sysroot for myos-login.

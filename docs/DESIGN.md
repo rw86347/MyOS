@@ -9,7 +9,9 @@ GPT + a FAT32 EFI System Partition with `/EFI/BOOT/BOOTX64.EFI`. That 64-bit
 app (`arch/i386/boot/efi/`) loads the same 32-bit kernel to 1 MiB, fills
 BOOTINFO from `GetMemoryMap` and GOP, drops to protected mode
 (`efi_jump.asm`), and jumps to `_start`. GOP above 4 GiB uses PSE-36.
-Not the x86_64 port (roadmap 12b).
+Not the x86_64 port (roadmap 12b). The `dualChip` branch lays out that
+port: `ARCH=i386` (default) or `ARCH=x86_64`, one tree — see "Two chips,
+one tree" below.
 - **Stage 1** (`arch/i386/boot/mbr.asm`, 512 bytes): the BIOS loads it at 0x7C00; it loads
   stage 2 to 0x7E00 with `int 0x13` AH=0x42 and jumps there.
 - **Stage 2** (`arch/i386/boot/stage2.asm`): reads the BIOS memory map (`int 0x15` E820),
@@ -212,5 +214,32 @@ Open questions:
 - Root filesystem at boot: initramfs only at first. Later, do we mount ext4 from disk with an
   initramfs that holds the drivers (Linux style)?
 
+## Two chips, one tree
+
+Pentium (i686, BIOS) and the modern UEFI PCs (x86-64) share this repository.
+They do **not** share a kernel binary or a `/usr` tree.
+
+- **Kernel.** `arch/i386/` and `arch/x86_64/` each implement entry, paging,
+  interrupts, and syscall *entry*. `kernel/`, `mm/`, `fs/`, `net/` stay one
+  copy. No `#ifdef __x86_64__` in the middle of a syscall. Physical addresses
+  are `phys_addr_t` (64-bit) even on i386 (`include/types.h`). The file list
+  for the new dir is `arch/x86_64/PORT`. `make ARCH=x86_64` refuses to link
+  a kernel until that port exists.
+- **Userland.** One `live/packages.txt` (package *names*).
+  `live/packages.x86_64.txt` is only the delta (`!firefox`, `chromium`).
+  `tools/fetch-live.py --arch x86_64` merges them and writes
+  `live/packages.x86_64.lock` and `build/live/rootfs-x86_64.tar`. Optional
+  files: `live/overlay.x86_64/`, `build/live/extra.x86_64/`. Do not copy
+  `live/overlay/` or `live/myos-login/`. MyOS's own programs are compiled
+  twice, two sysroots.
+- **Disk.** Two images from one Makefile: BIOS live (`myos-live.img`) and
+  later a 64-bit UEFI live. Almost every ELF is arch-specific; "common" on
+  disk is themes, `/etc`, and scripts. No multiarch `/usr`.
+- **First 12b step.** A 64-bit kernel that stays in long mode and prints
+  hello in QEMU+OVMF. Then musl x86_64 hello. Then the x86_64 live root.
+  Chromium (and maybe Cursor later) are the last line of the delta, not a
+  reason to fork the tree.
+
 ## Unchanged goals
 - Linux i386 syscall ABI (`int 0x80`), ELF, static musl binaries first.
+  x86_64 will use the Linux x86_64 ABI (`syscall`); i386 compat is later.

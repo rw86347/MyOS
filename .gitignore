@@ -1,4 +1,6 @@
 build/
+build-live-output.txt
+fetch-live-output.txt
 *.o
 *.elf
 *.bin

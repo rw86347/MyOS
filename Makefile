@@ -21,6 +21,9 @@
 #   make utm        "dist/MyOS read-write.utm": a ready-made UTM virtual machine
 #   make live-root  build/live/rootfs.tar: all the live disk's software
 #   make uefi       build/myos-uefi.img: GPT + FAT16 ESP, boots on UEFI (no CSM)
+#   ARCH=i386       default: Pentium kernel + Alpine x86 userland
+#   ARCH=x86_64     64-bit kernel is not built yet (arch/x86_64/PORT).
+#                   Userland fetch: python3 tools/fetch-live.py --arch x86_64
 #   make run-uefi-text  boot that image in QEMU+OVMF, serial only
 #   make clean      delete build/
 #
@@ -38,6 +41,18 @@
 #   tools/mksplash.py          --png-->   build/splash.bin  (320x200, mode 13h)
 #   myos.img = [ mbr.bin | stage2.bin | splash.bin | kernel.bin | initrd.cpio | padding ]
 # =============================================================================
+
+# One tree, two chips. ARCH picks the CPU dir and the Alpine arch name.
+# The kernel still only links for i386; x86_64 is the 12b port.
+ARCH ?= i386
+ifeq ($(filter $(ARCH),i386 x86_64),)
+  $(error ARCH must be i386 or x86_64 (got $(ARCH)))
+endif
+ifeq ($(ARCH),i386)
+  ALPINE_ARCH := x86
+else
+  ALPINE_ARCH := x86_64
+endif
 
 CC      := i686-elf-gcc
 OBJCOPY := i686-elf-objcopy
@@ -139,6 +154,14 @@ QEMU_FLAGS = -m 64M -cpu pentium3 \
              -netdev user,id=net0 -device e1000,netdev=net0
 
 .PHONY: diskattacks verify-disktests verify-tests attacks all dist utm utm-hd hd live-root live-extra live-theme live-hd utm-live run-live run-hd test-hd run run-full run-text debug test check-selftests test-shell bench run-bench usb clean fuzz fuzz-build fuzz-replay diskfuzz diskfuzz-replay verify-racetests uefi run-uefi-text test-uefi live-uefi test-live-uefi live-login-initrd test-uefi-login
+
+ifeq ($(ARCH),x86_64)
+.PHONY: need-x86_64-kernel
+need-x86_64-kernel:
+	@echo "ARCH=x86_64: no kernel yet. See arch/x86_64/PORT and docs/DESIGN.md." >&2
+	@exit 1
+$(IMG) $(BUILD)/kernel.elf $(BUILD)/kernel.bin: need-x86_64-kernel
+endif
 
 all: $(IMG) $(USB)
 
@@ -506,7 +529,7 @@ hd: $(HD)
 # (live/packages.lock), plus the MyOS source, in one archive:
 # build/live/rootfs.tar. `tools/fetch-live.py --update` re-resolves the list.
 live-root: live-extra
-	python3 tools/fetch-live.py
+	python3 tools/fetch-live.py --arch $(ALPINE_ARCH)
 
 # What MyOS itself puts on the live disk, on top of the packages
 # (build/live/extra, copied in by tools/fetch-live.py):
@@ -528,7 +551,7 @@ LOGIN_CFLAGS := -std=c11 -O2 -Wall -Wextra -march=i686 -D_GNU_SOURCE -nostdinc \
 LOGIN_LDLIBS := -lX11 -lXft -lImlib2 -lpam -lc -lgcc
 
 $(LIVE_SYSROOT)/.done:
-	python3 tools/fetch-live.py --sysroot
+	python3 tools/fetch-live.py --arch $(ALPINE_ARCH) --sysroot
 
 $(LOGIN_BIN): live/myos-login/myos-login.c live/common/xpic.h | $(LIVE_SYSROOT)/.done
 	@mkdir -p $(dir $@) $(BUILD)/live
@@ -701,7 +724,7 @@ LIVE_TAR := $(BUILD)/live/rootfs.tar
 LIVE_HD  := $(BUILD)/myos-live.img
 LIVE_MB  := 1536
 $(LIVE_TAR): $(LIVE_THEME) $(LOGIN_BIN) $(MENU_BIN) $(SETTINGS_BIN) $(XSETTINGS_BIN) $(ADDUSER_BIN) $(FILES_BIN) $(PREVIEW_BIN) $(WP_BIN) live/packages.lock $(shell find live/overlay -type f)
-	python3 tools/fetch-live.py
+	python3 tools/fetch-live.py --arch $(ALPINE_ARCH)
 $(LIVE_HD): $(IMG) $(LIVE_TAR) tools/mklivehd.sh tools/mbr-partition.sh
 	E2FS=$(E2FS) tools/mklivehd.sh $(IMG) $(LIVE_TAR) $@ $(LIVE_MB)
 live-hd: $(LIVE_HD)
@@ -711,7 +734,7 @@ live-hd: $(LIVE_HD)
 $(LIVE_LOGIN_TAR): $(LIVE_THEME) $(LOGIN_BIN) $(MENU_BIN) $(XSETTINGS_BIN) \
                    live/packages.lock tools/fetch-live.py \
                    $(shell find live/overlay -type f)
-	python3 tools/fetch-live.py --login-root
+	python3 tools/fetch-live.py --arch $(ALPINE_ARCH) --login-root
 	@tar -tf $@ | grep -q '^usr/bin/myos-login$$' \
 	  || { echo "login-root.tar has no myos-login"; exit 1; }
 $(LIVE_LOGIN_INITRD): $(LIVE_LOGIN_TAR) tools/tar2cpio.py live/ram-init

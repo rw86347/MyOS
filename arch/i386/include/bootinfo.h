@@ -9,6 +9,7 @@
 #define ARCH_I386_BOOTINFO_H
 
 #include <stdint.h>
+#include <types.h>
 
 #define BOOTINFO_PHYS 0x1000
 #define E820_MAX      32
@@ -45,9 +46,9 @@ struct bootinfo {
     uint32_t fb_phys_hi;            /* physical bits 63:32 (0 if below 4 GiB) */
 } __attribute__((packed));
 
-static inline uint64_t bootinfo_fb_phys(const struct bootinfo *bi)
+static inline phys_addr_t bootinfo_fb_phys(const struct bootinfo *bi)
 {
-    return (uint64_t)bi->fb_phys | ((uint64_t)bi->fb_phys_hi << 32);
+    return (phys_addr_t)bi->fb_phys | ((phys_addr_t)bi->fb_phys_hi << 32);
 }
 
 _Static_assert(__builtin_offsetof(struct bootinfo, font_phys) == 12 + E820_MAX * 24,

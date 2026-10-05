@@ -228,6 +228,9 @@ Mark a step `[x]` only when its "Done when" check works.
 - [ ] **12b. GPD Pocket 4** (`docs/hardwareRequirements.md`) — `arch/x86_64`, a UEFI loader,
   ACPI, PCIe with MSI/MSI-X; then NVMe (its boot SSD, native driver) and xHCI; then the
   Linux drivers through the shim (`r8169` for its Ethernet, `amdgpu`, ...).
+  Branch `dualChip` started the tree shape: `ARCH=`, `phys_addr_t`,
+  `live/packages.x86_64.txt`, `arch/x86_64/PORT`. The 64-bit kernel is not
+  built yet. First visible check: QEMU+OVMF prints hello from long mode.
 - [ ] **13. WiFi** — pick ONE chip with open docs (e.g. Atheros AR5xxx / ath5k), port driver + firmware loading,
   802.11 + WPA2 (run `wpa_supplicant` in user space).
   Done when: connects to a WPA2 network.

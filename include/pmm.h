@@ -2,8 +2,11 @@
 #define PMM_H
 
 #include <stdint.h>
+#include <types.h>
 
-/* Physical memory manager: 4 KiB frames of RAM, by physical address. */
+/* Physical memory manager: 4 KiB frames of RAM, by physical address.
+   Allocators still return uint32_t (the 768 MiB direct map). New code
+   that names firmware bars uses phys_addr_t. */
 
 void     pmm_init(void);             /* read the BIOS memory map */
 uint32_t pmm_alloc(void);            /* a free frame's physical address, or 0 */

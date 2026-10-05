@@ -21,7 +21,8 @@ when it's fixed. File references point at the comment that mentions the gap.
   mounted — any other (someone's Linux disk in an old PC) is left alone.
 - **E820 map holds at most 32 entries.** (`layout.inc`, `E820_MAX`)
 - **UEFI loader starts the existing 32-bit kernel** (`make uefi` / `make live-uefi`).
-  There is no `arch/x86_64` yet. GOP above 4 GiB is mapped with PSE-36
+  There is no `arch/x86_64` kernel yet (`dualChip` has the PORT list and
+  `ARCH=`). GOP above 4 GiB is mapped with PSE-36
   for the kernel console (32-bit virtual address, 36-bit physical in
   the PDE). User `mmap` of `/dev/fb0` cannot name that address (32-bit
   PTEs), so `simplefb` keeps an 8 MiB RAM shadow and, on the first mmap,

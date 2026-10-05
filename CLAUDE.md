@@ -82,6 +82,7 @@ ahead on throughput of big, complex workloads; don't add complexity chasing that
 ## Planned layout
 ```
 arch/i386/     boot code, GDT/IDT, interrupts, paging, context switch (CPU-specific only)
+arch/x86_64/   64-bit twins of those files (roadmap 12b; arch/x86_64/PORT)
 arch/arm/      (later)
 kernel/        scheduler, syscalls, ELF loader, process management (portable)
 mm/            physical + virtual memory, kmalloc

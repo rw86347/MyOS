@@ -1639,3 +1639,13 @@ kernel was drawing in RAM, the GOP still showed the firmware splash.
 fbcon stays on the real bar (PSE-36); the shadow starts when X mmaps.
 The loader no longer prints to ConOut before ExitBootServices (it
 paints a blue bar, then gold).
+
+## 2026-10-05 — dualChip: one tree for i386 and x86_64
+
+Branched `dualChip`. The Pentium path is unchanged (`ARCH=i386`, same
+lock file, same `make test`). The 64-bit kernel is not written yet:
+`make ARCH=x86_64` stops with a pointer to `arch/x86_64/PORT`.
+`fetch-live.py --arch x86_64` will merge `live/packages.x86_64.txt`
+(drop Firefox, add Chromium) when someone runs `--update`. Physical
+addresses are `phys_addr_t` in `include/types.h`. Design: "Two chips,
+one tree" in `docs/DESIGN.md`.
