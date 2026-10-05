@@ -1621,7 +1621,21 @@ that put GOP at `0x400000000` used to leave the kernel blind; PSE-36
 
 The live ext2 root on the stick is invisible: the only USB controller is
 xHCI (`8086:43ed`) and this kernel has no USB mass-storage driver. So
-process 1 is still the RAM initramfs `/init` (BusyBox), not runit /
-`myos-login`. `/init` then died with SIGSEGV (read of `0x10`); TLS GS is
-now saved on `set_thread_area` so the next stick write can tell if that
-was the canary.
+process 1 was the RAM BusyBox `/init`, not runit / `myos-login`. `/init`
+then died with SIGSEGV (read of `0x10`); TLS GS is now saved on
+`set_thread_area`.
+
+The live UEFI ESP now carries a login-only initramfs (Alpine base +
+runit + X + IceWM + `myos-login`, not Firefox/gcc/office). The UEFI
+loader sizes that file instead of capping it at 4 MiB. The Pentium
+`make test` image is still the small BusyBox ramdisk.
+
+On the MSI, runit reached stage 2 (6746 files) but the login never
+replaced the kernel text. GOP is at `0x400000000`; `mmap` of `/dev/fb0`
+truncated that to physical 0. A RAM shadow plus a 16 ms blit thread
+gives X a 32-bit address it can write. Putting fbcon on that shadow
+made the next boot look stuck on "calling ExitBootServices": the
+kernel was drawing in RAM, the GOP still showed the firmware splash.
+fbcon stays on the real bar (PSE-36); the shadow starts when X mmaps.
+The loader no longer prints to ConOut before ExitBootServices (it
+paints a blue bar, then gold).

@@ -138,7 +138,7 @@ QEMU_FLAGS = -m 64M -cpu pentium3 \
              -drive format=raw,file=$(DATA),index=2,media=disk \
              -netdev user,id=net0 -device e1000,netdev=net0
 
-.PHONY: diskattacks verify-disktests verify-tests attacks all dist utm utm-hd hd live-root live-extra live-theme live-hd utm-live run-live run-hd test-hd run run-full run-text debug test check-selftests test-shell bench run-bench usb clean fuzz fuzz-build fuzz-replay diskfuzz diskfuzz-replay verify-racetests uefi run-uefi-text test-uefi live-uefi test-live-uefi
+.PHONY: diskattacks verify-disktests verify-tests attacks all dist utm utm-hd hd live-root live-extra live-theme live-hd utm-live run-live run-hd test-hd run run-full run-text debug test check-selftests test-shell bench run-bench usb clean fuzz fuzz-build fuzz-replay diskfuzz diskfuzz-replay verify-racetests uefi run-uefi-text test-uefi live-uefi test-live-uefi live-login-initrd test-uefi-login
 
 all: $(IMG) $(USB)
 
@@ -379,15 +379,23 @@ test-uefi: $(UEFI_IMG)
 	  || { echo "FAIL: UEFI kernel ran but initramfs missing"; exit 1; }
 	@echo "UEFI OK: OVMF started the 32-bit kernel"
 
+# Login-only initramfs (rules sit with live-hd: they need LOGIN_BIN).
+LIVE_LOGIN_TAR    := $(BUILD)/live/login-root.tar
+LIVE_LOGIN_INITRD := $(BUILD)/live/login-initrd.cpio
+
 # Live desktop on the same GPT disk: ESP + ext2 "myos-root" from make live-hd.
+# The ESP carries the login initrd so a machine with no visible disks still
+# reaches myos-login from RAM. QEMU still mounts the ext2 partition.
 LIVE_UEFI := $(BUILD)/myos-live-uefi.img
-$(LIVE_UEFI): $(BUILD)/BOOTX64.EFI $(BUILD)/kernel.bin $(INITRD) $(BUILD)/myos-live.img \
+$(LIVE_UEFI): $(BUILD)/BOOTX64.EFI $(BUILD)/kernel.bin $(LIVE_LOGIN_INITRD) $(BUILD)/myos-live.img \
               arch/i386/boot/efi/vga-font.bin tools/mkuefi.py
-	python3 tools/mkuefi.py --out $@ --esp-mb 64 --root-file $(BUILD)/myos-live.img --root-from-mbr \
-	  --file EFI/BOOT/BOOTX64.EFI=$(BUILD)/BOOTX64.EFI \
-	  --file EFI/MYOS/KERNEL.BIN=$(BUILD)/kernel.bin \
-	  --file EFI/MYOS/INITRD.CPIO=$(INITRD) \
-	  --file EFI/MYOS/FONT.BIN=arch/i386/boot/efi/vga-font.bin
+	ESP=$$(( $$(wc -c < $(LIVE_LOGIN_INITRD)) / 1048576 + 32 )); \
+	  [ $$ESP -lt 128 ] && ESP=128; \
+	  python3 tools/mkuefi.py --out $@ --esp-mb $$ESP --root-file $(BUILD)/myos-live.img --root-from-mbr \
+	    --file EFI/BOOT/BOOTX64.EFI=$(BUILD)/BOOTX64.EFI \
+	    --file EFI/MYOS/KERNEL.BIN=$(BUILD)/kernel.bin \
+	    --file EFI/MYOS/INITRD.CPIO=$(LIVE_LOGIN_INITRD) \
+	    --file EFI/MYOS/FONT.BIN=arch/i386/boot/efi/vga-font.bin
 live-uefi: $(LIVE_UEFI)
 
 test-live-uefi: $(LIVE_UEFI)
@@ -409,6 +417,37 @@ test-live-uefi: $(LIVE_UEFI)
 	@grep -q "mounted at /" $(BUILD)/live-uefi-serial.log \
 	  || { echo "FAIL: myos-root did not become /"; exit 1; }
 	@echo "LIVE UEFI OK: OVMF started the kernel and mounted myos-root"
+
+# RAM-only login (no ext2): what a real UEFI laptop does until USB MSC exists.
+UEFI_LOGIN_IMG := $(BUILD)/myos-uefi-login.img
+$(UEFI_LOGIN_IMG): $(BUILD)/BOOTX64.EFI $(BUILD)/kernel.bin $(LIVE_LOGIN_INITRD) \
+                   arch/i386/boot/efi/vga-font.bin tools/mkuefi.py
+	ESP=$$(( $$(wc -c < $(LIVE_LOGIN_INITRD)) / 1048576 + 32 )); \
+	  [ $$ESP -lt 128 ] && ESP=128; \
+	  python3 tools/mkuefi.py --out $@ --esp-mb $$ESP \
+	    --file EFI/BOOT/BOOTX64.EFI=$(BUILD)/BOOTX64.EFI \
+	    --file EFI/MYOS/KERNEL.BIN=$(BUILD)/kernel.bin \
+	    --file EFI/MYOS/INITRD.CPIO=$(LIVE_LOGIN_INITRD) \
+	    --file EFI/MYOS/FONT.BIN=arch/i386/boot/efi/vga-font.bin
+test-uefi-login: $(UEFI_LOGIN_IMG)
+	@rm -f $(BUILD)/uefi-login-serial.log
+	@cp $(OVMF_VARS) $(BUILD)/ovmf-vars.fd
+	@(sleep 70; echo quit) \
+	  | $(QEMU64) -machine q35 -m 1024M -cpu qemu64 \
+	    -drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
+	    -drive if=pflash,format=raw,file=$(BUILD)/ovmf-vars.fd \
+	    -drive if=none,format=raw,file=$(UEFI_LOGIN_IMG),id=bootdisk \
+	    -device ide-hd,drive=bootdisk,bootindex=0 \
+	    -net none -no-reboot -display none \
+	    -serial file:$(BUILD)/uefi-login-serial.log -monitor stdio >/dev/null || true
+	@cat $(BUILD)/uefi-login-serial.log; echo
+	@grep -q "Hello world from MyOS" $(BUILD)/uefi-login-serial.log \
+	  || { echo "FAIL: login UEFI did not start the kernel"; exit 1; }
+	@grep -q "initramfs: [1-9][0-9][0-9][0-9] files" $(BUILD)/uefi-login-serial.log \
+	  || { echo "FAIL: login initrd did not unpack"; exit 1; }
+	@grep -qE "MyOS is up|First boot:|/init exited|myos-login" $(BUILD)/uefi-login-serial.log \
+	  || { echo "FAIL: runit/myos-login did not start"; exit 1; }
+	@echo "UEFI LOGIN OK: RAM userland reached runit or myos-login"
 
 # --- a package to share ------------------------------------------------------
 # The normal boot image is a complete disk: written byte for byte to a USB
@@ -666,6 +705,20 @@ $(LIVE_TAR): $(LIVE_THEME) $(LOGIN_BIN) $(MENU_BIN) $(SETTINGS_BIN) $(XSETTINGS_
 $(LIVE_HD): $(IMG) $(LIVE_TAR) tools/mklivehd.sh tools/mbr-partition.sh
 	E2FS=$(E2FS) tools/mklivehd.sh $(IMG) $(LIVE_TAR) $@ $(LIVE_MB)
 live-hd: $(LIVE_HD)
+
+# RAM login for a UEFI stick when the kernel cannot see the ext2 root.
+# The Pentium floppy initrd stays BusyBox. WritePerfect is left on disk.
+$(LIVE_LOGIN_TAR): $(LIVE_THEME) $(LOGIN_BIN) $(MENU_BIN) $(XSETTINGS_BIN) \
+                   live/packages.lock tools/fetch-live.py \
+                   $(shell find live/overlay -type f)
+	python3 tools/fetch-live.py --login-root
+	@tar -tf $@ | grep -q '^usr/bin/myos-login$$' \
+	  || { echo "login-root.tar has no myos-login"; exit 1; }
+$(LIVE_LOGIN_INITRD): $(LIVE_LOGIN_TAR) tools/tar2cpio.py live/ram-init
+	python3 tools/tar2cpio.py $< $@ --add init=live/ram-init
+	@test $$(wc -c < $@) -lt $$((384 * 1024 * 1024)) \
+	  || { echo "login initrd is over 384 MiB"; exit 1; }
+live-login-initrd: $(LIVE_LOGIN_INITRD)
 
 # The live disk in UTM, as its own machine (its own UUID).
 UTM_LIVE_VM := dist/MyOS live.utm

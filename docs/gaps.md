@@ -22,11 +22,17 @@ when it's fixed. File references point at the comment that mentions the gap.
 - **E820 map holds at most 32 entries.** (`layout.inc`, `E820_MAX`)
 - **UEFI loader starts the existing 32-bit kernel** (`make uefi` / `make live-uefi`).
   There is no `arch/x86_64` yet. GOP above 4 GiB is mapped with PSE-36
-  (`simplefb` on the MSI laptop at `0x400000000`). GPT is read only far
-  enough to find the ESP and a Linux `myos-root` (16 entries).
+  for the kernel console (32-bit virtual address, 36-bit physical in
+  the PDE). User `mmap` of `/dev/fb0` cannot name that address (32-bit
+  PTEs), so `simplefb` keeps an 8 MiB RAM shadow and, on the first mmap,
+  blits it every 16 ms. Until then fbcon writes the real GOP. GPT is
+  read only far enough to find the ESP and a Linux `myos-root` (16
+  entries).
 - **No USB mass storage.** A live UEFI stick's `myos-root` is not mounted
-  on a machine whose only disk is the stick itself (xHCI only). The kernel
-  then runs the RAM initramfs `/init`, not the graphical login.
+  on a machine whose only disk is the stick itself (xHCI only). The live
+  UEFI ESP ships a login-only initramfs (base+init+desktop, not Firefox /
+  gcc / office) so process 1 is runit → `myos-login` from RAM. The Pentium
+  image still uses the small BusyBox initrd.
 
 ## Live disk userland (`live/`, 2026-10-03)
 - **Boots to the graphical login** (`make live-hd`, `make utm-live`): `myos-login`

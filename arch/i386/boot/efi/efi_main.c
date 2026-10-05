@@ -158,6 +158,22 @@ static int alloc_at(struct efi_boot_services *bs, u64 addr, u32 pages)
            && a == addr;
 }
 
+static int file_size(struct efi_file *root, u16 *name, u64 *out)
+{
+    struct efi_file *f = 0;
+    u64 pos;
+    if (root->open(root, &f, name, EFI_FILE_MODE_READ, 0) != EFI_SUCCESS || !f)
+        return -1;
+    if (f->set_position(f, ~0ull) != EFI_SUCCESS
+        || f->get_position(f, &pos) != EFI_SUCCESS) {
+        f->close(f);
+        return -1;
+    }
+    f->close(f);
+    *out = pos;
+    return 0;
+}
+
 static int load_file(struct efi_file *root, u16 *name, void *dest, u64 cap, u64 *out_size)
 {
     struct efi_file *f = 0;
@@ -383,21 +399,31 @@ efi_status efi_main(efi_handle image, struct efi_system_table *st)
     say_hex(ksize);
     say("\r\n");
 
-    ipages = 1024;                              /* cap 4 MiB; grow if needed */
+    /* Size first: the live login initrd is tens of MiB, not 4. Leave the
+       32-bit kernel room under the 768 MiB direct-map cap. */
+    if (file_size(root, iname, &isize) < 0) {
+        say("initrd\r\n");
+        return EFI_NOT_FOUND;
+    }
+    if (!isize || isize > (384ull << 20)) {
+        say("initrd too big\r\n");
+        return EFI_NOT_FOUND;
+    }
+    ipages = pages_for(isize);
     extra = INITRD_LOAD;
+    /* The 32-bit kernel only direct-maps 768 MiB. Firmware often has a
+       hole around 8 MiB, so a large login initrd cannot sit at INITRD_LOAD
+       (right after .bss). Fall back to the highest fit under 768 MiB. */
     if (!alloc_at(bs, INITRD_LOAD, ipages)) {
-        extra = 0xFFFFF000ull;
+        extra = 0x30000000ull;
         if (bs->allocate_pages(AllocateMaxAddress, EfiLoaderData, ipages, &extra)
-            != EFI_SUCCESS) {
-            say("no room for initrd\r\n");
+            != EFI_SUCCESS || extra >= 0x30000000ull
+            || extra + isize > 0x30000000ull) {
+            say("no room for initrd under 768 MiB\r\n");
             return EFI_NOT_FOUND;
         }
     }
-    if (extra > 0xFFFFFFFFull) {
-        say("initrd above 4 GiB\r\n");
-        return EFI_NOT_FOUND;
-    }
-    if (load_file(root, iname, (void *)extra, (u64)ipages * EFI_PAGE, &isize) < 0) {
+    if (load_file(root, iname, (void *)extra, isize, &isize) < 0) {
         say("initrd\r\n");
         return EFI_NOT_FOUND;
     }
@@ -419,9 +445,10 @@ efi_status efi_main(efi_handle image, struct efi_system_table *st)
 
     memcpy((void *)(low + (JUMP_PHYS - BOOTINFO_PHYS)), trampoline, sizeof trampoline);
 
-    /* Do not print to ConOut after this: OutputString allocates and the
-       memory-map key ExitBootServices needs goes stale. Serial is port I/O. */
-    say("calling ExitBootServices\r\n");
+    /* No ConOut after this. OutputString allocates; a deferred GOP
+       update can stale the map key and hang ExitBootServices on the
+       last printed line. Colour the bar instead. */
+    paint_bar(0x002080C0u);         /* blue: about to leave UEFI */
 
     /* GetMemoryMap + ExitBootServices: the map changes if we allocate, so
        the first GetMemoryMap is a size probe; then one extra page of slack. */
@@ -430,7 +457,7 @@ efi_status efi_main(efi_handle image, struct efi_system_table *st)
         bs->get_memory_map(&map_size, 0, &map_key, &desc_size, &desc_ver);
         map_size += desc_size * 8;
         if (bs->allocate_pool(EfiLoaderData, map_size, (void **)&map) != EFI_SUCCESS) {
-            say("no map pool\r\n");
+            paint_bar(0x00C01010u);
             return EFI_NOT_FOUND;
         }
         stt = bs->get_memory_map(&map_size, map, &map_key, &desc_size, &desc_ver);
@@ -448,10 +475,9 @@ efi_status efi_main(efi_handle image, struct efi_system_table *st)
         map = 0;
     }
     if (stt != EFI_SUCCESS) {
-        say("ExitBootServices failed ");
-        say_hex(stt);
-        say("\r\n");
-        return stt;
+        paint_bar(0x00C01010u);     /* red: still in UEFI */
+        for (;;)
+            ;
     }
 
     /* No firmware calls after this. Place the kernel at 1 MiB if we had
@@ -460,7 +486,7 @@ efi_status efi_main(efi_handle image, struct efi_system_table *st)
         memcpy((void *)(u64)BOOTINFO_PHYS, (void *)low, 3 * EFI_PAGE);
     if (ksrc != KERNEL_LOAD)
         memcpy((void *)(u64)KERNEL_LOAD, (void *)ksrc, (u64)kpages * EFI_PAGE);
-    paint_bar(0x00C06020u);         /* golden bar: we left UEFI */
+    paint_bar(0x00C06020u);         /* gold: we left UEFI */
     __asm__ volatile ("cli");
     ((void (*)(void))(u64)JUMP_PHYS)();
     for (;;)

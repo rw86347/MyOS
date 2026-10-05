@@ -24,13 +24,30 @@ sudo dd if=/Users/rwilson/Dropbox/dev/MyOS/build/myos-live-uefi.img of=/dev/rdis
 Do not pick `build/myos.img` or `build/myos-live.img` for a UEFI-only PC.
 Those are BIOS/MBR disks; the firmware will skip them.
 
+## What the colours mean
+
+The loader paints a 48-pixel bar on the GOP instead of printing after
+it has the memory map (ConOut can hang ExitBootServices):
+
+- **Blue** — about to call ExitBootServices. If it stays blue, firmware
+  did not return.
+- **Gold** — left UEFI, jumping to the 32-bit kernel.
+- **Red** — ExitBootServices failed.
+- Kernel text, then the Golden Hour login — that is success.
+
+A 32-bit pointer cannot hold the GOP at `0x400000000`. The kernel
+reaches it with PSE-36 (extra physical bits in the page directory).
+X draws in a low RAM copy; the kernel copies that onto the real bar.
+
 ## Boot the PC
 
 Plug the stick in, power on, open the boot menu (often F12, F10, Esc).
 Choose the USB entry that says UEFI, not "legacy".
 
 This kernel has no USB mass-storage driver. On a laptop whose only
-"disk" is the stick, `myos-root` is not mounted and you get the RAM
-initramfs (a shell), not the Golden Hour login. The framebuffer at
-addresses above 4 GiB is mapped with PSE-36; if you see `simplefb`
-and kernel text, drawing works.
+"disk" is the stick, `myos-root` is not mounted. The ESP's initramfs
+is then a login-only userland: runit starts `myos-login` (X on
+`/dev/fb0`). Firefox and the rest stay on the invisible ext2
+partition. The framebuffer above 4 GiB is mapped with PSE-36.
+
+The empty live password is just Enter.

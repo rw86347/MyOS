@@ -9,13 +9,37 @@
  */
 #include <bootinfo.h>
 #include <errno.h>
+#include <interrupts.h>
 #include <kprintf.h>
 #include <linux/fb.h>
 #include <linux/io.h>
 #include <memlayout.h>
+#include <pmm.h>
 #include <string.h>
+#include <thread.h>
+#include <timer.h>
 
 static struct fb_info info;
+
+/*
+ * How a 32-bit kernel reaches a framebuffer above 4 GiB
+ * ----------------------------------------------------
+ * A 32-bit *pointer* cannot hold 0x400000000. The CPU still can: PSE-36
+ * puts physical bits 39:32 in the page-directory entry, so a normal
+ * virtual address (here the WC window at 0xF8000000) translates to that
+ * 36-bit physical bar. Kernel fbcon writes through that mapping — the
+ * MSI already showed 1920×1080 that way.
+ *
+ * User mmap cannot. fork()/destroy treat every user PDE as a 4 KiB page
+ * table, so a user PTE is 32-bit and (uint32_t)smem_start of 4 GiB is 0.
+ * Programs therefore mmap a low RAM copy; after that mmap we blit it
+ * onto the real bar. Until mmap, screen_base stays the GOP so the
+ * kernel log is not invisible on the firmware splash.
+ */
+static volatile void *gop_va;
+static void *shadow;
+static uint32_t shadow_bytes;
+static int shadow_live;             /* 1: fbcon and X share the RAM copy */
 
 static int no_check(struct fb_var_screeninfo *var, struct fb_info *fb)
 {
@@ -34,6 +58,20 @@ static const struct fb_ops ops = {
     .fb_check_var = no_check,
     .fb_set_par = no_set,
 };
+
+static struct wait_queue blit_wait;
+
+static void shadow_sync(void *arg)
+{
+    (void)arg;
+    for (;;) {
+        uint32_t flags = irq_save();
+        uint32_t deadline = timer_ms() + 16;
+        wq_sleep_until(&blit_wait, deadline ? deadline : 1);
+        irq_restore(flags);
+        fb_shadow_flush();
+    }
+}
 
 void simplefb_init(void)
 {
@@ -67,16 +105,49 @@ void simplefb_init(void)
         info.var.blue = (struct fb_bitfield){ 0, 8, 0 };
     }
     memcpy(info.fix.id, "simplefb", 9);
-    info.fix.smem_start = (unsigned long)bi->fb_phys;
+    info.screen_base = va;                      /* kernel console: the real bar */
+    if (bootinfo_fb_phys(bi) > 0xFFFFFFFFull) {
+        uint32_t pages = (bytes + 4095) / 4096;
+        uint32_t pa = pmm_alloc_run(pages);
+        if (!pa) {
+            kprintf("simplefb: no RAM shadow; /dev/fb0 mmap will not reach GOP\n");
+            info.fix.smem_start = 0;
+        } else {
+            shadow = P2V(pa);
+            shadow_bytes = bytes;
+            gop_va = va;
+            memset(shadow, 0, bytes);           /* RAM; do not read the iGPU BAR */
+            info.fix.smem_start = pa;
+            kprintf("simplefb: RAM shadow at %08lx (used when X mmaps /dev/fb0)\n",
+                    (unsigned long)pa);
+        }
+    } else {
+        info.fix.smem_start = (unsigned long)bi->fb_phys;
+    }
     info.fix.smem_len = bytes;
     info.fix.type = FB_TYPE_PACKED_PIXELS;
     info.fix.visual = FB_VISUAL_TRUECOLOR;
     info.fix.line_length = bi->fb_pitch;
     info.fbops = &ops;
-    info.screen_base = va;
     info.screen_size = bytes;
     if (register_framebuffer(&info) == 0)
         kprintf("simplefb: %lux%lu at %08lx%08lx\n",
                 (unsigned long)bi->fb_width, (unsigned long)bi->fb_height,
                 (unsigned long)bi->fb_phys_hi, (unsigned long)bi->fb_phys);
+}
+
+void fb_shadow_on_mmap(void)
+{
+    if (!gop_va || !shadow || shadow_live)
+        return;
+    info.screen_base = shadow;                  /* fbcon and X now share it */
+    shadow_live = 1;
+    if (!thread_create("fbblit", shadow_sync, NULL))
+        kprintf("simplefb: no blit thread; X will draw only in RAM\n");
+}
+
+void fb_shadow_flush(void)
+{
+    if (shadow_live && gop_va && shadow)
+        memcpy((void *)gop_va, shadow, shadow_bytes);
 }

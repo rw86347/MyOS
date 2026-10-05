@@ -15,6 +15,7 @@
 #include <kprintf.h>
 #include <linux/fb.h>
 #include <mm.h>
+#include <pmm.h>
 #include <string.h>
 #include <uaccess.h>
 #include <vfs.h>
@@ -117,9 +118,13 @@ static int fb_mmap(struct file *f, struct vma *vma)
 {
     (void)f;
     struct fb_info *info = registered_fb[0];
-    if (!info)
+    if (!info || !info->fix.smem_start)
         return -ENODEV;
-    vma->flags |= VM_WC;
+    fb_shadow_on_mmap();
+    /* RAM shadows are write-back (same type as the kernel's direct map).
+       Real video memory stays write-combining. */
+    if (info->fix.smem_start >= pmm_end())
+        vma->flags |= VM_WC;
     return vm_iomap_memory(vma, (uint32_t)info->fix.smem_start, info->fix.smem_len);
 }
 

@@ -7,6 +7,9 @@
 
 void     pmm_init(void);             /* read the BIOS memory map */
 uint32_t pmm_alloc(void);            /* a free frame's physical address, or 0 */
+/* `pages` consecutive frames, lowest first, or 0. For a framebuffer
+   shadow: user mmap needs one physical base. */
+uint32_t pmm_alloc_run(uint32_t pages);
 void     pmm_free(uint32_t phys);    /* drop one owner; freed when none left */
 void     pmm_refs_init(void);        /* after vmm_init(): enable sharing */
 void     pmm_ref(uint32_t phys);     /* one more owner (copy-on-write) */

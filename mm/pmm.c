@@ -236,6 +236,22 @@ uint32_t pmm_alloc(void)
     return pa;          /* 0: out of memory (frame 0 is never free) */
 }
 
+uint32_t pmm_alloc_run(uint32_t pages)
+{
+    uint32_t run = 0;
+    if (!pages)
+        return 0;
+    for (uint32_t f = 0; f < nframes; f++) {
+        run = is_used(f) ? 0 : run + 1;
+        if (run == pages) {
+            uint32_t first = f + 1 - pages;
+            mark_range((uint64_t)first * PAGE_SIZE, (uint64_t)pages * PAGE_SIZE, 0);
+            return first * PAGE_SIZE;
+        }
+    }
+    return 0;
+}
+
 void pmm_free(uint32_t phys)
 {
     uint32_t f = phys / PAGE_SIZE;

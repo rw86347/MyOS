@@ -135,6 +135,13 @@ int fb_set_var(struct fb_info *info, struct fb_var_screeninfo *var);
    framebuffer is registered, so opening it fails). */
 const struct file_ops *fb_file_ops(void);
 
+/* If /dev/fb0 is a RAM shadow of a GOP above 4 GiB, copy it to the
+   hardware. No-op on BIOS/Bochs. Not for interrupt handlers (8 MiB). */
+void fb_shadow_flush(void);
+
+/* First mmap of that shadow: switch fbcon onto it and start the blit. */
+void fb_shadow_on_mmap(void);
+
 /* fbcon (drivers/video/fbcon.c): take over the console on info; and
    info's mode changed (re-measure, redraw). */
 void fbcon_attach(struct fb_info *info);
