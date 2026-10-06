@@ -560,6 +560,11 @@ int proc_execve(uintptr_t user_path, uintptr_t user_argv, uintptr_t user_envp)
     proc_clear_exe(p);
     p->exe = exe;                       /* reference from program_load */
     thread_set_name(thread_current(), base_name(prog));
+#ifdef TRACE_EXEC
+    /* make TRACE=1: every program started, on the screen, for machines
+       with no serial port to read a log from (docs/LOG.md, 2026-10-06). */
+    kprintf("[exec %d] %s%s%s\n", p->pid, prog, argc > 1 ? " " : "", argc > 1 ? a->argv[1] : "");
+#endif
     kfree(a);
 
     /* Return to user mode at the new program's entry, with its stack, clean
@@ -588,6 +593,14 @@ int proc_execve(uintptr_t user_path, uintptr_t user_argv, uintptr_t user_envp)
 /* The last thread is gone: the process becomes a zombie with p->status. */
 static void process_end(struct process *p)
 {
+#ifdef TRACE_EXEC
+    if (W_IFEXITED(p->status))
+        kprintf("[exit %d] %s: status %d\n", p->pid, thread_current()->name,
+                W_EXITSTATUS(p->status));
+    else
+        kprintf("[exit %d] %s: signal %d\n", p->pid, thread_current()->name,
+                W_TERMSIG(p->status));
+#endif
     signal_alarm_cancel(p);
     ptimer_release_all(p);
     sem_exit(p);                        /* SEM_UNDO: give back what it held */

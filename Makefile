@@ -90,6 +90,42 @@ ifeq ($(ARCH),x86_64)
     BUILD := build/x86_64
   endif
 endif
+# make TRACE=1 <target>: the kernel prints every program started and every
+# exit, and its serial-only log lines, on the screen — for a real machine
+# with no serial port. A build folder of its own: normal builds never have it.
+ifeq ($(TRACE),1)
+  MODE_FLAGS += -DTRACE_EXEC
+  BUILD := $(BUILD)/trace
+endif
+
+# make CMDLINE=word <target>: the kernel's command line (/proc/cmdline),
+# built in until a boot loader passes one. "nodesktop": the login service
+# doesn't start X, so the text console shows everything (with TRACE=1, the
+# kernel's own lines too) — for a real machine with no serial port. Its own
+# build folder.
+ifneq ($(CMDLINE),)
+  MODE_FLAGS += -DMYOS_CMDLINE='"$(CMDLINE)"'
+  BUILD := $(BUILD)/$(subst $(empty) $(empty),-,$(CMDLINE))
+endif
+
+# make IWLDEBUG=1 <target>: iwlwifi's own debug lines (the commands it sends
+# the firmware, scans, joining...) in the kernel log, for bringing a card up
+# on a real machine (drivers/net/wireless/intel/iwlwifi/myos.c). Its own
+# build folder; a 256 KiB kernel log.
+ifeq ($(IWLDEBUG),1)
+  MODE_FLAGS += -DMYOS_IWLDEBUG
+  BUILD := $(BUILD)/iwldebug
+endif
+
+# make WIFISIM=1 <target>: the kernel also has the simulated Wi-Fi radio of
+# the self-tests (drivers/net/wireless/sim.c: two access points, one WPA2),
+# registered at boot, so the real Wi-Fi programs (wpa_supplicant, the tray
+# icon) can be tried on a whole system in QEMU. Test code: a build folder
+# of its own, never a normal boot.
+ifeq ($(WIFISIM),1)
+  MODE_FLAGS += -DWIFI_SIM
+  BUILD := $(BUILD)/wifisim
+endif
 
 # Freestanding: no host OS, no C library. Only compiler-provided headers like
 # <stdint.h> and <stddef.h> are available.
@@ -107,11 +143,13 @@ LDFLAGS := -T arch/i386/linker.ld -nostdlib -ffreestanding -O2 -Wl,--no-warn-rwx
 LIBS    := -lgcc    # gcc's helper routines (e.g. 64-bit division on i386)
 
 # Test and benchmark code goes only into its own build mode.
-TEST_SRCS  := kernel/selftest.c kernel/disk_demo.c $(wildcard kernel/*_test.c)
+TEST_SRCS  := kernel/selftest.c kernel/disk_demo.c $(wildcard kernel/*_test.c) \
+              drivers/net/wireless/sim.c drivers/net/wireless/sim_crypto.c
 BENCH_SRCS := kernel/bench.c
 C_SRCS  := $(filter-out $(TEST_SRCS) $(BENCH_SRCS), \
              $(wildcard arch/i386/*.c kernel/*.c drivers/*.c fs/*.c mm/*.c net/*.c \
-                        drivers/gpu/drm/*.c drivers/gpu/drm/tiny/*.c drivers/video/*.c))
+                        drivers/gpu/drm/*.c drivers/gpu/drm/tiny/*.c drivers/video/*.c \
+                        net/wireless/*.c))
 ifeq ($(MODE),test)
   C_SRCS += $(TEST_SRCS)
 endif
@@ -131,6 +169,9 @@ USER_BINS := $(patsubst user/%.asm,$(BUILD)/user/%.elf,$(wildcard user/*.asm)) \
              $(patsubst user/%.c,$(BUILD)/user/%.elf,$(wildcard user/*.c)) \
              $(patsubst user/musl/%.c,$(BUILD)/user/musl/%.elf,$(wildcard user/musl/*.c))
 USER_LIB  := $(BUILD)/user/lib/crt0.o $(BUILD)/user/lib/mini.o
+# user/sys/systest.c, raw system calls for either CPU (rule below): test
+# builds carry it too, as /bin/rawsystest.
+SYSTEST   := $(BUILD)/user/sys/systest
 # Alpine Linux packages, unpacked (tools/fetch-alpine.sh; see the initramfs).
 ALPINE := build/ext/alpine
 ALPINE_STAMP := $(ALPINE)/.fetched
@@ -158,7 +199,8 @@ ifeq ($(ARCH),x86_64)
   ifeq ($(X86_64_KERNEL),full)
     C_SRCS  := $(filter-out $(TEST_SRCS) $(BENCH_SRCS) arch/x86_64/early.c kernel/elf.c, \
                $(wildcard arch/x86_64/*.c kernel/*.c drivers/*.c fs/*.c mm/*.c net/*.c \
-                          drivers/gpu/drm/*.c drivers/gpu/drm/tiny/*.c drivers/video/*.c))
+                          drivers/gpu/drm/*.c drivers/gpu/drm/tiny/*.c drivers/video/*.c \
+                          net/wireless/*.c))
     ifeq ($(MODE),test)
       C_SRCS += $(TEST_SRCS)
     endif
@@ -173,6 +215,43 @@ ifeq ($(ARCH),x86_64)
     C_SRCS  := arch/x86_64/early.c
     C_OBJS  := $(patsubst %.c,$(BUILD)/%.o,$(C_SRCS))
     OBJS    := $(BUILD)/arch/x86_64/entry.o $(C_OBJS)
+  endif
+endif
+
+# Intel's Wi-Fi driver, iwlwifi (the MSI's AX201; docs/WIFI-PLAN.md W6):
+# Linux's own files, compiled against our Linux API headers as Linux
+# compiles them (GNU C, its config switches, compiler_types.h first), and
+# linked into the kernel. x86_64 only: no old PC has one. IWLWIFI=0 leaves
+# it out (530 KB of code).
+IWL_DIR := drivers/net/wireless/intel/iwlwifi
+ifeq ($(ARCH),x86_64)
+  ifeq ($(X86_64_KERNEL),full)
+    IWLWIFI ?= 1
+  endif
+endif
+ifeq ($(IWLWIFI),1)
+  IWL_SRCS := $(shell find $(IWL_DIR) -name '*.c')
+  IWL_OBJS := $(patsubst %.c,$(BUILD)/%.o,$(IWL_SRCS))
+  OBJS     += $(IWL_OBJS)
+  C_OBJS   += $(IWL_OBJS)
+  CFLAGS   += -DMYOS_IWLWIFI
+  $(IWL_OBJS): CFLAGS += -std=gnu11 -D__KERNEL__ -DKBUILD_MODNAME='"iwlwifi"' -I$(IWL_DIR) \
+                         -include linux/compiler_types.h -funsigned-char -Wno-override-init \
+                         $(addprefix -D,$(addsuffix =1,CONFIG_IWLWIFI CONFIG_IWLMVM CONFIG_PCI \
+                           CONFIG_MAC80211 CONFIG_CFG80211 CONFIG_PM)) \
+                         -Wno-unused-parameter -Wno-sign-compare -Wno-missing-field-initializers \
+                         -Wno-address-of-packed-member -Wno-pointer-sign -Wno-unused-function \
+                         -Wno-unused-variable -Wno-unused-but-set-variable -Wno-type-limits
+  ifeq ($(IWLDEBUG),1)
+    $(IWL_OBJS): CFLAGS += -DCONFIG_IWLWIFI_DEBUG=1
+  endif
+endif
+
+ifeq ($(WIFISIM),1)
+  ifneq ($(MODE),test)                  # (test builds have it already)
+    SIM_OBJS := $(BUILD)/drivers/net/wireless/sim.o $(BUILD)/drivers/net/wireless/sim_crypto.o
+    OBJS     += $(SIM_OBJS)
+    C_OBJS   += $(SIM_OBJS)
   endif
 endif
 
@@ -330,7 +409,7 @@ $(INITRD): $(INITRD_FILES) $(ALPINE_STAMP) tools/busybox-applets.txt Makefile
 	  | cpio -o -H newc -R 0:0 --quiet > ../initrd.cpio
 else
 $(INITRD): $(INITRD_FILES) $(ALPINE_STAMP) tools/busybox-applets.txt \
-           $(if $(MODE_FLAGS),$(USER_BINS) $(TEST_FILES)) Makefile
+           $(if $(MODE_FLAGS),$(USER_BINS) $(TEST_FILES) $(SYSTEST)) Makefile
 	@rm -rf $(BUILD)/initramfs
 	@mkdir -p $(BUILD)/initramfs/bin $(BUILD)/initramfs/usr/lib $(BUILD)/initramfs/root \
 	          $(BUILD)/initramfs/tmp $(BUILD)/initramfs/lib $(BUILD)/initramfs/etc/terminfo
@@ -338,6 +417,13 @@ $(INITRD): $(INITRD_FILES) $(ALPINE_STAMP) tools/busybox-applets.txt \
 ifneq ($(MODE_FLAGS),)
 	@mkdir -p $(BUILD)/initramfs/test
 	for f in $(USER_BINS); do cp $$f $(BUILD)/initramfs/bin/$$(basename $$f .elf); done
+	cp $(SYSTEST) $(BUILD)/initramfs/bin/rawsystest
+	cp $(ALPINE)/usr/sbin/iw $(BUILD)/initramfs/bin/iw
+	cp -P $(ALPINE)/usr/lib/libnl-3.so.* $(ALPINE)/usr/lib/libnl-genl-3.so.* $(BUILD)/initramfs/usr/lib/
+	cp $(ALPINE)/sbin/wpa_supplicant $(ALPINE)/sbin/wpa_cli $(BUILD)/initramfs/bin/
+	cp $(ALPINE)/lib/libcrypto.so.3 $(ALPINE)/lib/libssl.so.3 $(BUILD)/initramfs/lib/
+	cp -P $(ALPINE)/usr/lib/libdbus-1.so.* $(ALPINE)/usr/lib/libpcsclite.so.1 \
+	      $(ALPINE)/usr/lib/libpcsclite_real.so.1 $(BUILD)/initramfs/usr/lib/
 	cp -R user/rootfs/. $(BUILD)/initramfs/
 	seq 1 20000 > $(BUILD)/initramfs/test/numbers.txt
 endif
@@ -469,8 +555,10 @@ uefi: $(UEFI_IMG)
 
 # OVMF is 64-bit firmware, so this is qemu-system-x86_64 (not i386 / pentium3).
 # Serial is the console we can see with -display none.
+# 4 GiB, as on a real laptop: the firmware then puts its stack and our initrd
+# above 2 GiB, which is how two boot bugs hid at 256 MiB (docs/LOG.md, 2026-10-05).
 QEMU_UEFI_DISK = $(UEFI_IMG)
-QEMU_UEFI_FLAGS = -machine q35 -m 256M -cpu qemu64 \
+QEMU_UEFI_FLAGS = -machine q35 -m 4G -cpu qemu64 \
 	-drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
 	-drive if=pflash,format=raw,file=$(BUILD)/ovmf-vars.fd \
 	-drive if=none,format=raw,file=$(QEMU_UEFI_DISK),id=bootdisk \
@@ -507,8 +595,8 @@ endif
 
 # user/sys/systest.c: the system call layer checked from a program's side,
 # with raw syscalls (no C library), for whichever CPU ARCH is. It goes only
-# into a test copy of the initramfs and UEFI image, never the normal ones.
-SYSTEST      := $(BUILD)/user/sys/systest
+# into a test copy of the initramfs and UEFI image (and `make test`'s), never
+# the normal ones. (SYSTEST is named near USER_BINS.)
 TEST_INITRD  := $(BUILD)/initrd-test.cpio
 UEFI_TEST_IMG := $(BUILD)/myos-uefi-test.img
 ifeq ($(ARCH),x86_64)
@@ -547,8 +635,11 @@ UEFI_SHELL_CMDS := "uname -m" "echo hello from user space" "ls /" "echo hi | wc 
                    "trap 'echo caught usr1' USR1; kill -USR1 \$$\$$; echo after trap" \
                    "sh -c 'kill -SEGV \$$\$$'; echo killed \$$?" \
                    "awk 'BEGIN { print 1.5 * 3 }'"
+# Also an NVMe disk (a snapshot of the FAT32 test disk): on x86_64 it must run
+# on MSI-X (the local APIC, docs/WIFI-PLAN.md W0a) and be read through it.
+# OVMF puts its registers above 4 GiB, where i386 must say it can't map them.
 test-uefi-shell: QEMU_UEFI_DISK = $(UEFI_TEST_IMG)
-test-uefi-shell: $(UEFI_TEST_IMG)
+test-uefi-shell: $(UEFI_TEST_IMG) $(USB)
 	@rm -f $(BUILD)/uefi-shell.log
 	@cp $(OVMF_VARS) $(BUILD)/ovmf-vars.fd
 	@(sleep 15; tools/qemu-type.sh systest | while read k; do echo "$$k"; sleep 0.05; done; \
@@ -560,6 +651,8 @@ test-uefi-shell: $(UEFI_TEST_IMG)
 	  tools/qemu-type.sh "echo after ctrl-c" | while read k; do echo "$$k"; sleep 0.05; done; \
 	  sleep 2; echo quit) \
 	  | $(QEMU64) $(QEMU_UEFI_FLAGS) -display none \
+	    -drive if=none,format=raw,file=$(USB),id=nvme0,snapshot=on \
+	    -device nvme,drive=nvme0,serial=myos-nvme \
 	    -serial file:$(BUILD)/uefi-shell.log -monitor stdio >/dev/null || true
 	@perl -pe 's/\e\[[0-9;?]*[A-Za-z]//g; s/\r//g' $(BUILD)/uefi-shell.log > $(BUILD)/uefi-shell.txt
 	@sed -n '/Welcome/,$$p' $(BUILD)/uefi-shell.txt; echo
@@ -579,6 +672,12 @@ test-uefi-shell: $(UEFI_TEST_IMG)
 	  grep -q "^killed 139" $$L || { echo "FAIL: death by signal"; ok=0; }; \
 	  grep -q "^4.5" $$L || { echo "FAIL: floating point"; ok=0; }; \
 	  grep -q "^after ctrl-c" $$L || { echo "FAIL: Ctrl-C"; ok=0; }; \
+	  if [ "$(ARCH)" = x86_64 ]; then \
+	    grep -q "^nvme: nvme0n1: .*MSI-X irq 16" $$L || { echo "FAIL: NVMe on MSI-X"; ok=0; }; \
+	    grep -q "^fat32: nvme0n1.* mounted" $$L || { echo "FAIL: read through MSI-X"; ok=0; }; \
+	  else \
+	    grep -q "^nvme: cannot map .*above 4 GiB" $$L || { echo "FAIL: NVMe above 4 GiB not reported"; ok=0; }; \
+	  fi; \
 	  [ $$ok = 1 ] && echo "UEFI SHELL TEST OK ($(ARCH))" || exit 1
 
 # Login-only initramfs (rules sit with live-hd: they need LOGIN_BIN).
@@ -614,7 +713,8 @@ endif
 # Live desktop on the same GPT disk: ESP + ext2 "myos-root" from make live-hd.
 # The ESP carries the login initrd so a machine with no visible disks still
 # reaches myos-login from RAM. QEMU still mounts the ext2 partition.
-# The 64-bit kernel is still hello-only: it will not start this initrd yet.
+# x86_64: full kernel + login initrd; userland may still need syscalls (see
+# docs/x86_64-LIVE-HANDOFF.md) before myos-login appears.
 LIVE_UEFI := $(BUILD)/myos-live-uefi.img
 $(LIVE_UEFI): $(BUILD)/BOOTX64.EFI $(BUILD)/kernel.bin $(LIVE_LOGIN_INITRD) $(LIVE_HD) \
               arch/i386/boot/efi/vga-font.bin tools/mkuefi.py
@@ -658,11 +758,15 @@ $(UEFI_LOGIN_IMG): $(BUILD)/BOOTX64.EFI $(BUILD)/kernel.bin $(LIVE_LOGIN_INITRD)
 	    --file EFI/MYOS/KERNEL.BIN=$(BUILD)/kernel.bin \
 	    --file EFI/MYOS/INITRD.CPIO=$(LIVE_LOGIN_INITRD) \
 	    --file EFI/MYOS/FONT.BIN=arch/i386/boot/efi/vga-font.bin
+# Laptop-like (the MSI Katana, docs/hardware-msi-katana-gf66.md): 4 GiB, a
+# Cirrus card we have no driver for, so the screen is the firmware's
+# framebuffer (simplefb), and no PIT (pit=off: the HPET must give the tick).
+# Then the login screen must really be showing (tools/check-xscreen.py).
 test-uefi-login: $(UEFI_LOGIN_IMG)
-	@rm -f $(BUILD)/uefi-login-serial.log
+	@rm -f $(BUILD)/uefi-login-serial.log $(BUILD)/uefi-login-screen.ppm
 	@cp $(OVMF_VARS) $(BUILD)/ovmf-vars.fd
-	@(sleep 70; echo quit) \
-	  | $(QEMU64) -machine q35 -m 1024M -cpu qemu64 \
+	@(sleep 110; echo "screendump $(BUILD)/uefi-login-screen.ppm"; sleep 2; echo quit) \
+	  | $(QEMU64) -machine q35,pit=off -m 4G -cpu qemu64 -vga cirrus \
 	    -drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
 	    -drive if=pflash,format=raw,file=$(BUILD)/ovmf-vars.fd \
 	    -drive if=none,format=raw,file=$(UEFI_LOGIN_IMG),id=bootdisk \
@@ -676,7 +780,11 @@ test-uefi-login: $(UEFI_LOGIN_IMG)
 	  || { echo "FAIL: login initrd did not unpack"; exit 1; }
 	@grep -qE "MyOS is up|First boot:|/init exited|myos-login" $(BUILD)/uefi-login-serial.log \
 	  || { echo "FAIL: runit/myos-login did not start"; exit 1; }
-	@echo "UEFI LOGIN OK: RAM userland reached runit or myos-login"
+	@python3 tools/check-xscreen.py $(BUILD)/uefi-login-screen.ppm \
+	  || { echo "FAIL: the X login screen is not showing"; exit 1; }
+	@grep -q "the HPET gives the 1 ms tick" $(BUILD)/uefi-login-serial.log \
+	  || { echo "FAIL: no HPET tick without the PIT"; exit 1; }
+	@echo "UEFI LOGIN OK: the X login screen shows (simplefb, 4 GiB, no PIT)"
 
 # --- a package to share ------------------------------------------------------
 # The normal boot image is a complete disk: written byte for byte to a USB
@@ -726,6 +834,21 @@ $(HD): $(IMG) tools/mbr-partition.sh
 	    -E offset=$$((START * 512)),root_owner=0:0 -F $@ $(ROOT_MB)M && \
 	  tools/mbr-partition.sh $@ $$S $$START $$(( $(ROOT_MB) * 2048 ))
 	@echo "Built $@ (boot area + $(ROOT_MB) MiB ext2 myos-root)"
+
+# The Wi-Fi icon on a whole desktop (docs/WIFI-PLAN.md W4): boots the RAM
+# login image on a kernel with the simulated radio, logs in, and joins the
+# WPA2 network through the tray icon's list, as a person would
+# (tools/wifi-desktop.qs); the screenshots land in $(BUILD).
+test-wifi-desktop: $(UEFI_LOGIN_IMG)
+	@[ "$(WIFISIM)" = 1 ] && [ "$(ARCH)" = x86_64 ] \
+	  || { echo "test-wifi-desktop: make ARCH=x86_64 WIFISIM=1 test-wifi-desktop"; exit 1; }
+	python3 tools/qemu-desktop.py $(UEFI_LOGIN_IMG) tools/wifi-desktop.qs \
+	  $(BUILD)/wifi-desktop-serial.log $(BUILD) $(OVMF_CODE) $(OVMF_VARS)
+	@grep -q "wifi: the simulated radio is up" $(BUILD)/wifi-desktop-serial.log \
+	  || { echo "FAIL: no simulated radio"; exit 1; }
+	@grep -q "ipv4: 192.168.77.10 on wlan0" $(BUILD)/wifi-desktop-serial.log \
+	  || { echo "FAIL: not connected through the tray icon (see $(BUILD)/wifi-*.png)"; exit 1; }
+	@echo "WIFI DESKTOP OK: joined MyOS-Test from the tray icon (screenshots: $(BUILD)/wifi-*.png)"
 
 hd: $(HD)
 
@@ -794,21 +917,36 @@ $(SETTINGS_BIN): live/myos-settings/myos-settings.c live/myos-settings/scale.h |
 	@mkdir -p $(dir $@) $(BUILD)/live
 	$(CC) $(LOGIN_CFLAGS) $(GTK_CFLAGS) -Wno-deprecated-declarations -c $< -o $(BUILD)/live/myos-settings.o
 	$(call LIVE_LINK,$(BUILD)/live/myos-settings.o,-lgtk-3 -lgdk-3 -lgobject-2.0 -lglib-2.0 -lcairo -lX11 -lm)
+# The Wi-Fi tray icon (live/myos-wifi): GTK3, wpa_supplicant's control
+# socket. Started by IceWM's startup script.
+WIFI_BIN := $(LIVE_EXTRA)/usr/bin/myos-wifi
+$(WIFI_BIN): live/myos-wifi/myos-wifi.c live/myos-settings/scale.h | $(LIVE_SYSROOT)/.done
+	@mkdir -p $(dir $@) $(BUILD)/live
+	$(CC) $(LOGIN_CFLAGS) $(GTK_CFLAGS) -Ilive/myos-settings -Wno-deprecated-declarations \
+	  -c $< -o $(BUILD)/live/myos-wifi.o
+	$(call LIVE_LINK,$(BUILD)/live/myos-wifi.o,-lgtk-3 -lgdk-3 -lgdk_pixbuf-2.0 -lgobject-2.0 \
+	  -lglib-2.0 -lcairo -lpango-1.0 -lX11 -lm)
 # My Files (live/myos-files): GTK3 for the window, cairo and pango for
 # the drawing, librsvg for the theme's SVG icons.
 FILES_BIN := $(LIVE_EXTRA)/usr/bin/myos-files
-$(FILES_BIN): live/myos-files/myos-files.c live/myos-settings/scale.h | $(LIVE_SYSROOT)/.done
+HEIF_PIXBUF_OBJ := $(BUILD)/live/heif-pixbuf.o
+$(HEIF_PIXBUF_OBJ): live/myos-heic/heif-pixbuf.c live/myos-heic/heif-pixbuf.h | $(LIVE_SYSROOT)/.done
+	@mkdir -p $(dir $@)
+	$(CC) $(LOGIN_CFLAGS) $(GTK_CFLAGS) -Ilive/myos-heic -Wno-deprecated-declarations \
+	  -c $< -o $@
+$(FILES_BIN): live/myos-files/myos-files.c live/myos-settings/scale.h $(HEIF_PIXBUF_OBJ) | $(LIVE_SYSROOT)/.done
 	@mkdir -p $(dir $@) $(BUILD)/live
 	$(CC) $(LOGIN_CFLAGS) $(GTK_CFLAGS) -isystem $(LIVE_SYSROOT)/usr/include/librsvg-2.0 \
 	  -isystem $(LIVE_SYSROOT)/usr/include/poppler/glib \
-	  -Ilive/myos-settings -Wno-deprecated-declarations -Wno-format-truncation \
-	  -c $< -o $(BUILD)/live/myos-files.o
-	$(call LIVE_LINK,$(BUILD)/live/myos-files.o,-lgtk-3 -lgdk-3 -lgdk_pixbuf-2.0 -lpoppler-glib \
-	  -lgobject-2.0 -lglib-2.0 -lgio-2.0 -lpango-1.0 -lpangocairo-1.0 -lcairo -lrsvg-2 -lX11 -lm)
+	  -Ilive/myos-settings -Ilive/myos-heic -Wno-deprecated-declarations -Wno-format-truncation \
+	  -c live/myos-files/myos-files.c -o $(BUILD)/live/myos-files.o
+	$(call LIVE_LINK,$(BUILD)/live/myos-files.o $(HEIF_PIXBUF_OBJ),-lgtk-3 -lgdk-3 -lgdk_pixbuf-2.0 \
+	  -lpoppler-glib -lheif -lgobject-2.0 -lglib-2.0 -lgio-2.0 -lpango-1.0 -lpangocairo-1.0 \
+	  -lcairo -lrsvg-2 -lX11 -lm)
 # Preview (live/myos-preview): the Mac's Preview — PDFs through poppler
 # (qpdf, run as a program, rewrites their pages), pictures through
-# gdk-pixbuf's loaders, and TIFF, JPEG 2000, OpenEXR, Photoshop and HEIC
-# through their libraries. /usr/bin/preview is the short name.
+# gdk-pixbuf's loaders, and TIFF, JPEG 2000, OpenEXR, Photoshop and HEIC/HEIF
+# through libheif (shared heif-pixbuf.c with My Files). /usr/bin/preview is the short name.
 PREVIEW_BIN  := $(LIVE_EXTRA)/usr/bin/myos-preview
 PREVIEW_SRC  := $(wildcard live/myos-preview/*.c)
 PREVIEW_OBJS := $(PREVIEW_SRC:live/myos-preview/%.c=$(BUILD)/live/preview/%.o)
@@ -817,9 +955,9 @@ $(BUILD)/live/preview/%.o: live/myos-preview/%.c live/myos-preview/preview.h liv
 	@mkdir -p $(dir $@)
 	$(CC) $(LOGIN_CFLAGS) $(GTK_CFLAGS) $(addprefix -isystem $(LIVE_SYSROOT)/usr/include/,poppler/glib \
 	  openjpeg-2.5) -Wno-deprecated-declarations -c $< -o $@
-$(PREVIEW_BIN): $(PREVIEW_OBJS) live/myos-preview/preview.desktop
+$(PREVIEW_BIN): $(PREVIEW_OBJS) $(HEIF_PIXBUF_OBJ) live/myos-preview/preview.desktop
 	@mkdir -p $(dir $@) $(LIVE_EXTRA)/usr/share/applications
-	$(call LIVE_LINK,$(PREVIEW_OBJS),-lgtk-3 -lgdk-3 -lgdk_pixbuf-2.0 -lpoppler-glib -lgio-2.0 \
+	$(call LIVE_LINK,$(PREVIEW_OBJS) $(HEIF_PIXBUF_OBJ),-lgtk-3 -lgdk-3 -lgdk_pixbuf-2.0 -lpoppler-glib -lgio-2.0 \
 	  -lgobject-2.0 -lglib-2.0 -lpangocairo-1.0 -lpango-1.0 -lcairo -ltiff -lopenjp2 -lheif \
 	  -lOpenEXR-3_1 -lX11 -lm)
 	ln -sf myos-preview $(dir $@)preview
@@ -913,6 +1051,16 @@ ifeq ($(wildcard $(WP_DIR)/src/main.c),)
 WP_BIN :=
 endif
 
+# The firmware drivers load at run time (tools/fetch-firmware.sh, pinned
+# linux-firmware files) into the image's /lib/firmware: x86_64 only, for
+# iwlwifi.
+ifeq ($(ARCH),x86_64)
+  FW_STAMP := $(BUILD)/live/firmware.stamp
+endif
+$(FW_STAMP): tools/fetch-firmware.sh
+	tools/fetch-firmware.sh $(LIVE_EXTRA)/lib/firmware
+	@mkdir -p $(dir $@) && touch $@
+
 LIVE_THEME := $(LIVE_EXTRA)/.theme
 $(LIVE_THEME): live/theme/make-live-theme.py assets/themes/golden-hour/make-theme.py \
                live/writeperfect/writeperfect.svg live/myos-preview/preview.svg
@@ -920,11 +1068,11 @@ $(LIVE_THEME): live/theme/make-live-theme.py assets/themes/golden-hour/make-them
 	@touch $@
 
 live-theme: $(LIVE_THEME)
-live-extra: $(LIVE_THEME) $(LOGIN_BIN) $(MENU_BIN) $(SETTINGS_BIN) $(XSETTINGS_BIN) $(ADDUSER_BIN) $(FILES_BIN) $(PREVIEW_BIN) $(WP_BIN)
+live-extra: $(FW_STAMP) $(LIVE_THEME) $(LOGIN_BIN) $(MENU_BIN) $(SETTINGS_BIN) $(XSETTINGS_BIN) $(ADDUSER_BIN) $(FILES_BIN) $(PREVIEW_BIN) $(WIFI_BIN) $(WP_BIN)
 
 # The live disk: like `make hd`, but myos-root holds the live userland
 # (tools/mklivehd.sh: owners, setuid bits and case-only names kept).
-$(LIVE_TAR): $(LIVE_THEME) $(LOGIN_BIN) $(MENU_BIN) $(SETTINGS_BIN) $(XSETTINGS_BIN) $(ADDUSER_BIN) $(FILES_BIN) $(PREVIEW_BIN) $(WP_BIN) $(LIVE_LOCK) $(shell find live/overlay -type f)
+$(LIVE_TAR): $(FW_STAMP) $(LIVE_THEME) $(LOGIN_BIN) $(MENU_BIN) $(SETTINGS_BIN) $(XSETTINGS_BIN) $(ADDUSER_BIN) $(FILES_BIN) $(PREVIEW_BIN) $(WIFI_BIN) $(WP_BIN) $(LIVE_LOCK) $(shell find live/overlay -type f) $(shell find live/overlay.local -type f 2>/dev/null)
 	python3 tools/fetch-live.py --arch $(ALPINE_ARCH)
 ifeq ($(ARCH),x86_64)
 $(LIVE_HD): $(LIVE_TAR) tools/mklivehd.sh
@@ -937,9 +1085,9 @@ live-hd: $(LIVE_HD)
 
 # RAM login for a UEFI stick when the kernel cannot see the ext2 root.
 # The Pentium floppy initrd stays BusyBox. WritePerfect is left on disk.
-$(LIVE_LOGIN_TAR): $(LIVE_THEME) $(LOGIN_BIN) $(MENU_BIN) $(XSETTINGS_BIN) \
+$(LIVE_LOGIN_TAR): $(FW_STAMP) $(LIVE_THEME) $(LOGIN_BIN) $(MENU_BIN) $(XSETTINGS_BIN) $(WIFI_BIN) \
                    $(LIVE_LOCK) tools/fetch-live.py \
-                   $(shell find live/overlay -type f)
+                   $(shell find live/overlay -type f) $(shell find live/overlay.local -type f 2>/dev/null)
 	python3 tools/fetch-live.py --arch $(ALPINE_ARCH) --login-root
 	@tar -tf $@ | grep -q '^usr/bin/myos-login$$' \
 	  || { echo "login-root.tar has no myos-login"; exit 1; }
@@ -1057,17 +1205,22 @@ endif
 check-selftests: $(IMG) $(USB)
 	$(call make-test-disk,$(DATA),1024)
 	@rm -f $(BUILD)/serial.log
-	@(sleep 8; for k in h i ret; do echo "sendkey $$k"; sleep 0.2; done; \
+	@# Type and click once the self-tests have finished (up to 90 s), not
+	@# after a fixed time: the suite grows, and a fixed clock cut it short.
+	@(i=0; while [ $$i -lt 900 ] && ! grep -q "^Self-tests:" $(BUILD)/serial.log 2>/dev/null; do \
+	    sleep 0.1; i=$$((i + 1)); done; sleep 1; \
+	  for k in h i ret; do echo "sendkey $$k"; sleep 0.2; done; \
 	  echo "mouse_move 10 5"; sleep 0.3; echo "mouse_button 1"; sleep 0.3; \
 	  echo "mouse_button 0"; sleep 0.3; \
 	  echo "screendump $(BUILD)/screen.ppm"; sleep 0.5; \
 	  echo "sendkey f10"; sleep 1; echo quit) \
-	  | $(QEMU) $(QEMU_FLAGS) -display none \
+	  | $(QEMU) $(QEMU_FLAGS) -device edu -display none \
 	    -serial file:$(BUILD)/serial.log -monitor stdio >/dev/null
 	@cat $(BUILD)/serial.log; echo
 	@L=$(BUILD)/serial.log; ok=1; \
 	  grep -q "Timer: 1000 Hz (sleep 100 ms = 10[0-9] ticks)" $$L || { echo "FAIL: timer"; ok=0; }; \
 	  grep -q "Self-tests: [0-9]* passed, 0 failed" $$L || { echo "FAIL: disk self-tests"; ok=0; }; \
+	  if grep -q "wifi sim: iwlwifi would fail" $$L; then echo "FAIL: the Wi-Fi core broke a rule iwlwifi's firmware enforces"; ok=0; fi; \
 	  grep -q "fault)> hi" $$L || { echo "FAIL: keyboard echo"; ok=0; }; \
 	  grep -q "mouse: PS/2, with a wheel" $$L || { echo "FAIL: PS/2 mouse found"; ok=0; }; \
 	  grep -q "mouse: dx=10 dy=-5 wheel=0 buttons=0" $$L || { echo "FAIL: mouse movement"; ok=0; }; \
@@ -1122,7 +1275,7 @@ check-selftests: $(IMG) $(USB)
 # QEMU's monitor (tools/qemu-type.sh); check what the shell printed (with
 # the terminal escape sequences taken out).
 SHELL_TEST_CMDS := 'echo hello from $$0 $$BASH_VERSION' 'ls /' 'echo one two three | wc -w' \
-                   'cat /etc/hostname' 'cd /etc; pwd' 'uname -sm' \
+                   'cat /etc/hostname' 'cd /etc; pwd' 'uname -sm' 'ip addr' 'ip route' \
                    'ping -c 2 10.0.2.2' 'ping -c 1 -W 1 example.com' \
                    'cmp /proc/net/dns /etc/resolv.conf && echo resolv from kernel' \
                    'wget -q -O /tmp/e.html http://example.com/ && echo wget ok $$(wc -c < /tmp/e.html); rm -f /tmp/e.html' \
@@ -1162,6 +1315,8 @@ test-shell: $(IMG) $(USB)
 	  grep -q "^myos[[:space:]]*$$" $$L || { echo "FAIL: cat"; ok=0; }; \
 	  grep -q "^/etc[[:space:]]*$$" $$L || { echo "FAIL: cd/pwd"; ok=0; }; \
 	  grep -q "^Linux i686" $$L || { echo "FAIL: uname"; ok=0; }; \
+	  grep -q "inet 10.0.2.15/24 .*eth0" $$L || { echo "FAIL: ip addr (rtnetlink)"; ok=0; }; \
+	  grep -q "default via 10.0.2.2 dev eth0" $$L || { echo "FAIL: ip route (rtnetlink)"; ok=0; }; \
 	  grep -q "2 packets transmitted, 2 packets received" $$L || { echo "FAIL: ping 10.0.2.2 (raw ICMP socket, alarm)"; ok=0; }; \
 	  grep -q "PING example.com ([0-9]" $$L || { echo "FAIL: DNS through musl (UDP socket, resolv.conf)"; ok=0; }; \
 	  grep -q "^resolv from kernel$$" $$L || { echo "FAIL: /etc/resolv.conf was not taken from /proc/net/dns (so DNS only works where 10.0.2.3 exists)"; ok=0; }; \

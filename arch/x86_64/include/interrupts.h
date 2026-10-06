@@ -16,10 +16,15 @@ struct regs {
     uint64_t rsp, ss;
 };
 
-typedef void (*irq_handler_t)(struct regs *r);
+typedef void (*isr_fn_t)(struct regs *r);
 
 void idt_init(void);
-void irq_install(int irq, irq_handler_t handler);
+/* IRQ numbers: 0-15 are the 8259's lines, 16-31 MSI/MSI-X vectors handed
+   out by apic.c. Either way IRQ n arrives as CPU vector 32 + n. */
+#define IRQ_MSI_FIRST 16
+#define NR_IRQS       32
+
+void irq_install(int irq, isr_fn_t handler);
 
 static inline void interrupts_enable(void)  { __asm__ volatile ("sti"); }
 static inline void interrupts_disable(void) { __asm__ volatile ("cli"); }

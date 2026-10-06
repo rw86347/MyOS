@@ -61,6 +61,18 @@
 #define NR_getrusage   77
 /* (more, 2026-10-05: time setting, capabilities, namespaces, swap) */
 #define NR_chroot          61
+#define NR_setxattr        226
+#define NR_lsetxattr       227
+#define NR_fsetxattr       228
+#define NR_getxattr        229
+#define NR_lgetxattr       230
+#define NR_fgetxattr       231
+#define NR_listxattr       232
+#define NR_llistxattr      233
+#define NR_flistxattr      234
+#define NR_removexattr     235
+#define NR_lremovexattr    236
+#define NR_fremovexattr    237
 #define NR_inotify_init    291
 #define NR_inotify_add_watch 292
 #define NR_inotify_rm_watch 293
@@ -93,6 +105,7 @@
 #define NR_clock_adjtime64 405
 #define NR_vfork       190
 #define NR_sendfile64  239
+#define NR_copy_file_range 377
 #define NR_mmap2       192
 #define NR_getdents64  220
 #define NR_fcntl64     221

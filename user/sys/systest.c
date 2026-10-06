@@ -26,7 +26,10 @@ enum { S_read = 0, S_write = 1, S_open = 2, S_close = 3, S_lseek = 8, S_mmap = 9
        S_personality = 135, S_statfs = 137, S_adjtimex = 159, S_chroot = 161,
        S_time = 201, S_fadvise = 221, S_clock_gettime = 228, S_exit_group = 231,
        S_inotify_add_watch = 254, S_inotify_rm_watch = 255, S_unshare = 272,
-       S_inotify_init1 = 294, S_syncfs = 306 };
+       S_inotify_init1 = 294, S_syncfs = 306, S_copy_file_range = 326,
+       S_getxattr = 191, S_fsetxattr = 190, S_flistxattr = 196,
+       S_ioctl = 16, S_socket = 41, S_sendto = 44, S_recvfrom = 45, S_bind = 49, S_setsockopt = 54,
+       S_getsockname = 51 };
 enum { F_GETLK = 5, F_SETLK = 6 };
 #else
 #define X64 0
@@ -42,7 +45,10 @@ enum { S_read = 3, S_write = 4, S_open = 5, S_close = 6, S_lseek = 19, S_mmap = 
        S_statfs = 268, S_adjtimex = 124, S_chroot = 61, S_time = 13,
        S_fadvise = 272, S_clock_gettime = 403, S_exit_group = 252,
        S_inotify_add_watch = 292, S_inotify_rm_watch = 293, S_unshare = 310,
-       S_inotify_init1 = 332, S_syncfs = 344 };
+       S_inotify_init1 = 332, S_syncfs = 344, S_copy_file_range = 377,
+       S_getxattr = 229, S_fsetxattr = 228, S_flistxattr = 234,
+       S_ioctl = 54, S_socket = 359, S_bind = 361, S_getsockname = 367,
+       S_sendto = 369, S_recvfrom = 371, S_setsockopt = 366 };
 enum { F_GETLK = 12, F_SETLK = 13 };    /* the flock64 ones (musl) */
 #endif
 
@@ -224,6 +230,27 @@ static void t_sendfile(void)
     check(n == 3000 && pos == 3000 && got == 3000 && same(buf2, buf, 3000),
           "sendfile file->pipe", n);
     SC1(S_close, p[0]); SC1(S_close, p[1]); SC1(S_close, src); SC1(S_close, dst);
+}
+
+/* copy_file_range with both offsets given (the files' positions stay), and
+   the extended-attribute calls' "not supported" answers. */
+static void t_copy_range(void)
+{
+    long src = SC3(S_open, "/tmp/sf_src", O_RDONLY, 0);      /* (from t_sendfile) */
+    long dst = SC3(S_open, "/tmp/cfr_dst", O_RDWR | O_CREAT | O_TRUNC, 0644);
+    int64_t in_off = 10, out_off = 5;
+    long n = SC6(S_copy_file_range, src, &in_off, dst, &out_off, 4000, 0);
+    long pos = SC3(S_lseek, dst, 0, 1);
+    SC3(S_lseek, dst, 5, 0);
+    long got = SC3(S_read, dst, buf2, 4000);
+    check(n == 4000 && in_off == 4010 && out_off == 4005 && pos == 0 && got == 4000 &&
+          same(buf2, buf + 10, 4000), "copy_file_range", n);
+    check(SC5(S_fsetxattr, dst, "user.x", "v", 1, 0) == -95 &&
+          SC3(S_flistxattr, dst, buf2, 100) == 0 &&
+          SC4(S_getxattr, "/tmp/no-such-file", "user.x", buf2, 100) == -2,
+          "xattr: not supported", 0);
+    SC1(S_close, src);
+    SC1(S_close, dst);
 }
 
 /* --- signals: sigaction with SA_SIGINFO, setitimer, pause ----------------- */
@@ -473,7 +500,7 @@ static void t_misc(void)
 
     long size = SC3(S_syslog, 10, 0, 0);
     long n = SC3(S_syslog, 3, buf, sizeof buf);
-    check(size == 16384 && n > 0 && contains(buf, n, "MyOS"), "syslog (dmesg)", n);
+    check(size == 65536 && n > 0 && contains(buf, n, "MyOS"), "syslog (dmesg)", n);
 
     long sf[32];
     fill(sf, 0, sizeof sf);
@@ -508,11 +535,352 @@ static void t_misc(void)
     SC1(S_close, fd);
 }
 
+/* --- netlink and the interface ioctls ---------------------------------- */
+
+struct nlmsghdr { uint32_t len; uint16_t type, flags; uint32_t seq, pid; };
+struct nlattr { uint16_t len, type; };
+struct sockaddr_nl { uint16_t family, pad; uint32_t pid, groups; };
+#define AF_UNIX 1
+#define AF_NETLINK 16
+#define SOCK_DGRAM 2
+#define SOCK_RAW 3
+#define NETLINK_ROUTE 0
+#define NETLINK_GENERIC 16
+#define NLM_F_REQUEST 1
+#define NLM_F_DUMP 0x300
+#define NLMSG_ERROR 2
+#define NLMSG_DONE 3
+#define RTM_NEWLINK 16
+#define RTM_GETLINK 18
+#define GENL_ID_CTRL 0x10
+#define ENOENT 2
+
+/* Send a request and read one answer datagram into buf: its length. */
+static long nl_ask(long fd, void *req, uint32_t len, void *buf, uint32_t size)
+{
+    struct sockaddr_nl k = { AF_NETLINK, 0, 0, 0 };
+    if (SC6(S_sendto, fd, req, len, 0, &k, sizeof k) != (long)len)
+        return -1;
+    return SC6(S_recvfrom, fd, buf, size, 0x40 /* MSG_DONTWAIT */, 0, 0);
+}
+
+/* The first attribute `type` after a fixed header of `skip` bytes. */
+static const struct nlattr *nl_attr(const struct nlmsghdr *h, uint32_t skip, uint16_t type)
+{
+    const uint8_t *p = (const uint8_t *)(h + 1) + skip, *end = (const uint8_t *)h + h->len;
+    while (p + 4 <= end) {
+        const struct nlattr *a = (const void *)p;
+        if (a->len < 4)
+            break;
+        if ((a->type & 0x3FFF) == type)
+            return a;
+        p += (a->len + 3u) & ~3u;
+    }
+    return 0;
+}
+
+static void t_netlink(void)
+{
+    static uint32_t buf[1024];          /* 4 KiB, aligned */
+    long fd = SC3(S_socket, AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+    struct sockaddr_nl me = { AF_NETLINK, 0, 0, 0 };
+    uint32_t mlen = sizeof me;
+    check(fd >= 0 && SC3(S_bind, fd, &me, sizeof me) == 0 &&
+          SC3(S_getsockname, fd, &me, &mlen) == 0 && mlen == sizeof me &&
+          me.family == AF_NETLINK && me.pid != 0, "netlink socket, bind", fd);
+
+    /* RTM_GETLINK dump: lo is link 1, then NLMSG_DONE. */
+    struct { struct nlmsghdr h; uint8_t family, pad[3]; } dump =
+        { { sizeof dump, RTM_GETLINK, NLM_F_REQUEST | NLM_F_DUMP, 7, 0 }, 0, { 0 } };
+    long n = nl_ask(fd, &dump, sizeof dump, buf, sizeof buf);
+    int lo = 0, done = 0, seq_ok = 1;
+    for (long off = 0; n > 0 && off + 16 <= n; ) {
+        const struct nlmsghdr *h = (const void *)((uint8_t *)buf + off);
+        if (h->len < 16 || off + (long)h->len > n)
+            break;
+        seq_ok &= h->seq == 7 && h->pid == me.pid;
+        if (h->type == RTM_NEWLINK) {
+            const struct nlattr *a = nl_attr(h, 16, 3 /* IFLA_IFNAME */);
+            int32_t index = *(const int32_t *)((const uint8_t *)(h + 1) + 4);
+            if (a && same(a + 1, "lo", 3) && index == 1)
+                lo = 1;
+        }
+        if (h->type == NLMSG_DONE)
+            done = 1;
+        off += (h->len + 3u) & ~3u;
+    }
+    check(lo && done && seq_ok, "rtnetlink link dump", n);
+    SC1(S_close, fd);
+
+    /* Generic netlink: the controller knows itself; nl80211 isn't there yet. */
+    fd = SC3(S_socket, AF_NETLINK, SOCK_RAW, NETLINK_GENERIC);
+    struct {
+        struct nlmsghdr h;
+        uint8_t cmd, version; uint16_t reserved;
+        struct nlattr a; char name[8];
+    } q = { { sizeof q, GENL_ID_CTRL, NLM_F_REQUEST, 1, 0 }, 3 /* GETFAMILY */, 1, 0,
+            { 4 + 7, 2 /* CTRL_ATTR_FAMILY_NAME */ }, "nlctrl" };
+    n = nl_ask(fd, &q, sizeof q, buf, sizeof buf);
+    const struct nlmsghdr *h = (const void *)buf;
+    const struct nlattr *id = n > 16 && h->type == GENL_ID_CTRL ? nl_attr(h, 4, 1) : 0;
+    check(id && *(const uint16_t *)(id + 1) == GENL_ID_CTRL, "genetlink family nlctrl", n);
+    q.a.len = 4 + 7;
+    for (int k = 0; k < 7; k++)
+        q.name[k] = "nl8021"[k];
+    n = nl_ask(fd, &q, sizeof q, buf, sizeof buf);
+    check(n >= 20 && h->type == NLMSG_ERROR && (int32_t)buf[4] == -ENOENT,
+          "genetlink unknown family", n >= 20 ? (int32_t)buf[4] : n);
+    SC1(S_close, fd);
+
+    /* SIOCGIFINDEX on a UNIX socket, as musl's if_nametoindex asks. */
+    struct { char name[16]; int32_t v; uint8_t pad[2 * sizeof(void *) + 4]; } ifr;
+    fill(&ifr, 0, sizeof ifr);
+    ifr.name[0] = 'l';
+    ifr.name[1] = 'o';
+    fd = SC3(S_socket, AF_UNIX, SOCK_DGRAM, 0);
+    check(SC3(S_ioctl, fd, 0x8933 /* SIOCGIFINDEX */, &ifr) == 0 && ifr.v == 1,
+          "SIOCGIFINDEX lo", ifr.v);
+    SC1(S_close, fd);
+}
+
+/* --- AF_PACKET: link-layer frames (wpa_supplicant's EAPOL, DHCP clients) --- */
+
+struct sockaddr_ll { uint16_t family, protocol; int32_t ifindex; uint16_t hatype;
+                     uint8_t pkttype, halen, addr[8]; };
+
+/* (Out of line: on i386 a six-argument syscall needs every register.) */
+static __attribute__((noinline)) long p_sendto(long fd, const void *b, long n, const void *to, long tl)
+{
+    return SC6(S_sendto, fd, b, n, 0, to, tl);
+}
+static __attribute__((noinline)) long p_recvfrom(long fd, void *b, long n, void *from, uint32_t *fl)
+{
+    return SC6(S_recvfrom, fd, b, n, 0x40 /* MSG_DONTWAIT */, from, fl);
+}
+
+static void t_packet(void)
+{
+    /* eth0's index and address, as wpa_supplicant's l2_packet asks for them. */
+    struct { char name[16]; union { int32_t index; struct { uint16_t family; uint8_t mac[14]; } hw; } u;
+             uint8_t pad[2 * sizeof(void *)]; } ifr;
+    long fd = SC3(S_socket, 17 /* AF_PACKET */, SOCK_DGRAM, 0x0608 /* htons(ETH_P_ARP) */);
+    check(fd >= 0, "AF_PACKET socket", fd);
+    fill(&ifr, 0, sizeof ifr);
+    for (int k = 0; k < 5; k++)
+        ifr.name[k] = "eth0"[k];
+    if (SC3(S_ioctl, fd, 0x8933 /* SIOCGIFINDEX */, &ifr) != 0) {
+        SC1(S_close, fd);
+        return;                         /* no eth0 here */
+    }
+    int32_t idx = ifr.u.index;
+    check(SC3(S_ioctl, fd, 0x8927 /* SIOCGIFHWADDR */, &ifr) == 0, "packet socket: SIOCGIFHWADDR", 0);
+    uint8_t mac[6];
+    for (int k = 0; k < 6; k++)
+        mac[k] = ifr.u.hw.mac[k];
+    struct sockaddr_ll ll = { 17, 0x0608, idx, 1, 0, 6, { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff } };
+    check(SC3(S_bind, fd, &ll, sizeof ll) == 0, "packet socket: bind to eth0, ARP", 0);
+
+    /* Who has 10.0.2.2 (QEMU's gateway)? Sent and answered through the socket. */
+    uint8_t arp[28] = { 0, 1, 8, 0, 6, 4, 0, 1 };
+    for (int k = 0; k < 6; k++)
+        arp[8 + k] = mac[k];
+    arp[14] = 10; arp[15] = 0; arp[16] = 2; arp[17] = 15;
+    arp[24] = 10; arp[25] = 0; arp[26] = 2; arp[27] = 2;
+    check(p_sendto(fd, arp, sizeof arp, &ll, sizeof ll) == (long)sizeof arp,
+          "packet socket: send an ARP request", 0);
+    static uint8_t got[64];
+    struct sockaddr_ll from;
+    uint32_t flen = sizeof from;
+    long n = 0, start = now_ms();
+    while (now_ms() - start < 2000) {
+        flen = sizeof from;
+        n = p_recvfrom(fd, got, sizeof got, &from, &flen);
+        if (n >= 28 && got[7] == 2 && got[14] == 10 && got[17] == 2)
+            break;                      /* the reply (not our own request) */
+        long tv[2] = { 0, 10000 };
+        SC5(S_select, 0, 0, 0, 0, tv);
+    }
+    check(n >= 28 && got[7] == 2 && from.family == 17 && from.ifindex == idx && from.halen == 6 &&
+          same(from.addr, got + 8, 6), "packet socket: the ARP reply, with the sender's address", n);
+    SC1(S_close, fd);
+}
+
+/* --- nl80211: Wi-Fi's netlink family (W2c) ------------------------------ */
+
+#define NL80211_CMD_GET_INTERFACE    5
+#define NL80211_CMD_NEW_INTERFACE    7
+#define NL80211_CMD_GET_SCAN         32
+#define NL80211_CMD_TRIGGER_SCAN     33
+#define NL80211_CMD_NEW_SCAN_RESULTS 34
+#define NL80211_ATTR_IFINDEX         3
+#define NL80211_ATTR_IFNAME          4
+#define NL80211_ATTR_BSS             47
+#define NL80211_BSS_FREQUENCY        2
+#define NL80211_BSS_INFORMATION_ELEMENTS 6
+#define NL80211_BSS_SIGNAL_MBM       7
+#define NLM_F_ACK                    4
+
+struct genl_req {
+    struct nlmsghdr h;
+    uint8_t cmd, version; uint16_t reserved;
+    struct nlattr a; uint32_t v;        /* one u32 attribute (the ifindex) */
+};
+
+/* Every message in a datagram of n bytes: f(message) for each. */
+#define each_msg(h, base, n) \
+    for (const struct nlmsghdr *h = (const void *)(base); \
+         (const uint8_t *)h + 16 <= (const uint8_t *)(base) + (n) && h->len >= 16 && \
+         (const uint8_t *)h + h->len <= (const uint8_t *)(base) + (n); \
+         h = (const void *)((const uint8_t *)h + ((h->len + 3u) & ~3u)))
+
+/* The attribute `type` inside a nested attribute. */
+static const struct nlattr *nested(const struct nlattr *outer, uint16_t type)
+{
+    const uint8_t *p = (const uint8_t *)(outer + 1), *end = (const uint8_t *)outer + outer->len;
+    while (p + 4 <= end) {
+        const struct nlattr *a = (const void *)p;
+        if (a->len < 4 || p + a->len > end)
+            break;
+        if ((a->type & 0x3FFF) == type)
+            return a;
+        p += (a->len + 3u) & ~3u;
+    }
+    return 0;
+}
+
+/* The family "nl80211": its id, and the id of its multicast group "scan". */
+static int nl80211_ids(long fd, uint16_t *family, uint32_t *scan, uint32_t *buf, uint32_t size)
+{
+    struct {
+        struct nlmsghdr h;
+        uint8_t cmd, version; uint16_t reserved;
+        struct nlattr a; char name[8];
+    } q = { { sizeof q, GENL_ID_CTRL, NLM_F_REQUEST, 1, 0 }, 3, 1, 0,
+            { 4 + 8, 2 }, "nl80211" };
+    long n = nl_ask(fd, &q, sizeof q, buf, size);
+    const struct nlmsghdr *h = (const void *)buf;
+    if (n < 20 || h->type != GENL_ID_CTRL)
+        return 0;
+    const struct nlattr *id = nl_attr(h, 4, 1), *groups = nl_attr(h, 4, 7);
+    if (!id || !groups)
+        return 0;
+    *family = *(const uint16_t *)(id + 1);
+    for (uint16_t k = 1; k < 16; k++) {
+        const struct nlattr *g = nested(groups, k);
+        const struct nlattr *name = g ? nested(g, 1) : 0, *gid = g ? nested(g, 2) : 0;
+        if (name && gid && same(name + 1, "scan", 5))
+            *scan = *(const uint32_t *)(gid + 1);
+    }
+    return *scan != 0;
+}
+
+/* Up to `ms` milliseconds for a datagram: its length, or 0. */
+static long nl_wait(long fd, void *buf, uint32_t size, long ms)
+{
+    long start = now_ms();
+    while (now_ms() - start < ms) {
+        long n = SC6(S_recvfrom, fd, buf, size, 0x40 /* MSG_DONTWAIT */, 0, 0);
+        if (n > 0)
+            return n;
+        long tv[2] = { 0, 10000 };
+        SC5(S_select, 0, 0, 0, 0, tv);
+    }
+    return 0;
+}
+
+static void t_nl80211(void)
+{
+    static uint32_t buf[2048];          /* 8 KiB, aligned */
+    long fd = SC3(S_socket, AF_NETLINK, SOCK_RAW, NETLINK_GENERIC);
+    uint16_t fam = 0;
+    uint32_t scan_grp = 0;
+    check(nl80211_ids(fd, &fam, &scan_grp, buf, sizeof buf), "nl80211 family, its scan group",
+          fam);
+
+    /* The interfaces: is there a wlan0? (Only `make test` kernels have a radio.) */
+    struct genl_req r = { { 20, fam, NLM_F_REQUEST | NLM_F_DUMP, 2, 0 },
+                          NL80211_CMD_GET_INTERFACE, 1, 0, { 0, 0 }, 0 };
+    long n = nl_ask(fd, &r, 20, buf, sizeof buf);
+    uint32_t ifindex = 0;
+    each_msg(h, buf, n) {
+        const struct nlattr *name = h->type == fam ? nl_attr(h, 4, NL80211_ATTR_IFNAME) : 0;
+        const struct nlattr *idx = h->type == fam ? nl_attr(h, 4, NL80211_ATTR_IFINDEX) : 0;
+        if (name && idx && same(name + 1, "wlan0", 6))
+            ifindex = *(const uint32_t *)(idx + 1);
+    }
+    if (!ifindex) {
+        SC1(S_close, fd);
+        return;                         /* no Wi-Fi radio in this kernel */
+    }
+    check(ifindex > 1, "nl80211 interface dump: wlan0", (long)ifindex);
+
+    /* Up, as `ip link set wlan0 up` does it. */
+    struct { char name[16]; int16_t flags; uint8_t pad[2 * sizeof(void *) + 6]; } ifr;
+    fill(&ifr, 0, sizeof ifr);
+    for (int k = 0; k < 6; k++)
+        ifr.name[k] = "wlan0"[k];
+    long ufd = SC3(S_socket, AF_UNIX, SOCK_DGRAM, 0);
+    SC3(S_ioctl, ufd, 0x8913 /* SIOCGIFFLAGS */, &ifr);
+    ifr.flags |= 1;                     /* IFF_UP */
+    check(SC3(S_ioctl, ufd, 0x8914 /* SIOCSIFFLAGS */, &ifr) == 0, "wlan0 up", 0);
+
+    /* Listen for scan events, start a scan, wait for the results event. */
+    check(SC5(S_setsockopt, fd, 270 /* SOL_NETLINK */, 1 /* ADD_MEMBERSHIP */, &scan_grp, 4) == 0,
+          "join the scan group", (long)scan_grp);
+    struct genl_req t = { { sizeof t, fam, NLM_F_REQUEST | NLM_F_ACK, 3, 0 },
+                          NL80211_CMD_TRIGGER_SCAN, 1, 0, { 8, NL80211_ATTR_IFINDEX }, ifindex };
+    struct sockaddr_nl k = { AF_NETLINK, 0, 0, 0 };
+    SC6(S_sendto, fd, &t, sizeof t, 0, &k, sizeof k);
+    int acked = 0, started = 0, results = 0;
+    long err = 1;
+    for (int tries = 0; tries < 8 && !results; tries++) {
+        n = nl_wait(fd, buf, sizeof buf, 3000);
+        each_msg(h, buf, n) {
+            if (h->type == NLMSG_ERROR && h->seq == 3) {
+                err = *(const int32_t *)(h + 1);
+                acked = 1;
+            }
+            if (h->type == fam && h->seq == 0) {
+                uint8_t cmd = *(const uint8_t *)(h + 1);
+                started |= cmd == NL80211_CMD_TRIGGER_SCAN;
+                results |= cmd == NL80211_CMD_NEW_SCAN_RESULTS;
+            }
+        }
+    }
+    check(acked && err == 0, "nl80211 TRIGGER_SCAN accepted", err);
+    check(started && results, "nl80211 scan events: started, results", started * 2 + results);
+
+    /* The results: MyOS-Test on 2437 MHz at -42 dBm. */
+    struct genl_req g = { { sizeof g, fam, NLM_F_REQUEST | NLM_F_DUMP, 4, 0 },
+                          NL80211_CMD_GET_SCAN, 1, 0, { 8, NL80211_ATTR_IFINDEX }, ifindex };
+    n = nl_ask(fd, &g, sizeof g, buf, sizeof buf);
+    int found = 0, networks = 0;
+    each_msg(h, buf, n) {
+        const struct nlattr *bss = h->type == fam ? nl_attr(h, 4, NL80211_ATTR_BSS) : 0;
+        if (!bss)
+            continue;
+        networks++;
+        const struct nlattr *freq = nested(bss, NL80211_BSS_FREQUENCY);
+        const struct nlattr *sig = nested(bss, NL80211_BSS_SIGNAL_MBM);
+        const struct nlattr *ies = nested(bss, NL80211_BSS_INFORMATION_ELEMENTS);
+        const uint8_t *ie = ies ? (const uint8_t *)(ies + 1) : 0;
+        if (freq && sig && ie && ie[0] == 0 /* SSID */ && ie[1] == 9 && same(ie + 2, "MyOS-Test", 9))
+            found = *(const uint32_t *)(freq + 1) == 2437 && *(const int32_t *)(sig + 1) == -4200;
+    }
+    check(networks == 2 && found, "nl80211 scan results: MyOS-Test, 2437 MHz, -42 dBm", networks);
+
+    ifr.flags &= ~1;
+    SC3(S_ioctl, ufd, 0x8914, &ifr);
+    SC1(S_close, ufd);
+    SC1(S_close, fd);
+}
+
 void cmain(void)
 {
     t_cputime();
     t_clocks();
     t_sendfile();
+    t_copy_range();
     t_signals();
     t_sem();
     t_msg();
@@ -520,6 +888,17 @@ void cmain(void)
     t_inotify();
     t_locks();
     t_misc();
+    t_netlink();
+    t_packet();
+    t_nl80211();
+    /* Leave /tmp as we found it: its files are memory (`make test` counts
+       every page after the programs have run). */
+    SC1(S_unlink, "/tmp/sf_src");
+    SC1(S_unlink, "/tmp/sf_dst");
+    SC1(S_unlink, "/tmp/cfr_dst");
+    SC1(S_unlink, "/tmp/lockf");
+    SC1(S_rmdir, "/tmp/itest");
+    SC1(S_rmdir, "/tmp/jail");
     if (failed) {
         out("systest: ");
         outn(failed);

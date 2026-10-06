@@ -1,0 +1,5 @@
+#ifndef LINUX_TIMEKEEPING_H
+#define LINUX_TIMEKEEPING_H
+#include <linux/ktime.h>
+#include <linux/time.h>
+#endif

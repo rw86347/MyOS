@@ -23,6 +23,11 @@ void pcache_selftest(void);
 void bio_selftest(void);
 void fatvfs_selftest(void);
 void net_selftest(void);
+void firmware_selftest(void);
+void shim_selftest(void);
+void shim_pci_selftest(void);
+void shim_net_selftest(void);
+void wifi_selftest(void);
 
 void check(int ok, const char *what)
 {
@@ -48,6 +53,7 @@ void run_selftests(void)
             TIMER_HZ, timer_ms() - t0);
 
     initrd_selftest();      /* the initramfs arrived intact */
+    firmware_selftest();    /* request_firmware, from the archive */
     mem_selftest();         /* first: it checks the heap is back to empty */
     random_selftest();      /* ChaCha20 against the RFC vector */
     drm_selftest();         /* display modes, the Bochs VGA, fbdev, fbcon */
@@ -58,6 +64,10 @@ void run_selftests(void)
     fatvfs_selftest();      /* FAT32 files through the VFS */
     net_selftest();         /* loopback packet path, PCI e1000 */
     thread_selftest();      /* kernel threads + context switch */
+    shim_selftest();        /* the Linux driver API: timers, work, locks */
+    shim_pci_selftest();    /* ...and PCI, IRQs, DMA, on QEMU's edu card */
+    shim_net_selftest();    /* ...and sk_buffs, net_devices, NAPI */
+    wifi_selftest();        /* the 802.11 core, on the simulated radio */
     user_selftest();        /* ring 3 programs, syscalls, ELF, FPU */
     sched_selftest();       /* starts the 20 x 1 ms slot scheduler */
     selftest_summary();

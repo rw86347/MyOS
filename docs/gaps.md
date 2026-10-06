@@ -20,12 +20,14 @@ when it's fixed. File references point at the comment that mentions the gap.
   initramfs; /data must be on another disk. Only ext2 disks labelled `myos-data` are
   mounted — any other (someone's Linux disk in an old PC) is left alone.
 - **E820 map holds at most 32 entries.** (`layout.inc`, `E820_MAX`)
-- **UEFI loader starts the existing 32-bit kernel** (`make uefi` / `make live-uefi`).
-  The x86_64 kernel (2026-10-05) is the portable kernel in the higher half;
-  it runs 64-bit BusyBox from the initramfs (`make ARCH=x86_64
-  test-uefi-shell`, with signals) but not yet the live disk's myos-login.
-  Lengths inside mm.c are 32-bit (a 4 GiB+ mmap is refused). The list is
-  in docs/x86_64-PORT-PLAN.md. GOP above 4 GiB on i386 is mapped with PSE-36
+- **x86_64 live userland builds; graphical login blocked on syscalls** (2026-10-05).
+  `make ARCH=x86_64 live-extra` / `live-uefi` produce ELF64 musl binaries and
+  images; `test-live-uefi` mounts myos-root. Runit stage 1 runs from the login
+  initrd but stops in first-boot: **430** (`fsopen`, util-linux `mount`),
+  **326** (`copy_file_range`), **190** (`vfork`) — see `docs/x86_64-LIVE-HANDOFF.md`.
+  BusyBox shell still works (`make ARCH=x86_64 test-uefi-shell`). i386
+  `make live-uefi` uses the 32-bit kernel.
+- **UEFI / GOP (i386):** GOP above 4 GiB on i386 is mapped with PSE-36
   for the kernel console (32-bit virtual address, 36-bit physical in
   the PDE). User `mmap` of `/dev/fb0` cannot name that address (32-bit
   PTEs), so `simplefb` keeps an 8 MiB RAM shadow and, on the first mmap,
@@ -107,6 +109,19 @@ when it's fixed. File references point at the comment that mentions the gap.
   with no /sys udev would have nothing to read.
 
 ## CPU / interrupts
+
+- MSI/MSI-X (W0a, 2026-10-06): 16 IRQs in all (16-31), handed out once and
+  never given back; every message goes to the boot CPU. No IOAPIC: a device
+  whose only interrupt is a line the 8259 can't see, and that has no MSI,
+  gets none. The i386 kernel can't map registers above 4 GiB (no PAE), so
+  under UEFI firmware that places 64-bit BARs high its NVMe stays off.
+
+- The tick: the 8254 PIT, or the HPET in legacy replacement mode when the PIT
+  is silent (gated on new Intel chipsets; found on the MSI 2026-10-06). The
+  HPET is assumed at 0xFED00000 (Intel and AMD default) because the ACPI HPET
+  table isn't read yet. With neither, the boot says "NO TICK" and sleeps never
+  end. The planned tick is the local APIC timer in one-shot mode (CLAUDE.md),
+  which also needs the APIC instead of the 8259 for device interrupts.
 - **Uses the old 8259 PIC and PIT**; real machines from ~2005 have the APIC. Switch to the
   local APIC timer / IOAPIC later. (`arch/i386/pic.c`)
 - **No double-fault task gate.** A kernel stack overflow becomes a triple fault (reboot)
@@ -378,6 +393,14 @@ when it's fixed. File references point at the comment that mentions the gap.
 
 ## Networking configuration (step 10f, 2026-10-03)
 
+- Netlink (W0b, 2026-10-06) answers questions only: links, addresses and
+  routes can't be changed through it yet (RTM_NEWLINK/NEWADDR/NEWROUTE are
+  EOPNOTSUPP; SIOCSIFFLAGS can bring a link up or down). Multicast groups
+  are remembered but no events are sent, so a program watching for a link
+  to come up never hears it. No `ip route get`. Messages between programs
+  (a destination pid other than 0) are refused. No /proc/net/dev, so
+  `ifconfig` prints no counters.
+
 - **No DHCP lease renewal.** `net/dhcp.c` parses the lease time and ignores
   it: the address is kept until reboot. On a network whose server hands it to
   someone else when the lease expires, two machines end up with one address.
@@ -441,6 +464,14 @@ when it's fixed. File references point at the comment that mentions the gap.
 
 ## Drivers
 
+- Serial (COM1): a machine without a UART used to jam the console once the
+  8 KiB output ring filled (nothing emptied it; found on the MSI 2026-10-06).
+  Now serial_init checks for the UART and turns serial off without one. Still
+  open: a UART that exists but whose IRQ 4 never arrives (not routed through
+  the 8259 on some modern boards) would fill the ring the same way. The
+  console makes a program wait for serial room on purpose, so test logs lose
+  nothing; a missing interrupt needs a fallback (refill from the timer tick,
+  or drop serial output when it stops draining).
 - The e1000's transmit descriptors were only reclaimed inside `e1000_poll`,
   which runs from `net_rx_action`. Nothing on the transmit path called it and
   a completed transmit raises no interrupt (only `IMS_RXT0|IMS_LSC` are
@@ -471,6 +502,73 @@ when it's fixed. File references point at the comment that mentions the gap.
 - `drain()` reads `rx_count` outside `irq_save`. Safe only because `netif_rx`
   is never actually called from an interrupt handler, which the `irq_save`
   inside it suggests was once the intent.
+
+- IPv4 runs on one device at a time (W3b, 2026-10-06): the active one is the
+  last link that became usable (Wi-Fi once connected and authorized), and
+  each device keeps its own lease for when it is active again. Enough for a
+  laptop with one network at a time; two networks at once (wired and Wi-Fi,
+  routes by destination) need real per-device routing. Connections made on
+  the old device stop working when IPv4 moves, as when a laptop changes
+  networks. The kernel's own DHCP client renews nothing (an hour's lease
+  from the simulated AP, forever).
+- The Linux driver API (W2a, 2026-10-06), shortcuts a driver could notice:
+  - `dmi_check_system` never matches: we don't read the SMBIOS tables, so a
+    driver's per-laptop quirk tables are skipped.
+  - `pci_disable_link_state` does nothing (ASPM stays as the firmware set
+    it). iwlwifi asks for L0s/L1 off on some chips; if the AX201 is flaky
+    on the MSI, this is a first suspect. `pci_reset_function` (FLR),
+    `pci_stop_and_remove_bus_device` and `pci_rescan_bus` are declared but
+    not written yet (a driver's last-resort recovery).
+  - Crash dumps (`dev_coredump*`) are freed at once: nowhere to put them.
+  - `net_ratelimit()` is always true: a flood of driver errors all print.
+  - `kobject_uevent*` reach no one (no sysfs, no udev).
+  - `dump_stack()` prints only the caller's address (no frame pointers).
+  - `BUILD_BUG_ON` with a non-constant checks nothing (Linux's would catch
+    some of those at build time through the optimizer).
+- WPA2 (W3c, 2026-10-06):
+  - **No software crypto.** Keys go to the driver (set_key); a driver that
+    refuses a cipher can't join networks that need it. No TKIP (WPA1), no
+    WEP, no management-frame protection (802.11w: the IGTK, BIP), no SAE
+    (WPA3) yet — iwlwifi does all of these in hardware, so they come with
+    W6/W7 if the home network wants them.
+  - Received packet numbers aren't checked by us (replay protection): we
+    trust the hardware (iwlwifi checks them, `RX_FLAG_PN_VALIDATED`).
+  - The group key's rekeying (the AP's 2-way handshake) is wpa_supplicant's
+    and should work, but the simulated AP never rekeys, so it's untested.
+  - AF_PACKET (`net/packet.c`): no socket filters (SO_ATTACH_FILTER is
+    accepted and ignored), no PACKET_MMAP rings, no promiscuous mode, no
+    outgoing-frame taps (a packet socket sees received frames only).
+  - No rtnetlink link events (RTM_NEWLINK/DELLINK): when a driver makes
+    wlan0 again, wpa_supplicant doesn't hear it; its runit service watches
+    wlan0's interface number and starts over instead.
+  - RTM_SETLINK (link mode "dormant") is answered with an error that
+    wpa_supplicant ignores; there is no `/dev/rfkill`.
+- The tray (myos-menu, 2026-10-06) has one slot: the first program to dock
+  gets it (the Wi-Fi icon); a second one isn't shown. The volume icon is
+  still a picture.
+- Unix datagram sockets (2026-10-06): at most 16 datagrams / 64 KiB wait
+  for one socket and a datagram is at most 16 KiB (Linux allows ~200 KiB);
+  no autobind (an unbound sender is nameless, so it can't be answered); no
+  SO_PASSCRED / SCM_CREDENTIALS; shutdown() on a datagram socket says
+  ENOTCONN.
+- iwlwifi on our core (W6, 2026-10-06), what differs from mac80211:
+  - A firmware restart replays the connection to the driver as mac80211
+    does (interface, channel, link settings, the AP's peer, keys), but not
+    a scan that was running, and the queue timing it replays is our default
+    (we don't use the AP's WMM parameters yet).
+  - No block-ack sessions: we never start one and ignore the AP's ADDBA,
+    so no A-MPDU aggregation — Wi-Fi 6 works, but well below its speed.
+  - Signal-quality (CQM) events aren't sent to wpa_supplicant (no roaming
+    by signal); beacon loss waits for the driver's connection loss.
+  - No channel-switch handling: an AP that changes channel is lost and
+    found again.
+  - No 802.11w (management frame protection): networks that require it
+    (WPA3, some WPA2) can't be joined yet.
+  - PCI: "remove" hides the device and "rescan" brings it back (no real
+    re-enumeration); pci_find_ext_capability always says none (no ECAM yet),
+    so iwlwifi skips what it would set there (LTR, L1 substates).
+  - No wireless-regdb of our own: a card that doesn't know its country
+    keeps the channels its driver registered (Intel's cards know).
 
 ### Display (step 11b, 2026-10-03)
 - **Only QEMU/UTM's std VGA (Bochs, 1234:1111) gets graphics.** Real old PCs and every
@@ -519,6 +617,24 @@ when it's fixed. File references point at the comment that mentions the gap.
   round trips (instant in QEMU; on a real mouse maybe 10-30 ms of boot time — make it
   interrupt-driven if a real machine shows it). Movements go into a 64-entry ring that
   nothing reads yet: `/dev/input` for X comes next (step 11b). No USB mouse.
+- **Laptop touchpad is I2C HID, not the PS/2 mouse** (MSI Katana GF66 11UE,
+  `docs/hardware-msi-katana-gf66.md`, 2026-10-06). The pad (Synaptics `06CB:7E7E`
+  or ELAN `04F3:30AA` on `PNP0C50`) reports each finger. Two-finger scrolling
+  like a Mac is possible on the hardware. It is not on the 8042 AUX port
+  (`drivers/mouse.c` may see a ghost pointer). Split:
+  - **Kernel (the blocker):** Intel LPSS I2C `8086:43e8` (`intel-lpss` +
+    `i2c-designware`), then `i2c-hid` and `hid-multitouch`. Put contacts on a
+    real `/dev/input/event*` as `ABS_MT_*`, or synthesize `REL_WHEEL` there.
+    `drivers/evdev.c` only speaks PS/2 `REL_X`/`REL_Y`/`REL_WHEEL` on event1.
+    No I2C, no HID. SMBus `8086:43a3` is a different adapter; the pad is not
+    on it.
+  - **Userspace (the Mac feel):** natural scroll (content follows the fingers),
+    tap-to-click, pinch. That is libinput (or the old X Synaptics driver). The
+    live disk has only `xf86-input-evdev` on `/dev/input/event1`
+    (`live/overlay/etc/X11/xorg.conf.d/10-myos.conf`), which does not turn
+    finger positions into a gesture. Until the kernel emits a wheel, or we add
+    libinput, two fingers do nothing even if HID is up. Force Touch, inertia
+    and Spaces swipes are not this pad.
 - **All drivers are in the kernel**; the plan is to move most to user space. (`docs/DESIGN.md`)
 - **Network security, not yet done** (needed before "bullet proof"; the threat model and
   the plan are in `docs/security.md`):
@@ -586,7 +702,10 @@ when it's fixed. File references point at the comment that mentions the gap.
   the two are told apart by whether `snd_wnd` is zero. Smaller and one timer fewer, but it
   means a connection that alternates between a shut window and real loss shares one counter
   between the two.
-- **TCP** (step 10e): client side only, no listen/accept. No congestion control
+- **TCP** (step 10e): client side only, no listen/accept. The live disk ships
+  OpenSSH (`sshd` under runit, `ssh` the client) and a static web server
+  (`darkhttpd`, off until `doas myos-httpd enable`). Neither can accept a
+  connection until listen/accept exist. Outbound `ssh` can still reach another host. No congestion control
   (no slow start): at most 4 segments in flight, a fixed limit, not a response to
   loss. No out-of-order queue, SACK, window scaling (16 KiB window), timestamps,
   or RTT estimate (retransmit timer 250 ms doubling to 4 s, 8 tries; a shut window
@@ -650,6 +769,9 @@ All of these are fixed; what is left is the testing gap and the capability one.
 - **`/sys` holds one thing**: `class/graphics/fb0`, because the X server's fbdev
   driver refuses a screen without it (`fs/sysfs.c`). Anything else that reads /sys —
   udev, libinput, power management — finds nothing.
+- **Two-finger scroll needs kernel HID first**, then a userspace gesture
+  reader. X only binds `xf86-input-evdev` to event0/event1. The laptop pad
+  and the split (kernel vs libinput) are under Drivers.
 - **Programs that look at other processes find nothing.** With no `/proc/<pid>`,
   `pidof`, `pgrep`, `ps` and `top` come back empty, so service scripts that wait for
   a program to appear spin for ever.

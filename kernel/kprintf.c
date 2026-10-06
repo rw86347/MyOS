@@ -180,11 +180,16 @@ static void vformat(struct out *o, const char *fmt, va_list ap)
 /*
  * Everything kprintf and klog print is also kept in a ring buffer, so that
  * `dmesg` (the syslog syscall) can show it later — on a real machine, where
- * nobody was watching the serial port at boot. 16 KiB: a boot is ~4 KiB.
+ * nobody was watching the serial port at boot. 64 KiB: a boot is ~4 KiB,
+ * but one Wi-Fi firmware crash dump is ~5 KiB, and its debug lines more.
  * When it is full the oldest text goes. `head` counts every byte ever
  * written; the byte for count c is at logbuf[c % LOG_SIZE].
  */
-#define LOG_SIZE 16384                  /* a power of two */
+#ifdef MYOS_IWLDEBUG
+#define LOG_SIZE 262144                 /* (make IWLDEBUG=1: the driver's debug lines) */
+#else
+#define LOG_SIZE 65536                  /* a power of two */
+#endif
 static char logbuf[LOG_SIZE];
 static uint32_t log_head;               /* bytes written since boot */
 static uint32_t log_cleared;            /* dmesg -c: start of what READ_ALL shows */
@@ -225,7 +230,11 @@ void klog(const char *fmt, ...)
 {
     va_list ap;
     va_start(ap, fmt);
+#ifdef TRACE_EXEC
+    struct out o = { to_console, 0, {0} };  /* make TRACE=1: on the screen too */
+#else
     struct out o = { to_serial, 0, {0} };
+#endif
     vformat(&o, fmt, ap);
     va_end(ap);
 }

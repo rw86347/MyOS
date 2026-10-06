@@ -41,9 +41,10 @@ vec%1:
 
 section .text
 
-; Generate the 48 stubs. Exceptions 8, 10-14, 17, 21, 29, 30 have error codes.
+; Generate the 64 stubs: 0-31 CPU exceptions (8, 10-14, 17, 21, 29, 30 have
+; error codes), 32-47 the 8259's IRQs 0-15, 48-63 MSI IRQs 16-31 (apic.c).
 %assign i 0
-%rep 48
+%rep 64
   %if i == 8 || (i >= 10 && i <= 14) || i == 17 || i == 21 || i == 29 || i == 30
     STUB_ERR i
   %else
@@ -51,6 +52,12 @@ section .text
   %endif
   %assign i i+1
 %endrep
+
+; Vector 0xFF: the local APIC's "spurious" interrupt (one it had to take
+; back). It wants no EOI and there is nothing to do: return at once.
+global isr_spurious
+isr_spurious:
+    iretd
 
 ; int 0x80: system calls. Same shape as the others (no error code).
 global isr_syscall
@@ -90,12 +97,12 @@ isr_return:
     add esp, 8                  ; drop vector number + error code
     iretd                       ; return to the interrupted code (pops EIP, CS, EFLAGS)
 
-; Table of the 48 stub addresses, so C can fill in the IDT with a loop.
+; Table of the 64 stub addresses, so C can fill in the IDT with a loop.
 section .rodata
 global isr_stub_table
 isr_stub_table:
 %assign i 0
-%rep 48
+%rep 64
     dd vec %+ i
   %assign i i+1
 %endrep

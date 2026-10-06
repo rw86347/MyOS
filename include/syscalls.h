@@ -138,6 +138,18 @@ SYSCALL_DEF(sys_fstatfs64);
 SYSCALL_DEF(sys_mount);
 SYSCALL_DEF(sys_umount2);
 SYSCALL_DEF(sys_pivot_root);
+SYSCALL_DEF(sys_setxattr);              /* extended attributes: none here */
+SYSCALL_DEF(sys_lsetxattr);
+SYSCALL_DEF(sys_fsetxattr);
+SYSCALL_DEF(sys_getxattr);
+SYSCALL_DEF(sys_lgetxattr);
+SYSCALL_DEF(sys_fgetxattr);
+SYSCALL_DEF(sys_listxattr);
+SYSCALL_DEF(sys_llistxattr);
+SYSCALL_DEF(sys_flistxattr);
+SYSCALL_DEF(sys_removexattr);
+SYSCALL_DEF(sys_lremovexattr);
+SYSCALL_DEF(sys_fremovexattr);
 
 /* fs/inotify.c */
 SYSCALL_DEF(sys_inotify_init);

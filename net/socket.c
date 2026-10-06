@@ -12,7 +12,8 @@
  * then sleeps on net_wait, which the e1000 interrupt wakes.
  *
  * Supported: AF_INET with SOCK_STREAM (TCP, client side: tcp.c), SOCK_DGRAM
- * (UDP) and SOCK_RAW + IPPROTO_ICMP (ping). AF_UNIX is in unix.c. AF_INET6 says EAFNOSUPPORT, which musl's resolver expects on a
+ * (UDP) and SOCK_RAW + IPPROTO_ICMP (ping). AF_UNIX is in unix.c,
+ * AF_NETLINK in netlink.c, AF_PACKET in packet.c. AF_INET6 says EAFNOSUPPORT, which musl's resolver expects on a
  * machine without IPv6.
  */
 #include <errno.h>
@@ -525,6 +526,8 @@ static uint32_t sock_poll(struct file *f)
 static int32_t sock_ioctl(struct file *f, uint32_t cmd, uintptr_t arg)
 {
     struct sock *s = f->priv;
+    if ((cmd & 0xFF00) == 0x8900)
+        return dev_ioctl(cmd, arg);     /* SIOCGIFINDEX and friends */
     if (cmd == FIONREAD) {
         net_rx_action();
         uint32_t n = s->type == SOCK_STREAM ? tcp_rx_avail(s->tcp)
@@ -573,15 +576,24 @@ static const struct file_ops sock_ops = {
 
 /* --- the syscalls -------------------------------------------------------- */
 
-/* An AF_UNIX socket's calls are in unix.c. */
+/* An AF_UNIX socket's calls are in unix.c, an AF_NETLINK socket's in
+   netlink.c. */
 #define TO_UNIX(fn) \
     do { if (unix_fd(a1)) return fn(a1, a2, a3, a4, a5, a6); } while (0)
+#define TO_NETLINK(fn) \
+    do { if (netlink_fd(a1)) return fn(a1, a2, a3, a4, a5, a6); } while (0)
+#define TO_PACKET(fn) \
+    do { if (packet_fd(a1)) return fn(a1, a2, a3, a4, a5, a6); } while (0)
 
 /* int socket(int domain, int type, int protocol) */
 SYSCALL_DEF(sys_socket)
 {
     if (a1 == AF_UNIX)
         return unix_socket(a2, a3);
+    if (a1 == AF_NETLINK)
+        return netlink_socket(a2, a3);
+    if (a1 == AF_PACKET)
+        return packet_socket(a2, a3);
     if (a1 != AF_INET)
         return -EAFNOSUPPORT;
     uint32_t type = a2 & SOCK_TYPE_MASK;
@@ -632,6 +644,8 @@ SYSCALL_DEF(sys_socket)
 SOCK_SYSCALL(sys_bind)
 {
     TO_UNIX(unix_bind);
+    TO_NETLINK(netlink_bind);
+    TO_PACKET(packet_bind);
     struct sock *s = sock_of(a1, 0);
     if (!s)
         return bad_fd(a1);
@@ -660,6 +674,8 @@ SOCK_SYSCALL(sys_bind)
 SOCK_SYSCALL(sys_connect)
 {
     TO_UNIX(unix_connect);
+    TO_NETLINK(netlink_connect);
+    TO_PACKET(packet_unsupported);
     struct file *f;
     struct sock *s = sock_of(a1, &f);
     if (!s)
@@ -698,6 +714,8 @@ SOCK_SYSCALL(sys_connect)
 SOCK_SYSCALL(sys_getsockname)
 {
     TO_UNIX(unix_getsockname);
+    TO_NETLINK(netlink_getsockname);
+    TO_PACKET(packet_getsockname);
     struct sock *s = sock_of(a1, 0);
     if (!s)
         return bad_fd(a1);
@@ -713,6 +731,8 @@ SOCK_SYSCALL(sys_getsockname)
 SOCK_SYSCALL(sys_getpeername)
 {
     TO_UNIX(unix_getpeername);
+    TO_NETLINK(netlink_getpeername);
+    TO_PACKET(packet_unsupported);
     struct sock *s = sock_of(a1, 0);
     if (!s)
         return bad_fd(a1);
@@ -734,6 +754,8 @@ SOCK_SYSCALL(sys_getpeername)
 SOCK_SYSCALL(sys_sendto)
 {
     TO_UNIX(unix_sendto);
+    TO_NETLINK(netlink_sendto);
+    TO_PACKET(packet_sendto);
     struct file *f;
     struct sock *s = sock_of(a1, &f);
     if (!s)
@@ -749,6 +771,8 @@ SOCK_SYSCALL(sys_sendto)
 SOCK_SYSCALL(sys_recvfrom)
 {
     TO_UNIX(unix_recvfrom);
+    TO_NETLINK(netlink_recvfrom);
+    TO_PACKET(packet_recvfrom);
     struct file *f;
     struct sock *s = sock_of(a1, &f);
     if (!s)
@@ -776,6 +800,8 @@ static int read_msg(uintptr_t umsg, struct user_msghdr *m, struct user_iovec *io
 SOCK_SYSCALL(sys_sendmsg)
 {
     TO_UNIX(unix_sendmsg);
+    TO_NETLINK(netlink_sendmsg);
+    TO_PACKET(packet_sendmsg);
     struct file *f;
     struct sock *s = sock_of(a1, &f);
     if (!s)
@@ -837,6 +863,8 @@ SOCK_SYSCALL(sys_sendmsg)
 SOCK_SYSCALL(sys_recvmsg)
 {
     TO_UNIX(unix_recvmsg);
+    TO_NETLINK(netlink_recvmsg);
+    TO_PACKET(packet_recvmsg);
     struct file *f;
     struct sock *s = sock_of(a1, &f);
     if (!s)
@@ -866,6 +894,8 @@ SOCK_SYSCALL(sys_recvmsg)
 SOCK_SYSCALL(sys_setsockopt)
 {
     TO_UNIX(unix_setsockopt);
+    TO_NETLINK(netlink_setsockopt);
+    TO_PACKET(packet_setsockopt);
     if (!sock_of(a1, 0))
         return bad_fd(a1);
     return 0;
@@ -874,6 +904,8 @@ SOCK_SYSCALL(sys_setsockopt)
 SOCK_SYSCALL(sys_getsockopt)
 {
     TO_UNIX(unix_getsockopt);
+    TO_NETLINK(netlink_getsockopt);
+    TO_PACKET(packet_getsockopt);
     struct sock *s = sock_of(a1, 0);
     if (!s)
         return bad_fd(a1);
@@ -902,6 +934,8 @@ SOCK_SYSCALL(sys_getsockopt)
 SOCK_SYSCALL(sys_shutdown)
 {
     TO_UNIX(unix_shutdown);
+    TO_NETLINK(netlink_unsupported);
+    TO_PACKET(packet_unsupported);
     struct sock *s = sock_of(a1, 0);
     if (!s)
         return bad_fd(a1);
@@ -919,12 +953,16 @@ SOCK_SYSCALL(sys_shutdown)
 SOCK_SYSCALL(sys_listen)
 {
     TO_UNIX(unix_listen);
+    TO_NETLINK(netlink_unsupported);
+    TO_PACKET(packet_unsupported);
     return sock_of(a1, 0) ? -EOPNOTSUPP : bad_fd(a1);
 }
 
 SOCK_SYSCALL(sys_accept4)
 {
     TO_UNIX(unix_accept4);
+    TO_NETLINK(netlink_unsupported);
+    TO_PACKET(packet_unsupported);
     return sock_of(a1, 0) ? -EOPNOTSUPP : bad_fd(a1);
 }
 
@@ -932,7 +970,7 @@ SYSCALL_DEF(sys_socketpair)
 {
     if (a1 == AF_UNIX)
         return unix_socketpair(a2, a3, a4);
-    return a1 == AF_INET ? -EOPNOTSUPP : -EAFNOSUPPORT;
+    return a1 == AF_INET || a1 == AF_NETLINK || a1 == AF_PACKET ? -EOPNOTSUPP : -EAFNOSUPPORT;
 }
 
 /* socketcall(call, args): the old one-syscall-for-all. args points at an

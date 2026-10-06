@@ -17,6 +17,10 @@
 #ifndef INITRD_LOAD
 #define INITRD_LOAD 0x2000000ull
 #endif
+/* The kernel reaches RAM only below this: DIRECTMAP_LIMIT in
+   arch/x86_64/include/memlayout.h (not included here: it defines
+   KERNEL_LOAD too). Keep the two equal. */
+#define KERNEL_RAM_LIMIT 0x80000000ull
 
 static struct efi_system_table *g_st;
 static u64 g_fb;
@@ -136,10 +140,16 @@ static int file_size(struct efi_file *root, u16 *name, u64 *out)
     return 0;
 }
 
+/* Some firmware hangs, fails or resets the machine when one Read() asks
+   for tens of MiB; OVMF doesn't mind. Linux's EFI stub reads in 1 MiB
+   pieces for the same reason, and so do we. A dot every 8 MiB shows that
+   a slow USB stick is still being read. */
+#define READ_CHUNK (1ull << 20)
+
 static int load_file(struct efi_file *root, u16 *name, void *dest, u64 cap, u64 *out_size)
 {
     struct efi_file *f = 0;
-    u64 sz, pos;
+    u64 sz, pos, done;
     if (root->open(root, &f, name, EFI_FILE_MODE_READ, 0) != EFI_SUCCESS || !f) {
         say("open failed\r\n");
         return -1;
@@ -158,11 +168,16 @@ static int load_file(struct efi_file *root, u16 *name, void *dest, u64 cap, u64 
         f->close(f);
         return -1;
     }
-    sz = pos;
-    if (f->read(f, &sz, dest) != EFI_SUCCESS || sz != pos) {
-        say("read failed\r\n");
-        f->close(f);
-        return -1;
+    for (done = 0; done < pos; done += sz) {
+        u64 want = pos - done < READ_CHUNK ? pos - done : READ_CHUNK;
+        sz = want;
+        if (f->read(f, &sz, (u8 *)dest + done) != EFI_SUCCESS || sz != want) {
+            say("read failed\r\n");
+            f->close(f);
+            return -1;
+        }
+        if ((done + sz) % (8 * READ_CHUNK) == 0)
+            say(".");
     }
     f->close(f);
     *out_size = pos;
@@ -251,7 +266,12 @@ static void take_gop(struct efi_boot_services *bs, struct bootinfo *bi)
     g_pitch = info->pixels_per_scan_line * 4;
     g_w = info->width;
     g_h = info->height;
-    if (info->pixel_format == PixelBlueGreenRedReserved8BitPerColor)
+    /* bootinfo's fb_format is 1 when RED is in the low byte. UEFI's
+       "BlueGreenRed" names the bytes in memory order, blue first: as a
+       32-bit pixel that is XRGB, red at bit 16, our 0. (The common one:
+       OVMF and every PC we have seen.) */
+    if (info->pixel_format == PixelRedGreenBlueReserved8BitPerColor
+        || (info->pixel_format == PixelBitMask && info->red_mask == 0x000000FFu))
         pixfmt = 1;
     say("gop ");
     say_hex(g_w);
@@ -268,6 +288,16 @@ static void take_gop(struct efi_boot_services *bs, struct bootinfo *bi)
     bi->fb_bpp = 32;
     bi->fb_format = pixfmt;
     bi->loader_magic = BOOTINFO_MAGIC;
+}
+
+/* Leave the reason on the screen long enough to read (or photograph),
+   then go back to the firmware, which tries its next boot entry. */
+static efi_status give_up(const char *why)
+{
+    say(why);
+    say("\r\nMyOS loader stopped; back to the firmware in 30 s.\r\n");
+    g_st->boot->stall(30 * 1000000ull);
+    return EFI_NOT_FOUND;
 }
 
 efi_status efi_main(efi_handle image, struct efi_system_table *st);
@@ -299,16 +329,18 @@ efi_status efi_main(efi_handle image, struct efi_system_table *st)
     if (!st || !st->boot)
         return EFI_NOT_FOUND;
     bs = st->boot;
+    /* The firmware resets the machine if a boot program runs for 5 minutes
+       without calling ExitBootServices (the UEFI "watchdog"). A big initrd
+       on a slow USB stick can take that long. Off, as GRUB does. */
+    bs->set_watchdog_timer(0, 0, 0, 0);
 
     low = BOOTINFO_PHYS;
     if (!alloc_at(bs, BOOTINFO_PHYS, 2)) {      /* bootinfo + 8x16 font */
         say("0x1000 busy, allocating elsewhere\r\n");
         low = 0xFFFFF000ull;
         if (bs->allocate_pages(AllocateMaxAddress, EfiLoaderData, 2, &low)
-            != EFI_SUCCESS) {
-            say("no bootinfo pages\r\n");
-            return EFI_NOT_FOUND;
-        }
+            != EFI_SUCCESS)
+            return give_up("no bootinfo pages");
     }
     kpages = pages_for(KERNEL_END - KERNEL_LOAD);
     ksrc = KERNEL_LOAD;
@@ -316,25 +348,19 @@ efi_status efi_main(efi_handle image, struct efi_system_table *st)
         say("1 MiB busy, allocating elsewhere\r\n");
         ksrc = 0xFFFFF000ull;
         if (bs->allocate_pages(AllocateMaxAddress, EfiLoaderData, kpages, &ksrc)
-            != EFI_SUCCESS) {
-            say("no kernel pages\r\n");
-            return EFI_NOT_FOUND;
-        }
+            != EFI_SUCCESS)
+            return give_up("no kernel pages");
     }
     memset((void *)low, 0, 2 * EFI_PAGE);
     memset((void *)ksrc, 0, (u64)kpages * EFI_PAGE);
 
     if (bs->handle_protocol(image, &li_guid, (void **)&li) != EFI_SUCCESS || !li
         || bs->handle_protocol(li->device, &fs_guid, (void **)&fs) != EFI_SUCCESS || !fs
-        || fs->open_volume(fs, &root) != EFI_SUCCESS || !root) {
-        say("no ESP filesystem\r\n");
-        return EFI_NOT_FOUND;
-    }
+        || fs->open_volume(fs, &root) != EFI_SUCCESS || !root)
+        return give_up("no ESP filesystem");
 
-    if (load_file(root, kname, (void *)ksrc, KERNEL_END - KERNEL_LOAD, &ksize) < 0) {
-        say("kernel\r\n");
-        return EFI_NOT_FOUND;
-    }
+    if (load_file(root, kname, (void *)ksrc, KERNEL_END - KERNEL_LOAD, &ksize) < 0)
+        return give_up("kernel not loaded");
     say("kernel ");
     say_hex(ksize);
     say("\r\n");
@@ -344,27 +370,28 @@ efi_status efi_main(efi_handle image, struct efi_system_table *st)
         say("no initrd (hello kernel)\r\n");
         isize = 0;
     } else if (isize > (512ull << 20)) {
-        say("initrd too big\r\n");
-        return EFI_NOT_FOUND;
+        return give_up("initrd too big");
     } else {
         ipages = pages_for(isize);
         extra = INITRD_LOAD;
         if (!alloc_at(bs, INITRD_LOAD, ipages)) {
-            extra = 0xFFFFFFFFull;
+            /* Real firmware keeps something of its own in low memory, so a
+               big initrd rarely fits right after the kernel. The kernel
+               reaches RAM only below KERNEL_RAM_LIMIT (2 GiB), and firmware
+               hands out the highest fit, so "below 4 GiB" would be above
+               the kernel's reach: ask for below the limit. */
+            extra = KERNEL_RAM_LIMIT - 1;
             if (bs->allocate_pages(AllocateMaxAddress, EfiLoaderData, ipages, &extra)
-                != EFI_SUCCESS) {
-                say("no initrd pages\r\n");
-                return EFI_NOT_FOUND;
-            }
+                != EFI_SUCCESS || extra + isize > KERNEL_RAM_LIMIT)
+                return give_up("no room for the initrd below 2 GiB");
         }
-        if (load_file(root, iname, (void *)extra, isize, &isize) < 0) {
-            say("initrd load failed\r\n");
-            return EFI_NOT_FOUND;
-        }
-        say("initrd ");
+        say("initrd ");             /* before the read: a hang shows where */
         say_hex(isize);
         say(" @ ");
         say_hex(extra);
+        say(" ");
+        if (load_file(root, iname, (void *)extra, isize, &isize) < 0)
+            return give_up("initrd not loaded");
         say("\r\n");
     }
 

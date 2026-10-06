@@ -9,6 +9,8 @@ fetch-live-output.txt
 dist/
 disks/
 __pycache__/
+# This machine's own live-disk settings (the home Wi-Fi network): never committed.
+live/overlay.local/
 
 # The live disk is its own repo (myos-live), checked out here.
 /live/

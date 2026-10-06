@@ -333,6 +333,51 @@ static void unix_sockets(void)
     close(sv[0]);
     close(sv[1]);
     signal(SIGPIPE, SIG_DFL);
+
+    /* Datagrams, the way wpa_cli talks to wpa_supplicant's control socket:
+       the server is bound to a path; the client binds a name of its own,
+       connects, sends; the server answers whoever sent (recvfrom). */
+    struct sockaddr_un srv = { .sun_family = AF_UNIX }, cli = { .sun_family = AF_UNIX };
+    strcpy(srv.sun_path, "/tmp/boottest-dgram");
+    strcpy(cli.sun_path, "/tmp/boottest-cli");
+    unlink(srv.sun_path);
+    unlink(cli.sun_path);
+    int ds = socket(AF_UNIX, SOCK_DGRAM, 0), dc = socket(AF_UNIX, SOCK_DGRAM, 0);
+    check(bind(ds, (struct sockaddr *)&srv, sizeof srv) == 0 &&
+          bind(dc, (struct sockaddr *)&cli, sizeof cli) == 0 &&
+          connect(dc, (struct sockaddr *)&srv, sizeof srv) == 0 &&
+          send(dc, "STATUS", 6, 0) == 6 && send(dc, "PING", 4, 0) == 4,
+          "unix dgram: bind, connect, two datagrams");
+    struct sockaddr_un from;
+    socklen_t fl = sizeof from;
+    ssize_t n1 = recvfrom(ds, got, sizeof got, 0, (struct sockaddr *)&from, &fl);
+    check(n1 == 6 && memcmp(got, "STATUS", 6) == 0 && strcmp(from.sun_path, cli.sun_path) == 0 &&
+          read(ds, got, sizeof got) == 4, "unix dgram: boundaries kept, the sender's name");
+    static char reply[4096];
+    memset(reply, 'r', sizeof reply);
+    struct pollfd dp = { .fd = dc, .events = POLLIN };
+    check(sendto(ds, reply, sizeof reply, 0, (struct sockaddr *)&from, fl) == sizeof reply &&
+          poll(&dp, 1, 1000) == 1 && recv(dc, got, 100, MSG_PEEK | MSG_TRUNC) == sizeof reply &&
+          recv(dc, got, sizeof got, 0) == sizeof reply, "unix dgram: a 4 KiB answer; peek, MSG_TRUNC");
+    int dx = socket(AF_UNIX, SOCK_DGRAM, 0);
+    check(fails(sendto(dx, "x", 1, 0, (struct sockaddr *)&cli, sizeof cli), EPERM) &&
+          fails(send(dx, "x", 1, MSG_DONTWAIT), ENOTCONN),
+          "unix dgram: a connected socket hears only its peer; send needs an address");
+    close(dx);
+    int fillok = 1;
+    while (send(dc, "f", 1, MSG_DONTWAIT) == 1)
+        fillok++;
+    check(errno == EAGAIN && fillok > 1, "unix dgram: a full queue: EAGAIN");
+    close(ds);
+    check(fails(send(dc, "x", 1, 0), ECONNREFUSED), "unix dgram: the server gone: ECONNREFUSED");
+    close(dc);
+    unlink(srv.sun_path);
+    unlink(cli.sun_path);
+    check(socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) == 0 && write(sv[0], "ab", 2) == 2 &&
+          write(sv[0], "c", 1) == 1 && read(sv[1], got, 8) == 2 && read(sv[1], got, 8) == 1 &&
+          got[0] == 'c', "unix dgram: socketpair keeps boundaries");
+    close(sv[0]);
+    close(sv[1]);
 }
 
 /* Two opens of one file are two lock owners; a fork shares its parent's. */

@@ -174,10 +174,16 @@ static int file_size(struct efi_file *root, u16 *name, u64 *out)
     return 0;
 }
 
+/* Some firmware hangs, fails or resets the machine when one Read() asks
+   for tens of MiB; OVMF doesn't mind. Linux's EFI stub reads in 1 MiB
+   pieces for the same reason, and so do we. A dot every 8 MiB shows that
+   a slow USB stick is still being read. */
+#define READ_CHUNK (1ull << 20)
+
 static int load_file(struct efi_file *root, u16 *name, void *dest, u64 cap, u64 *out_size)
 {
     struct efi_file *f = 0;
-    u64 sz, pos;
+    u64 sz, pos, done;
     if (root->open(root, &f, name, EFI_FILE_MODE_READ, 0) != EFI_SUCCESS || !f) {
         say("open failed\r\n");
         return -1;
@@ -196,11 +202,16 @@ static int load_file(struct efi_file *root, u16 *name, void *dest, u64 cap, u64 
         f->close(f);
         return -1;
     }
-    sz = pos;
-    if (f->read(f, &sz, dest) != EFI_SUCCESS || sz != pos) {
-        say("read failed\r\n");
-        f->close(f);
-        return -1;
+    for (done = 0; done < pos; done += sz) {
+        u64 want = pos - done < READ_CHUNK ? pos - done : READ_CHUNK;
+        sz = want;
+        if (f->read(f, &sz, (u8 *)dest + done) != EFI_SUCCESS || sz != want) {
+            say("read failed\r\n");
+            f->close(f);
+            return -1;
+        }
+        if ((done + sz) % (8 * READ_CHUNK) == 0)
+            say(".");
     }
     f->close(f);
     *out_size = pos;
@@ -327,6 +338,16 @@ static void take_gop(struct efi_boot_services *bs, struct bootinfo *bi)
     bi->fb_format = pixfmt;
 }
 
+/* Leave the reason on the screen long enough to read (or photograph),
+   then go back to the firmware, which tries its next boot entry. */
+static efi_status give_up(const char *why)
+{
+    say(why);
+    say("\r\nMyOS loader stopped; back to the firmware in 30 s.\r\n");
+    g_st->boot->stall(30 * 1000000ull);
+    return EFI_NOT_FOUND;
+}
+
 efi_status efi_main(efi_handle image, struct efi_system_table *st);
 
 /* Absolute pointers so the PE has a .reloc table. Real firmware often
@@ -358,6 +379,10 @@ efi_status efi_main(efi_handle image, struct efi_system_table *st)
     if (!st || !st->boot)
         return EFI_NOT_FOUND;
     bs = st->boot;
+    /* The firmware resets the machine if a boot program runs for 5 minutes
+       without calling ExitBootServices (the UEFI "watchdog"). A big initrd
+       on a slow USB stick can take that long. Off, as GRUB does. */
+    bs->set_watchdog_timer(0, 0, 0, 0);
 
     kpages = pages_for((u64)INITRD_LOAD - KERNEL_LOAD);
     low = BOOTINFO_PHYS;
@@ -365,50 +390,38 @@ efi_status efi_main(efi_handle image, struct efi_system_table *st)
         say("0x1000 busy, allocating elsewhere\r\n");
         low = 0xFFFFF000ull;
         if (bs->allocate_pages(AllocateMaxAddress, EfiLoaderData, 3, &low)
-            != EFI_SUCCESS) {
-            say("no low pages\r\n");
-            return EFI_NOT_FOUND;
-        }
+            != EFI_SUCCESS)
+            return give_up("no low pages");
     }
     ksrc = KERNEL_LOAD;
     if (!alloc_at(bs, KERNEL_LOAD, kpages)) {
         say("1 MiB busy, allocating elsewhere\r\n");
         ksrc = 0xFFFFF000ull;
         if (bs->allocate_pages(AllocateMaxAddress, EfiLoaderData, kpages, &ksrc)
-            != EFI_SUCCESS) {
-            say("no kernel pages\r\n");
-            return EFI_NOT_FOUND;
-        }
+            != EFI_SUCCESS)
+            return give_up("no kernel pages");
     }
     memset((void *)low, 0, 3 * EFI_PAGE);
     memset((void *)ksrc, 0, (u64)kpages * EFI_PAGE);
 
     if (bs->handle_protocol(image, &li_guid, (void **)&li) != EFI_SUCCESS || !li
         || bs->handle_protocol(li->device, &fs_guid, (void **)&fs) != EFI_SUCCESS || !fs
-        || fs->open_volume(fs, &root) != EFI_SUCCESS || !root) {
-        say("no ESP filesystem\r\n");
-        return EFI_NOT_FOUND;
-    }
+        || fs->open_volume(fs, &root) != EFI_SUCCESS || !root)
+        return give_up("no ESP filesystem");
 
     if (load_file(root, kname, (void *)ksrc,
-                  (u64)INITRD_LOAD - KERNEL_LOAD, &ksize) < 0) {
-        say("kernel\r\n");
-        return EFI_NOT_FOUND;
-    }
+                  (u64)INITRD_LOAD - KERNEL_LOAD, &ksize) < 0)
+        return give_up("kernel not loaded");
     say("kernel ");
     say_hex(ksize);
     say("\r\n");
 
     /* Size first: the live login initrd is tens of MiB, not 4. Leave the
        32-bit kernel room under the 768 MiB direct-map cap. */
-    if (file_size(root, iname, &isize) < 0) {
-        say("initrd\r\n");
-        return EFI_NOT_FOUND;
-    }
-    if (!isize || isize > (384ull << 20)) {
-        say("initrd too big\r\n");
-        return EFI_NOT_FOUND;
-    }
+    if (file_size(root, iname, &isize) < 0)
+        return give_up("no initrd");
+    if (!isize || isize > (384ull << 20))
+        return give_up("initrd too big");
     ipages = pages_for(isize);
     extra = INITRD_LOAD;
     /* The 32-bit kernel only direct-maps 768 MiB. Firmware often has a
@@ -418,19 +431,16 @@ efi_status efi_main(efi_handle image, struct efi_system_table *st)
         extra = 0x30000000ull;
         if (bs->allocate_pages(AllocateMaxAddress, EfiLoaderData, ipages, &extra)
             != EFI_SUCCESS || extra >= 0x30000000ull
-            || extra + isize > 0x30000000ull) {
-            say("no room for initrd under 768 MiB\r\n");
-            return EFI_NOT_FOUND;
-        }
+            || extra + isize > 0x30000000ull)
+            return give_up("no room for the initrd below 768 MiB");
     }
-    if (load_file(root, iname, (void *)extra, isize, &isize) < 0) {
-        say("initrd\r\n");
-        return EFI_NOT_FOUND;
-    }
-    say("initrd ");
+    say("initrd ");                 /* before the read: a hang shows where */
     say_hex(isize);
     say(" @ ");
     say_hex(extra);
+    say(" ");
+    if (load_file(root, iname, (void *)extra, isize, &isize) < 0)
+        return give_up("initrd not loaded");
     say("\r\n");
 
     if (load_file(root, fname, (void *)(low + (FONT_PHYS - BOOTINFO_PHYS)),

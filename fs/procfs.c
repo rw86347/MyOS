@@ -13,6 +13,9 @@
  *   /proc/self/fd/0 ... 63    one link per fd slot
  *   /proc/self/exe            a link to the caller's program (Firefox,
  *                             and anything that asks "where am I?")
+ *   /proc/cmdline             the kernel's command line: for now the one
+ *                             built in (make CMDLINE=...), e.g. "nodesktop",
+ *                             which the login service reads
  *
  * The tree is built once, at mount time, from ordinary RAM nodes. What's
  * special is what a link points to: "self" means whoever is looking, so
@@ -28,6 +31,11 @@
 #include <proc.h>
 #include <string.h>
 #include <vfs.h>
+
+#ifndef MYOS_CMDLINE
+#define MYOS_CMDLINE ""
+#endif
+static const char cmdline_text[] = MYOS_CMDLINE "\n";
 
 /* The links' names, "0".."63": nodes point at their name, not a copy. */
 static char fd_names[FD_MAX][3];
@@ -106,6 +114,11 @@ int procfs_mount(const char *path)
         return -ENOMEM;
     dns->size = fmt_dns(ipv4_dns);
     dns->data = (const uint8_t *)dns_text;
+    struct inode *cmdline = vfs_add(proc, "cmdline", 7, S_IFREG | 0444);
+    if (!cmdline)
+        return -ENOMEM;
+    cmdline->size = sizeof cmdline_text - 1;
+    cmdline->data = (const uint8_t *)cmdline_text;
     return 0;
 }
 

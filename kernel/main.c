@@ -44,6 +44,7 @@
 #include <random.h>
 #include <sched.h>
 #include <serial.h>
+#include <shim.h>
 #include <sysenter.h>
 #include <thread.h>
 #include <syscalls.h>
@@ -208,6 +209,7 @@ void kernel_main(void)
     kprintf("Hello world from MyOS!  (protected mode, own boot loader)\n");
 #endif
     vt_set_color(VT_LIGHT_GREY, VT_BLACK);
+    kprintf("serial: %s\n", serial_present() ? "COM1" : "no COM1 (messages on the screen only)");
 
     cpu_init();             /* what can this CPU do? (stops if too old) */
 
@@ -227,6 +229,7 @@ void kernel_main(void)
     keyboard_init();        /* IRQ 1 */
     mouse_init();           /* IRQ 12, if there is a PS/2 mouse */
     interrupts_enable();    /* sti: from now on, IRQs can arrive */
+    timer_check();          /* a PIT that never ticks (new chipsets): the HPET */
 
     kprintf("Memory: %lu MiB usable, paging on, kernel at %p, heap at %p\n",
             pmm_usable_count() / 256, (void *)_start, (void *)KHEAP_START);
@@ -236,10 +239,32 @@ void kernel_main(void)
                                anything that needs an unguessable number */
     initrd_init();          /* the initramfs stage 2 loaded */
     thread_init();          /* kernel_main becomes thread 0, "main" */
+    shim_init();            /* Linux's timers and work queues, for drivers */
     pci_init();             /* which PCI devices are fitted: the IDE controller, the NIC */
     drm_init();             /* a display card: the console moves to pixels, /dev/fb0 */
     storage_init();         /* IDE disks and their partitions */
     net_init();             /* loopback, then the e1000 and IPv4 if the card is there */
+#if defined(WIFI_SIM) && !defined(SELFTEST)
+    {   /* make WIFISIM=1: the self-tests' simulated radio, for trying the
+           Wi-Fi programs on a whole system (test builds only). */
+        int sim_wifi_init(void);
+        if (sim_wifi_init() == 0)
+            kprintf("wifi: the simulated radio is up (MyOS-Test, MyOS-Open-5G)\n");
+    }
+#endif
+#ifdef MYOS_IWLWIFI
+    {   /* Intel Wi-Fi (Linux's iwlwifi, built in; drivers/net/wireless/
+           intel/iwlwifi/myos.c). The firmware loads in the background from
+           /lib/firmware (the root file system is mounted by now). */
+        void iwlwifi_myos_init(void);
+        iwlwifi_myos_init();
+#ifdef MYOS_IWLDEBUG
+        kprintf("wifi: iwlwifi built in, with its debug lines (dmesg)\n");
+#else
+        kprintf("wifi: iwlwifi built in (Intel Wi-Fi 6 AX201 and its family)\n");
+#endif
+    }
+#endif
 
 #if defined(SELFTEST)
     run_selftests();        /* ends with the slot scheduler running */

@@ -90,4 +90,5 @@ global boot_page_directory
 alignb 4096
 boot_page_directory:    resb 4096       ; must be 4 KiB aligned (CR3 needs it)
 boot_stack:             resb 16384      ; 16 KiB kernel stack
+global boot_stack_top                   ; (a crash's stack scan: where "main"'s stack ends)
 boot_stack_top:

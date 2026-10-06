@@ -22,8 +22,10 @@ SECTIONS
     . = KERNEL_VBASE + 0x100000;
 
     .text : AT(ADDR(.text) - KERNEL_VBASE) {
+        __text_start = .;       /* (a crash's stack scan: what is code) */
         *(.text.entry)          /* _start — must be first */
         *(.text .text.*)
+        __text_end = .;
     }
 
     .rodata : AT(ADDR(.rodata) - KERNEL_VBASE) {

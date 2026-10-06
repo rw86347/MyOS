@@ -20,8 +20,9 @@ isr %+ %1:
 
 section .text
 
+; 0-31 CPU exceptions, 32-47 the 8259's IRQs 0-15, 48-63 MSI IRQs 16-31.
 %assign v 0
-%rep 48
+%rep 64
   %if v == 8 || (v >= 10 && v <= 14) || v == 17 || v == 21 || v == 29 || v == 30
     ISR_PUSH_ERR v
   %else
@@ -29,6 +30,12 @@ section .text
   %endif
   %assign v v+1
 %endrep
+
+; Vector 0xFF: the local APIC's "spurious" interrupt (one it had to take
+; back). It wants no EOI and there is nothing to do: return at once.
+global isr_spurious
+isr_spurious:
+    iretq
 
 isr_common:
     push rax
@@ -74,7 +81,7 @@ section .rodata
 global isr_stub_table
 isr_stub_table:
 %assign v 0
-%rep 48
+%rep 64
     dq isr %+ v
   %assign v v+1
 %endrep

@@ -1,4 +1,5 @@
 #include <gdt.h>
+#include <apic.h>
 #include <interrupts.h>
 #include <kprintf.h>
 #include <pic.h>
@@ -31,9 +32,10 @@ struct idt_ptr64 {
 
 static struct idt_gate64 idt[256];
 #define IRQ_SHARE 4
-static irq_handler_t irq_handlers[16][IRQ_SHARE];
+static isr_fn_t irq_handlers[NR_IRQS][IRQ_SHARE];
 
-extern const uint64_t isr_stub_table[48];
+extern const uint64_t isr_stub_table[32 + NR_IRQS];
+extern char isr_spurious[];
 
 static void set_gate(int vector, uint64_t handler)
 {
@@ -48,19 +50,23 @@ static void set_gate(int vector, uint64_t handler)
 
 void idt_init(void)
 {
-    for (int v = 0; v < 48; v++)
+    for (int v = 0; v < 32 + NR_IRQS; v++)
         set_gate(v, isr_stub_table[v]);
+    set_gate(0xFF, (uint64_t)(uintptr_t)isr_spurious);
     struct idt_ptr64 ptr = { sizeof idt - 1, (uint64_t)(uintptr_t)idt };
     __asm__ volatile ("lidt %0" : : "m"(ptr));
     pic_init();
 }
 
-void irq_install(int irq, irq_handler_t handler)
+void irq_install(int irq, isr_fn_t handler)
 {
+    if (irq < 0 || irq >= NR_IRQS)
+        return;
     for (int k = 0; k < IRQ_SHARE; k++)
         if (!irq_handlers[irq][k] || irq_handlers[irq][k] == handler) {
             irq_handlers[irq][k] = handler;
-            pic_unmask(irq);
+            if (irq < IRQ_MSI_FIRST)
+                pic_unmask(irq);        /* an MSI has no line to unmask */
             return;
         }
 }
@@ -123,6 +129,28 @@ static void user_exception(struct regs *r, uint64_t cr2)
     proc_exit(W_SIGNALED(sig));
 }
 
+/* A kernel crash: who called whom. The kernel has no frame pointers, so,
+   as Linux does without them, the stack is scanned for values that point
+   into the kernel's code: return addresses, mostly — some are stale, so
+   read it from the top. Only within the thread's own stack, so the scan
+   itself can't fault. Look them up with x86_64-elf-addr2line -f -e
+   kernel.elf ADDRESSES. */
+extern char __text_start[], __text_end[], boot_stack_top[];
+
+static void stack_scan(uint64_t sp)
+{
+    struct thread *t = thread_current();
+    uint64_t top = t && t->stack ? (uint64_t)t->stack + THREAD_STACK : (uint64_t)boot_stack_top;
+    if (sp & 7 || sp >= top || top - sp > 16384)
+        return;
+    kprintf("in thread \"%s\"; called from (newest first):", t ? t->name : "?");
+    int n = 0;
+    for (const uint64_t *p = (const uint64_t *)sp; (uint64_t)p < top && n < 16; p++)
+        if (*p >= (uint64_t)__text_start && *p < (uint64_t)__text_end)
+            kprintf("%s%lx", n++ % 4 ? " " : "\n  ", *p);
+    kprintf("\n");
+}
+
 static void exception(struct regs *r)
 {
     uint64_t cr2;
@@ -138,6 +166,7 @@ static void exception(struct regs *r)
     kprintf("\n*** CPU EXCEPTION %lu: %s ***\n", r->vector,
             exception_names[r->vector < 32 ? r->vector : 0]);
     kprintf("RIP=%016lx CR2=%016lx error code %lx\n", regs_ip(r), cr2, r->err_code);
+    stack_scan(regs_sp(r));
     serial_flush();
     for (;;)
         __asm__ volatile ("cli; hlt");
@@ -167,11 +196,14 @@ void interrupt_dispatch(struct regs *r)
     }
     int irq = (int)r->vector - PIC_IRQ_BASE;
     cpu_idle_end();
-    if (pic_is_spurious(irq))
+    if (irq < IRQ_MSI_FIRST && pic_is_spurious(irq))
         return;
     for (int k = 0; k < IRQ_SHARE && irq_handlers[irq][k]; k++)
         irq_handlers[irq][k](r);
-    pic_send_eoi(irq);
+    if (irq < IRQ_MSI_FIRST)
+        pic_send_eoi(irq);
+    else
+        lapic_eoi();                    /* an MSI is acknowledged at the local APIC */
     sched_preempt_check();
     if (regs_user_mode(r))
         SIGNAL_CHECK(r);                /* e.g. Ctrl-C for a busy program */

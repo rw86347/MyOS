@@ -25,12 +25,20 @@
  * the receiver may be closed meanwhile). A connection waiting in a
  * listener's queue is held by the queue until accept() takes it.
  *
- * Not yet: datagram sockets (socket() works, so syslog fails quietly at
- * connect), passing file descriptors (SCM_RIGHTS), credentials messages.
+ * Datagram sockets (SOCK_DGRAM) keep message boundaries and have no
+ * connection: each datagram is sent to a name (sendto) or to the socket
+ * connect() named, and the receiver learns the sender's name (recvfrom).
+ * wpa_supplicant's control socket works this way (wpa_cli, the tray icon),
+ * as does syslog. A datagram is one kmalloc'd record in the receiver's
+ * queue, bounded in count and bytes: a sender waits (or gets EAGAIN) while
+ * it is full.
+ *
+ * Not yet: passing file descriptors (SCM_RIGHTS), credentials messages.
  */
 #include <errno.h>
 #include <kheap.h>
 #include <memlayout.h>
+#include <netdevice.h>
 #include <pmm.h>
 #include <proc.h>
 #include <signal.h>
@@ -49,6 +57,7 @@
 #define SOCK_CLOEXEC   02000000
 
 #define MSG_PEEK     0x02
+#define MSG_TRUNC    0x20
 #define MSG_DONTWAIT 0x40
 #define MSG_NOSIGNAL 0x4000
 
@@ -73,6 +82,9 @@
 #define PATH_UN     108             /* sizeof sun_path */
 #define BOUND_MAX   32              /* bound sockets, machine-wide */
 #define IOV_MAX_K   16
+#define DGRAM_MAX   16384           /* the largest datagram */
+#define DQ_MAX      16              /* datagrams waiting for one socket (Linux: 10) */
+#define DQ_BYTES    65536           /* ...and their bytes */
 
 enum { U_NEW, U_LISTEN, U_CONNECTED };
 
@@ -93,11 +105,25 @@ struct usock {
     struct inode *node;             /* a path name's socket node */
     struct ucred cred, peercred;    /* ours, and the other end's (SO_PEERCRED) */
     struct wait_queue wq;           /* readers, writers waiting for room, accept */
+    /* SOCK_DGRAM: peer is where send() goes (connect), held, one way. */
+    struct udgram *dq, *dq_last;    /* datagrams waiting for us to read */
+    uint32_t dq_count, dq_bytes;
+    int closed;                     /* its file is gone: sends to it are refused */
+};
+
+/* A datagram waiting to be read, with its sender's name (for recvfrom). */
+struct udgram {
+    struct udgram *next;
+    uint32_t len, fromlen;
+    uint8_t from[PATH_UN];
+    uint8_t data[];
 };
 
 static struct usock *bound[BOUND_MAX];
 
 static const struct file_ops unix_ops;
+static int read_name(uintptr_t uaddr, uint32_t alen, uint8_t *name, uint32_t *len);
+static struct usock *find_bound(const uint8_t *name, uint32_t len, int *err);
 
 static struct inode unix_inode = {
     .ino = 0, .mode = S_IFSOCK | 0777, .nlink = 1, .name = "socket", .name_len = 6,
@@ -116,8 +142,8 @@ static void my_cred(struct ucred *c)
 static struct usock *usock_new(int type)
 {
     struct usock *s = kmalloc(sizeof *s);
-    uint32_t page = pmm_alloc();
-    if (!s || !page) {
+    uint32_t page = type == SOCK_STREAM ? pmm_alloc() : 0;  /* (datagrams: no ring) */
+    if (!s || (type == SOCK_STREAM && !page)) {
         if (s) kfree(s);
         if (page) pmm_free(page);
         return NULL;
@@ -125,17 +151,30 @@ static struct usock *usock_new(int type)
     memset(s, 0, sizeof *s);
     s->type = type;
     s->refs = 1;
-    s->buf = P2V(page);
+    s->buf = page ? P2V(page) : NULL;
     my_cred(&s->cred);
     return s;
 }
 
 static void uget(struct usock *s) { s->refs++; }
 
+static void dq_free(struct usock *s)
+{
+    while (s->dq) {
+        struct udgram *d = s->dq;
+        s->dq = d->next;
+        kfree(d);
+    }
+    s->dq_last = NULL;
+    s->dq_count = s->dq_bytes = 0;
+}
+
 static void uput(struct usock *s)
 {
     if (--s->refs == 0) {
-        pmm_free(V2P(s->buf));
+        if (s->buf)
+            pmm_free(V2P(s->buf));
+        dq_free(s);
         kfree(s);
     }
 }
@@ -158,7 +197,13 @@ static void pair(struct usock *a, struct usock *b)
 static void usock_close(struct usock *s)
 {
     struct usock *p = s->peer;
-    if (p) {
+    if (s->type == SOCK_DGRAM) {
+        s->peer = NULL;
+        if (p)
+            uput(p);                /* our hold on where we sent */
+        s->closed = 1;              /* senders still holding us get ECONNREFUSED */
+        dq_free(s);
+    } else if (p) {
         p->peer = NULL;
         p->rd_shut = 1;             /* it reads what's left, then end of file */
         s->peer = NULL;
@@ -291,19 +336,187 @@ static int32_t usock_read(struct usock *s, uint8_t *ubuf, uint32_t n, int nonblo
     return n;
 }
 
+/* --- datagrams -------------------------------------------------------------------- */
+
+/* One datagram, gathered from iov, into to's queue (to is held by the
+   caller). It is copied in before it is queued, so a fault leaves no half
+   datagram behind. */
+static int32_t dgram_send(struct usock *s, struct usock *to, const struct user_iovec *iov,
+                          uint32_t niov, int nonblock)
+{
+    uint32_t len = 0;
+    for (uint32_t i = 0; i < niov; i++)
+        if (iov[i].len > DGRAM_MAX || (len += (uint32_t)iov[i].len) > DGRAM_MAX)
+            return -EMSGSIZE;
+    struct udgram *d = kmalloc(sizeof *d + len);
+    if (!d)
+        return -ENOBUFS;
+    uint32_t at = 0;
+    for (uint32_t i = 0; i < niov; i++) {
+        if (copy_from_user(d->data + at, (const void *)(uintptr_t)iov[i].base,
+                           (uint32_t)iov[i].len) < 0) {
+            kfree(d);
+            return -EFAULT;
+        }
+        at += (uint32_t)iov[i].len;
+    }
+    d->next = NULL;
+    d->len = len;
+    d->fromlen = s->namelen;
+    memcpy(d->from, s->name, s->namelen);
+    for (;;) {
+        int err = 0;
+        if (to->closed)
+            err = -ECONNREFUSED;
+        else if (to->dq_count < DQ_MAX && to->dq_bytes + len <= DQ_BYTES)
+            break;
+        else if (nonblock)
+            err = -EAGAIN;
+        else if (signal_pending())
+            err = -EINTR;
+        if (err) {
+            kfree(d);
+            return err;
+        }
+        wq_sleep(&to->wq);          /* its reader will make room */
+    }
+    if (to->dq_last)
+        to->dq_last->next = d;
+    else
+        to->dq = d;
+    to->dq_last = d;
+    to->dq_count++;
+    to->dq_bytes += len;
+    wake(to);
+    return (int32_t)len;
+}
+
+/* The next datagram, scattered into iov; what doesn't fit is dropped
+   (*trunc). Its sender's name goes to from/fromlen. Returns the bytes
+   copied, or with MSG_TRUNC the datagram's real length, as Linux does. */
+static int32_t dgram_recv(struct usock *s, const struct user_iovec *iov, uint32_t niov,
+                          uint32_t flags, int nonblock, uint8_t *from, uint32_t *fromlen,
+                          int *trunc)
+{
+    while (!s->dq) {
+        if (s->rd_shut)
+            return 0;
+        if (nonblock)
+            return -EAGAIN;
+        if (signal_pending())
+            return -EINTR;
+        wq_sleep(&s->wq);
+    }
+    struct udgram *d = s->dq;       /* out of the queue first: the copy may sleep */
+    s->dq = d->next;
+    if (!s->dq)
+        s->dq_last = NULL;
+    s->dq_count--;
+    s->dq_bytes -= d->len;
+    uint32_t at = 0;
+    int err = 0;
+    for (uint32_t i = 0; i < niov && at < d->len; i++) {
+        uint32_t k = d->len - at < iov[i].len ? d->len - at : (uint32_t)iov[i].len;
+        if (copy_to_user((void *)(uintptr_t)iov[i].base, d->data + at, k) < 0) {
+            err = -EFAULT;
+            break;
+        }
+        at += k;
+    }
+    uint32_t len = d->len;
+    *trunc = at < len;
+    *fromlen = d->fromlen;
+    memcpy(from, d->from, d->fromlen);
+    if (flags & MSG_PEEK) {         /* back in front, for the next read */
+        d->next = s->dq;
+        s->dq = d;
+        if (!d->next)
+            s->dq_last = d;
+        s->dq_count++;
+        s->dq_bytes += len;
+    } else {
+        kfree(d);
+        wake(s);                    /* room for a sender */
+    }
+    if (err)
+        return err;
+    return (int32_t)(flags & MSG_TRUNC ? len : at);
+}
+
+/* Where a datagram goes: the name given, else the connected socket.
+   Returned held. A socket connected elsewhere takes nothing from us
+   (Linux's rule: EPERM). */
+static struct usock *dgram_dest(struct usock *s, uintptr_t uaddr, uint32_t alen, int *err)
+{
+    struct usock *to = s->peer;
+    if (uaddr && alen) {
+        uint8_t name[PATH_UN];
+        uint32_t len;
+        *err = read_name(uaddr, alen, name, &len);
+        if (*err)
+            return NULL;
+        to = find_bound(name, len, err);
+        if (!to)
+            return NULL;
+        if (to->type != SOCK_DGRAM) {
+            *err = -EPROTOTYPE;
+            return NULL;
+        }
+    } else if (!to) {
+        *err = -ENOTCONN;
+        return NULL;
+    }
+    if (to->closed) {
+        *err = -ECONNREFUSED;
+        return NULL;
+    }
+    if (to->peer && to->peer != s) {
+        *err = -EPERM;
+        return NULL;
+    }
+    uget(to);
+    return to;
+}
+
 static int32_t unix_read(struct file *f, void *ubuf, uint32_t n)
 {
-    return usock_read(f->priv, ubuf, n, f->flags & O_NONBLOCK, 0);
+    struct usock *s = f->priv;
+    if (s->type == SOCK_DGRAM) {
+        struct user_iovec v = { (uintptr_t)ubuf, n };
+        uint8_t from[PATH_UN];
+        uint32_t fromlen;
+        int trunc;
+        return dgram_recv(s, &v, 1, 0, f->flags & O_NONBLOCK, from, &fromlen, &trunc);
+    }
+    return usock_read(s, ubuf, n, f->flags & O_NONBLOCK, 0);
 }
 
 static int32_t unix_write(struct file *f, const void *ubuf, uint32_t n)
 {
-    return usock_write(f->priv, ubuf, n, f->flags & O_NONBLOCK, 0);
+    struct usock *s = f->priv;
+    if (s->type == SOCK_DGRAM) {
+        int err;
+        struct usock *to = dgram_dest(s, 0, 0, &err);
+        if (!to)
+            return err;
+        struct user_iovec v = { (uintptr_t)ubuf, n };
+        int32_t r = dgram_send(s, to, &v, 1, f->flags & O_NONBLOCK);
+        uput(to);
+        return r;
+    }
+    return usock_write(s, ubuf, n, f->flags & O_NONBLOCK, 0);
 }
 
 static uint32_t unix_poll(struct file *f)
 {
     struct usock *s = f->priv;
+    if (s->type == SOCK_DGRAM) {
+        struct usock *p = s->peer;
+        uint32_t r = s->dq || s->rd_shut ? POLLIN : 0;
+        if (!p || p->closed || (p->dq_count < DQ_MAX && p->dq_bytes < DQ_BYTES))
+            r |= POLLOUT;
+        return r;
+    }
     if (s->state == U_LISTEN)
         return s->nback ? POLLIN : 0;
     if (s->state != U_CONNECTED)
@@ -321,8 +534,10 @@ static uint32_t unix_poll(struct file *f)
 static int32_t unix_ioctl(struct file *f, uint32_t cmd, uintptr_t arg)
 {
     struct usock *s = f->priv;
-    if (cmd == FIONREAD) {
-        uint32_t n = s->head - s->tail;
+    if ((cmd & 0xFF00) == 0x8900)
+        return dev_ioctl(cmd, arg);     /* musl's if_nametoindex asks here */
+    if (cmd == FIONREAD) {             /* (a datagram socket: the next one's size) */
+        uint32_t n = s->type == SOCK_DGRAM ? (s->dq ? s->dq->len : 0) : s->head - s->tail;
         return copy_to_user((void *)arg, &n, 4) < 0 ? -EFAULT : 0;
     }
     if (cmd == FIONBIO) {
@@ -501,6 +716,20 @@ SYSCALL_DEF(unix_connect)
     int err = read_name(a2, a3, name, &len);
     if (err)
         return err;
+    if (s->type == SOCK_DGRAM) {     /* just "send() goes there"; again: elsewhere */
+        struct usock *to = find_bound(name, len, &err);
+        if (!to)
+            return err;
+        if (to->type != SOCK_DGRAM)
+            return -EPROTOTYPE;
+        if (to->peer && to->peer != s)
+            return -EPERM;
+        uget(to);
+        if (s->peer)
+            uput(s->peer);
+        s->peer = to;
+        return 0;
+    }
     if (s->state == U_CONNECTED)
         return -EISCONN;
     if (s->state == U_LISTEN)
@@ -593,8 +822,16 @@ SYSCALL_DEF(unix_sendto)
 {
     struct file *f;
     struct usock *s = usock_of(a1, &f);
-    if (s->type != SOCK_STREAM)
-        return -ENOTCONN;
+    if (s->type == SOCK_DGRAM) {
+        int err;
+        struct usock *to = dgram_dest(s, a5, a6, &err);
+        if (!to)
+            return err;
+        struct user_iovec v = { a2, a3 };
+        int32_t r = dgram_send(s, to, &v, 1, (f->flags & O_NONBLOCK) || (a4 & MSG_DONTWAIT));
+        uput(to);
+        return r;
+    }
     return usock_write(s, (const uint8_t *)a2, a3,
                        (f->flags & O_NONBLOCK) || (a4 & MSG_DONTWAIT), a4 & MSG_NOSIGNAL);
 }
@@ -603,6 +840,20 @@ SYSCALL_DEF(unix_recvfrom)
 {
     struct file *f;
     struct usock *s = usock_of(a1, &f);
+    if (s->type == SOCK_DGRAM) {
+        struct user_iovec v = { a2, a3 };
+        uint8_t from[PATH_UN];
+        uint32_t fromlen;
+        int trunc;
+        int32_t r = dgram_recv(s, &v, 1, a4, (f->flags & O_NONBLOCK) || (a4 & MSG_DONTWAIT),
+                               from, &fromlen, &trunc);
+        if (r >= 0) {
+            int err = write_name(a5, a6, from, fromlen);
+            if (err)
+                return err;
+        }
+        return r;
+    }
     int32_t r = usock_read(s, (uint8_t *)a2, a3,
                            (f->flags & O_NONBLOCK) || (a4 & MSG_DONTWAIT), a4 & MSG_PEEK);
     if (r >= 0 && a5 && a6) {
@@ -645,9 +896,15 @@ SYSCALL_DEF(unix_sendmsg)
         if (cm.level == SOL_SOCKET && cm.type == SCM_RIGHTS)
             return -EOPNOTSUPP;     /* passing fds: not yet */
     }
-    if (s->type != SOCK_STREAM)
-        return -ENOTCONN;
     int nonblock = (f->flags & O_NONBLOCK) || (a3 & MSG_DONTWAIT);
+    if (s->type == SOCK_DGRAM) {     /* all of the iovecs: one datagram */
+        struct usock *to = dgram_dest(s, m.name, m.namelen, &err);
+        if (!to)
+            return err;
+        int32_t r = dgram_send(s, to, iov, (uint32_t)m.iovlen, nonblock);
+        uput(to);
+        return r;
+    }
     int32_t done = 0;
     for (uint32_t i = 0; i < m.iovlen; i++) {
         if (!iov[i].len)
@@ -673,6 +930,23 @@ SYSCALL_DEF(unix_recvmsg)
     if (err)
         return err;
     int nonblock = (f->flags & O_NONBLOCK) || (a3 & MSG_DONTWAIT);
+    if (s->type == SOCK_DGRAM) {
+        uint8_t from[PATH_UN];
+        uint32_t fromlen;
+        int trunc;
+        int32_t r = dgram_recv(s, iov, (uint32_t)m.iovlen, a3, nonblock, from, &fromlen, &trunc);
+        if (r < 0)
+            return r;
+        uint32_t fl = trunc ? MSG_TRUNC : 0;
+        user_addr_t none = 0;
+        if ((m.name && (err = write_name(m.name, a2 + offsetof(struct user_msghdr, namelen),
+                                         from, fromlen))) ||
+            copy_to_user((void *)(a2 + offsetof(struct user_msghdr, controllen)),
+                         &none, sizeof none) < 0 ||
+            copy_to_user((void *)(a2 + offsetof(struct user_msghdr, flags)), &fl, 4) < 0)
+            return err ? err : -EFAULT;
+        return r;
+    }
     int32_t done = 0;
     for (uint32_t i = 0; i < m.iovlen; i++) {
         if (!iov[i].len)
@@ -713,7 +987,7 @@ SYSCALL_DEF(unix_getsockopt)
     case SO_TYPE:       val = (uint32_t)s->type; break;
     case SO_ERROR:      val = 0; break;
     case SO_SNDBUF:
-    case SO_RCVBUF:     val = BUF_SIZE; break;
+    case SO_RCVBUF:     val = s->type == SOCK_DGRAM ? DQ_BYTES : BUF_SIZE; break;
     case SO_ACCEPTCONN: val = s->state == U_LISTEN; break;
     case SO_PEERCRED:
         if (s->state != U_CONNECTED)
@@ -760,7 +1034,7 @@ int32_t unix_socketpair(uint32_t type, uint32_t protocol, uintptr_t usv)
     uint32_t t = type & SOCK_TYPE_MASK;
     if (type & ~(SOCK_TYPE_MASK | SOCK_NONBLOCK | SOCK_CLOEXEC))
         return -EINVAL;
-    if (t != SOCK_STREAM)
+    if (t != SOCK_STREAM && t != SOCK_DGRAM)
         return -EOPNOTSUPP;
     if (protocol != 0)
         return -EPROTONOSUPPORT;
@@ -770,7 +1044,12 @@ int32_t unix_socketpair(uint32_t type, uint32_t protocol, uintptr_t usv)
         if (b) uput(b);
         return -ENOMEM;
     }
-    pair(a, b);
+    if (t == SOCK_DGRAM) {          /* each sends to the other */
+        a->peer = b, b->peer = a;
+        uget(a), uget(b);
+    } else {
+        pair(a, b);
+    }
     a->peercred = b->cred;
     b->peercred = a->cred;
     int fa = install(a, type);

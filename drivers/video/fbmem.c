@@ -56,6 +56,10 @@ static int mode_differs(const struct fb_var_screeninfo *a, const struct fb_var_s
 int fb_set_var(struct fb_info *info, struct fb_var_screeninfo *var)
 {
     uint32_t activate = var->activate;
+    if (!info->fbops->fb_check_var) {       /* one fixed mode (simplefb): any */
+        *var = info->var;                   /* request gets it, as on Linux; */
+        return 0;                           /* X sets the current mode at start */
+    }
     int err = info->fbops->fb_check_var(var, info);
     if (err)
         return err;
@@ -125,7 +129,7 @@ static int fb_mmap(struct file *f, struct vma *vma)
        Real video memory stays write-combining. */
     if (info->fix.smem_start >= pmm_end())
         vma->flags |= VM_WC;
-    return vm_iomap_memory(vma, (uint32_t)info->fix.smem_start, info->fix.smem_len);
+    return vm_iomap_memory(vma, info->fix.smem_start, info->fix.smem_len);   /* all 64 bits */
 }
 
 static const struct file_ops fb_fops = {

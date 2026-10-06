@@ -17,8 +17,10 @@ SECTIONS
     . = KERNEL_VBASE + KERNEL_LOAD;
 
     .text : AT(ADDR(.text) - KERNEL_VBASE) {
+        __text_start = .;       /* (a crash's stack scan: what is code) */
         *(.text.entry)
         *(.text .text.*)
+        __text_end = .;
     }
 
     .rodata : AT(ADDR(.rodata) - KERNEL_VBASE) {

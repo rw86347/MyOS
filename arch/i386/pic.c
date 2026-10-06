@@ -53,6 +53,12 @@ void pic_init(void)
     outb(PIC2_DATA, 0xFF);
 }
 
+void pic_mask(int irq)
+{
+    uint16_t port = irq < 8 ? PIC1_DATA : PIC2_DATA;
+    outb(port, inb(port) | (1 << (irq & 7)));
+}
+
 void pic_unmask(int irq)
 {
     uint16_t port = irq < 8 ? PIC1_DATA : PIC2_DATA;

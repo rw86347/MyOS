@@ -117,7 +117,7 @@ struct efi_boot_services {
     efi_status (*exit_boot_services)(efi_handle image, u64 map_key);
     void *get_next_monotonic_count;
     efi_status (*stall)(u64 microseconds);
-    void *set_watchdog_timer;
+    efi_status (*set_watchdog_timer)(u64 seconds, u64 code, u64 data_size, u16 *data);
     void *connect_controller;
     void *disconnect_controller;
     efi_status (*open_protocol)(efi_handle handle, efi_guid *protocol, void **iface,

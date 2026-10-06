@@ -2,6 +2,7 @@
 #define MM_H
 
 #include <stdint.h>
+#include <types.h>
 
 /*
  * An address space: one process's view of memory (Linux: mm_struct).
@@ -53,8 +54,9 @@ struct vma {
        so the BSS past p_filesz is zeros even when the file continues. */
     uint32_t file_end;
     /* VM_PFNMAP: the physical address of file offset 0 (file_end is then
-       the device's length). */
-    uint32_t phys;
+       the device's length). 64-bit: a GOP framebuffer can be above 4 GiB
+       (on x86_64 it is mapped there directly; i386 uses a RAM shadow). */
+    phys_addr_t phys;
 };
 
 struct mm {
@@ -92,6 +94,7 @@ int mm_remove(struct mm *mm, user_addr_t start, user_addr_t end);
 /* A page fault at va (CPU error code err) in the current address space:
    0 if it was fixed (demand paging, copy-on-write), -1 if it's a real error. */
 int mm_fault(user_addr_t va, uint32_t err);
+int mm_mincore(user_addr_t start, uint32_t pages, uint8_t *vec);   /* see mm.c */
 
 /* The brk and mmap system calls, on the current address space. fmode: the
    file's open() flags (its O_ACCMODE decides what MAP_SHARED may do). */
@@ -110,8 +113,8 @@ intptr_t mm_mmap_device(user_addr_t addr, uint32_t len, uint32_t prot, uint32_t 
 
 /* For a device's .mmap: make vma map physical [phys, phys + size),
    starting at the vma's file offset (Linux: vm_iomap_memory). 0, or
-   -EINVAL if the vma reaches past size. */
-int vm_iomap_memory(struct vma *vma, uint32_t phys, uint32_t size);
+   -EINVAL if the vma reaches past size rounded up to whole pages. */
+int vm_iomap_memory(struct vma *vma, phys_addr_t phys, uint32_t size);
 int32_t  mm_mprotect(user_addr_t addr, uint32_t len, uint32_t prot);
 
 /* shmdt: remove the shared-memory attach that starts at addr — every area

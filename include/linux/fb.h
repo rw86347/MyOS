@@ -99,7 +99,8 @@ struct file_ops;
 
 /* What a framebuffer driver does (Linux: struct fb_ops, the subset we use). */
 struct fb_ops {
-    /* Adjust *var to what the hardware can do; -EINVAL if impossible. */
+    /* Adjust *var to what the hardware can do; -EINVAL if impossible.
+       NULL: one fixed mode, which every request gets (simplefb). */
     int (*fb_check_var)(struct fb_var_screeninfo *var, struct fb_info *info);
     /* Switch to info->var (already checked); update info->fix. */
     int (*fb_set_par)(struct fb_info *info);

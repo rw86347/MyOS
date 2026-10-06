@@ -50,7 +50,10 @@
 #define QLEN    128                 /* events per reader */
 #define READERS 4                   /* open files per device */
 
-struct input_event { uint32_t sec, usec; uint16_t type, code; int32_t value; };
+/* The time is a struct timeval, two longs: 16 bytes in all on i386, 24 on
+   x86_64 — the same struct is right on both. */
+struct input_event { long sec, usec; uint16_t type, code; int32_t value; };
+_Static_assert(sizeof(struct input_event) == 2 * sizeof(long) + 8, "Linux's input_event");
 
 struct reader {
     int dev;
@@ -108,8 +111,8 @@ static void put(struct reader *r, uint32_t ms, uint16_t type, uint16_t code, int
         put(r, ms, EV_SYN, SYN_DROPPED, 0);
     }
     struct input_event *e = &r->q[r->head % QLEN];
-    e->sec = ms / 1000;
-    e->usec = ms % 1000 * 1000;
+    e->sec = (long)(ms / 1000);
+    e->usec = (long)(ms % 1000 * 1000);
     e->type = type, e->code = code, e->value = value;
     r->head++;
 }

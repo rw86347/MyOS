@@ -33,7 +33,8 @@
 #define KERNEL_VBASE     0xFFFFFFFF80000000ull  /* the image: physical 0 is here too */
 #define KERNEL_SPACE_START DIRECTMAP_BASE       /* everything above is the kernel's */
 
-/* Direct-mapped physical RAM (pmm's limit, too: frames are 32-bit numbers). */
+/* Direct-mapped physical RAM (pmm's limit, too: frames are 32-bit numbers).
+   The UEFI loader puts the initrd below it: KERNEL_RAM_LIMIT there. */
 #define DIRECTMAP_LIMIT  0x80000000ull          /* 2 GiB for now */
 
 #define KHEAP_START      0xFFFFFFFFC0000000ull

@@ -65,6 +65,24 @@ static int run(const char *path, const char *const argv[])
     return code;
 }
 
+/* Pages in use that neither the heap nor the caches account for: what a
+   program that leaked would leave behind (printed per program below). */
+static long held_pages(void)
+{
+    return -(long)pmm_free_count() - (long)kheap_pages() - (long)bcache_pages() - (long)pcache_pages();
+}
+
+static int run_counted(const char *path, const char *const argv[])
+{
+    long before = held_pages();
+    int code = run(path, argv);
+    long leaked = held_pages() - before;
+    if (leaked)
+        kprintf("User mode: %s left %ld pages behind\n", path, leaked);
+    return code;
+}
+#define run run_counted
+
 /* Plays "another program using the FPU": keeps wiping st0 and xmm0. If the
    kernel didn't save/restore user FPU state, the fpu program would see this
    thread's values instead of its own. */
@@ -185,6 +203,17 @@ void user_selftest(void)
     static const char *const sys_args[] = { "systest", NULL };
     check(run("/bin/systest", sys_args) == 0,
           "user: uname, clocks, sleep, poll, TLS, mprotect, openat (step 8)");
+    /* The raw-syscall checks (user/sys/systest.c), here also where a Wi-Fi
+       radio exists (the simulated one): nl80211, a scan from user space. */
+    static const char *const raw_args[] = { "rawsystest", NULL };
+    check(run("/bin/rawsystest", raw_args) == 0,
+          "user: raw system calls; nl80211: interfaces, scan, results (W2c)");
+    /* Alpine's iw, unchanged, scanning on the simulated radio (W2c). */
+    static const char *const iw_args[] = { "sh", "/bin/wifi-iw.sh", NULL };
+    check(run("/bin/sh", iw_args) == 0, "user: iw dev wlan0 scan lists the simulated networks (W2c)");
+    /* Alpine's wpa_supplicant, unchanged, joining the WPA2 network (W3c). */
+    static const char *const wpa_args[] = { "sh", "/bin/wifi-wpa.sh", NULL };
+    check(run("/bin/sh", wpa_args) == 0, "user: wpa_supplicant joins the WPA2 network; DHCP, ping (W3c)");
     static const char *const fs_args[] = { "fstest", NULL };
     check(run("/bin/fstest", fs_args) == 0,
           "user: writable files: create, write, rename, rm -r, exec (step 8i)");
@@ -224,7 +253,13 @@ void user_selftest(void)
     /* Every page comes back — exactly. The only pages allowed to stay
        missing are the ones the kernel heap took to grow, and the two
        caches (both keep them). */
-    check(pmm_free_count() + (kheap_pages() - heap_before) +
-          (bcache_pages() - cache_before) + (pcache_pages() - pc_before) == free_before,
-          "user: every program page freed (none leaked)");
+    long missing = (long)free_before - (long)(pmm_free_count() + (kheap_pages() - heap_before) +
+                   (bcache_pages() - cache_before) + (pcache_pages() - pc_before));
+    if (missing)
+        kprintf("user: %ld pages missing (free %lu -> %lu, heap +%lu, caches +%lu +%lu)\n", missing,
+                (unsigned long)free_before, (unsigned long)pmm_free_count(),
+                (unsigned long)(kheap_pages() - heap_before),
+                (unsigned long)(bcache_pages() - cache_before),
+                (unsigned long)(pcache_pages() - pc_before));
+    check(missing == 0, "user: every program page freed (none leaked)");
 }

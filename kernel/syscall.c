@@ -155,58 +155,52 @@ SYSCALL(sys_pwrite64)
  * or the program fall back to read + write — the same as on Linux for a
  * file that doesn't support it.
  */
-SYSCALL(sys_sendfile)
+/* The copy loop sendfile and copy_file_range share: up to `count` bytes of
+   regular file `src` from *pos into `out` — at *out_pos if out_pos is given
+   (out's own position stays), else at out's position, which moves. Page
+   cache -> one kernel page -> the destination's write, on a private copy of
+   its open file that says "kernel memory". Returns the bytes done (and moves
+   *pos and *out_pos), or -errno if nothing was done. */
+static int32_t copy_file_data(struct file *in, int64_t *pos, struct file *out,
+                              int64_t *out_pos, uint32_t count)
 {
-    struct file *out = fd_get(a1), *in = fd_get(a2);
-    if (!out || !in)
-        return -EBADF;
-    if ((in->flags & O_ACCMODE) == O_WRONLY || (out->flags & O_ACCMODE) == O_RDONLY)
-        return -EBADF;
     struct inode *src = in->inode;
-    /* The source must be file data the kernel can copy out: a regular file
-       in RAM or on a disk (not a /proc file, which is made up on reading). */
-    if (!S_ISREG(src->mode) || (src->ops && !src->fs))
-        return -EINVAL;
-    if (!out->ops->write || !out->ops->kbuf_ok || (out->flags & O_APPEND))
-        return -EINVAL;                 /* (O_APPEND: as on Linux) */
-    int64_t pos = in->pos;
-    if (a3 && copy_from_user(&pos, (const void *)a3, sizeof pos) < 0)
-        return -EFAULT;
-    if (pos < 0)
-        return -EINVAL;
-    uint32_t count = a4 > RW_MAX ? RW_MAX : (uint32_t)a4;
     uint32_t page = pmm_alloc();
     if (!page)
         return -ENOMEM;
     uint8_t *buf = P2V(page);
-
     file_get(in);                       /* both can sleep below: hold them */
     file_get(out);
     int32_t done = 0, err = 0;
     while ((uint32_t)done < count) {
-        if (pos >= src->size)
+        if (*pos >= src->size)
             break;                      /* end of the file */
         uint32_t k = count - done;
         if (k > PAGE_SIZE)
             k = PAGE_SIZE;
-        if (k > src->size - pos)
-            k = (uint32_t)(src->size - pos);
-        err = file_copy_out(src, (uint32_t)pos, buf, k);
+        if (k > src->size - *pos)
+            k = (uint32_t)(src->size - *pos);
+        err = file_copy_out(src, (uint32_t)*pos, buf, k);
         if (err < 0)
             break;
-        /* The destination's write, on a private copy of its open file that
-           says "kernel memory". Its position is carried back (a regular
-           file); a pipe, terminal or socket has none that matters. */
         struct file w = *out;
         w.kbuf = 1;
+        if (out_pos)
+            w.pos = (uint32_t)*out_pos;
         int32_t n = out->ops->write(&w, buf, k);
-        out->pos = w.pos;
+        if (out_pos) {
+            if (n > 0)
+                *out_pos += n;
+        } else {
+            out->pos = w.pos;           /* a regular file's position moves; a pipe,
+                                           terminal or socket has none that matters */
+        }
         if (n <= 0) {
             err = n;
             break;
         }
         done += n;
-        pos += n;
+        *pos += n;
         if ((uint32_t)n < k || signal_pending())
             break;                      /* full, or someone wants us: return */
     }
@@ -217,15 +211,87 @@ SYSCALL(sys_sendfile)
     file_put(out);
     file_put(in);
     pmm_free(page);
+    return done == 0 && err < 0 ? err : done;
+}
 
-    if (done == 0 && err < 0)
-        return err;
+/* The source must be file data the kernel can copy out: a regular file in
+   RAM or on a disk (not a /proc file, which is made up on reading). */
+static int copyable_source(const struct inode *src)
+{
+    return S_ISREG(src->mode) && (!src->ops || src->fs);
+}
+
+SYSCALL(sys_sendfile)
+{
+    struct file *out = fd_get(a1), *in = fd_get(a2);
+    if (!out || !in)
+        return -EBADF;
+    if ((in->flags & O_ACCMODE) == O_WRONLY || (out->flags & O_ACCMODE) == O_RDONLY)
+        return -EBADF;
+    if (!copyable_source(in->inode))
+        return -EINVAL;
+    if (!out->ops->write || !out->ops->kbuf_ok || (out->flags & O_APPEND))
+        return -EINVAL;                 /* (O_APPEND: as on Linux) */
+    int64_t pos = in->pos;
+    if (a3 && copy_from_user(&pos, (const void *)a3, sizeof pos) < 0)
+        return -EFAULT;
+    if (pos < 0)
+        return -EINVAL;
+    int32_t done = copy_file_data(in, &pos, out, NULL, a4 > RW_MAX ? RW_MAX : (uint32_t)a4);
+    if (done < 0)
+        return done;
     if (a3) {
         if (copy_to_user((void *)a3, &pos, sizeof pos) < 0)
             return -EFAULT;
     } else {
         in->pos = (uint32_t)pos;
     }
+    return done;
+}
+
+/*
+ * ssize_t copy_file_range(int fd_in, off64_t *off_in, int fd_out,
+ *                         off64_t *off_out, size_t len, unsigned flags)
+ * Copy between two regular files inside the kernel (coreutils' cp and
+ * install use it first). An offset pointer that is NULL means "the file's
+ * own position, which moves". The same loop as sendfile, so the same rules:
+ * at most RW_MAX a call, and a destination that can't take kernel memory is
+ * -EXDEV — which tells the program to copy with read and write instead.
+ */
+SYSCALL(sys_copy_file_range)
+{
+    if (a6)
+        return -EINVAL;                 /* no flags are defined */
+    struct file *in = fd_get(a1), *out = fd_get(a3);
+    if (!in || !out)
+        return -EBADF;
+    if ((in->flags & O_ACCMODE) == O_WRONLY || (out->flags & O_ACCMODE) == O_RDONLY ||
+        (out->flags & O_APPEND))
+        return -EBADF;
+    if (!copyable_source(in->inode) || !S_ISREG(out->inode->mode))
+        return -EINVAL;
+    if (!out->ops->write || !out->ops->kbuf_ok)
+        return -EXDEV;
+    int64_t pos = in->pos, opos = out->pos;
+    if ((a2 && copy_from_user(&pos, (const void *)a2, sizeof pos) < 0) ||
+        (a4 && copy_from_user(&opos, (const void *)a4, sizeof opos) < 0))
+        return -EFAULT;
+    uint32_t count = a5 > RW_MAX ? RW_MAX : (uint32_t)a5;
+    if (pos < 0 || opos < 0)
+        return -EINVAL;
+    if (in->inode == out->inode && pos < opos + count && opos < pos + count)
+        return -EINVAL;                 /* the same file, overlapping */
+    int32_t done = copy_file_data(in, &pos, out, a4 ? &opos : NULL, count);
+    if (done < 0)
+        return done;
+    if (a2) {
+        if (copy_to_user((void *)a2, &pos, sizeof pos) < 0)
+            return -EFAULT;
+    } else {
+        in->pos = (uint32_t)pos;
+    }
+    if (a4 && copy_to_user((void *)a4, &opos, sizeof opos) < 0)
+        return -EFAULT;
     return done;
 }
 
@@ -854,6 +920,32 @@ SYSCALL(sys_faccessat)
 /* madvise, set_robust_list...: nothing to do, success. */
 SYSCALL(sys_nop) { return 0; }
 
+/* int mincore(void *addr, size_t length, unsigned char *vec): one byte per
+   page of the range, 1 if it is in RAM. Programs also use it to find out
+   where memory is mapped at all — GNU tools' stack-overflow handler (gnulib)
+   probes the stack's extent page by page — so a page in no area must be
+   ENOMEM. When this was a stub answering "all there", each `grep` walked the
+   address space for most of a minute. */
+SYSCALL(sys_mincore)
+{
+    if (a1 & (PAGE_SIZE - 1))
+        return -EINVAL;
+    if (a1 + a2 < a1 || a1 + a2 > USER_ADDR_END)
+        return -ENOMEM;
+    uintptr_t pages = (a2 + PAGE_SIZE - 1) / PAGE_SIZE;
+    uint8_t vec[256];
+    for (uintptr_t done = 0; done < pages; ) {
+        uint32_t n = pages - done < sizeof vec ? (uint32_t)(pages - done) : sizeof vec;
+        int err = mm_mincore(a1 + done * PAGE_SIZE, n, vec);
+        if (err)
+            return err;
+        if (copy_to_user((void *)(a3 + done), vec, n) < 0)
+            return -EFAULT;
+        done += n;
+    }
+    return 0;
+}
+
 /* sync(): write every changed disk block now. fsync(fd) / fdatasync(fd):
    the same (the cache doesn't know which blocks belong to which file). */
 /* File data first (it is in the page cache), then the metadata. */
@@ -1332,6 +1424,18 @@ static const syscall_fn syscall_table[] U = {     /* (x86_64: unused, dropped) *
     [NR_times]      = sys_times,
     [NR_syncfs]     = sys_syncfs,
     [NR_chroot]     = sys_chroot,
+    [NR_setxattr] = sys_setxattr,
+    [NR_lsetxattr] = sys_lsetxattr,
+    [NR_fsetxattr] = sys_fsetxattr,
+    [NR_getxattr] = sys_getxattr,
+    [NR_lgetxattr] = sys_lgetxattr,
+    [NR_fgetxattr] = sys_fgetxattr,
+    [NR_listxattr] = sys_listxattr,
+    [NR_llistxattr] = sys_llistxattr,
+    [NR_flistxattr] = sys_flistxattr,
+    [NR_removexattr] = sys_removexattr,
+    [NR_lremovexattr] = sys_lremovexattr,
+    [NR_fremovexattr] = sys_fremovexattr,
     [NR_inotify_init] = sys_inotify_init,
     [NR_inotify_init1] = sys_inotify_init1,
     [NR_inotify_add_watch] = sys_inotify_add_watch,
@@ -1395,7 +1499,7 @@ static const syscall_fn syscall_table[] U = {     /* (x86_64: unused, dropped) *
     [NR_setgid32]   = sys_setgid,
     [NR_setfsuid32] = sys_setfsuid,
     [NR_setfsgid32] = sys_setfsgid,
-    [NR_mincore]    = sys_nop,
+    [NR_mincore]    = sys_mincore,
     [NR_readahead]  = sys_nop,
     [NR_madvise]    = sys_nop,
     [NR_sched_getaffinity] = sys_getaffinity,
@@ -1475,6 +1579,7 @@ static const syscall_fn syscall_table[] U = {     /* (x86_64: unused, dropped) *
     [NR_pread64]    = sys_pread64,
     [NR_pwrite64]   = sys_pwrite64,
     [NR_sendfile64] = sys_sendfile,
+    [NR_copy_file_range] = sys_copy_file_range,
     [NR_getcwd]     = sys_getcwd,
     [NR_getdents64] = sys_getdents64,
     [NR_fcntl64]    = sys_fcntl,
@@ -1558,7 +1663,7 @@ static const syscall_fn syscall_table64[] = {
     [NR64_pipe]         = sys_pipe,
     [NR64_sched_yield]  = sys_sched_yield,
     [NR64_mremap]       = sys_mremap,
-    [NR64_mincore]      = sys_nop,
+    [NR64_mincore]      = sys_mincore,
     [NR64_madvise]      = sys_nop,
     [NR64_dup]          = sys_dup,
     [NR64_dup2]         = sys_dup2,
@@ -1569,6 +1674,7 @@ static const syscall_fn syscall_table64[] = {
     [NR64_setitimer]    = sys_setitimer,
     [NR64_getpid]       = sys_getpid,
     [NR64_sendfile]     = sys_sendfile,
+    [NR64_copy_file_range] = sys_copy_file_range,
     [NR64_socket]       = sys_socket,
     [NR64_connect]      = sys_connect,
     [NR64_accept]       = sys_accept_x64,
@@ -1625,6 +1731,18 @@ static const syscall_fn syscall_table64[] = {
     [NR64_clock_adjtime] = sys_clock_adjtime,
     [NR64_syncfs]       = sys_syncfs,
     [NR64_chroot]       = sys_chroot,
+    [NR64_setxattr] = sys_setxattr,
+    [NR64_lsetxattr] = sys_lsetxattr,
+    [NR64_fsetxattr] = sys_fsetxattr,
+    [NR64_getxattr] = sys_getxattr,
+    [NR64_lgetxattr] = sys_lgetxattr,
+    [NR64_fgetxattr] = sys_fgetxattr,
+    [NR64_listxattr] = sys_listxattr,
+    [NR64_llistxattr] = sys_llistxattr,
+    [NR64_flistxattr] = sys_flistxattr,
+    [NR64_removexattr] = sys_removexattr,
+    [NR64_lremovexattr] = sys_lremovexattr,
+    [NR64_fremovexattr] = sys_fremovexattr,
     [NR64_inotify_init] = sys_inotify_init,
     [NR64_inotify_init1] = sys_inotify_init1,
     [NR64_inotify_add_watch] = sys_inotify_add_watch,

@@ -31,6 +31,7 @@
 #include <socket.h>
 #include <string.h>
 #include <tcp.h>
+#include <thread.h>
 #include <timer.h>
 #include <udp.h>
 
@@ -82,6 +83,11 @@ struct neigh {
 
 static struct neigh table[NEIGH_N];
 static struct net_device *eth;
+
+struct net_device *ipv4_dev(void)
+{
+    return eth;
+}
 static volatile int ping_got;
 static uint16_t ping_seq;
 static uint32_t ping_dst;
@@ -151,7 +157,7 @@ static int eth_send(const uint8_t dst[6], uint16_t proto, const void *payload, u
 {
     if (!eth || len > ETH_DATA_LEN)
         return -EINVAL;
-    struct sk_buff *skb = alloc_skb(2 + ETH_HLEN + len);
+    struct sk_buff *skb = alloc_skb(2 + ETH_HLEN + len, 0);
     if (!skb)
         return -ENOMEM;
     skb_reserve(skb, 2);
@@ -339,7 +345,7 @@ static void arp_flush(uint32_t ip, const uint8_t mac[6])
 
 static int on_arp(struct sk_buff *skb)
 {
-    if (skb->len < sizeof(struct arp_pkt)) {
+    if (skb->len < sizeof(struct arp_pkt) || skb->dev != eth) {    /* (another device's) */
         kfree_skb(skb);
         return 0;
     }
@@ -409,7 +415,7 @@ static struct sk_buff *ip_frame(uint32_t src, uint32_t dst, uint8_t proto,
     if (!eth || len > ETH_DATA_LEN - sizeof(struct iphdr))
         return NULL;
     uint32_t total = sizeof(struct iphdr) + len;
-    struct sk_buff *skb = alloc_skb(2 + ETH_HLEN + total);
+    struct sk_buff *skb = alloc_skb(2 + ETH_HLEN + total, 0);
     if (!skb)
         return NULL;
     skb_reserve(skb, 2);
@@ -491,7 +497,7 @@ int ip_send_bootp(const void *udp, uint32_t len)
 
 static int on_ip(struct sk_buff *skb)
 {
-    if (skb->len < sizeof(struct iphdr)) {
+    if (skb->len < sizeof(struct iphdr) || skb->dev != eth) {      /* (another device's) */
         kfree_skb(skb);
         return 0;
     }
@@ -717,14 +723,19 @@ void ipv4_init(void)
     random_bytes(idents, sizeof idents);
     ident_key = random_u32();
     rl_key = random_u32();
+    /* The handlers first, always: a machine whose only network is Wi-Fi has
+       no eth0 now and needs them later; with eth0, the reply to our own
+       first broadcast arrives inside dhcp_configure. */
+    dev_add_pack(&arp_pt);
+    dev_add_pack(&ip_pt);
     eth = dev_get_by_name("eth0");
     if (!eth)
         return;
-    dev_add_pack(&arp_pt);
-    dev_add_pack(&ip_pt);
-    /* The packet handlers have to be registered before this: the reply to our
-       own first broadcast arrives inside it. */
     dhcp_configure();
+    eth->in4.addr = ipv4_addr;
+    eth->in4.mask = ipv4_mask;
+    eth->in4.gw = ipv4_gw;
+    eth->in4.dns = ipv4_dns;
     int bits = 0;
     for (uint32_t m = ipv4_mask; m & 0x80000000u; m <<= 1)
         bits++;
@@ -733,6 +744,72 @@ void ipv4_init(void)
     print_ip(" gateway ", ipv4_gw);
     print_ip(" dns ", ipv4_dns);
     kprintf("\n");
+}
+
+/* --- which device IPv4 runs on ------------------------------------------------- */
+
+/* Move to dev, keeping the old device's lease with it for later. The
+   neighbour table belonged to the old link: forgotten. */
+static void activate(struct net_device *dev)
+{
+    if (eth) {
+        eth->in4.addr = ipv4_addr;
+        eth->in4.mask = ipv4_mask;
+        eth->in4.gw = ipv4_gw;
+        eth->in4.dns = ipv4_dns;
+    }
+    eth = dev;
+    ipv4_addr = dev ? dev->in4.addr : 0;
+    ipv4_mask = dev && dev->in4.mask ? dev->in4.mask : IPV4_MASK_STATIC;
+    ipv4_gw = dev ? dev->in4.gw : 0;
+    ipv4_dns = dev ? dev->in4.dns : 0;
+    memset(table, 0, sizeof table);
+}
+
+/* DHCP for a device that just became active, in a thread of its own: the
+   exchange waits for answers, up to seconds. */
+static void lease_thread(void *arg)
+{
+    struct net_device *dev = arg;
+    irq_save();                         /* (like the net thread: no interrupt races it) */
+    struct dhcp_lease l;
+    if (dhcp_lease(dev, &l) == 0 && eth == dev) {
+        dev->in4.addr = ipv4_addr = l.addr;
+        dev->in4.mask = ipv4_mask = l.mask;
+        dev->in4.gw = ipv4_gw = l.gw;
+        dev->in4.dns = ipv4_dns = l.dns;
+        print_ip("ipv4: ", ipv4_addr);
+        kprintf(" on %s\n", dev->name);
+    }
+    thread_exit();
+}
+
+void ipv4_link_up(struct net_device *dev)
+{
+    if (!dev || dev == eth)
+        return;
+    activate(dev);
+    kprintf("ipv4: now on %s\n", dev->name);
+    if (!dev->in4.addr)
+        thread_create("ipconfig", lease_thread, dev);
+}
+
+void ipv4_link_down(struct net_device *dev)
+{
+    if (!dev)
+        return;
+    memset(&dev->in4, 0, sizeof dev->in4);     /* (its lease was for that network) */
+    if (dev != eth)
+        return;
+    struct net_device *next = NULL;
+    for (int i = 1; i <= NETDEV_MAX && !next; i++) {
+        struct net_device *d = dev_get_by_index(i);
+        if (d && d != dev && (d->flags & IFF_UP) && !(d->flags & IFF_LOOPBACK) && d->in4.addr)
+            next = d;
+    }
+    eth = NULL;                         /* (dev's settings are cleared, not saved) */
+    activate(next);
+    kprintf("ipv4: %s gone, now on %s\n", dev->name, next ? next->name : "nothing");
 }
 
 int net_ping(uint32_t dst)

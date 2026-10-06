@@ -17,12 +17,18 @@
  *
  * Before interrupts are set up (serial_irq_init), and when the kernel
  * crashes (serial_flush), we fall back to polling, so nothing is lost.
+ *
+ * Most laptops have no COM1 at all. Then nothing would ever empty the ring:
+ * no UART, no interrupt. It fills during boot, and from then on the console
+ * refuses programs' writes (fs/dev.c waits for room in it). So serial_init
+ * first checks that a UART is there, and without one serial output is off.
  */
 #include <interrupts.h>
 #include <io.h>
 #include <serial.h>
 
 #define COM1        0x3F8
+#define SCRATCH     7           /* a spare register: keeps what we write */
 #define LSR_THRE    0x20        /* line status: transmit FIFO empty */
 #define IER_THRE    0x02        /* interrupt enable: "transmit FIFO empty" */
 #define FIFO_SIZE   16
@@ -30,6 +36,7 @@
 
 static char txbuf[TXBUF];
 static uint32_t head, tail;     /* write here / send from here; head - tail = used */
+static int present;             /* a UART answers at COM1 */
 static int irq_mode;            /* 1 = interrupt-driven */
 static int tx_running;          /* the THRE interrupt is on and will come */
 
@@ -40,6 +47,15 @@ static int fifo_empty(void)
 
 void serial_init(void)
 {
+    /* A UART keeps what we write in its scratch register; with nothing at
+       the port, reads give 0xFF. Two patterns, so a stuck bus can't pass. */
+    outb(COM1 + SCRATCH, 0x5A);
+    if (inb(COM1 + SCRATCH) != 0x5A)
+        return;
+    outb(COM1 + SCRATCH, 0xA5);
+    if (inb(COM1 + SCRATCH) != 0xA5)
+        return;
+    present = 1;
     outb(COM1 + 1, 0x00);   /* no UART interrupts yet */
     outb(COM1 + 3, 0x80);   /* set DLAB bit: next two writes set the baud divisor */
     outb(COM1 + 0, 0x01);   /* divisor low byte:  115200 / 1 = 115200 baud */
@@ -71,8 +87,26 @@ static void serial_irq(struct regs *r)
     fill_fifo();
 }
 
+int serial_present(void)
+{
+    return present;
+}
+
+/* From the timer tick. If the transmitter's interrupt never comes (a UART
+   whose IRQ 4 the board doesn't wire to the 8259), keep the queue moving
+   anyway: refill the FIFO when it is empty. One port read per tick, and
+   only while output is waiting; with the interrupt working it finds the
+   FIFO already busy. Interrupts are off (we are in the tick). */
+void serial_tick(void)
+{
+    if (tx_running && fifo_empty())
+        fill_fifo();
+}
+
 void serial_irq_init(void)
 {
+    if (!present)
+        return;
     irq_install(4, serial_irq);
     irq_mode = 1;
 }
@@ -99,6 +133,8 @@ static void put_queued(char c)
 
 void serial_write_n(const char *s, size_t n)
 {
+    if (!present)
+        return;
     if (!irq_mode) {
         for (size_t i = 0; i < n; i++) {
             if (s[i] == '\n')
@@ -120,7 +156,7 @@ void serial_write_n(const char *s, size_t n)
 
 size_t serial_space(void)
 {
-    return irq_mode ? TXBUF - (head - tail) : TXBUF;
+    return present && irq_mode ? TXBUF - (head - tail) : TXBUF;
 }
 
 void serial_flush(void)

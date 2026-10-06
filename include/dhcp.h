@@ -22,6 +22,11 @@
    back to the static numbers and returns -errno. */
 int dhcp_configure(void);
 
+/* One DHCP exchange on dev (the device IPv4 runs on): the lease, or -errno. */
+struct net_device;
+struct dhcp_lease { uint32_t addr, mask, gw, dns; };
+int dhcp_lease(struct net_device *dev, struct dhcp_lease *out);
+
 /* Whether a transaction is open, which is the only time the receive path
    accepts a broadcast (net/ipv4.c says why). False before and after. */
 int dhcp_open(void);

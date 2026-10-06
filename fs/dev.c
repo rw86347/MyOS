@@ -8,6 +8,8 @@
  *
  *   1,3  null      reads: end of file; writes: thrown away
  *   1,5  zero      reads: zero bytes; writes: thrown away
+ *   1,8  random    } reads: random bytes (kernel/random.c's ChaCha20, the
+ *   1,9  urandom   } same as getrandom()); writes: stirred into the pool
  *   5,0  tty       the terminal of the process  } both the console here
  *   5,1  console   the system console           }
  *   5,2  ptmx      a new pseudo-terminal pair (pty.c); its slave is
@@ -23,6 +25,7 @@
 #include <kprintf.h>
 #include <linux/fb.h>
 #include <pty.h>
+#include <random.h>
 #include <serial.h>
 #include <string.h>
 #include <tty.h>
@@ -121,6 +124,47 @@ static int32_t zero_read(struct file *f, void *user_buf, uint32_t n)
     return done;
 }
 
+/* /dev/random and /dev/urandom: one source, always ready, never blocks
+   (as Linux since 5.6 once it is seeded). Capped like zero_read, and the
+   bytes are wiped from the stack after each copy. */
+static int32_t random_read(struct file *f, void *user_buf, uint32_t n)
+{
+    (void)f;
+    if (n > RW_MAX)
+        n = RW_MAX;
+    uint8_t buf[64];
+    uint32_t done = 0;
+    while (done < n) {
+        uint32_t k = n - done < sizeof buf ? n - done : sizeof buf;
+        random_bytes(buf, k);
+        int rc = copy_to_user((uint8_t *)user_buf + done, buf, k);
+        memset(buf, 0, k);
+        if (rc < 0)
+            return done ? (int32_t)done : -EFAULT;
+        done += k;
+    }
+    return done;
+}
+
+/* Writing stirs the bytes in (no entropy credited — there is no count). */
+static int32_t random_write(struct file *f, const void *user_buf, uint32_t n)
+{
+    (void)f;
+    if (n > RW_MAX)
+        n = RW_MAX;
+    uint8_t buf[64];
+    uint32_t done = 0;
+    while (done < n) {
+        uint32_t k = n - done < sizeof buf ? n - done : sizeof buf;
+        if (copy_from_user(buf, (const uint8_t *)user_buf + done, k) < 0)
+            return done ? (int32_t)done : -EFAULT;
+        random_add(buf, k);
+        done += k;
+    }
+    return done;
+}
+
+static const struct file_ops random_ops = { .read = random_read, .write = random_write };
 static const struct file_ops null_ops = { .read = null_read, .write = sink_write, .kbuf_ok = 1 };
 static const struct file_ops zero_ops = { .read = zero_read, .write = sink_write, .kbuf_ok = 1 };
 
@@ -131,6 +175,8 @@ void dev_attach(struct inode *i)
     switch (i->rdev) {
     case DEV(1, 3): i->ops = &null_ops;    break;
     case DEV(1, 5): i->ops = &zero_ops;    break;
+    case DEV(1, 8):
+    case DEV(1, 9): i->ops = &random_ops;  break;
     case DEV(5, 0): i->ops = &devtty_ops;  break;
     case DEV(5, 1): i->ops = &console_ops; break;
     case DEV(5, 2): i->ops = pty_master_ops(); break;
@@ -179,6 +225,8 @@ void dev_init(void)
         return;
     make_node(dev, "null", DEV(1, 3));
     make_node(dev, "zero", DEV(1, 5));
+    make_node(dev, "random", DEV(1, 8));
+    make_node(dev, "urandom", DEV(1, 9));
     make_node(dev, "tty", DEV(5, 0));
     make_node(dev, "console", DEV(5, 1));
     make_node(dev, "ptmx", DEV(5, 2));

@@ -57,7 +57,7 @@ void net_selftest(void)
     if (!lo)
         return;
 
-    struct sk_buff *skb = alloc_skb(64);
+    struct sk_buff *skb = alloc_skb(64, 0);
     check(skb != NULL, "net: alloc a packet");
     if (!skb)
         return;
@@ -98,7 +98,7 @@ void net_selftest(void)
         int sent = 0;
         uint32_t f = irq_save();
         for (int i = 0; i < tries; i++) {
-            struct sk_buff *s = alloc_skb(ETH_ZLEN);
+            struct sk_buff *s = alloc_skb(ETH_ZLEN, 0);
             if (!s)
                 break;
             unsigned char *q = skb_put(s, ETH_ZLEN);
@@ -128,7 +128,7 @@ void net_selftest(void)
     static struct napi_struct napi;
     static struct net_device dummy;
     polls = 0;
-    netif_napi_add(&dummy, &napi, test_poll, 64);
+    netif_napi_add_weight(&dummy, &napi, test_poll, 64);
     napi_enable(&napi);
     napi_schedule(&napi);
     net_rx_action();

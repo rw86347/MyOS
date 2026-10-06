@@ -13,10 +13,13 @@
  * This tick will drive the time-slot scheduler: 20 slots x 1 ms (DESIGN.md).
  */
 #include <cycles.h>
+#include <hpet.h>
 #include <interrupts.h>
 #include <io.h>
+#include <kprintf.h>
 #include <sched.h>
 #include <signal.h>
+#include <serial.h>
 #include <thread.h>
 #include <timer.h>
 
@@ -27,10 +30,14 @@
 /* volatile: changed by the interrupt handler behind the main code's back,
    so the compiler must re-read it from memory every time. */
 static volatile uint32_t ticks;
+/* The same count with Linux's name and width (unsigned long: 32 bits on
+   i386, 64 on x86_64), for drivers written to Linux's API (linux/jiffies.h). */
+volatile unsigned long jiffies;
 
 static void timer_irq(struct regs *r)
 {
     ticks++;
+    jiffies++;
     struct thread *t = thread_current();    /* (NULL until thread_init) */
     if (t && !t->is_idle) {             /* CPU time: whoever this tick interrupted */
         if ((r->cs & 3) == 3)
@@ -42,7 +49,35 @@ static void timer_irq(struct regs *r)
     thread_timer_tick(ticks);           /* wake timed sleepers that are due */
     signal_alarm_tick(ticks);           /* SIGALRM for alarm/setitimer */
     ptimer_tick(ticks);                 /* timer_create's timers */
+    serial_tick();                      /* COM1 output, if its IRQ is missing */
     sched_tick();                       /* next time slot; may switch threads */
+}
+
+/* Wait for the next tick, at most `limit` CPU cycles. 1 if it came. */
+static int tick_within(uint64_t limit)
+{
+    uint32_t start = ticks;
+    uint64_t t0 = cycles_now();
+    while (ticks == start)
+        if (cycles_now() - t0 > limit)
+            return 0;
+    return 1;
+}
+
+/* Does the PIT really tick? On the old PCs it does: the first tick, within
+   1 ms, ends the wait. New Intel chipsets may switch its clock off (docs/
+   hardware-msi-katana-gf66.md); then the HPET takes over IRQ 0 (hpet.c).
+   50 million cycles is 10 ms on a 5 GHz CPU and 25 ms on a 2 GHz one,
+   plenty for a 1 ms tick. Interrupts must be on. */
+void timer_check(void)
+{
+    if (tick_within(50000000ull))
+        return;
+    if (hpet_legacy_start(TIMER_HZ) == 0 && tick_within(50000000ull))
+        kprintf("timer: the PIT does not tick; the HPET gives the 1 ms tick\n");
+    else
+        kprintf("timer: NO TICK: the PIT does not count and there is no HPET."
+                " Sleeps and time slots will not work.\n");
 }
 
 void timer_init(void)

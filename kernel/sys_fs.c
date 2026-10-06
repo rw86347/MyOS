@@ -640,6 +640,47 @@ SYSCALL_DEF(sys_mount)
     return -ENODEV;
 }
 
+/* --- extended attributes ---------------------------------------------------- */
+/*
+ * setxattr / getxattr / listxattr / removexattr, each in three forms: by
+ * path, by path without following a final symlink (l*), by fd (f*).
+ * MyOS's file systems keep no extended attributes (SELinux labels, ACLs,
+ * user.* notes), so the answer is the one Linux gives on such a file system:
+ * "not supported" for get, set and remove, and an empty list. Programs that
+ * copy attributes (coreutils' install and cp -a, tar, rsync) take that as
+ * "nothing to copy" and carry on; -ENOSYS made some of them complain. The
+ * file is looked up (or the fd checked) first, so a missing one is still
+ * -ENOENT / -EBADF, as on Linux.
+ */
+enum { XATTR_PATH, XATTR_LPATH, XATTR_FD };
+
+static int32_t xattr_target(int how, uintptr_t arg)
+{
+    if (how == XATTR_FD)
+        return fd_get(arg) ? 0 : -EBADF;
+    struct inode *i;
+    return target_of(AT_FDCWD, arg, how == XATTR_LPATH ? AT_SYMLINK_NOFOLLOW : 0, &i);
+}
+
+#define XATTR_CALL(name, how, answer)                                       \
+    SYSCALL_DEF(name)                                                       \
+    {                                                                       \
+        int32_t err = xattr_target(how, a1);                                \
+        return err ? err : (answer);                                        \
+    }
+XATTR_CALL(sys_setxattr,     XATTR_PATH,  -EOPNOTSUPP)
+XATTR_CALL(sys_lsetxattr,    XATTR_LPATH, -EOPNOTSUPP)
+XATTR_CALL(sys_fsetxattr,    XATTR_FD,    -EOPNOTSUPP)
+XATTR_CALL(sys_getxattr,     XATTR_PATH,  -EOPNOTSUPP)
+XATTR_CALL(sys_lgetxattr,    XATTR_LPATH, -EOPNOTSUPP)
+XATTR_CALL(sys_fgetxattr,    XATTR_FD,    -EOPNOTSUPP)
+XATTR_CALL(sys_listxattr,    XATTR_PATH,  0)            /* no names: length 0 */
+XATTR_CALL(sys_llistxattr,   XATTR_LPATH, 0)
+XATTR_CALL(sys_flistxattr,   XATTR_FD,    0)
+XATTR_CALL(sys_removexattr,  XATTR_PATH,  -EOPNOTSUPP)
+XATTR_CALL(sys_lremovexattr, XATTR_LPATH, -EOPNOTSUPP)
+XATTR_CALL(sys_fremovexattr, XATTR_FD,    -EOPNOTSUPP)
+
 /* pivot_root(new_root, put_old): see vfs_pivot_root. Root only, and not from
    inside a chroot (whose "/" is not the one being moved). */
 SYSCALL_DEF(sys_pivot_root)

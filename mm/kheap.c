@@ -284,14 +284,71 @@ void *kmalloc(size_t size)
     return p;
 }
 
+/* --- physically contiguous blocks ----------------------------------------- */
+
+/* Linux drivers expect kmalloc memory to be physically contiguous (they
+   hand it to devices for DMA), and our big blocks are not: their pages are
+   scattered, only the virtual addresses line up. So the Linux API's
+   kmalloc (kernel/linux_slab.c) takes bigger blocks as a run of pages from
+   the PMM, seen through the direct map. The first 16 bytes say so — the
+   same place a slab page keeps its header — so kfree can tell. */
+#define CONT_MAGIC  0x434F4E54          /* "CONT" */
+
+struct cont_page {
+    uint32_t magic;
+    uint32_t pages;
+    uint32_t pad[2];
+};
+
+void *kmalloc_contig(size_t size)
+{
+    uint32_t pages = (uint32_t)((size + sizeof(struct cont_page) + PAGE_SIZE - 1) / PAGE_SIZE);
+    uint32_t pa = pages == 1 ? pmm_alloc() : pmm_alloc_run(pages);
+    if (!pa)
+        return NULL;
+    struct cont_page *h = P2V(pa);
+    h->magic = CONT_MAGIC;
+    h->pages = pages;
+    return h + 1;
+}
+
+static struct cont_page *cont_of(const void *ptr)
+{
+    struct cont_page *h = (struct cont_page *)((uintptr_t)ptr & ~(uintptr_t)(PAGE_SIZE - 1));
+    return h->magic == CONT_MAGIC && (const void *)(h + 1) == ptr ? h : NULL;
+}
+
 void kfree(void *ptr)
 {
     if (!ptr)
         return;
-    if ((uintptr_t)ptr < KHEAP_START)
-        small_free(ptr);                /* in the direct map: a size class */
-    else
+    if ((uintptr_t)ptr < KHEAP_START) {
+        struct cont_page *h = cont_of(ptr);
+        if (h) {                        /* a contiguous run */
+            uint32_t pa = (uint32_t)V2P(h), pages = h->pages;
+            h->magic = 0;
+            for (uint32_t k = 0; k < pages; k++)
+                pmm_free(pa + k * PAGE_SIZE);
+        } else {
+            small_free(ptr);            /* in the direct map: a size class */
+        }
+    } else {
         big_free(ptr);
+    }
+}
+
+size_t kheap_size(const void *ptr)
+{
+    if (!ptr)
+        return 0;
+    if ((uintptr_t)ptr < KHEAP_START && cont_of(ptr))
+        return cont_of(ptr)->pages * PAGE_SIZE - sizeof(struct cont_page);
+    if ((uintptr_t)ptr < KHEAP_START) {     /* the class, from the page's header */
+        const struct slab_page *page =
+            (const struct slab_page *)((uintptr_t)ptr & ~(uintptr_t)(PAGE_SIZE - 1));
+        return class_size[page->cls];
+    }
+    return ((const struct block *)ptr - 1)->size;
 }
 
 void kheap_stats(uint32_t *used, uint32_t *free_bytes, uint32_t *mapped)

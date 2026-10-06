@@ -11,6 +11,7 @@
 #define CPU_PSE   (1u << 3)     /* 4 MiB pages */
 #define CPU_TSC   (1u << 4)     /* rdtsc cycle counter */
 #define CPU_MSR   (1u << 5)     /* rdmsr / wrmsr */
+#define CPU_APIC  (1u << 9)     /* a local APIC (MSI, its timer) */
 #define CPU_SEP   (1u << 11)    /* sysenter / sysexit (fast syscalls) */
 #define CPU_PGE   (1u << 13)    /* global pages (survive a CR3 reload) */
 #define CPU_CMOV  (1u << 15)

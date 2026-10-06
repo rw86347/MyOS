@@ -125,6 +125,14 @@ bring the network up. The earlier "lwIP or ours" choice is closed.
 Licence note: those drivers are GPLv2, so a MyOS image that includes them is effectively
 GPLv2 too; MyOS has no licence file yet — pick one before any Linux driver source is copied in.
 
+Decided (2026-10-06, Rodger): **the kernel is ours; the interfaces are Linux's.**
+MyOS copies Linux's interfaces — the driver API, the program ABI — and implements
+them itself. Linux code comes in only as a driver, never as part of the kernel:
+for Wi-Fi the 802.11 stack is ours (nl80211 above it, mac80211's driver API below
+it) and Intel's `iwlwifi` plugs into it unchanged, taken under its BSD-3-Clause
+terms, as FreeBSD's LinuxKPI does. No GPL-only file goes in, so MyOS's licence
+stays a free choice. Plan: `docs/WIFI-PLAN.md`.
+
 Decided (2026-10-03, later the same day): the first e1000 and the IPv4 path are
 original code, written against that same `net_device` / `sk_buff` / NAPI boundary,
 because the licence file is still missing. Porting a Linux driver later stays

@@ -8,7 +8,6 @@
  * firmware picked the mode, and we have no driver for the real GPU yet.
  */
 #include <bootinfo.h>
-#include <errno.h>
 #include <interrupts.h>
 #include <kprintf.h>
 #include <linux/fb.h>
@@ -41,23 +40,9 @@ static void *shadow;
 static uint32_t shadow_bytes;
 static int shadow_live;             /* 1: fbcon and X share the RAM copy */
 
-static int no_check(struct fb_var_screeninfo *var, struct fb_info *fb)
-{
-    (void)var;
-    (void)fb;
-    return -EINVAL;             /* the firmware's mode is the only mode */
-}
-
-static int no_set(struct fb_info *fb)
-{
-    (void)fb;
-    return -EINVAL;
-}
-
-static const struct fb_ops ops = {
-    .fb_check_var = no_check,
-    .fb_set_par = no_set,
-};
+/* No fb_check_var: the firmware's mode is the only mode, and fb_set_var
+   answers every request with it (Linux's simplefb has none either). */
+static const struct fb_ops ops;
 
 static struct wait_queue blit_wait;
 

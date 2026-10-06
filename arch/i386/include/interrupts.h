@@ -16,13 +16,18 @@ struct regs {
                                      ring 3 (check cs & 3 before using them) */
 };
 
-typedef void (*irq_handler_t)(struct regs *r);
+typedef void (*isr_fn_t)(struct regs *r);
 
 /* Fill in the IDT and load it. Call once, early. */
 void idt_init(void);
 
 /* Run `handler` whenever hardware IRQ `irq` (0-15) fires, and unmask it. */
-void irq_install(int irq, irq_handler_t handler);
+/* IRQ numbers: 0-15 are the 8259's lines, 16-31 MSI/MSI-X vectors handed
+   out by apic.c. Either way IRQ n arrives as CPU vector 32 + n. */
+#define IRQ_MSI_FIRST 16
+#define NR_IRQS       32
+
+void irq_install(int irq, isr_fn_t handler);
 
 static inline void interrupts_enable(void)  { __asm__ volatile ("sti"); }
 static inline void interrupts_disable(void) { __asm__ volatile ("cli"); }

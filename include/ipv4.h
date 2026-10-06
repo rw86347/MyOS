@@ -19,13 +19,22 @@
  * has no address yet.
  *
  * Plain words rather than a struct behind an accessor because every send
- * reads one: a load, not a call. They are written once, by the DHCP client,
- * before any socket exists, and read-only afterwards — so nothing has to
- * reason about them changing under it. Renewing a lease (which we do not do
- * yet) would be the first thing to break that, and would need the sockets to
- * be told.
+ * reads one: a load, not a call. They belong to the one device IPv4 runs on
+ * at a time (ipv4_dev(): eth0, or wlan0 once Wi-Fi connects — a laptop's
+ * situation); switching devices swaps them, and connections made on the
+ * old one stop working, as when a laptop changes networks.
  */
 extern uint32_t ipv4_addr, ipv4_mask, ipv4_gw, ipv4_dns;
+
+/* The device those belong to, or NULL if there is none. */
+struct net_device;
+struct net_device *ipv4_dev(void);
+
+/* A link became usable (Wi-Fi: associated and authorized): IPv4 moves to it,
+   with the lease it had, or asks DHCP for one in a thread of its own. When
+   the active link goes, IPv4 moves to another one that is up, if any. */
+void ipv4_link_up(struct net_device *dev);
+void ipv4_link_down(struct net_device *dev);
 
 /* What to use if no DHCP server answers. These are QEMU user-net's own
    numbers, which is also what its built-in DHCP server hands out, so a

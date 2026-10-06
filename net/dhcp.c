@@ -316,54 +316,64 @@ static void recv_cb(void *ctx, uint32_t src, uint16_t sport,
     dhcp_input(src, sport, data, len);
 }
 
-int dhcp_configure(void)
+/* Ask dev's network for a lease (dev must be the device IPv4 runs on: the
+   exchange goes out through it). 0 and *out, or -errno. */
+int dhcp_lease(struct net_device *dev, struct dhcp_lease *out)
 {
-    struct net_device *eth = dev_get_by_name("eth0");
-    if (!eth) {
-        use_static();
-        return -ENODEV;
-    }
     int rc = udp_bind(BOOTP_CLIENT, recv_cb, &open_now);
-    if (rc < 0) {
-        use_static();
+    if (rc < 0)
         return rc;
-    }
     /* A guessable transaction id lets anyone on the segment answer a request
        they never saw, which is the whole of DHCP's (weak) defence. */
     xid = random_u32();
     open_now = 1;
-    rc = exchange(eth->dev_addr, DHCP_DISCOVER, DHCP_OFFER);
+    rc = exchange(dev->dev_addr, DHCP_DISCOVER, DHCP_OFFER);
     if (rc == 0) {
         /* The REQUEST has to name the address from the offer, so keep it
            across the second exchange: a reply to the request overwrites
            offer_addr with the same value, and a NAK leaves it alone. */
         uint32_t asked = offer_addr;
-        rc = exchange(eth->dev_addr, DHCP_REQUEST, DHCP_ACK);
+        rc = exchange(dev->dev_addr, DHCP_REQUEST, DHCP_ACK);
         if (rc == 0 && offer_addr != asked)
             rc = -EINVAL;           /* acknowledged something we did not ask for */
     }
     open_now = 0;
     udp_unbind(BOOTP_CLIENT);
-    if (rc < 0) {
-        print_ip("dhcp: no answer, using ", IPV4_ADDR_STATIC);
-        kprintf("\n");
-        use_static();
+    if (rc < 0)
         return rc;
-    }
-    /* Said out loud because the fallback above would, under QEMU, produce
-       exactly the same four addresses -- so without this line a boot log
-       cannot tell a working DHCP client from one that never got a reply, and
-       neither can the self-test that checks for it. */
+    /* Said out loud: under QEMU the static fallback below produces exactly
+       the same four addresses, so without this line a boot log cannot tell
+       a working DHCP client from one that never got a reply. */
     print_ip("dhcp: lease from ", offer_server);
     kprintf("\n");
-    ipv4_addr = offer_addr;
+    out->addr = offer_addr;
     /* A server need not send a netmask or a gateway, and one that sends a
        netmask of zero would put every address off-subnet. Fall back to the
        class-C guess, which is right on every network this runs on. */
-    ipv4_mask = offer_mask ? offer_mask : IPV4_MASK_STATIC;
-    ipv4_gw = offer_gw;
+    out->mask = offer_mask ? offer_mask : IPV4_MASK_STATIC;
+    out->gw = offer_gw;
     /* No nameserver offered: try the gateway, which is usually also a
        resolver. Better than leaving DNS pointed at nothing. */
-    ipv4_dns = offer_dns ? offer_dns : offer_gw;
+    out->dns = offer_dns ? offer_dns : offer_gw;
+    return 0;
+}
+
+int dhcp_configure(void)
+{
+    struct net_device *eth = dev_get_by_name("eth0");
+    struct dhcp_lease l;
+    int rc = eth ? dhcp_lease(eth, &l) : -ENODEV;
+    if (rc < 0) {
+        if (eth) {
+            print_ip("dhcp: no answer, using ", IPV4_ADDR_STATIC);
+            kprintf("\n");
+        }
+        use_static();
+        return rc;
+    }
+    ipv4_addr = l.addr;
+    ipv4_mask = l.mask;
+    ipv4_gw = l.gw;
+    ipv4_dns = l.dns;
     return 0;
 }

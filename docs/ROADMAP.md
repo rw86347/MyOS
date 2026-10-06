@@ -241,9 +241,15 @@ Mark a step `[x]` only when its "Done when" check works.
     queues, and x86_64's own layouts (statfs, select, shm*, ...). `user/sys/systest.c`.
   - [ ] Next: the live desktop (`myos-login`, X) on the x86_64 kernel, then the
     GPD Pocket 4 itself (ACPI, MSI, NVMe, xHCI).
-- [ ] **13. WiFi** — pick ONE chip with open docs (e.g. Atheros AR5xxx / ath5k), port driver + firmware loading,
-  802.11 + WPA2 (run `wpa_supplicant` in user space).
-  Done when: connects to a WPA2 network.
+- [ ] **13. WiFi** — the MSI Katana's Intel AX201: our own 802.11 stack with Linux's
+  interfaces (nl80211 up, mac80211's driver API down), Intel's `iwlwifi` through the
+  shim, `wpa_supplicant` in user space, a Windows-style tray icon. Steps W0-W8 in
+  `docs/WIFI-PLAN.md` (decided 2026-10-06; replaces the ath5k idea).
+  Done when: the MSI connects to a WPA2 network from the tray icon.
+  Progress (2026-10-06): W0-W3, W5 and W6 done — in QEMU, Alpine's
+  wpa_supplicant joins a simulated WPA2 network through our stack, and
+  iwlwifi links into the x86_64 kernel; the tray icon is written (its
+  screenshot test is left); next is W7, the real card on the MSI.
 - [ ] **14. ARM port** — one board (original Raspberry Pi), device tree, ARM boot path.
 
 ## Notes

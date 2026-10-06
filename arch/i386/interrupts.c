@@ -14,6 +14,7 @@
  *   vector 128     int 0x80        -> Linux system call (syscall.c)
  */
 #include <gdt.h>
+#include <apic.h>
 #include <interrupts.h>
 #include <kprintf.h>
 #include <pic.h>
@@ -42,10 +43,11 @@ struct idt_ptr {
 
 static struct idt_gate idt[256];
 #define IRQ_SHARE 4
-static irq_handler_t irq_handlers[16][IRQ_SHARE];
+static isr_fn_t irq_handlers[NR_IRQS][IRQ_SHARE];
 
-extern const uint32_t isr_stub_table[48];    /* from isr.asm */
+extern const uint32_t isr_stub_table[32 + NR_IRQS];    /* from isr.asm */
 extern char isr_syscall[];
+extern char isr_spurious[];
 
 /* type_attr 0x8E = present | ring 0 | 32-bit interrupt gate.
    An "interrupt gate" turns interrupts off while the handler runs, so a
@@ -64,10 +66,11 @@ static void set_gate(int vector, uint32_t handler, int user_allowed)
 
 void idt_init(void)
 {
-    for (int v = 0; v < 48; v++)
+    for (int v = 0; v < 32 + NR_IRQS; v++)
         set_gate(v, isr_stub_table[v], 0);
     set_gate(0x80, (uint32_t)(uintptr_t)isr_syscall, 1);
-    /* Vectors 48-255 stay empty (not present). Using one would cause a
+    set_gate(0xFF, (uint32_t)(uintptr_t)isr_spurious, 0);
+    /* The other vectors stay empty (not present). Using one would cause a
        General Protection fault, which we do catch. */
 
     struct idt_ptr ptr = { sizeof idt - 1, (uint32_t)(uintptr_t)idt };
@@ -78,12 +81,15 @@ void idt_init(void)
 
 /* PCI devices share interrupt lines, so a line has up to IRQ_SHARE
    handlers; each one checks whether its own device asked. */
-void irq_install(int irq, irq_handler_t handler)
+void irq_install(int irq, isr_fn_t handler)
 {
+    if (irq < 0 || irq >= NR_IRQS)
+        return;
     for (int k = 0; k < IRQ_SHARE; k++)
         if (!irq_handlers[irq][k] || irq_handlers[irq][k] == handler) {
             irq_handlers[irq][k] = handler;
-            pic_unmask(irq);
+            if (irq < IRQ_MSI_FIRST)
+                pic_unmask(irq);        /* an MSI has no line to unmask */
             return;
         }
     kprintf("irq %d: too many devices share it\n", irq);
@@ -203,6 +209,23 @@ static void exception(struct regs *r)
     kprintf("EIP=%08lx  CS=%04lx  EFLAGS=%08lx  CR2=%08lx\n", r->eip, r->cs, r->eflags, cr2);
     kprintf("EAX=%08lx EBX=%08lx ECX=%08lx EDX=%08lx\n", r->eax, r->ebx, r->ecx, r->edx);
     kprintf("ESI=%08lx EDI=%08lx EBP=%08lx\n", r->esi, r->edi, r->ebp);
+    /* Who called whom: return addresses on the stack (no frame pointers,
+       so a scan, as Linux does without them; some values are stale). In
+       ring 0 the CPU pushed no ESP: the stack went on right after eflags. */
+    {
+        extern char __text_start[], __text_end[], boot_stack_top[];
+        struct thread *t = thread_current();
+        uint32_t sp = (uint32_t)&r->user_esp;
+        uint32_t top = t && t->stack ? (uint32_t)t->stack + THREAD_STACK : (uint32_t)boot_stack_top;
+        if (sp < top && top - sp <= 16384) {
+            kprintf("In thread \"%s\"; called from (newest first):", t ? t->name : "?");
+            int n = 0;
+            for (const uint32_t *p = (const uint32_t *)sp; (uint32_t)p < top && n < 16; p++)
+                if (*p >= (uint32_t)__text_start && *p < (uint32_t)__text_end)
+                    kprintf("%s%08lx", n++ % 6 ? " " : "\n  ", *p);
+            kprintf("\n");
+        }
+    }
     kprintf("System halted. (Look up EIP with: i686-elf-addr2line -e build/kernel.elf %lx)\n",
             r->eip);
     serial_flush();                 /* interrupts are off: send it all now */
@@ -232,11 +255,14 @@ void interrupt_dispatch(struct regs *r)
 
     int irq = r->vector - PIC_IRQ_BASE;
     cpu_idle_end();                 /* if the CPU was halted, it woke up now */
-    if (pic_is_spurious(irq))
+    if (irq < IRQ_MSI_FIRST && pic_is_spurious(irq))
         return;
     for (int k = 0; k < IRQ_SHARE && irq_handlers[irq][k]; k++)
         irq_handlers[irq][k](r);
-    pic_send_eoi(irq);
+    if (irq < IRQ_MSI_FIRST)
+        pic_send_eoi(irq);
+    else
+        lapic_eoi();                /* an MSI is acknowledged at the local APIC */
 
     /* If the timer said "time's up", switch threads now. This must come
        after the EOI: the PIC won't send another tick until it gets one. */

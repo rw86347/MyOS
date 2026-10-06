@@ -52,6 +52,7 @@
 #define EAFNOSUPPORT 97 /* address family not supported */
 #define EADDRINUSE 98   /* address already in use */
 #define EADDRNOTAVAIL 99 /* that address is not ours */
+#define ENOBUFS 105    /* no room in a queue (a netlink socket's) */
 #define EALREADY   114  /* a connect is already under way */
 #define EINPROGRESS 115 /* non-blocking connect started */
 #define ENETDOWN 100    /* the network device is not up */

@@ -1729,3 +1729,656 @@ legacy fallbacks DESIGN.md drops.
   in `make test-uefi-shell`. i386 `make test`, `test-shell`, `test-hd` pass.
   `make bench`: unchanged except +40 cycles on open+close (docs/performance.md).
 
+## 2026-10-05 — x86_64 live userland rebuild (Cursor)
+
+Refreshed `live/packages.x86_64.lock` (563 packages; stale gcc pin had broken
+sysroot fetch). Rebuilt sysroot, `live-extra` (ELF64 myos-login, menu, Settings,
+Files, Preview, WritePerfect, Golden Hour theme), `login-initrd-x86_64.cpio`
+(~120 MiB), `myos-live-root.img` (2 GiB), and `myos-live-uefi.img`.
+`make ARCH=x86_64 test-live-uefi` mounts myos-root; `test-uefi-login` reaches
+runit stage 1 but not myos-login — kernel lacks syscalls 430/326/190 (handoff:
+`docs/x86_64-LIVE-HANDOFF.md`). No kernel changes in this pass.
+
+
+## 2026-10-05 — x86_64 live desktop; the first real-laptop boot
+
+**Desktop in QEMU.** myos-login, Xorg and IceWM now run on x86_64, from the RAM
+login initrd and from the disk image. What it took:
+- `mincore` was a no-op returning 0, and grep (gnulib) probes the stack's extent
+  with it: 55 million calls, and first boot looked hung. It is real now
+  (`mm_mincore`; ENOMEM for unmapped pages), on both CPUs.
+- evdev's `struct input_event` was 16 bytes on x86_64 (should be 24: the timeval is
+  two longs), so X never saw Enter.
+- `/dev/fb0` mmap cut the framebuffer's physical address to 32 bits;
+  `vma.phys` is `phys_addr_t` now (GOP is above 4 GiB on real machines).
+- New on both: `copy_file_range` (shares sendfile's loop), the 12 xattr calls
+  (no xattrs: set/get -EOPNOTSUPP, list 0). systest checks them.
+
+**Real hardware: rebooted in a loop.** The laptop showed the loader's first two
+lines and reset. Reproduced in QEMU just by giving it more RAM: with 2 GiB or more
+the kernel died before its first line. Three bugs, none visible at 1 GiB:
+1. `entry.asm` switched to its own page tables (first 1 GiB only) while RSP was
+   still the firmware's stack — at 2.6 GiB. The first `push` faulted, the
+   firmware's IDT was unmapped too: triple fault, reset. Now RSP moves to
+   `boot_stack` before CR3 changes.
+2. The x86_64 loader's fallback put the initrd "anywhere below 4 GiB"; firmware
+   hands out the highest fit, above the kernel's 2 GiB direct map. Now below
+   2 GiB (`KERNEL_RAM_LIMIT`, = `DIRECTMAP_LIMIT`). QEMU with 4 GiB takes this
+   path too: the space after the kernel is busy.
+3. Both loaders read the 120 MiB initrd with one `Read()`. Some firmware hangs or
+   resets on that (Linux's EFI stub reads 1 MiB at a time for the same reason).
+   Now 1 MiB pieces, a dot per 8 MiB, the 5-minute UEFI watchdog off (as GRUB
+   does), and an error stays on screen 30 s.
+QEMU: boots at 1, 2, 2.7, 4 and 8 GiB; the live image reaches the login screen
+with 4 GiB. `test-uefi-shell` passes on both CPUs.
+
+**Then the MSI booted to runit, but X did not start.** QEMU's screen is the
+Bochs card (drivers/gpu/drm/tiny/bochs.c); a laptop's is the firmware's
+framebuffer (simplefb), which X had never run on. `-vga cirrus` (no driver of
+ours, so simplefb) reproduced it. Three bugs on that path:
+1. `vm_iomap_memory` compared bytes: 800x600x4 is 468.75 pages, X maps 469,
+   EINVAL. Linux rounds the area up to whole pages; so do we now (1366x768
+   and 1600x900 laptops would have hit it too).
+2. simplefb refused every FBIOPUT_VSCREENINFO, even of the current mode,
+   which X sets at start. Like Linux, a driver with no `fb_check_var` now
+   gets its one mode back as success.
+3. The x86_64 loader had UEFI's pixel format backwards (UEFI's "BlueGreenRed"
+   names bytes in memory order, i.e. XRGB): red and blue swapped in X.
+With `-vga cirrus` the login screen and the IceWM desktop now come up with the
+right colours; `make test`, `test-uefi-shell` (both CPUs) pass.
+
+**Still stuck at runit stage 2 on the MSI: no COM1.** Console output goes to
+the screen and to a serial ring that COM1's interrupt empties. The MSI has no
+UART, so nothing ever emptied it: about 8 KiB into the boot it was full, and
+the console then refused programs' writes (a write returns 0 when the ring has
+no room, so the screen waits for the serial port). Getty, X and myos-login
+stalled writing their first lines. QEMU `-serial none` reproduced it: `seq
+3000` stopped at 1246. serial_init now checks the UART's scratch register
+(no UART reads 0xFF) and switches serial output off without one.
+The login service also says more on the screen: a line when it starts X, and
+a runit `finish` script that shows the X log's (EE) lines when it fails.
+
+**Still stuck at stage 2: the PIT does not tick.** (Rodger's
+docs/hardware-msi-katana-gf66.md: a Tiger Lake board need not have a usable
+PIT; Intel chipsets gate its clock to save power.) No IRQ 0 means no time
+slot ever ends and no timed sleep wakes: stage 1 is scripts that never sleep,
+so it finished; stage 2 is services that do (runsv waits 1 s before a
+restart, myos-login polls X every 100 ms), so it stopped. QEMU
+`-machine q35,pit=off` reproduced it: X started, then everything froze.
+Now timer_check() (after `sti`) waits for the first tick, at most 50 million
+TSC cycles; old PCs pass within 1 ms. Without one, drivers/hpet.c starts the
+HPET (fixed address 0xFED00000; ACPI not read yet) in legacy replacement
+mode, where its timer 0 raises IRQ 0 on the 8259 just as the PIT did, so the
+tick handler is unchanged. The boot says which: `timer: the PIT does not
+tick; the HPET gives the 1 ms tick`, and `serial: COM1` or `no COM1`.
+`make TRACE=1` builds a kernel that prints every exec and exit on the screen
+(build/x86_64/trace/). `test-uefi-login` now runs with `pit=off`; all tests
+pass on both CPUs. `LIVE_STALE_LOCK=1` builds the live disk from the lock
+when packages.txt has moved on (new packages are left out, with a warning).
+
+## 2026-10-06 — ssh, a static web server, and compilers on the live disk
+OpenSSH client and server are on both live disks. `sshd` is a runit service
+(on by default). Empty passwords and root logins are refused
+(`PermitEmptyPasswords no`); set one with `passwd` before expecting a remote
+login. Host keys are made on first boot.
+
+`darkhttpd` serves `/var/www/html` on port 80. It is installed and off.
+`doas myos-httpd enable` turns it on; `disable` / `status` are the other two
+verbs. No CGI.
+
+`g++` moved from [build-only] (Mac sysroot only) onto the disk. Python now
+has headers and pip. Java is OpenJDK 8 on i386 (Alpine has nothing newer
+there) and OpenJDK 17 on x86_64. Incoming TCP still needs listen/accept
+(`docs/gaps.md`); the daemons ship anyway.
+
+## 2026-10-06 — Wi-Fi plan; W0a: MSI and MSI-X
+
+Rodger wants Wi-Fi on the MSI (Intel AX201) with a Windows-style tray icon,
+and the rule for it: **the kernel is ours, the interfaces are Linux's**. So
+the 802.11 stack will be ours (nl80211 up, mac80211's driver API down) and
+Intel's `iwlwifi` plugs in unchanged under its BSD-3-Clause terms, as on
+FreeBSD. Plan and steps: `docs/WIFI-PLAN.md`; DESIGN.md records the rule.
+
+W0a, the first step, is what every modern device needs: the AX201 (like the
+MSI's NVMe and xHCI) has no line the 8259 sees ("irq 255"); it signals with
+MSI-X, a memory write the chipset turns into an interrupt at the CPU's
+local APIC. New:
+- `arch/*/apic.c`: the local APIC (memory-mapped or x2APIC MSRs), switched on
+  only when a driver first asks for MSI, so old PCs run as before. It masks
+  the APIC's own timer/thermal/perf/error entries and leaves LINT0 (the 8259)
+  as the firmware set it.
+- IRQs 16-31 are MSI vectors 48-63 (the IRQ = vector - 32 rule just goes on);
+  `interrupt_dispatch` acknowledges them at the APIC, not the 8259. Vector
+  0xFF is the APIC's spurious one: an `iret`, nothing else.
+- `drivers/pci.c`: Linux's names — `pci_find_capability`,
+  `pci_alloc_irq_vectors` (MSI-X, else MSI, else the line), `pci_irq_vector`;
+  `pci_bar_phys` reads 64-bit BARs; `pci_map_mmio` takes a 64-bit address.
+- `nvme.c` is the first user: MSI-X when there is one, and then it never
+  touches INTMS/INTMC (the spec forbids it under MSI-X).
+- Partitions are named as Linux names them: `nvme0n1p1`, not `nvme0n11`.
+
+`make ARCH=x86_64 test-uefi-shell` now attaches an NVMe disk: OVMF puts its
+registers at 768 GiB, it runs on `MSI-X irq 16`, and its FAT32 partition is
+read and mounted through it. The i386 kernel says it cannot map registers
+above 4 GiB (no PAE) — under SeaBIOS the same disk is below 4 GiB and works
+on MSI-X too. All tests pass on both CPUs.
+
+## 2026-10-06 — W0b: netlink and the interface ioctls
+
+Programs talk to the kernel's network code through netlink sockets: `ip`,
+musl's getifaddrs(), GLib's network monitor, and for Wi-Fi wpa_supplicant
+and iw (nl80211 is a generic netlink family). New `net/netlink.c`:
+AF_NETLINK sockets (SOCK_RAW/DGRAM; NETLINK_ROUTE and NETLINK_GENERIC);
+bind/getsockname with Linux's port ids; requests answered inside the
+sendmsg into a queue of <= 4 KiB datagrams (musl reads with MSG_DONTWAIT);
+MSG_PEEK/MSG_TRUNC; SO_PASSCRED credentials (GLib believes a netlink message
+only with them). rtnetlink: RTM_GETLINK (dump or one link), RTM_GETADDR and
+RTM_GETROUTE dumps. Generic netlink: the controller, CTRL_CMD_GETFAMILY by
+name, id or dump, with multicast groups — the directory nl80211 joins in W2.
+`net/dev_ioctl.c` (Linux's net/core/dev_ioctl.c): SIOCGIFNAME/INDEX/FLAGS/
+SIFFLAGS (root: up/down)/ADDR/NETMASK/BRDADDR/MTU/HWADDR/TXQLEN/CONF on any
+socket; `dev_get_flags` and `dev_change_flags` are shared with netlink.
+Devices now have an `ifindex` (lo is 1).
+
+BusyBox in QEMU prints what Linux prints: `ip addr` shows eth0 with its MAC
+and `inet 10.0.2.15/24 brd 10.0.2.255 scope global eth0`; `ip route` shows
+`default via 10.0.2.2 dev eth0` and the subnet route; `ifconfig` works (it
+misses /proc/net/dev's counters). `make test-shell` checks both; systest
+checks a link dump, the nlctrl lookup, an unknown family's ENOENT and
+SIOCGIFINDEX on a UNIX socket, on both CPUs. The desktop still logs in with
+no program crashing (trace build). All tests pass.
+
+## 2026-10-06 — W0c: firmware files
+
+Intel's Wi-Fi chip forgets its program at power-off; the driver hands it
+1-2 MiB of "ucode" from /lib/firmware at every start. `kernel/firmware.c`
+gives drivers Linux's `request_firmware` / `firmware_request_nowarn` /
+`release_firmware` (`include/linux/firmware.h`): /lib/firmware/updates/
+then /lib/firmware/. A file still in the initramfs archive is lent where it
+lies (CLAUDE.md rule 5: no copy); a disk file, or one changed since boot, is
+copied into the heap once. The file is held until it is released. Linux
+also decompresses .xz/.zst firmware; we want plain files, so the live disk
+build will unpack them. Self-test (make test): `firmware: myos-test.fw, 19
+bytes, from the archive (no copy)`, and ENOENT for a missing name.
+
+## 2026-10-06 — W1a: the Linux driver API, kernel services
+
+Intel's driver (166 files, 118,000 lines for the AX201) calls about 220
+Linux kernel functions below 802.11. The first third of them, written for
+MyOS with Linux's names: `include/linux/` (types, list, bitops, bitfield,
+byteorder, unaligned, err, printk, atomic, refcount, spinlock, mutex,
+rcupdate, completion, wait, jiffies, ktime, delay, timer, workqueue, slab,
+string, module, kconfig) and `kernel/linux_lib.c`, `linux_slab.c`,
+`linux_sync.c`, `timer_list.c`, `workqueue.c`.
+
+The design follows from how this kernel runs: one CPU, and kernel code is
+only switched away when it sleeps (interrupts are off otherwise). That is
+Linux's non-SMP, non-preemptive case, so a spinlock is "interrupts off",
+RCU readers need no bookkeeping (Tiny RCU; frees are still deferred to a
+worker), and `jiffies` is a real variable the 1 ms tick counts. Timers run
+in one thread ("ktimers") from a sorted list — it sleeps exactly until the
+first is due, and the tick itself does no timer work. Each workqueue is a
+thread; system_wq is "events". `IS_ENABLED(CONFIG_…)` works as in Linux.
+printk sends errors and warnings to the screen, info to the log, and
+compiles debug out.
+
+`make test` checks 15 things: Linux printf formats (%pM, %*ph, precision,
+%zu, %llx), kstrto*, strscpy, lists, bits and fields, a 128-bit
+mul-then-divide, kzalloc/krealloc/kstrdup, timers firing in order (a
+deleted one not), work, delayed work (a cancelled one not), completions
+with and without timeout, a mutex holding off another thread, and a
+workqueue of its own. 154 self-tests pass; all suites pass on both CPUs.
+
+## 2026-10-06 — W1b: devices, PCI drivers, IRQs, DMA (the Linux driver API)
+
+The part of Linux's driver API that touches hardware: `struct device`
+(names like "0000:00:14.3", drvdata, devm_* resources released newest first
+when a driver lets go), the PCI driver model (an id table, probe/remove,
+config space in bytes/words/dwords, BAR sizes found the standard way with
+decoding off, pcim_iomap, MSI/MSI-X on top of W0a), request_irq and
+request_threaded_irq (one native entry runs a line's Linux handlers; a hard
+handler that answers IRQ_WAKE_THREAD gets its thread part run by
+"irq/N-name", where it may sleep), and the DMA API (no IOMMU: the device
+address is the physical one; dma_alloc_coherent, dma_map_single/page,
+dma_pool, struct page = its direct-map address with pmm share counts as its
+owners). Linux's kmalloc memory is physically contiguous and drivers DMA
+from it, so the shim's kmalloc above 1 KiB now takes a page run through the
+direct map (`kmalloc_contig`; kfree knows it by a 16-byte header, where a
+slab page keeps its own).
+
+Native renames to make room for Linux's names: the ISR type is `isr_fn_t`
+(Linux's irq_handler_t has another shape), pci_dev's bus number is `busnr`
+(Linux's `bus` is a struct pci_bus pointer, which iwlwifi follows to
+`->self`). New `pic_mask`.
+
+`make test` adds QEMU's "edu" card, a teaching PCI device, and binds a
+driver written only against Linux's API to it: probe by id table, BAR size
+1 MiB, a register that inverts what is written, an MSI interrupt through a
+hard and a threaded handler, DMA from RAM into the card and back (a
+coherent buffer out, a kmalloc'd one mapped back in, compared), and
+remove with devres switching decoding off. 164 self-tests pass; all suites
+pass on both CPUs.
+
+## 2026-10-06 — W1c: packets and network devices (the Linux driver API)
+
+One packet type for the network stack and for Linux drivers: struct sk_buff
+now has Linux's layout — next/prev first (a queue head poses as a packet,
+as in Linux), the 48-byte control buffer (mac80211 keeps its tx info there),
+header offsets, checksum fields, and after the data the "shared info": up to
+17 page fragments (a Wi-Fi card hands over received pages without a copy)
+and the count of clones sharing the block. Blocks over 1 KiB are contiguous
+pages, so a driver may DMA skb->data. `linux/skbuff.h` +
+`kernel/linux_skbuff.c`: queues, put/push/pull/trim, frags, clone, copy,
+pskb_expand_head, linearize, skb_header_pointer across the boundary.
+Order-n pages are Linux's compound pages: the last put_page frees all 2^n
+frames (a small hash table keeps their order).
+
+`linux/netdevice.h` + `kernel/linux_netdev.c`: alloc_netdev (private area
+32-byte aligned, as Linux guarantees), register_netdevice (listed, still
+down — bringing it up is dev_open, which wpa_supplicant will do), stopped
+transmit queues (dev_queue_xmit leaves the packet with its sender), carrier,
+NAPI on a dummy device (napi_schedule now wakes the network thread), rtnl.
+The native stack changed with it: alloc_skb(size, gfp), eth_type_trans
+returns network order, netif_napi_add has Linux's 3 arguments (+ _weight),
+and an ifindex slot is never reused while its device lives.
+
+`make test` checks it all and that every skb and page comes back: 183
+self-tests pass, and every suite passes on both CPUs. W1 is done: the
+driver API below 802.11.
+
+
+## 2026-10-06 — W2a: the 802.11 headers; Intel's iwlwifi compiles on them
+
+The driver interface of our 802.11 stack, written down: `linux/ieee80211.h`
+(the frame header and its frame-control tests, management and action
+frames, element ids, cipher suites, the HT/VHT/HE/EHT/UHR capability bits),
+`net/cfg80211.h` (wiphy, bands, channels, chandefs, scan and scheduled-scan
+requests, found networks, station statistics, regulatory calls) and
+`net/mac80211.h` (ieee80211_hw, vif, sta, txq, the tx and rx info that live
+in skb->cb, the 76 callbacks iwlwifi fills in, and the core functions it
+calls). Ours, written from what the driver uses — about 770 names out of
+Linux's 3,400; a script compared every one of our 400 constants with
+Linux's values (one wrong bit found and fixed). Three ISC-licensed Linux
+headers are copied with their notices: the nl80211 UAPI, `net/regulatory.h`
+and `net/ieee80211_radiotap.h`.
+
+Four iwlwifi headers are GPL-only, so they are ours: `iwl-debug.h` (same
+macros; debug lines compile to nothing unless CONFIG_IWLWIFI_DEBUG),
+`iwl-devtrace.h` (empty trace points — every register access passes one, so
+they must cost nothing), `mvm/rs.h` with `mvm/rs-myos.c` (the AX201's
+firmware chooses rates; the driver-side algorithm isn't needed), and
+`mei/iwl-mei.h` ("no Management Engine", what Linux has without
+CONFIG_IWLMEI).
+
+The rest of the Linux API the driver reaches for: scatter lists (with
+their chain encoding), Linux 7's typed allocations (`kzalloc_obj`),
+overflow-checked sizes, `__free(kfree)` and lock guards, struct_group,
+DEFINE_RAW_FLEX, per-CPU pointers (one CPU: plain pointers), DMI tables,
+ACPI object types, PTP clock and cross-timestamp types, kobject events,
+rfkill, cache alignment. Two of Linux's choices now hold for drivers here
+too: `u64` is `unsigned long long` on both CPUs (drivers print it with
+%llu), and PAGE_SIZE is an unsigned long; the driver builds with
+`-funsigned-char`, as Linux does. BUILD_BUG_ON became Linux's kind (also
+accepts a non-constant inside a `__builtin_constant_p` test).
+
+*Check:* `tools/iwlwifi-check.py` — 72 of 72 iwlwifi files compile with
+-Wall and no warnings. `make test` 183 self-tests (one run of four failed
+racetest's "epoll_ctl while the fd is replaced"; the next three passed —
+watching it), `make test-shell`, `make ARCH=x86_64 test-uefi-shell` pass.
+Next, W2b: our 802.11 core behind these headers and a simulated radio.
+
+## 2026-10-06 — W2b: our 802.11 core finds networks (on a simulated radio)
+
+`net/wireless/` is MyOS's 802.11 core, behind the W2a headers. Linux splits
+this into cfg80211 and mac80211 so that "full MAC" cards can skip the
+second; we have only soft-MAC drivers (iwlwifi, the simulated radio), so it
+is one core, and the configuration half calls the frame half directly —
+no ops table with a single implementation.
+
+A driver allocates its radio (`ieee80211_alloc_hw`: the wiphy, the core's
+state and the driver's private data in one block), fills in bands and
+flags, and registers: it becomes phy0 and a station interface `wlan0`
+appears with the card's address. `ip link set wlan0 up` (or the test)
+starts the driver and adds the interface; down undoes both. Frames the
+driver receives in its interrupt are queued in O(1) for a work thread.
+Scans are the radio's own (`hw_scan`), as on Intel's cards: the core
+builds the probe-request elements per band (rates, HT, VHT) and hands the
+request down; beacons and probe responses heard meanwhile fill a table of
+64 networks per radio (looked up by BSSID and channel, the channel taken
+from the AP's own DS or HT element, the oldest entry replaced when full);
+the driver reports the end and the core frees the request.
+
+To test it without a card, `drivers/net/wireless/sim.c` (test builds
+only): a radio with 13 channels at 2.4 GHz and 4 at 5 GHz, written to the
+same driver API as iwlwifi, scanning an "air" with two access points that
+answer with probe responses (one WPA2 with an RSN element, one open).
+
+`make test`: 194 self-tests pass, 10 new — wlan0 appears and comes up, a
+17-channel scan finds both networks with the right channel, signal and
+security, a second scan while one runs is refused, down stops the driver.
+On the way: skb queues link through a two-pointer view of the head (as
+Linux's sk_buff_list), which GCC 15's bounds checks wanted.
+
+## 2026-10-06 — W2c: nl80211; Alpine's iw scans on MyOS
+
+Wi-Fi's user-space interface: `net/wireless/nl80211.c` answers the
+generic-netlink family "nl80211" with Linux's messages and numbers —
+protocol features, the radio (GET_WIPHY: everything in one message, or
+split one band per message when the program says it can put them back
+together, which large Intel radios need), the interfaces, starting and
+stopping a scan, the scan results (each network with its BSSID, channel,
+signal, TSF, beacon interval, capabilities and elements), and the "scan"
+events. For it, `net/netlink.c` now lets other files build messages, answer
+requests and send multicast events (`include/genetlink.h`).
+
+Two things learned from running the real programs: libnl reads one
+datagram, stops at the answer it wanted and drops the rest, then waits for
+the ack in the *next* datagram — so the ack must travel alone, as Linux
+sends it (a GetFamily answer and its ack shared a datagram until now). And
+iw starts listening for "scan done" only after it has asked for the scan
+(its source warns about that race); on hardware a scan takes seconds, so
+the simulated radio now dwells 10 ms on each channel too.
+
+The `make test` harness used to type its keys 8 seconds after boot; the
+suite outgrew that and was cut short. It now waits for the "Self-tests:"
+line. Two page checks learned to allow the kernel heap's growth, and the
+raw syscall test (now also in `make test`, as /bin/rawsystest) removes the
+files it left in /tmp — their pages counted as leaked.
+
+*Check:* `make test`, 196 self-tests: rawsystest drives nl80211 by hand,
+then Alpine's iw 6.9 and libnl 3.9 (pinned in fetch-alpine.sh, test
+builds only) run `iw dev` and `iw dev wlan0 scan` against the simulated
+radio and print both networks — MyOS-Test, 2437 MHz, −42 dBm, RSN CCMP/PSK;
+MyOS-Open-5G, 5180 MHz — as on Linux. UEFI shell tests pass on both CPUs.
+
+## 2026-10-06 — W3a: joining a Wi-Fi network
+
+`net/wireless/mlme.c` joins a network as a station, the way Linux's
+mac80211 and cfg80211 do it between them: find the network (scanning for it
+by name if the table hasn't heard it), take the strongest access point of
+that name, tune a channel context to it, create the AP as a peer in the
+driver, send Authentication (open system) and Association Request, each
+tried three times 300 ms apart, and on success take the association id and
+put the carrier up. The driver hears every step in mac80211's order —
+sta_state one state at a time, channel-context add/assign, bss_info /
+vif_cfg / link_info changes, mgd_prepare_tx/complete_tx around each
+exchange — so iwlwifi will see the sequence it expects. An open network is
+usable at once; a protected one waits for wpa_supplicant (W3c).
+
+nl80211 gained CONNECT, DISCONNECT and GET_STATION, the CONNECT and
+DISCONNECT events, the "associated" mark in scan results and the SSID and
+channel of a connected interface — what `iw dev wlan0 link` reads. The
+simulated radio grew an access point: on its channel it answers
+Authentication and Association after 2 ms "in the air", and forgets us when
+deauthenticated.
+
+`make test`: 199 self-tests pass. The kernel joins MyOS-Open-5G (AID 1, the
+driver's peer authorized) and leaves it (the peer gone); Alpine's iw runs
+`connect -w`, `link` and `disconnect`. Found on the way, not Wi-Fi: each
+busybox `timeout` leaves an orphaned watcher whose pages stay held for
+seconds, which tripped the page-leak check; the test script doesn't use
+`timeout`, and the orphan question is a separate task. user_test.c now
+prints any program that leaves pages behind.
+
+## 2026-10-06 — W3b: IP over Wi-Fi
+
+`net/wireless/data.c` carries Ethernet frames over the air: outgoing ones
+become 802.11 data frames (to the AP, the RFC 1042 LLC/SNAP header in
+front of the Ethernet type) and go to the driver's queue for their
+priority — the TXQ model iwlwifi uses (wake_tx_queue, then the driver
+pulls with ieee80211_tx_dequeue) — or to its tx(); incoming ones from our
+AP turn back into Ethernet frames for the network stack. Until the link is
+authorized only EAPOL passes, both ways (wpa_supplicant's control port,
+for W3c). netif_rx now wakes the network thread, as Linux raises its
+receive softirq.
+
+The IPv4 stack, which knew one card (eth0), now runs on one device at a
+time: the last link to become usable takes it over, each device keeps its
+lease for when it is active again, and the kernel's DHCP client runs for a
+new device in a thread of its own. When Wi-Fi leaves, IPv4 goes back to
+eth0 and its old lease. The packet handlers are registered even without
+eth0 — the MSI laptop has no Ethernet driver, only Wi-Fi.
+
+The simulated access point got a small network behind it: it answers ARP
+for 192.168.77.1, runs a DHCP server that hands out 192.168.77.10, and
+answers ping. One test lesson: a kernel thread pinging with interrupts on
+never lets the work threads that carry Wi-Fi frames run (net_sleep halts
+instead of sleeping), so the self-test pings as a syscall would, with
+interrupts off.
+
+`make test`, 202 self-tests: IPv4 moves to wlan0, leases 192.168.77.10,
+pings 192.168.77.1, and is back on eth0 with 10.0.2.15 afterwards; from
+user space `ifconfig wlan0` shows the lease and busybox ping answers in
+4 ms. test-shell and both UEFI shell tests still pass.
+
+## 2026-10-06 — W3c: WPA2 with wpa_supplicant
+
+Alpine's wpa_supplicant 2.10, unchanged, now joins the simulated WPA2
+network: it scans, connects through nl80211, runs the 4-way handshake
+with the simulated access point, installs the pairwise and group keys,
+and opens the port; then the kernel's DHCP client gets 192.168.77.10 over
+the protected link and ping answers.
+
+What the kernel needed:
+- **Keys** (`net/wireless/key.c`): NEW_KEY / DEL_KEY / SET_KEY go to the
+  driver's set_key, as mac80211 does; we have no software crypto, so the
+  hardware encrypts and decrypts. SET_STATION "authorized" opens the
+  control port and starts IPv4.
+- **AF_PACKET sockets** (`net/packet.c`): wpa_supplicant sends and
+  receives EAPOL frames on one.
+- **/dev/random and /dev/urandom**: wpa_supplicant reads its nonces
+  there and gave up without them ("Could not open /dev/urandom").
+- **EAPOL during association**: the AP sends handshake message 1 right
+  behind its association answer. Our data path saw it before the MLME
+  work had handled the answer and dropped it, so the handshake timed out
+  after 10 s. Linux's mac80211 lets EAPOL from the AP through before the
+  association is marked; now ours does too.
+
+The simulated AP is a WPA2 authenticator now (test builds only): SHA-1,
+HMAC, PBKDF2, the 802.11 PRF, AES and AES key wrap in
+`drivers/net/wireless/sim_crypto.c`, checked at boot against published
+test vectors so a failed handshake points at the kernel and not the test
+AP. Its frames aren't really encrypted — "the air" delivers a protected
+frame only if the receiving hardware holds the key the AP derived, which
+is what a wrong key would look like on a real radio.
+
+`make test`: 207 self-tests pass; test-shell and both UEFI shell tests
+still pass.
+
+## 2026-10-06 — Unix datagrams; the Wi-Fi icon; Wi-Fi on the live disk; iwlwifi links
+
+**wpa_cli and Unix datagrams.** wpa_supplicant's control socket — how
+wpa_cli and the tray icon talk to it — is a Unix *datagram* socket, which
+MyOS didn't have (`connect` said ECONNREFUSED). `net/unix.c` has them now:
+each datagram is one kmalloc'd record in the receiver's queue (at most 16
+and 64 KiB waiting), with the sender's name, so `recvfrom` can answer it;
+`connect` just names where `send` goes; a socket connected elsewhere
+refuses strangers (EPERM, Linux's rule); a closed one refuses everything
+(ECONNREFUSED); `socketpair` works too. boottest checks it the way wpa_cli
+uses it, and `make test` now runs `wpa_cli status` against the real
+wpa_supplicant: COMPLETED, MyOS-Test, WPA2-PSK.
+
+**The tray icon** (`live/myos-wifi/myos-wifi.c`): signal bars, a list of
+networks that drops up from the tray, Connect, the network security key.
+Built for the 64-bit disk; its screendump test is still to do.
+
+**The live disk** gets wpa_supplicant, iw and wireless-regdb (64-bit: the
+MSI), the AX201's firmware from linux-firmware (pinned by tag and SHA-256),
+a runit service that waits for wlan0, and the icon in IceWM's startup.
+`fetch-live.py --add` pins new packages and leaves every existing pin as
+it is (`--update` re-resolves all of them).
+
+**iwlwifi links.** Intel's driver, all 72 files, is now part of the x86_64
+kernel and its init runs at boot. Linking it showed 64 functions we lacked;
+none needed a design change. Most were mac80211 calls for modes we don't
+offer (being an access point, TDLS, block-ack sessions we never start),
+which do nothing and say why. The ones that matter:
+- finding our AP and our keys (one peer per interface, so no searching);
+- losing the connection (we leave; wpa_supplicant looks again);
+- a firmware restart: we drop the connections without telling the driver
+  (it has forgotten them), start it again and give it back its
+  interfaces;
+- the firmware's country rules applied to our channels;
+- loading firmware in the background;
+- PCI function-level reset, remove and rescan.
+
+The kernel grows from 374 KB of code to 851 KB; `IWLWIFI=0` leaves the
+driver out. In QEMU the driver registers and finds no card, which is all
+QEMU can show; the card itself is W7, on the MSI.
+
+## 2026-10-06 — The Wi-Fi icon on the desktop; the MSI image
+
+The tray icon now works on the 64-bit desktop, checked like a person would:
+`make ARCH=x86_64 WIFISIM=1 test-wifi-desktop` (`tools/qemu-desktop.py`,
+script `tools/wifi-desktop.qs`) logs in, clicks the icon, picks MyOS-Test,
+types its key, and the kernel gets its lease. Getting there needed:
+- **GTK in the RAM login image.** It had none, so no GTK program could
+  start there (the Wi-Fi icon, and Settings and My Files too). gtk+3.0 is
+  in the [desktop] group now: +17 MiB.
+- **A notification area.** The theme's tray is myos-menu's picture over
+  IceWM's taskbar, with a fixed network icon in it. myos-menu is now the
+  system tray (the freedesktop.org protocol): the real icon docks in that
+  slot.
+- **Its window showing at all.** Its window is a child of IceWM's taskbar,
+  and IceWM ignores map requests for windows it didn't make, so the tray
+  was never drawn on the 64-bit desktop. It is override-redirect now.
+- **SIGNAL_POLL.** wpa_supplicant asks for the channel survey with every
+  signal poll and failed without one; nl80211 answers GET_SURVEY now. The
+  icon shows real bars.
+
+`build/x86_64/myos-uefi-login.img` is the MSI's image: iwlwifi in the
+kernel, the AX201 firmware, wpa_supplicant, the icon, and the home network
+from `live/overlay.local/` (git-ignored; only the derived key, not the
+password). In QEMU it reaches the login screen; the card itself is W7.
+
+## 2026-10-06 — W7: iwlwifi on the real AX201, first run
+
+On the MSI, Intel's driver came up on our kernel: it found the card
+(00:14.3), loaded its firmware (QuZ-a0-hr-b0-77, the right revision), read
+the firmware's regulatory rules (world, "00", 28 rules) and registered
+wlan0 with the card's own address and 51 channels. Then the firmware
+crashed on the first scan: UMAC ADVANCED_SYSASSERT 0x2000278C, with "last
+host cmd" 0x0013010D (group 1, command 0x0D: SCAN_REQ_UMAC). Our restart
+brought it back once; the second crash made iwlwifi reset the card and
+make a new wlan0, which wpa_supplicant never noticed.
+
+Found by reading what our scan request gives the driver against what
+cfg80211 gives it: the BSSID was all zeros (cfg80211: the wildcard,
+ff:ff:ff:ff:ff:ff), and mvm copies it into the probe request it hands the
+firmware. Fixed in the core's wifi_scan, with cfg80211's other defaults
+(every rate, no TSF link), and nl80211 now checks scan flags against what
+the radio offers, as cfg80211 does. The simulated APs now ignore probe
+requests to any other BSSID, as real ones do, so the self-tests catch it.
+Whether the zero BSSID is what the firmware choked on, the next run says.
+
+For that run: `make IWLDEBUG=1` builds iwlwifi's own debug lines in (every
+command it sends the firmware, scans, joining) into a 256 KiB kernel log;
+the normal kernel log is 64 KiB now (one crash dump is ~5 KiB). The
+wpa_supplicant service starts over when wlan0 is made again. xterm has a
+scrollbar and 10000 lines of scrollback.
+
+## 2026-10-06 — W7, second run: scanning works; joining crashed
+
+With the BSSID fixed the firmware scanned without trouble and the list
+filled. Joining wilson1 then crashed it: iwlwifi's debug lines showed the
+channel (PHY_CONTEXT_CMD) accepted and the firmware asserting on the
+LINK_CONFIG_CMD that activates the link. That command is built from the
+link's settings, and two of them were never given to the driver:
+- the link's own address (bss_conf.addr): mac80211 copies the interface's
+  address there when it makes the interface; we sent 00:00:00:00:00:00;
+- the access categories' timing (conf_tx): mac80211 gives the standard's
+  defaults when an interface comes up; ours stayed zero (AIFS 0 isn't a
+  valid setting).
+Both are set now (`wifi_default_edca`: 802.11-2020 Table 9-155; plain
+DCF after joining an AP we don't use WMM with), the AP's beacon interval,
+DTIM, rates, slot and preamble are in place before the link is activated,
+and the self-test checks the address and the EDCA values the simulated
+radio receives. A firmware restart that leaves the interface out of the
+driver no longer means every scan fails ("network down") until a reboot:
+the next scan hands it back.
+
+Third run: the screen froze right after logging in, so no photos, with X
+covering whatever the kernel printed. So the next image boots without X:
+the kernel has a command line now, /proc/cmdline, built in for the moment
+(`make CMDLINE=nodesktop`), and the login service skips X when it says
+nodesktop. With TRACE=1 and IWLDEBUG=1 the text console then shows the
+kernel's lines and iwlwifi's as they happen: if it hangs again, the last
+screenful says where.
+
+Fourth run, text console: the kernel itself crashed — a page fault in
+iwlwifi's queue allocation (iwl_mvm_sta_alloc_queue), on a station pointer
+that pointed at freed memory. Our restart after a firmware error had freed
+the AP's peer without telling the driver (its firmware was dead), while
+iwlwifi still had that peer's queue on its to-do list. It also showed why
+the restart never worked: iwlwifi looks for the interface it is re-adding
+among the ones the stack kept, and we had marked it gone ("-16" and a
+warning from mvm/mac-ctxt.c).
+
+The restart is mac80211's now: nothing is freed; the driver is started
+again and told the whole connection once more, in mac80211's order (the
+interface, the channel context, queue timing and link settings, the AP as
+a peer state by state, the keys), and frames that waited are sent. A peer
+dropped while the driver is truly lost is kept until the driver is gone. The
+simulated radio can now crash its "firmware", and the self-test checks the
+connection survives it and ping still answers (209 self-tests).
+
+The desktop test was flaky (1 in 3): Enter went to the login screen before
+X took keys, and the pointer sometimes landed a dozen pixels off (QEMU
+hands X two moves at once and X speeds them up). myos-login now says on
+the console when its screen is up and when someone logged in; the test
+presses Enter until it has; the tray's list is driven by the keyboard,
+which the list now supports properly (choosing a network puts the focus on
+its Connect button, as on Windows). Three runs out of three pass.
+
+## 2026-10-07 — W7, fifth run: a crash in memcpy; crash messages name the callers
+
+The firmware failed again while restarting (FW_ERROR_RECOVERY_CMD), iwlwifi
+gave up on the card ("Device error - reprobe!"), commands failed with -5,
+and then the kernel read address 0 inside memcpy. memcpy has hundreds of
+callers, and the crash message showed only where it stopped. Kernel crash
+messages now also list the return addresses found on the thread's stack
+(no frame pointers, so a scan, as Linux does without them): newest first,
+for addr2line. On i386 `make test`'s F10 fault shows selftest_key called
+from kernel_main.
+
+What makes the firmware fail in the first place is still unseen: each time
+the restarts after it scrolled it away, and the crash prevented dmesg. So
+`make IWLDEBUG=1` now also sets iwlwifi's fw_restart off: after a firmware
+error the card just stops, the system stays up, and dmesg has the first
+error with the commands before it.
+
+## 2026-10-07 — W7, sixth run, and mac80211's order, read from its source
+
+The sixth run (no restarts) finally showed the first firmware error:
+LINK_CONFIG_CMD, a link *modify*, before authentication — the slot-time
+change our core sent with the BSSID. The crash after it was ours: iwlwifi
+copies link_conf->bssid on every change, and our teardown set it NULL
+(mac80211 keeps it pointing at a buffer and zeroes that).
+
+Then, as Rodger suggested, the whole connection path compared step by step
+with mac80211's own code (net/mac80211/mlme.c and chan.c of Linux 7.2.9,
+read for the order, not copied). Differences found and fixed: the AP's
+BSSID, beacon interval, basic rates and beacon timing (sync_tsf, the card's
+receive time, DTIM count) are filled in before the channel and announced
+after it, before the AP becomes a peer; the transmit power and "not idle"
+follow the channel; the DTIM period is set only at association, with slot
+time and preamble; an open network's peer is authorized before the
+association is announced; mgd_prepare_tx comes before every try, with no
+duration.
+
+The simulated radio is now strict about the rules the MSI's firmware
+enforced (NULL bssid, slot/preamble before association, BSSID before the
+peer, link address and EDCA before activation, zero BSSID in scans):
+`make test` fails if the core breaks one, the user-space wpa_supplicant runs
+included. It caught one at once (the restart replay activated the link
+before re-sending EDCA). The desktop test's pointer search was fooled by
+the tray icon's black tooltip; it looks close to the expected place first.
+
+Seventh run: no kernel crash; the firmware asserted on TLC_MNG_CONFIG_CMD
+(its rate control for a peer) — "last host cmd" 0x001F050F, group 5,
+command 0x0F. iwlwifi sends it the moment the AP becomes a peer, "already
+from what the AP advertised in the beacon/probe response" (its comment);
+our peer had no rates until the association answer. mac80211 fills them
+from the beacon before adding the peer (ieee80211_mgd_setup_link_sta); so
+does our core now, and the strict simulated driver checks it.
+

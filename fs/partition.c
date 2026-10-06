@@ -36,6 +36,23 @@ static const char *type_name(uint8_t type)
     }
 }
 
+/* A partition's name, as Linux makes it: the disk's name and the number,
+   with a 'p' between them when the disk's name ends in a digit ("hdb" ->
+   "hdb1", "nvme0n1" -> "nvme0n1p1"). 0 if it doesn't fit. */
+static int part_name(char *out, size_t size, const char *disk, int n)
+{
+    size_t len = strlen(disk);
+    int p = len && disk[len - 1] >= '0' && disk[len - 1] <= '9';
+    if (n < 1 || n > 9 || len + p + 2 > size)
+        return 0;
+    memcpy(out, disk, len);
+    if (p)
+        out[len++] = 'p';
+    out[len] = (char)('0' + n);
+    out[len + 1] = '\0';
+    return 1;
+}
+
 /* GPT type GUIDs as stored on disk (first three fields little-endian). */
 static const uint8_t guid_esp[16] = {
     0x28, 0x73, 0x2A, 0xC1, 0x1F, 0xF8, 0xD2, 0x11,
@@ -54,13 +71,7 @@ static int add_part(struct blockdev *disk, int n, uint32_t lba, uint32_t sectors
         .offset  = lba,
         .priv    = (void *)(uintptr_t)type,
     };
-    size_t len = strlen(disk->name);
-    if (len + 2 >= sizeof part.name || n > 9)
-        return 0;
-    memcpy(part.name, disk->name, len);
-    part.name[len] = (char)('0' + n);
-    part.name[len + 1] = '\0';
-    if (!blockdev_register(&part))
+    if (!part_name(part.name, sizeof part.name, disk->name, n) || !blockdev_register(&part))
         return 0;
     kprintf("part: %s: start %lu, %lu sectors (%lu MiB), type %02x %s\n",
             part.name, (unsigned long)lba, (unsigned long)sectors,
@@ -158,12 +169,8 @@ int partition_scan(struct blockdev *disk)
             .offset  = e.lba_first,
             .priv    = (void *)(uintptr_t)e.type,   /* remember the type byte */
         };
-        size_t len = strlen(disk->name);
-        memcpy(part.name, disk->name, len);         /* "hdb" + "1" */
-        part.name[len] = '1' + i;
-        part.name[len + 1] = '\0';
-
-        if (blockdev_register(&part)) {
+        if (part_name(part.name, sizeof part.name, disk->name, i + 1) &&
+            blockdev_register(&part)) {
             kprintf("part: %s: start %lu, %lu sectors (%lu MiB), type %02x %s\n",
                     part.name, e.lba_first, e.sectors, e.sectors / 2048,
                     e.type, type_name(e.type));

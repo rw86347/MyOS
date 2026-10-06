@@ -15,12 +15,14 @@
  * command; a longer one points at a page-sized list of entries.
  *
  * One I/O queue pair, one command at a time per controller, like the other
- * disk drivers. Pin-based interrupt (INTx): the line stays raised while a
- * completion is unread, so the handler masks it (INTMS) and the thread
- * unmasks it after reading the completion.
+ * disk drivers. The interrupt is MSI-X where the PCI code can give one
+ * (a message per completion: nothing to mask), else MSI or the pin (INTx).
+ * A pin stays raised while a completion is unread, so then the handler
+ * masks it (INTMS) and the thread unmasks it after reading the completion;
+ * under MSI-X the spec forbids touching INTMS/INTMC at all.
  *
- * Not done: MSI/MSI-X, more queues and commands in flight, namespaces
- * other than 1, sector sizes other than 512 bytes.
+ * Not done: more queues and commands in flight, namespaces other than 1,
+ * sector sizes other than 512 bytes.
  */
 #include <blockdev.h>
 #include <interrupts.h>
@@ -91,6 +93,7 @@ static struct queue admin, io;
 static uint64_t *prp_list;              /* one page: 512 entries */
 static uint32_t prp_list_phys;
 static uint8_t busy;
+static uint8_t msix;                    /* MSI-X: never touch INTMS/INTMC */
 static volatile uint8_t irq_seen;
 static struct wait_queue turn, irq_wait;
 
@@ -108,7 +111,8 @@ static void nvme_irq(struct regs *r)
     (void)r;
     if (!io.cq || !cq_ready(&io))
         return;                         /* not ours: the line is shared */
-    wr32(R_INTMS, 1);                   /* quiet until the thread has read it */
+    if (!msix)
+        wr32(R_INTMS, 1);               /* quiet until the thread has read it */
     irq_seen = 1;
     wq_wake_all(&irq_wait);
 }
@@ -195,7 +199,8 @@ static int io_cmd(struct sqe *e, uint8_t op, uint32_t lba, uint32_t count)
         err = reap(&io) ? -1 : 0;
     else
         kprintf("nvme: command %x timed out\n", op);
-    wr32(R_INTMC, 1);
+    if (!msix)
+        wr32(R_INTMC, 1);
     return err;
 }
 
@@ -374,16 +379,26 @@ void nvme_init(void)
     for (int i = 0; i < pci_count() && !pci; i++)
         if (pci_dev_at(i)->class_rev >> 8 == 0x010802)    /* NVM Express */
             pci = pci_dev_at(i);
-    if (!pci || (pci->bar[0] & 1) || ((pci->bar[0] & 6) == 4 && pci->bar[1]))
-        return;                         /* no device, or registers above 4 GiB */
-    uint32_t stride = 0;
-    regs = pci_map_mmio(pci->bar[0] & ~0xFu, 0x1000);
-    if (!regs)
+    phys_addr_t bar = pci ? pci_bar_phys(pci, 0) : 0;
+    if (!bar)
+        return;                         /* no device, or no memory BAR */
+    if (pci_alloc_irq_vectors(pci, 1, 1, PCI_IRQ_MSIX | PCI_IRQ_MSI | PCI_IRQ_INTX) < 0) {
+        kprintf("nvme: no interrupt (no MSI and no 8259 line)\n");
         return;
+    }
+    msix = pci->irq_type == PCI_IRQ_MSIX;
+    uint32_t stride = 0;
+    regs = pci_map_mmio(bar, 0x1000);
+    if (!regs) {
+        kprintf("nvme: cannot map its registers at %08lx%08lx%s\n",
+                (unsigned long)(bar >> 32), (unsigned long)bar,
+                bar >> 32 ? " (above 4 GiB: a 32-bit kernel can't)" : "");
+        return;
+    }
     uint32_t cap_hi = rd32(R_CAP + 4);
     stride = 4u << (cap_hi & 0xF);
     uint32_t to_ms = ((rd32(R_CAP) >> 24) & 0xFF) * 500 + 500;
-    regs = pci_map_mmio(pci->bar[0] & ~0xFu, DOORBELLS + 4 * stride);
+    regs = pci_map_mmio(bar, DOORBELLS + 4 * stride);
     if (!regs)
         return;
     pci_write_config(pci, 4, pci_read_config(pci, 4) | 0x6);  /* memory + bus master */
@@ -391,7 +406,8 @@ void nvme_init(void)
     wr32(R_CC, 0);
     if (wait_ready(0, to_ms) < 0)
         goto fail;
-    wr32(R_INTMS, 1);                   /* admin completions are polled */
+    if (!msix)
+        wr32(R_INTMS, 1);               /* admin completions are polled */
     if (queue_init(&admin, 0, stride) < 0 || queue_init(&io, 1, stride) < 0)
         goto fail;
     wr32(R_AQA, ((QSIZE - 1) << 16) | (QSIZE - 1));
@@ -441,8 +457,9 @@ void nvme_init(void)
 
     for (int k = 0; k < BOUNCE_PAGES && (bounce[k] = pmm_alloc()) != 0; k++)
         ;                               /* short of memory: fewer, used only if all there */
-    irq_install(pci->irq, nvme_irq);
-    wr32(R_INTMC, 1);
+    irq_install(pci_irq_vector(pci, 0), nvme_irq);
+    if (!msix)
+        wr32(R_INTMC, 1);
 
     struct blockdev dev = {
         .name    = "nvme0n1",
@@ -453,7 +470,9 @@ void nvme_init(void)
         .rwv     = nvme_rwv,
     };
     blockdev_register(&dev);
-    kprintf("nvme: nvme0n1: %lu MiB, irq %u\n", dev.sectors / 2048, pci->irq);
+    kprintf("nvme: nvme0n1: %lu MiB, %s irq %d\n", (unsigned long)(dev.sectors / 2048),
+            msix ? "MSI-X" : pci->irq_type == PCI_IRQ_MSI ? "MSI" : "pin",
+            pci_irq_vector(pci, 0));
     return;
 fail:
     kprintf("nvme: controller did not start (status %lx)\n", rd32(R_CSTS));

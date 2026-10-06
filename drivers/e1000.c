@@ -254,7 +254,7 @@ static int e1000_poll(struct napi_struct *napi, int budget)
             break;
         uint16_t len = d->length;
         if (len >= ETH_HLEN && len <= BUF_SZ && !d->errors) {
-            struct sk_buff *skb = alloc_skb(len);
+            struct sk_buff *skb = alloc_skb(len, 0);
             if (skb) {
                 unsigned char *p = skb_put(skb, len);
                 if (p) {
@@ -387,7 +387,7 @@ int e1000_init(void)
     memcpy(nic.dev.name, "eth0", 5);
     nic.dev.mtu = ETH_DATA_LEN;
     nic.dev.netdev_ops = &e1000_ops;
-    netif_napi_add(&nic.dev, &nic.napi, e1000_poll, 16);
+    netif_napi_add_weight(&nic.dev, &nic.napi, e1000_poll, 16);
     napi_enable(&nic.napi);
     if (pci->irq)
         irq_install(pci->irq, e1000_irq);

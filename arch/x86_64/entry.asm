@@ -18,6 +18,9 @@
 ;        PML4[511] kernel image      KERNEL_VBASE   + (0 .. 1 GiB)
 ;   3. load CR3, and jump to the high address of the next instruction
 ;
+; Nothing the firmware owns may be touched after step 3 — not even its
+; stack: it can lie above 1 GiB.
+;
 ; Then our GDT, our stack, and kernel_main. vmm_init (paging.c) replaces
 ; these tables with the real ones, which no longer have the identity map.
 
@@ -45,6 +48,13 @@ _start:
     sub rcx, rdi
     xor eax, eax
     rep stosb
+
+    ; Our own stack, now: the firmware's may be anywhere in RAM (2.6 GiB on
+    ; a 4 GiB machine), and once CR3 holds our tables only the first 1 GiB
+    ; is mapped. The first push would fault, with no handler we can reach
+    ; (the firmware's IDT is unmapped too): a triple fault, and the PC
+    ; resets. This is boot_stack's low address; .reload_cs moves RSP up.
+    lea rsp, [boot_stack_top]
 
     ; 2. The page directory: entry i maps physical i * 2 MiB.
     lea rdi, [boot_pd]
@@ -131,4 +141,5 @@ boot_pd:        resb 4096
 alignb 16
 boot_stack:
     resb 16384
+global boot_stack_top                   ; (a crash's stack scan: where "main"'s stack ends)
 boot_stack_top:

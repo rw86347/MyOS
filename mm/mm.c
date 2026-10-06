@@ -250,6 +250,24 @@ int mm_remove(struct mm *mm, user_addr_t start, user_addr_t end)
     return 0;
 }
 
+/* mincore: vec[k] = 1 if page k of [start, start + pages pages) is in RAM
+   now, 0 if not yet (demand paging hasn't made it). -ENOMEM if one is in no
+   area at all. Each area is looked up once, not each page. */
+int mm_mincore(user_addr_t start, uint32_t pages, uint8_t *vec)
+{
+    const struct vma *v = NULL;
+    for (uint32_t k = 0; k < pages; k++) {
+        user_addr_t va = start + (user_addr_t)k * PAGE_SIZE;
+        if (!v || va >= v->end || va < v->start) {
+            v = find(current_mm, va);
+            if (!v)
+                return -ENOMEM;
+        }
+        vec[k] = vmm_translate(va) != 0;
+    }
+    return 0;
+}
+
 int mm_fault(user_addr_t va, uint32_t err)
 {
     if (va >= USER_ADDR_END)
@@ -415,14 +433,19 @@ intptr_t mm_mmap(user_addr_t addr, uint32_t len, uint32_t prot, uint32_t flags,
     return err ? err : (intptr_t)addr;
 }
 
-int vm_iomap_memory(struct vma *vma, uint32_t phys, uint32_t size)
+int vm_iomap_memory(struct vma *vma, phys_addr_t phys, uint32_t size)
 {
+    /* Whole pages, as in Linux: an 800x600 screen is 468.75 pages and X
+       maps 469 (1366x768 is 1024.5). A start inside a page counts from
+       that page's start, again as Linux does. */
+    uint32_t in_page = (uint32_t)phys & (PAGE_SIZE - 1);
+    uint64_t bytes = PAGE_UP((uint64_t)size + in_page);
     uint32_t len = vma->end - vma->start;
-    if (vma->file_off > size || len > size - vma->file_off)
+    if (bytes > 0xFFFFFFFFu || vma->file_off > bytes || len > bytes - vma->file_off)
         return -EINVAL;
     vma->flags |= VM_PFNMAP;
-    vma->phys = phys;
-    vma->file_end = size;
+    vma->phys = phys - in_page;
+    vma->file_end = (uint32_t)bytes;
     return 0;
 }
 
