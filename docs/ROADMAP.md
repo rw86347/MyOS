@@ -122,8 +122,10 @@ Mark a step `[x]` only when its "Done when" check works.
   - [ ] 9e: FAT32 in the VFS: read, then write (USB sticks, swapping files with a Mac/PC).
     Read is in: the first FAT32 partition is mounted at /mnt (read-only). Write,
     which has to allocate clusters and update the FAT, is still open.
-  - Later: ext4 read, exFAT, ext4 write (needs a journal). USB disks need a USB host
-    controller first (UHCI/EHCI on old PCs, xHCI on the Pocket 4). NTFS is out of scope.
+  - [x] USB sticks and disks on xHCI (2026-10-07): our own xHCI and mass-storage
+    (bulk-only, SCSI) drivers; the live system runs from a USB stick in QEMU
+    (`make test-usb`). `docs/USB-PLAN.md`. Old PCs still need UHCI/EHCI.
+  - Later: ext4 read, exFAT, ext4 write (needs a journal). NTFS is out of scope.
 
 ## Phase 3 — Networking & beyond
 - [ ] **10. Network** — Linux's own NIC drivers through the Linux-API shim (decided

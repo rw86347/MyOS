@@ -226,10 +226,8 @@ void wifi_restart_work(struct work_struct *w)
     list_for_each_entry(sdata, &local->interfaces, list)
         if (!err && sdata->in_driver)
             err = local->ops->add_interface(hw, &sdata->vif);
-    if (!err) {
-        unsigned int filter = FIF_BCN_PRBRESP_PROMISC;
-        local->ops->configure_filter(hw, ~0u, &filter, 0);
-    }
+    if (!err)
+        wifi_configure_filter(local);
     list_for_each_entry(sdata, &local->interfaces, list)
         if (!err && sdata->in_driver)
             err = wifi_mlme_replay(sdata);

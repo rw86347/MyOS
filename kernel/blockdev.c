@@ -15,10 +15,26 @@ static int ndevices;
 
 struct blockdev *blockdev_register(const struct blockdev *dev)
 {
-    if (ndevices == BLOCKDEV_MAX)
-        return NULL;
-    devices[ndevices] = *dev;
-    return &devices[ndevices++];
+    uint32_t flags = irq_save();        /* the usb thread adds disks too */
+    struct blockdev *d = NULL;
+    if (ndevices < BLOCKDEV_MAX) {
+        devices[ndevices] = *dev;
+        d = &devices[ndevices++];
+    }
+    irq_restore(flags);
+    return d;
+}
+
+void blockdev_sd_name(char name[16])
+{
+    static int next;
+    uint32_t flags = irq_save();
+    int n = next++;
+    irq_restore(flags);
+    name[0] = 's';
+    name[1] = 'd';
+    name[2] = (char)('a' + n % 26);
+    name[3] = 0;
 }
 
 int blockdev_count(void)

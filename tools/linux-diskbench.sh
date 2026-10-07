@@ -1,7 +1,7 @@
 #!/bin/sh
 # Run user/diskbench.c on Linux (Debian 12's stock i686 kernel, 6.1) in the
 # same QEMU setup as MyOS's disk benchmark (tools/diskbench.sh), on one of
-# the four disk types: ide, ahci, nvme, virtio. $2: the ext2 test image.
+# the disk types: ide, ahci, nvme, virtio, usb. $2: the ext2 test image.
 set -e
 TYPE=$1
 IMG=$2
@@ -25,7 +25,9 @@ case $TYPE in
             DISK="-drive id=d0,file=$IMG,format=raw,if=none -device nvme,serial=myos0,drive=d0" ;;
     virtio) ROOTS="virtio_pci virtio_blk"
             DISK="-drive id=d0,file=$IMG,format=raw,if=none -device virtio-blk-pci,drive=d0" ;;
-    *) echo "usage: $0 ide|ahci|nvme|virtio image"; exit 1 ;;
+    usb)    ROOTS="xhci_pci usb_storage sd_mod"
+            DISK="-device qemu-xhci,id=xhci -drive id=d0,file=$IMG,format=raw,if=none -device usb-storage,bus=xhci.0,drive=d0" ;;
+    *) echo "usage: $0 ide|ahci|nvme|virtio|usb image"; exit 1 ;;
 esac
 rm -rf root && mkdir -p root/dev root/proc root/mnt root/m
 cp "$BIN" root/init

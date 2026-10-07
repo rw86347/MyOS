@@ -246,6 +246,28 @@ Warm 64 KiB is now within 1 800 instructions of the 64 KiB copy to the user buff
 itself (`rep movsd`: 16 384). Going lower needs zero-copy (`mmap`, which already
 maps cache pages).
 
+### USB stick (xHCI, bulk-only): MyOS vs Linux (2026-10-07)
+
+`tools/diskbench.sh usb`: the same benchmark, the ext2 image on a QEMU
+`usb-storage` stick behind `qemu-xhci` (it runs at 5 Gb/s). Linux loads
+`xhci_pci`, `usb_storage` and `sd_mod`. Instructions per call:
+
+| operation                     | Linux 6.1 |   MyOS | Linux / MyOS |
+|-------------------------------|----------:|-------:|-----:|
+| cold read 64 KiB, in order    |   117 431 | 31 311 | 3.8× |
+| warm read 64 KiB, in order    |    37 003 | 18 416 | 2.0× |
+| warm read 4 KiB, random       |     3 527 |  1 676 | 2.1× |
+| cold read 4 KiB, random       |    25 115 |  6 415 | 3.9× |
+| write 64 KiB (+ one fsync)    |   752 527 | 103 322 | 7.3× |
+
+Warm reads never reach the disk, so they match the other types. A disk
+command costs about 2 000-4 000 instructions more than on AHCI/NVMe/virtio:
+it is three USB transfers (command block, data, status) and two interrupts
+(the command block and the data are queued together; `docs/USB-PLAN.md`).
+Linux's path is longer still: the SCSI layer, usb-storage's own thread, and
+an interrupt for each of the three transfers. QEMU numbers only compare
+code; the real stick's speed is for the MSI to show.
+
 The same benchmark with less RAM (`MEM=20M`, `MEM=12M tools/diskbench.sh virtio
 myos`) checks that the cache gives memory back: at 20 MiB the numbers are within 3%
 (write 104 227); at 12 MiB an 8 MiB file no longer fits, so "warm" reads are partly

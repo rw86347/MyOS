@@ -569,6 +569,28 @@ when it's fixed. File references point at the comment that mentions the gap.
     so iwlwifi skips what it would set there (LTR, L1 substates).
   - No wireless-regdb of our own: a card that doesn't know its country
     keeps the channels its driver registered (Intel's cards know).
+  - The multicast filter is always the empty list (we join no groups: IPv4
+    only, no IGMP). mDNS or IPv6 would need the real list.
+- USB (`drivers/usb/`, 2026-10-07; `docs/USB-PLAN.md`): enough to run from
+  a USB stick. Missing:
+  - Hubs: a device behind a hub (or a laptop whose ports sit behind an
+    internal one) is listed as "a hub: not supported yet".
+  - Unplugging: the kernel says so but keeps the disk; its I/O then times
+    out (10 s per command). Its memory is not given back.
+  - Only xHCI. Old PCs (the Pentium 4 / M targets) have UHCI + EHCI, so
+    their USB sticks don't work yet. Intel 7/8-series chipsets (2012-2014)
+    start with their USB 3 ports routed to EHCI; Linux switches them over
+    (`usb_enable_intel_xhci_ports`), we don't.
+  - Bulk endpoints only: no keyboards or mice (interrupt endpoints), no
+    webcams (isochronous). Mass storage only; other classes are listed.
+  - Mass storage: bulk-only transport, LUN 0, 512-byte sectors; no UAS (a
+    faster USB 3 protocol), no write-protect check, no TRIM.
+  - One command at a time per controller's command ring, and a command that
+    times out is not aborted (CRCR.CA): the ring may then be stuck.
+  - "Wait for the stick we started from" needs the loader's BOOT_FROM_USB
+    flag: the x86_64 loader sets it, the i386 one doesn't.
+  - Not yet tested on real hardware (the MSI's Intel controller uses
+    64-byte contexts and scratchpad pages; QEMU's uses neither).
 
 ### Display (step 11b, 2026-10-03)
 - **Only QEMU/UTM's std VGA (Bochs, 1234:1111) gets graphics.** Real old PCs and every

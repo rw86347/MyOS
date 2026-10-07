@@ -52,10 +52,13 @@ X draws in a low RAM copy; the kernel copies that onto the real bar.
 Plug the stick in, power on, open the boot menu (often F12, F10, Esc).
 Choose the USB entry that says UEFI, not "legacy".
 
-This kernel has no USB mass-storage driver. On a laptop whose only
-"disk" is the stick, `myos-root` is not mounted. The ESP's initramfs
-is then a login-only userland: runit starts `myos-login` (X on
-`/dev/fb0`). Firefox and the rest stay on the invisible ext2
-partition. The framebuffer above 4 GiB is mapped with PSE-36.
+Since 2026-10-07 the kernel has its own USB stick driver (xHCI + mass
+storage, `docs/USB-PLAN.md`): it finds the stick again once it runs,
+and the stick's ext2 `myos-root` becomes `/` — the whole live system,
+and what you save stays on the stick. The boot screen shows `xhci:`,
+`usb 1-N:`, `usb-storage: sda:` and `ext2: sda2 mounted at /`. If that
+fails, the ESP's initramfs is still there as before: a login-only
+userland in RAM (runit starts `myos-login`, X on `/dev/fb0`). The
+framebuffer above 4 GiB is mapped with PSE-36.
 
 The empty live password is just Enter.

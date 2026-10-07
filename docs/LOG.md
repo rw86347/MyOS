@@ -2382,3 +2382,59 @@ our peer had no rates until the association answer. mac80211 fills them
 from the beacon before adding the peer (ieee80211_mgd_setup_link_sta); so
 does our core now, and the strict simulated driver checks it.
 
+
+## 2026-10-07 — USB sticks: the live system runs from the stick
+
+Rodger's MSI could only run the small login initramfs: once MyOS was up it
+could not see the stick it came from ("storage: no disks"). Now it can.
+Our own drivers (Linux's xhci-hcd and usb-storage are GPL-only, so the
+licence rule keeps them out), written from the xHCI 1.2 and USB
+mass-storage bulk-only specs; plan and steps in `docs/USB-PLAN.md`.
+
+- `drivers/usb/xhci.c`: the controller. Rings of 16-byte TRBs shared with
+  it, like NVMe's queues: a command ring, one transfer ring per endpoint,
+  an event ring for completions. Firmware hand-off, reset, MSI-X; a "usb"
+  thread resets each connected port, gives the device an address, reads
+  its descriptors and finds it a driver, while the IDE/AHCI/NVMe drivers
+  start. Later plugs come in through the port-change interrupt.
+- `drivers/usb/usb_storage.c`: a stick is a SCSI disk behind two bulk
+  pipes. Command block and data are queued together, straight from the
+  page cache's pages (scatter-gather, no copy); then the status.
+- `sda`, `sdb`... are shared with AHCI now (they both used "sda").
+- The x86_64 loader says when it was started from USB; the kernel then
+  waits up to 10 s for that stick's `myos-root` before falling back to RAM.
+
+First run: a read of sector 0 timed out. QEMU's trace showed why: its
+emulated stick answered the data, and the status request I had already
+queued behind it went "async" and never completed (QEMU starts the next
+transfer before it has finished the last). Linux and Windows ask for the
+status only after the data, so that is what we do too: two interrupts per
+command instead of one (Linux takes three).
+
+*Check:* `make ARCH=x86_64 test-usb` — OVMF boots the 2.2 GiB live image
+from a QEMU USB stick (no other disk); our driver finds it, `sda2` becomes
+`/`, the login screen is up 18 s after QEMU starts. Also by hand: a USB 2
+port (480 Mb/s), QEMU's NEC controller, and the stick pulled out before the
+kernel looked and plugged back in 3 s later (the kernel waited, found it,
+mounted it). `tools/test-disks.sh` gained a USB run: ext2test 24/24, fstest
+158/158 through the stick (the 32-bit kernel). Its other runs had been
+failing on the Linux-shim PCI tests, which need QEMU's `edu` card: now added.
+One of the four first runs failed racetest's known flaky "epoll_ctl while
+the fd is replaced"; three more passed. `make test` 210/210,
+`test-uefi-shell` and `test-wifi-desktop` pass.
+Benchmark (`tools/diskbench.sh usb`, `docs/performance.md`): cold 64 KiB
+read 31 311 instructions vs Linux 6.1's 117 431; 64 KiB write 103 322 vs
+752 527.
+
+Also: the Wi-Fi core now calls the driver's prepare_multicast before
+configure_filter, as mac80211 does; iwlwifi warned at mac80211.c:1948
+(no multicast filter command) on every association.
+
+U4, the same day on the MSI: it works. Both Intel controllers started on
+MSI (8086:9a17, the CPU's Thunderbolt xHCI, 5 ports; 8086:43ed, the
+chipset's, 24 ports, USB 3 on 17-24). The stick, 24a9:205a "USB DISK 3.2",
+60 000 MiB, became sda; `ext2: sda2 mounted at /` — the desktop and xterm
+ran from the stick. The webcam (30c9:0042) and the AX201's Bluetooth
+(8087:0026) were listed. The stick connected at 480 Mb/s on USB 2 port 4:
+still to find out whether that was the USB 2.0 socket or a USB 3 link that
+did not come back after our reset.

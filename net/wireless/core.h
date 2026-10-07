@@ -233,6 +233,9 @@ const struct cfg80211_bss *wifi_bss_find(struct ieee80211_local *local, const u8
 int wifi_authorize(struct ieee80211_sub_if_data *sdata, bool on);
 void wifi_connection_lost(struct ieee80211_sub_if_data *sdata, u16 reason);  /* any context */
 int wifi_driver_up(struct ieee80211_sub_if_data *sdata);
+/* Tell the driver which frames to pass up (mac80211's
+   ieee80211_configure_filter): the multicast list first, then the flags. */
+void wifi_configure_filter(struct ieee80211_local *local);
 int wifi_mlme_replay(struct ieee80211_sub_if_data *sdata);
 void wifi_mlme_wake(struct ieee80211_sub_if_data *sdata);
 void wifi_keys_replay(struct ieee80211_sub_if_data *sdata);

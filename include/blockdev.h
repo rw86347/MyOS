@@ -55,6 +55,10 @@ struct blockdev {
 /* Add a device to the global list. Returns it, or NULL if the list is full. */
 struct blockdev *blockdev_register(const struct blockdev *dev);
 
+/* The next SCSI-style disk name, "sda", "sdb", ... (AHCI and USB disks
+   share the letters, as on Linux). */
+void blockdev_sd_name(char name[16]);
+
 int  blockdev_count(void);
 struct blockdev *blockdev_get(int index);
 

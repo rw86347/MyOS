@@ -44,7 +44,12 @@ struct bootinfo {
     uint32_t fb_format;             /* 0 = XRGB, 1 = RGBX */
     uint64_t fb_phys;               /* full GOP address */
     uint32_t loader_magic;          /* BOOTINFO_MAGIC if loader filled GOP */
+    uint32_t boot_flags;            /* BOOT_FROM_USB, ... */
 } __attribute__((packed));
+
+/* The loader came from a USB disk: the kernel waits for that disk to show
+   up before it gives up on finding myos-root there. */
+#define BOOT_FROM_USB 1u
 
 static inline phys_addr_t bootinfo_fb_phys(const struct bootinfo *bi)
 {

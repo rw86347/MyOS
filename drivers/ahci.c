@@ -292,7 +292,6 @@ static void add_port(int n)
     pmm_free(idframe);
 
     struct blockdev dev = {
-        .name    = "sda",
         .sectors = sectors,
         .read    = ahci_read,
         .write   = ahci_write,
@@ -300,7 +299,7 @@ static void add_port(int n)
         .rwv     = ahci_rwv,
         .priv    = p,
     };
-    dev.name[2] = 'a' + nports - 1;
+    blockdev_sd_name(dev.name);
     blockdev_register(&dev);
     kprintf("ahci: %s: port %d, %lu MiB\n", dev.name, n, sectors / 2048);
 }

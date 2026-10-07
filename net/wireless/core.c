@@ -139,11 +139,26 @@ int wifi_driver_up(struct ieee80211_sub_if_data *sdata)
         return err;
     sdata->in_driver = true;
     wifi_default_edca(sdata, true);
+    wifi_configure_filter(local);
+    return 0;
+}
+
+void wifi_configure_filter(struct ieee80211_local *local)
+{
+    /* The multicast groups we have joined: none (IPv4 only, no IGMP).
+       The driver turns the list into its own filter command, which
+       configure_filter then takes over: iwlwifi warns, and filters
+       nothing, if it never got one. */
+    u64 mc = 0;
+    if (local->ops->prepare_multicast) {
+        struct netdev_hw_addr_list none = { .count = 0 };
+        INIT_LIST_HEAD(&none.list);
+        mc = local->ops->prepare_multicast(&local->hw, &none);
+    }
     /* Our own frames, broadcasts, and beacons and probe responses (for
        the list of networks); the driver says which it can filter. */
     unsigned int filter = FIF_BCN_PRBRESP_PROMISC;
-    local->ops->configure_filter(hw, ~0u, &filter, 0);
-    return 0;
+    local->ops->configure_filter(&local->hw, ~0u, &filter, mc);
 }
 
 static int wifi_open(struct net_device *dev)

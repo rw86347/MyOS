@@ -290,6 +290,24 @@ static void take_gop(struct efi_boot_services *bs, struct bootinfo *bi)
     bi->loader_magic = BOOTINFO_MAGIC;
 }
 
+/* Is the disk we were loaded from on USB? (Its device path has a USB node.) */
+static int on_usb(struct efi_boot_services *bs, efi_handle dev)
+{
+    efi_guid g = device_path_guid;
+    struct efi_device_path *p = 0;
+    if (bs->handle_protocol(dev, &g, (void **)&p) != EFI_SUCCESS || !p)
+        return 0;
+    for (int n = 0; n < 64 && p->type != 0x7F; n++) {
+        if (p->type == 3 && (p->subtype == 5 || p->subtype == 15 || p->subtype == 16))
+            return 1;
+        u16 len = (u16)(p->len[0] | p->len[1] << 8);
+        if (len < 4)
+            break;
+        p = (struct efi_device_path *)((u8 *)p + len);
+    }
+    return 0;
+}
+
 /* Leave the reason on the screen long enough to read (or photograph),
    then go back to the firmware, which tries its next boot entry. */
 static efi_status give_up(const char *why)
@@ -404,6 +422,10 @@ efi_status efi_main(efi_handle image, struct efi_system_table *st)
     bi->initrd_phys = extra;
     bi->initrd_size = (u32)isize;   /* 0 when INITRD.CPIO absent (hello image) */
     bi->font_phys = (fsize == 4096) ? FONT_PHYS : 0;
+    if (on_usb(bs, li->device)) {
+        bi->boot_flags |= BOOT_FROM_USB;
+        say("booted from USB\r\n");
+    }
     take_gop(bs, bi);
 
     paint_bar(0x002080C0u);         /* blue: about to leave UEFI */

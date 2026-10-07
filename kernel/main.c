@@ -19,6 +19,7 @@
 #include <bcache.h>
 #include <pcache.h>
 #include <blockdev.h>
+#include <bootinfo.h>
 #include <cpu.h>
 #include <ext2.h>
 #include <fat32.h>
@@ -50,6 +51,7 @@
 #include <syscalls.h>
 #include <timer.h>
 #include <tty.h>
+#include <usb.h>
 #include <vga.h>
 #include <vt.h>
 #ifdef SELFTEST
@@ -149,35 +151,59 @@ static void mount_root(struct blockdev *d)
    Without a "myos-root", MyOS runs from the initramfs in RAM (a live
    disk). Anything else is left alone: an old PC may still hold someone's
    Linux disk, and we never write to that. */
-static void storage_init(void)
+/* The disks from index `from` on: their partitions, then our labels.
+   Returns how far it got (the usb thread may add disks meanwhile). */
+static int scan_disks(int from, struct blockdev **rootdev, struct blockdev **datadev)
 {
-    ata_init();
-    virtio_blk_init();
-    ahci_init();
-    nvme_init();
-    int ndisks = blockdev_count();      /* scanning adds the partitions */
-    for (int i = 0; i < ndisks; i++)
-        partition_scan(blockdev_get(i));
-    bcache_init();                      /* and their blocks, cached */
-    pcache_init();                      /* and their files' pages */
-
-    struct blockdev *rootdev = NULL, *datadev = NULL;
-    for (int i = 0; i < blockdev_count(); i++) {
+    for (int i = from; i < blockdev_count(); i++)      /* adds the partitions */
+        if (!blockdev_get(i)->parent)
+            partition_scan(blockdev_get(i));
+    int i;
+    for (i = from; i < blockdev_count(); i++) {
         struct blockdev *d = blockdev_get(i);
         char label[17];
         if (d->parent ? partition_type(d) != 0x83 : has_partitions(d))
             continue;
         if (ext2_label(d, label) < 0)
             continue;                   /* not ext2 */
-        if (!rootdev && strcmp(label, "myos-root") == 0)
-            rootdev = d;
-        else if (!datadev && strcmp(label, "myos-data") == 0)
-            datadev = d;
+        if (!*rootdev && strcmp(label, "myos-root") == 0)
+            *rootdev = d;
+        else if (!*datadev && strcmp(label, "myos-data") == 0)
+            *datadev = d;
         else
             kprintf("ext2: %s (\"%s\") is not a MyOS disk: left alone\n", d->name, label);
     }
-    if (!ndisks)
-        kprintf("storage: no disks (USB mass storage is not in this kernel yet)\n");
+    return i;
+}
+
+static void storage_init(void)
+{
+    usb_init();                         /* USB sticks: found by the usb thread, */
+    ata_init();                         /* while these start */
+    virtio_blk_init();
+    ahci_init();
+    nvme_init();
+    usb_wait_boot(8000);
+    bcache_init();                      /* blocks, cached */
+    pcache_init();                      /* and files' pages */
+
+    struct blockdev *rootdev = NULL, *datadev = NULL;
+    int seen = scan_disks(0, &rootdev, &datadev);
+#ifdef BOOT_FROM_USB
+    /* We came from a USB stick, so its myos-root should be here: a slow
+       stick may show up late. Wait for it a while (Linux's "rootwait"). */
+    const struct bootinfo *bi = P2V(BOOTINFO_PHYS);
+    if (!rootdev && (bi->boot_flags & BOOT_FROM_USB)) {
+        kprintf("storage: waiting for the USB stick we started from\n");
+        for (int t = 0; t < 100 && !rootdev; t++) {
+            usb_sleep(100);
+            seen = scan_disks(seen, &rootdev, &datadev);
+        }
+    }
+#endif
+    (void)seen;
+    if (!blockdev_count())
+        kprintf("storage: no disks\n");
     if (rootdev)
         mount_root(rootdev);
     if (datadev)

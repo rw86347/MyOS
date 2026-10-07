@@ -175,9 +175,11 @@ This one is the 8042. A USB keyboard on a port still needs xHCI.
 
 ## USB host: xhci-pci
 
-**This is the live-stick blocker.** The only USB controller this unit
+**This was the live-stick blocker.** The only USB controller this unit
 showed is xHCI `8086:43ed`. Without it, the ext2 root on the stick is
 invisible and process 1 is the RAM initramfs (`docs/LOG.md`, 2026-10-05).
+Since 2026-10-07 MyOS has its own xHCI and USB stick driver
+(`drivers/usb/`, `docs/USB-PLAN.md`); first run on this machine pending (U4).
 
 - IDs:
   - `8086:43ed` — Tiger Lake-H PCH xHCI (the ports on the sides).

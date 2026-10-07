@@ -1,5 +1,6 @@
 #!/bin/sh
-# Disk benchmark, MyOS vs Linux, on one disk type: ide, ahci, nvme, virtio.
+# Disk benchmark, MyOS vs Linux, on one disk type: ide, ahci, nvme, virtio,
+# usb (a USB stick on xHCI).
 # Both kernels run user/diskbench.c on a copy of the same ext2 image (two
 # 8 MiB files of random data), in the same QEMU (-icount, pentium3, 64 MiB).
 # Usage: [MEM=20M] tools/diskbench.sh TYPE [myos|linux|both]
@@ -30,7 +31,8 @@ case $TYPE in
     ahci)   DISK="-device ahci,id=ahci -drive id=d0,file=$IMG,format=raw$T,if=none -device ide-hd,drive=d0,bus=ahci.0" ;;
     nvme)   DISK="-drive id=d0,file=$IMG,format=raw$T,if=none -device nvme,serial=myos0,drive=d0" ;;
     virtio) DISK="-drive id=d0,file=$IMG,format=raw$T,if=none -device virtio-blk-pci,drive=d0" ;;
-    *) echo "usage: $0 ide|ahci|nvme|virtio [myos|linux|both]"; exit 1 ;;
+    usb)    DISK="-device qemu-xhci,id=xhci -drive id=d0,file=$IMG,format=raw$T,if=none -device usb-storage,bus=xhci.0,drive=d0" ;;
+    *) echo "usage: $0 ide|ahci|nvme|virtio|usb [myos|linux|both]"; exit 1 ;;
 esac
 if [ $WHO != linux ]; then
     echo "== MyOS, $TYPE"
@@ -42,7 +44,7 @@ if [ $WHO != linux ]; then
         -netdev user,id=net0 -device e1000,netdev=net0 -display none \
         -serial file:$D/myos-$TYPE.log $CLOCK \
         -device isa-debug-exit,iobase=0xf4,iosize=0x04 >/dev/null 2>&1 || true
-    grep -a -E "diskbench|streambench|^ata|^ahci|^nvme|^virtio|mounted at /data" $D/myos-$TYPE.log || true
+    grep -a -E "diskbench|streambench|^ata|^ahci|^nvme|^virtio|^usb-storage|mounted at /data" $D/myos-$TYPE.log || true
 fi
 if [ $WHO != myos ]; then
     echo "== Linux 6.1, $TYPE"

@@ -149,7 +149,7 @@ BENCH_SRCS := kernel/bench.c
 C_SRCS  := $(filter-out $(TEST_SRCS) $(BENCH_SRCS), \
              $(wildcard arch/i386/*.c kernel/*.c drivers/*.c fs/*.c mm/*.c net/*.c \
                         drivers/gpu/drm/*.c drivers/gpu/drm/tiny/*.c drivers/video/*.c \
-                        net/wireless/*.c))
+                        drivers/usb/*.c net/wireless/*.c))
 ifeq ($(MODE),test)
   C_SRCS += $(TEST_SRCS)
 endif
@@ -200,7 +200,7 @@ ifeq ($(ARCH),x86_64)
     C_SRCS  := $(filter-out $(TEST_SRCS) $(BENCH_SRCS) arch/x86_64/early.c kernel/elf.c, \
                $(wildcard arch/x86_64/*.c kernel/*.c drivers/*.c fs/*.c mm/*.c net/*.c \
                           drivers/gpu/drm/*.c drivers/gpu/drm/tiny/*.c drivers/video/*.c \
-                          net/wireless/*.c))
+                          drivers/usb/*.c net/wireless/*.c))
     ifeq ($(MODE),test)
       C_SRCS += $(TEST_SRCS)
     endif
@@ -289,7 +289,7 @@ QEMU_FLAGS = -m 64M -cpu pentium3 \
              -drive format=raw,file=$(DATA),index=2,media=disk \
              -netdev user,id=net0 -device e1000,netdev=net0
 
-.PHONY: run-uefi test-uefi-shell diskattacks verify-disktests verify-tests attacks all dist utm utm-hd hd live-root live-extra live-theme live-hd utm-live run-live run-hd test-hd run run-full run-text debug test check-selftests test-shell bench run-bench usb clean fuzz fuzz-build fuzz-replay diskfuzz diskfuzz-replay verify-racetests uefi run-uefi-text test-uefi live-uefi test-live-uefi live-login-initrd test-uefi-login
+.PHONY: run-uefi test-uefi-shell diskattacks verify-disktests verify-tests attacks all dist utm utm-hd hd live-root live-extra live-theme live-hd utm-live run-live run-hd test-hd run run-full run-text debug test check-selftests test-shell bench run-bench usb clean fuzz fuzz-build fuzz-replay diskfuzz diskfuzz-replay verify-racetests uefi run-uefi-text test-uefi live-uefi test-live-uefi test-usb live-login-initrd test-uefi-login
 
 ifeq ($(ARCH),x86_64)
 all: uefi
@@ -746,6 +746,31 @@ test-live-uefi: $(LIVE_UEFI)
 	@grep -q "mounted at /" $(BUILD)/live-uefi-serial.log \
 	  || { echo "FAIL: myos-root did not become /"; exit 1; }
 	@echo "LIVE UEFI OK: OVMF started the kernel and mounted myos-root"
+
+# The live disk as a USB stick, the only disk (the laptop case): OVMF starts
+# MyOS from it, our xHCI driver finds the stick again, its myos-root becomes
+# "/", and the login screen comes up from it. docs/USB-PLAN.md.
+test-usb: $(LIVE_UEFI)
+	@rm -f $(BUILD)/usb-serial.log
+	@cp $(OVMF_VARS) $(BUILD)/ovmf-vars.fd
+	@(for i in $$(seq 150); do sleep 1; \
+	    grep -q "login screen is up" $(BUILD)/usb-serial.log 2>/dev/null && break; done; \
+	  echo quit) \
+	  | $(QEMU64) -machine q35,pit=off -m 4G -cpu qemu64 -vga cirrus \
+	    -drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
+	    -drive if=pflash,format=raw,file=$(BUILD)/ovmf-vars.fd \
+	    -device qemu-xhci,id=xhci \
+	    -drive if=none,format=raw,file=$(LIVE_UEFI),id=stick,snapshot=on \
+	    -device usb-storage,bus=xhci.0,drive=stick,bootindex=0 \
+	    -net none -no-reboot -display none \
+	    -serial file:$(BUILD)/usb-serial.log -monitor stdio >/dev/null || true
+	@L=$(BUILD)/usb-serial.log; ok=1; \
+	  grep -a "xhci\|usb\|sd[a-z]\|mounted at /\|login screen" $$L; \
+	  grep -q "^xhci: .*MSI-X" $$L || { echo "FAIL: xHCI with MSI-X"; ok=0; }; \
+	  grep -q "^usb-storage: sda: " $$L || { echo "FAIL: the stick as sda"; ok=0; }; \
+	  grep -q "^ext2: sda2 mounted at /:" $$L || { echo "FAIL: myos-root from the stick"; ok=0; }; \
+	  grep -q "the login screen is up" $$L || { echo "FAIL: the login screen"; ok=0; }; \
+	  [ $$ok = 1 ] && echo "USB TEST OK ($(ARCH)): the live system runs from a USB stick" || exit 1
 
 # RAM-only login (no ext2): what a real UEFI laptop does until USB MSC exists.
 UEFI_LOGIN_IMG := $(BUILD)/myos-uefi-login.img
