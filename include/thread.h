@@ -9,7 +9,14 @@
    next is decided by the scheduler (sched.h); this file is the mechanics.
    A thread that runs a user program belongs to a process (proc.h). */
 
-#define THREAD_MAX      64
+/* Threads in the whole system. A browser alone runs a hundred or more
+   (Chromium's processes together), so the 64-bit kernel has room for 512;
+   the 32-bit one, for old PCs, 256. A slot is ~700 bytes, static. */
+#ifdef ARCH_X86_64
+#define THREAD_MAX      512
+#else
+#define THREAD_MAX      256
+#endif
 #define THREAD_STACK    8192          /* bytes of kernel stack per thread */
 
 struct process;

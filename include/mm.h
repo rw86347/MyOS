@@ -86,7 +86,7 @@ int mm_add_file(struct mm *mm, user_addr_t start, user_addr_t end, uint32_t flag
                 struct inode *file, uint32_t file_off, uint32_t file_end);
 
 /* The lowest free stretch of len bytes from MMAP_BASE up, or 0. */
-user_addr_t mm_find_gap(struct mm *mm, uint32_t len);
+user_addr_t mm_find_gap(struct mm *mm, user_addr_t len);
 
 /* Remove [start, end) from the areas and unmap its pages. */
 int mm_remove(struct mm *mm, user_addr_t start, user_addr_t end);
@@ -99,23 +99,23 @@ int mm_mincore(user_addr_t start, uint32_t pages, uint8_t *vec);   /* see mm.c *
 /* The brk and mmap system calls, on the current address space. fmode: the
    file's open() flags (its O_ACCMODE decides what MAP_SHARED may do). */
 user_addr_t mm_brk(user_addr_t new_brk);
-intptr_t mm_mmap(user_addr_t addr, uint32_t len, uint32_t prot, uint32_t flags,
+intptr_t mm_mmap(user_addr_t addr, user_addr_t len, uint32_t prot, uint32_t flags,
                  struct inode *file, uint32_t off, uint32_t fmode);
-int32_t  mm_munmap(user_addr_t addr, uint32_t len);
-intptr_t mm_mremap(user_addr_t old, uint32_t old_len, uint32_t new_len,
+int32_t  mm_munmap(user_addr_t addr, user_addr_t len);
+intptr_t mm_mremap(user_addr_t old, user_addr_t old_len, user_addr_t new_len,
                    uint32_t flags, user_addr_t new_addr);
 
 /* mmap of a device file whose ops have .mmap (/dev/fb0). The area is
    always shared: writes reach the device, as with MAP_SHARED. */
 struct file;
-intptr_t mm_mmap_device(user_addr_t addr, uint32_t len, uint32_t prot, uint32_t flags,
+intptr_t mm_mmap_device(user_addr_t addr, user_addr_t len, uint32_t prot, uint32_t flags,
                         struct file *f, uint32_t off);
 
 /* For a device's .mmap: make vma map physical [phys, phys + size),
    starting at the vma's file offset (Linux: vm_iomap_memory). 0, or
    -EINVAL if the vma reaches past size rounded up to whole pages. */
 int vm_iomap_memory(struct vma *vma, phys_addr_t phys, uint32_t size);
-int32_t  mm_mprotect(user_addr_t addr, uint32_t len, uint32_t prot);
+int32_t  mm_mprotect(user_addr_t addr, user_addr_t len, uint32_t prot);
 
 /* shmdt: remove the shared-memory attach that starts at addr — every area
    of that segment in [addr, addr + its size), in the current address

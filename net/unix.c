@@ -33,7 +33,21 @@
  * queue, bounded in count and bytes: a sender waits (or gets EAGAIN) while
  * it is full.
  *
- * Not yet: passing file descriptors (SCM_RIGHTS), credentials messages.
+ * SOCK_SEQPACKET is both: a connection (listen/connect/accept, socketpair,
+ * end of file when the other end goes) carrying messages (the datagram
+ * queue). Chromium talks to its helper processes this way.
+ *
+ * Passing open files (SCM_RIGHTS): sendmsg's files are held (a reference
+ * each) in a `ufiles` record that travels with the data; recvmsg turns
+ * them into new fds of the receiver. A message carries its record. On a
+ * stream the record is pinned to the byte where that sendmsg's data
+ * starts: a read stops short of the next record's byte, so files never
+ * arrive with someone else's data (Linux's rule), and a plain read() that
+ * passes a record drops its files.
+ *
+ * Not yet: credentials messages (SCM_CREDENTIALS is accepted and ignored),
+ * and Linux's garbage collector for sockets passed over themselves (such a
+ * cycle is never freed).
  */
 #include <errno.h>
 #include <kheap.h>
@@ -52,14 +66,17 @@
 
 #define SOCK_STREAM    1
 #define SOCK_DGRAM     2
+#define SOCK_SEQPACKET 5
 #define SOCK_TYPE_MASK 0xf
 #define SOCK_NONBLOCK  04000
 #define SOCK_CLOEXEC   02000000
 
 #define MSG_PEEK     0x02
+#define MSG_CTRUNC   0x08
 #define MSG_TRUNC    0x20
 #define MSG_DONTWAIT 0x40
 #define MSG_NOSIGNAL 0x4000
+#define MSG_CMSG_CLOEXEC 0x40000000
 
 #define SOL_SOCKET    1
 #define SO_TYPE       3
@@ -85,10 +102,22 @@
 #define DGRAM_MAX   16384           /* the largest datagram */
 #define DQ_MAX      16              /* datagrams waiting for one socket (Linux: 10) */
 #define DQ_BYTES    65536           /* ...and their bytes */
+#define FD_PASS_MAX 64              /* files in one SCM_RIGHTS message (Linux: 253) */
+/* cmsg headers and data are padded to a word (CMSG_ALIGN). */
+#define CMSG_ALIGN(n) (((n) + sizeof(user_addr_t) - 1) & ~(user_addr_t)(sizeof(user_addr_t) - 1))
+#define CMSG_HDR      CMSG_ALIGN(sizeof(struct user_cmsghdr))
 
 enum { U_NEW, U_LISTEN, U_CONNECTED };
 
 struct ucred { int32_t pid; uint32_t uid, gid; };
+
+/* Files in flight (SCM_RIGHTS), each held. On a stream, `at` is the byte
+   (a head count) whose data they came with. */
+struct ufiles {
+    struct ufiles *next;
+    uint32_t at, n;
+    struct file *f[];
+};
 
 struct usock {
     int type, state;
@@ -106,7 +135,8 @@ struct usock {
     struct ucred cred, peercred;    /* ours, and the other end's (SO_PEERCRED) */
     struct wait_queue wq;           /* readers, writers waiting for room, accept */
     /* SOCK_DGRAM: peer is where send() goes (connect), held, one way. */
-    struct udgram *dq, *dq_last;    /* datagrams waiting for us to read */
+    struct udgram *dq, *dq_last;    /* messages waiting for us to read */
+    struct ufiles *fq, *fq_last;    /* stream: files with bytes in buf, in order */
     uint32_t dq_count, dq_bytes;
     int closed;                     /* its file is gone: sends to it are refused */
 };
@@ -114,6 +144,7 @@ struct usock {
 /* A datagram waiting to be read, with its sender's name (for recvfrom). */
 struct udgram {
     struct udgram *next;
+    struct ufiles *files;           /* passed with it, or NULL */
     uint32_t len, fromlen;
     uint8_t from[PATH_UN];
     uint8_t data[];
@@ -158,15 +189,37 @@ static struct usock *usock_new(int type)
 
 static void uget(struct usock *s) { s->refs++; }
 
+/* Close files that were in flight and will never be received. */
+static void files_drop(struct ufiles *u)
+{
+    if (!u)
+        return;
+    for (uint32_t k = 0; k < u->n; k++)
+        if (u->f[k])
+            file_put(u->f[k]);
+    kfree(u);
+}
+
 static void dq_free(struct usock *s)
 {
     while (s->dq) {
         struct udgram *d = s->dq;
         s->dq = d->next;
+        files_drop(d->files);
         kfree(d);
     }
     s->dq_last = NULL;
     s->dq_count = s->dq_bytes = 0;
+}
+
+static void fq_free(struct usock *s)
+{
+    while (s->fq) {
+        struct ufiles *u = s->fq;
+        s->fq = u->next;
+        files_drop(u);
+    }
+    s->fq_last = NULL;
 }
 
 static void uput(struct usock *s)
@@ -175,9 +228,13 @@ static void uput(struct usock *s)
         if (s->buf)
             pmm_free(V2P(s->buf));
         dq_free(s);
+        fq_free(s);
         kfree(s);
     }
 }
+
+/* Messages (datagrams, seqpackets) or a byte stream? */
+static int msgs(const struct usock *s) { return s->type != SOCK_STREAM; }
 
 static void wake(struct usock *s)
 {
@@ -197,6 +254,7 @@ static void pair(struct usock *a, struct usock *b)
 static void usock_close(struct usock *s)
 {
     struct usock *p = s->peer;
+    s->closed = 1;                  /* senders still holding us are refused */
     if (s->type == SOCK_DGRAM) {
         s->peer = NULL;
         if (p)
@@ -256,8 +314,11 @@ static int install(struct usock *s, uint32_t flags)
 
 /* --- reading and writing --------------------------------------------------- */
 
+/* Bytes into the peer's ring. *files (SCM_RIGHTS), if any, are pinned to
+   the first byte written and taken (set to NULL); still there afterwards
+   means nothing was written and the caller drops them. */
 static int32_t usock_write(struct usock *s, const uint8_t *ubuf, uint32_t n,
-                           int nonblock, int nosignal)
+                           int nonblock, int nosignal, struct ufiles **files)
 {
     uint32_t done = 0;
     if (s->state != U_CONNECTED)
@@ -286,6 +347,16 @@ static int32_t usock_write(struct usock *s, const uint8_t *ubuf, uint32_t n,
         /* Claim the space, then copy (pipe.c says why). p is held during
            the copy: if it sleeps and p's owner closes, the page stays ours. */
         uget(p);
+        if (files && *files) {          /* they go with this first byte */
+            (*files)->at = p->head;
+            (*files)->next = NULL;
+            if (p->fq_last)
+                p->fq_last->next = *files;
+            else
+                p->fq = *files;
+            p->fq_last = *files;
+            *files = NULL;
+        }
         p->head += k;
         uint32_t claimed = p->head;
         if (copy_from_user(p->buf + at, ubuf + done, first) < 0 ||
@@ -306,7 +377,11 @@ static int32_t usock_write(struct usock *s, const uint8_t *ubuf, uint32_t n,
     return done;
 }
 
-static int32_t usock_read(struct usock *s, uint8_t *ubuf, uint32_t n, int nonblock, int peek)
+/* Bytes out of our ring. Files pinned to the first byte read go to *files
+   (when the caller can take them; else they are closed); a read never
+   runs into the bytes of the next files, so they arrive with their own. */
+static int32_t usock_read(struct usock *s, uint8_t *ubuf, uint32_t n, int nonblock, int peek,
+                          struct ufiles **files)
 {
     if (s->state != U_CONNECTED)
         return -ENOTCONN;
@@ -322,8 +397,23 @@ static int32_t usock_read(struct usock *s, uint8_t *ubuf, uint32_t n, int nonblo
         wq_sleep(&s->wq);
     }
     uint32_t avail = s->head - s->tail;
+    struct ufiles *u = s->fq;
+    if (u && u->at == s->tail)      /* these came with the bytes starting here */
+        u = u->next;
+    if (u && (int32_t)(u->at - s->tail) > 0 && u->at - s->tail < avail)
+        avail = u->at - s->tail;    /* stop before the next files' bytes */
     if (n > avail)
         n = avail;
+    if (!peek && s->fq && s->fq->at == s->tail) {
+        struct ufiles *mine = s->fq;
+        s->fq = mine->next;
+        if (!s->fq)
+            s->fq_last = NULL;
+        if (files)
+            *files = mine;
+        else
+            files_drop(mine);       /* read() has nowhere to put them */
+    }
     uint32_t at = s->tail % BUF_SIZE;
     uint32_t first = n < BUF_SIZE - at ? n : BUF_SIZE - at;
     if (!peek)
@@ -342,7 +432,7 @@ static int32_t usock_read(struct usock *s, uint8_t *ubuf, uint32_t n, int nonblo
    caller). It is copied in before it is queued, so a fault leaves no half
    datagram behind. */
 static int32_t dgram_send(struct usock *s, struct usock *to, const struct user_iovec *iov,
-                          uint32_t niov, int nonblock)
+                          uint32_t niov, int nonblock, struct ufiles **files)
 {
     uint32_t len = 0;
     for (uint32_t i = 0; i < niov; i++)
@@ -351,6 +441,7 @@ static int32_t dgram_send(struct usock *s, struct usock *to, const struct user_i
     struct udgram *d = kmalloc(sizeof *d + len);
     if (!d)
         return -ENOBUFS;
+    d->files = NULL;
     uint32_t at = 0;
     for (uint32_t i = 0; i < niov; i++) {
         if (copy_from_user(d->data + at, (const void *)(uintptr_t)iov[i].base,
@@ -367,7 +458,7 @@ static int32_t dgram_send(struct usock *s, struct usock *to, const struct user_i
     for (;;) {
         int err = 0;
         if (to->closed)
-            err = -ECONNREFUSED;
+            err = s->type == SOCK_SEQPACKET ? -EPIPE : -ECONNREFUSED;
         else if (to->dq_count < DQ_MAX && to->dq_bytes + len <= DQ_BYTES)
             break;
         else if (nonblock)
@@ -379,6 +470,10 @@ static int32_t dgram_send(struct usock *s, struct usock *to, const struct user_i
             return err;
         }
         wq_sleep(&to->wq);          /* its reader will make room */
+    }
+    if (files) {                    /* the message carries them now */
+        d->files = *files;
+        *files = NULL;
     }
     if (to->dq_last)
         to->dq_last->next = d;
@@ -396,8 +491,10 @@ static int32_t dgram_send(struct usock *s, struct usock *to, const struct user_i
    copied, or with MSG_TRUNC the datagram's real length, as Linux does. */
 static int32_t dgram_recv(struct usock *s, const struct user_iovec *iov, uint32_t niov,
                           uint32_t flags, int nonblock, uint8_t *from, uint32_t *fromlen,
-                          int *trunc)
+                          int *trunc, struct ufiles **files)
 {
+    if (s->type == SOCK_SEQPACKET && s->state != U_CONNECTED)
+        return -ENOTCONN;
     while (!s->dq) {
         if (s->rd_shut)
             return 0;
@@ -435,12 +532,33 @@ static int32_t dgram_recv(struct usock *s, const struct user_iovec *iov, uint32_
         s->dq_count++;
         s->dq_bytes += len;
     } else {
+        if (files)
+            *files = d->files;
+        else
+            files_drop(d->files);   /* nowhere to put them */
         kfree(d);
         wake(s);                    /* room for a sender */
     }
     if (err)
         return err;
     return (int32_t)(flags & MSG_TRUNC ? len : at);
+}
+
+/* A connected message socket's sends go to its peer, held. */
+static struct usock *seq_dest(struct usock *s, int nosignal, int *err)
+{
+    if (s->state != U_CONNECTED) {
+        *err = -ENOTCONN;
+        return NULL;
+    }
+    if (!s->peer || s->wr_shut || s->peer->closed) {
+        if (!nosignal)
+            signal_send(proc_current(), SIGPIPE);
+        *err = -EPIPE;
+        return NULL;
+    }
+    uget(s->peer);
+    return s->peer;
 }
 
 /* Where a datagram goes: the name given, else the connected socket.
@@ -481,30 +599,31 @@ static struct usock *dgram_dest(struct usock *s, uintptr_t uaddr, uint32_t alen,
 static int32_t unix_read(struct file *f, void *ubuf, uint32_t n)
 {
     struct usock *s = f->priv;
-    if (s->type == SOCK_DGRAM) {
+    if (msgs(s)) {
         struct user_iovec v = { (uintptr_t)ubuf, n };
         uint8_t from[PATH_UN];
         uint32_t fromlen;
         int trunc;
-        return dgram_recv(s, &v, 1, 0, f->flags & O_NONBLOCK, from, &fromlen, &trunc);
+        return dgram_recv(s, &v, 1, 0, f->flags & O_NONBLOCK, from, &fromlen, &trunc, NULL);
     }
-    return usock_read(s, ubuf, n, f->flags & O_NONBLOCK, 0);
+    return usock_read(s, ubuf, n, f->flags & O_NONBLOCK, 0, NULL);
 }
 
 static int32_t unix_write(struct file *f, const void *ubuf, uint32_t n)
 {
     struct usock *s = f->priv;
-    if (s->type == SOCK_DGRAM) {
+    if (msgs(s)) {
         int err;
-        struct usock *to = dgram_dest(s, 0, 0, &err);
+        struct usock *to = s->type == SOCK_DGRAM ? dgram_dest(s, 0, 0, &err)
+                                                 : seq_dest(s, 0, &err);
         if (!to)
             return err;
         struct user_iovec v = { (uintptr_t)ubuf, n };
-        int32_t r = dgram_send(s, to, &v, 1, f->flags & O_NONBLOCK);
+        int32_t r = dgram_send(s, to, &v, 1, f->flags & O_NONBLOCK, NULL);
         uput(to);
         return r;
     }
-    return usock_write(s, ubuf, n, f->flags & O_NONBLOCK, 0);
+    return usock_write(s, ubuf, n, f->flags & O_NONBLOCK, 0, NULL);
 }
 
 static uint32_t unix_poll(struct file *f)
@@ -522,11 +641,21 @@ static uint32_t unix_poll(struct file *f)
     if (s->state != U_CONNECTED)
         return 0;
     uint32_t r = 0;
+    struct usock *p = s->peer;
+    if (s->type == SOCK_SEQPACKET) {
+        if (s->dq || s->rd_shut)
+            r |= POLLIN;
+        if (!p)
+            r |= POLLHUP;
+        else if (p->dq_count < DQ_MAX && p->dq_bytes < DQ_BYTES)
+            r |= POLLOUT;
+        return r;
+    }
     if (s->head != s->tail || s->rd_shut)
         r |= POLLIN;
-    if (!s->peer)
+    if (!p)
         r |= POLLHUP;
-    else if (s->peer->head - s->peer->tail < BUF_SIZE)
+    else if (p->head - p->tail < BUF_SIZE)
         r |= POLLOUT;
     return r;
 }
@@ -537,7 +666,7 @@ static int32_t unix_ioctl(struct file *f, uint32_t cmd, uintptr_t arg)
     if ((cmd & 0xFF00) == 0x8900)
         return dev_ioctl(cmd, arg);     /* musl's if_nametoindex asks here */
     if (cmd == FIONREAD) {             /* (a datagram socket: the next one's size) */
-        uint32_t n = s->type == SOCK_DGRAM ? (s->dq ? s->dq->len : 0) : s->head - s->tail;
+        uint32_t n = msgs(s) ? (s->dq ? s->dq->len : 0) : s->head - s->tail;
         return copy_to_user((void *)arg, &n, 4) < 0 ? -EFAULT : 0;
     }
     if (cmd == FIONBIO) {
@@ -641,7 +770,7 @@ int32_t unix_socket(uint32_t type, uint32_t protocol)
     uint32_t t = type & SOCK_TYPE_MASK;
     if (type & ~(SOCK_TYPE_MASK | SOCK_NONBLOCK | SOCK_CLOEXEC))
         return -EINVAL;
-    if (t != SOCK_STREAM && t != SOCK_DGRAM)
+    if (t != SOCK_STREAM && t != SOCK_DGRAM && t != SOCK_SEQPACKET)
         return -ESOCKTNOSUPPORT;
     if (protocol != 0)
         return -EPROTONOSUPPORT;
@@ -696,7 +825,7 @@ SYSCALL_DEF(unix_bind)
 SYSCALL_DEF(unix_listen)
 {
     struct usock *s = usock_of(a1, NULL);
-    if (s->type != SOCK_STREAM)
+    if (s->type == SOCK_DGRAM)
         return -EOPNOTSUPP;
     if (s->state == U_CONNECTED)
         return -EINVAL;
@@ -739,7 +868,7 @@ SYSCALL_DEF(unix_connect)
         return err;
     if (l->type != s->type)
         return -EPROTOTYPE;
-    if (s->type != SOCK_STREAM || l->state != U_LISTEN)
+    if (l->state != U_LISTEN)
         return -ECONNREFUSED;
     uget(l);                        /* it may close while we wait */
     while (l->nback >= l->maxback && l->state == U_LISTEN) {
@@ -822,31 +951,33 @@ SYSCALL_DEF(unix_sendto)
 {
     struct file *f;
     struct usock *s = usock_of(a1, &f);
-    if (s->type == SOCK_DGRAM) {
+    if (msgs(s)) {
         int err;
-        struct usock *to = dgram_dest(s, a5, a6, &err);
+        struct usock *to = s->type == SOCK_DGRAM ? dgram_dest(s, a5, a6, &err)
+                                                 : seq_dest(s, a4 & MSG_NOSIGNAL, &err);
         if (!to)
             return err;
         struct user_iovec v = { a2, a3 };
-        int32_t r = dgram_send(s, to, &v, 1, (f->flags & O_NONBLOCK) || (a4 & MSG_DONTWAIT));
+        int32_t r = dgram_send(s, to, &v, 1, (f->flags & O_NONBLOCK) || (a4 & MSG_DONTWAIT),
+                               NULL);
         uput(to);
         return r;
     }
     return usock_write(s, (const uint8_t *)a2, a3,
-                       (f->flags & O_NONBLOCK) || (a4 & MSG_DONTWAIT), a4 & MSG_NOSIGNAL);
+                       (f->flags & O_NONBLOCK) || (a4 & MSG_DONTWAIT), a4 & MSG_NOSIGNAL, NULL);
 }
 
 SYSCALL_DEF(unix_recvfrom)
 {
     struct file *f;
     struct usock *s = usock_of(a1, &f);
-    if (s->type == SOCK_DGRAM) {
+    if (msgs(s)) {
         struct user_iovec v = { a2, a3 };
         uint8_t from[PATH_UN];
         uint32_t fromlen;
         int trunc;
         int32_t r = dgram_recv(s, &v, 1, a4, (f->flags & O_NONBLOCK) || (a4 & MSG_DONTWAIT),
-                               from, &fromlen, &trunc);
+                               from, &fromlen, &trunc, NULL);
         if (r >= 0) {
             int err = write_name(a5, a6, from, fromlen);
             if (err)
@@ -855,7 +986,7 @@ SYSCALL_DEF(unix_recvfrom)
         return r;
     }
     int32_t r = usock_read(s, (uint8_t *)a2, a3,
-                           (f->flags & O_NONBLOCK) || (a4 & MSG_DONTWAIT), a4 & MSG_PEEK);
+                           (f->flags & O_NONBLOCK) || (a4 & MSG_DONTWAIT), a4 & MSG_PEEK, NULL);
     if (r >= 0 && a5 && a6) {
         uint32_t two = 2;           /* the sender has no name */
         uint16_t fam = AF_UNIX;
@@ -880,6 +1011,103 @@ static int read_msg(uintptr_t umsg, struct user_msghdr *m, struct user_iovec *io
     return 0;
 }
 
+/* The files a sendmsg passes (its SCM_RIGHTS message), each held; NULL
+   when there are none (or on an error: *err). Other control messages
+   (SCM_CREDENTIALS) are accepted and ignored. */
+static struct ufiles *files_from_user(const struct user_msghdr *m, int *err)
+{
+    struct ufiles *u = NULL;
+    user_addr_t off = 0;
+    *err = 0;
+    while (m->controllen >= sizeof(struct user_cmsghdr) &&
+           off <= m->controllen - sizeof(struct user_cmsghdr)) {
+        struct user_cmsghdr cm;
+        if (copy_from_user(&cm, (const void *)(uintptr_t)(m->control + off), sizeof cm) < 0) {
+            *err = -EFAULT;
+            break;
+        }
+        if (cm.len < CMSG_HDR || cm.len > m->controllen - off) {
+            *err = -EINVAL;
+            break;
+        }
+        if (cm.level == SOL_SOCKET && cm.type == SCM_RIGHTS) {
+            uint32_t n = (uint32_t)(cm.len - CMSG_HDR) / 4;
+            int32_t fds[FD_PASS_MAX];
+            if (u || n == 0 || n > FD_PASS_MAX) {
+                *err = -EINVAL;         /* (one SCM_RIGHTS per message here) */
+                break;
+            }
+            if (copy_from_user(fds, (const void *)(uintptr_t)(m->control + off + CMSG_HDR),
+                               n * 4) < 0) {
+                *err = -EFAULT;
+                break;
+            }
+            u = kmalloc(sizeof *u + n * sizeof u->f[0]);
+            if (!u) {
+                *err = -ENOMEM;
+                break;
+            }
+            u->next = NULL;
+            u->at = u->n = 0;
+            for (uint32_t k = 0; k < n; k++) {
+                struct file *f = fds[k] >= 0 ? fd_get(fds[k]) : NULL;
+                if (!f) {
+                    *err = -EBADF;
+                    break;
+                }
+                file_get(f);            /* in flight: held until received */
+                u->f[u->n++] = f;
+            }
+            if (*err)
+                break;
+        }
+        off += CMSG_ALIGN(cm.len);
+    }
+    if (*err) {
+        files_drop(u);
+        return NULL;
+    }
+    return u;
+}
+
+/* Received files become our fds, described in the caller's control buffer
+   (one SCM_RIGHTS message). Those that don't fit (or find no free fd) are
+   closed and MSG_CTRUNC says so. *clen: the control bytes used. */
+static int files_to_user(struct ufiles *u, const struct user_msghdr *m,
+                         uint32_t flags, uint32_t *mflags, user_addr_t *clen)
+{
+    *clen = 0;
+    if (!u)
+        return 0;
+    uint32_t room = m->controllen > CMSG_HDR ? (uint32_t)(m->controllen - CMSG_HDR) / 4 : 0;
+    int32_t fds[FD_PASS_MAX];
+    uint32_t k = 0;
+    struct process *me = proc_current();
+    for (; k < u->n && k < room; k++) {
+        int fd = fd_install(u->f[k]);   /* the reference moves to the new fd */
+        if (fd < 0)
+            break;
+        u->f[k] = NULL;
+        fds[k] = fd;
+        if (flags & MSG_CMSG_CLOEXEC)
+            me->cloexec |= 1ull << fd;
+        else
+            me->cloexec &= ~(1ull << fd);
+    }
+    if (k < u->n)
+        *mflags |= MSG_CTRUNC;
+    files_drop(u);                      /* the ones left over */
+    if (!k)
+        return 0;
+    struct user_cmsghdr cm = { CMSG_HDR + k * 4, SOL_SOCKET, SCM_RIGHTS };
+    if (copy_to_user((void *)(uintptr_t)m->control, &cm, sizeof cm) < 0 ||
+        copy_to_user((void *)(uintptr_t)(m->control + CMSG_HDR), fds, k * 4) < 0)
+        return -EFAULT;
+    user_addr_t used = CMSG_HDR + CMSG_ALIGN(k * 4);
+    *clen = used < m->controllen ? used : m->controllen;
+    return 0;
+}
+
 SYSCALL_DEF(unix_sendmsg)
 {
     struct file *f;
@@ -889,20 +1117,19 @@ SYSCALL_DEF(unix_sendmsg)
     int err = read_msg(a2, &m, iov);
     if (err)
         return err;
-    if (m.controllen >= sizeof(struct user_cmsghdr)) {
-        struct user_cmsghdr cm;
-        if (copy_from_user(&cm, (const void *)(uintptr_t)m.control, sizeof cm) < 0)
-            return -EFAULT;
-        if (cm.level == SOL_SOCKET && cm.type == SCM_RIGHTS)
-            return -EOPNOTSUPP;     /* passing fds: not yet */
-    }
+    struct ufiles *files = m.control && m.controllen ? files_from_user(&m, &err) : NULL;
+    if (err)
+        return err;
     int nonblock = (f->flags & O_NONBLOCK) || (a3 & MSG_DONTWAIT);
-    if (s->type == SOCK_DGRAM) {     /* all of the iovecs: one datagram */
-        struct usock *to = dgram_dest(s, m.name, m.namelen, &err);
-        if (!to)
-            return err;
-        int32_t r = dgram_send(s, to, iov, (uint32_t)m.iovlen, nonblock);
-        uput(to);
+    if (msgs(s)) {                  /* all of the iovecs: one message */
+        struct usock *to = s->type == SOCK_DGRAM ? dgram_dest(s, m.name, m.namelen, &err)
+                                                 : seq_dest(s, a3 & MSG_NOSIGNAL, &err);
+        int32_t r = err;
+        if (to) {
+            r = dgram_send(s, to, iov, (uint32_t)m.iovlen, nonblock, &files);
+            uput(to);
+        }
+        files_drop(files);          /* (not sent) */
         return r;
     }
     int32_t done = 0;
@@ -910,13 +1137,16 @@ SYSCALL_DEF(unix_sendmsg)
         if (!iov[i].len)
             continue;
         int32_t r = usock_write(s, (const uint8_t *)(uintptr_t)iov[i].base, iov[i].len,
-                                nonblock || done, a3 & MSG_NOSIGNAL);
-        if (r < 0)
+                                nonblock || done, a3 & MSG_NOSIGNAL, &files);
+        if (r < 0) {
+            files_drop(files);
             return done ? done : r;
+        }
         done += r;
         if ((uint32_t)r < iov[i].len)
             break;
     }
+    files_drop(files);              /* no data went: nothing carried them */
     return done;
 }
 
@@ -930,19 +1160,23 @@ SYSCALL_DEF(unix_recvmsg)
     if (err)
         return err;
     int nonblock = (f->flags & O_NONBLOCK) || (a3 & MSG_DONTWAIT);
-    if (s->type == SOCK_DGRAM) {
+    struct ufiles *files = NULL;
+    uint32_t fl = 0;
+    user_addr_t clen = 0;
+    if (msgs(s)) {
         uint8_t from[PATH_UN];
         uint32_t fromlen;
         int trunc;
-        int32_t r = dgram_recv(s, iov, (uint32_t)m.iovlen, a3, nonblock, from, &fromlen, &trunc);
+        int32_t r = dgram_recv(s, iov, (uint32_t)m.iovlen, a3, nonblock, from, &fromlen, &trunc,
+                               &files);
         if (r < 0)
             return r;
-        uint32_t fl = trunc ? MSG_TRUNC : 0;
-        user_addr_t none = 0;
-        if ((m.name && (err = write_name(m.name, a2 + offsetof(struct user_msghdr, namelen),
+        fl = trunc ? MSG_TRUNC : 0;
+        if ((err = files_to_user(files, &m, a3, &fl, &clen)) ||
+            (m.name && (err = write_name(m.name, a2 + offsetof(struct user_msghdr, namelen),
                                          from, fromlen))) ||
             copy_to_user((void *)(a2 + offsetof(struct user_msghdr, controllen)),
-                         &none, sizeof none) < 0 ||
+                         &clen, sizeof clen) < 0 ||
             copy_to_user((void *)(a2 + offsetof(struct user_msghdr, flags)), &fl, 4) < 0)
             return err ? err : -EFAULT;
         return r;
@@ -951,22 +1185,28 @@ SYSCALL_DEF(unix_recvmsg)
     for (uint32_t i = 0; i < m.iovlen; i++) {
         if (!iov[i].len)
             continue;
+        /* Files come with the first bytes only: the next ones' bytes end
+           the read (usock_read stops short of them). */
         int32_t r = usock_read(s, (uint8_t *)(uintptr_t)iov[i].base, iov[i].len,
-                               nonblock || done, a3 & MSG_PEEK);
-        if (r < 0)
-            return done ? done : r;
+                               nonblock || done, a3 & MSG_PEEK, done ? NULL : &files);
+        if (r < 0) {
+            if (done)
+                break;
+            files_drop(files);
+            return r;
+        }
         done += r;
         if ((uint32_t)r < iov[i].len || (a3 & MSG_PEEK))
             break;
     }
     uint32_t zero = 0;
-    user_addr_t none = 0;
-    if ((m.name && copy_to_user((void *)(a2 + offsetof(struct user_msghdr, namelen)),
+    if ((err = files_to_user(files, &m, a3, &fl, &clen)) ||
+        (m.name && copy_to_user((void *)(a2 + offsetof(struct user_msghdr, namelen)),
                                 &zero, 4) < 0) ||
         copy_to_user((void *)(a2 + offsetof(struct user_msghdr, controllen)),
-                     &none, sizeof none) < 0 ||
-        copy_to_user((void *)(a2 + offsetof(struct user_msghdr, flags)), &zero, 4) < 0)
-        return -EFAULT;
+                     &clen, sizeof clen) < 0 ||
+        copy_to_user((void *)(a2 + offsetof(struct user_msghdr, flags)), &fl, 4) < 0)
+        return err ? err : -EFAULT;
     return done;
 }
 
@@ -987,7 +1227,7 @@ SYSCALL_DEF(unix_getsockopt)
     case SO_TYPE:       val = (uint32_t)s->type; break;
     case SO_ERROR:      val = 0; break;
     case SO_SNDBUF:
-    case SO_RCVBUF:     val = s->type == SOCK_DGRAM ? DQ_BYTES : BUF_SIZE; break;
+    case SO_RCVBUF:     val = msgs(s) ? DQ_BYTES : BUF_SIZE; break;
     case SO_ACCEPTCONN: val = s->state == U_LISTEN; break;
     case SO_PEERCRED:
         if (s->state != U_CONNECTED)
@@ -1034,7 +1274,7 @@ int32_t unix_socketpair(uint32_t type, uint32_t protocol, uintptr_t usv)
     uint32_t t = type & SOCK_TYPE_MASK;
     if (type & ~(SOCK_TYPE_MASK | SOCK_NONBLOCK | SOCK_CLOEXEC))
         return -EINVAL;
-    if (t != SOCK_STREAM && t != SOCK_DGRAM)
+    if (t != SOCK_STREAM && t != SOCK_DGRAM && t != SOCK_SEQPACKET)
         return -EOPNOTSUPP;
     if (protocol != 0)
         return -EPROTONOSUPPORT;

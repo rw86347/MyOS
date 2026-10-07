@@ -465,7 +465,7 @@ SYSCALL(sys_statx)
     memset(&st, 0, sizeof st);
     st.stx_mask = STATX_BASIC_STATS;
     st.stx_blksize = 4096;
-    st.stx_nlink = i->nlink;
+    st.stx_nlink = procfs_nlink(i);
     st.stx_uid = i->uid;
     st.stx_gid = i->gid;
     st.stx_mode = (uint16_t)i->mode;
@@ -675,6 +675,15 @@ SYSCALL(sys_getdents64)
             i = (dir->flags & I_UNLINKED) ? dir : dir->parent;
         } else {
             i = next;
+            /* /proc/self/fd lists the caller's open fds, not every slot
+               (crashpad closes each one it finds). */
+            while (i && (i->flags & I_PROC_FD) && !fd_get(i->fs_ino)) {
+                struct inode *after = vfs_dir_after(i);
+                if (after)
+                    vfs_get(after);
+                vfs_put(i);
+                i = next = after;
+            }
             if (!i) {
                 ended = 1;              /* that was all */
                 break;
@@ -1309,7 +1318,7 @@ SYSCALL(sys_newfstatat)
     memset(&st, 0, sizeof st);
     st.st_dev = i->mnt ? i->mnt->dev_minor : 1;     /* major 0 (as statx) */
     st.st_ino = i->fs ? i->fs_ino : i->ino;
-    st.st_nlink = i->nlink;
+    st.st_nlink = procfs_nlink(i);
     st.st_mode = i->mode;
     st.st_uid = i->uid;
     st.st_gid = i->gid;
@@ -1327,14 +1336,13 @@ SYSCALL(sys_lstat_x64) { return sys_newfstatat(AT_FDCWD, a1, a2, AT_SYMLINK_NOFO
 SYSCALL(sys_fstat_x64) { return sys_newfstatat(a1, 0, a2, AT_EMPTY_PATH, 0, 0); }
 
 /* mmap(addr, len, prot, flags, fd, offset): the offset is in bytes (mmap2's
-   is in pages), and must be page aligned. Lengths and offsets are 32-bit
-   inside (mm.c, files): bigger ones are refused, not cut short. */
+   is in pages), and must be page aligned. Lengths are address-sized (mm.c
+   checks them: Chromium reserves 32 GiB at once); file offsets are 32-bit
+   inside, so a bigger one is refused, not cut short. */
 SYSCALL(sys_mmap_x64)
 {
     if (a6 & (PAGE_SIZE - 1))
         return -EINVAL;
-    if (a2 > 0xFFFFF000)
-        return -ENOMEM;
     if (a6 > 0xFFFFFFFF)
         return -EOVERFLOW;
     return sys_mmap2(a1, a2, a3, a4, a5, a6 / PAGE_SIZE);

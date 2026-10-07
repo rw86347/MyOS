@@ -10,9 +10,13 @@
  * that name is the same file as fstat(0). `login` refuses to run without
  * a terminal name. So for now /proc holds just that:
  *
- *   /proc/self/fd/0 ... 63    one link per fd slot
+ *   /proc/self/fd/0 ... 63    one link per fd slot (a listing shows only
+ *                             the caller's open ones)
  *   /proc/self/exe            a link to the caller's program (Firefox,
  *                             and anything that asks "where am I?")
+ *   /proc/self/task/          its link count is 2 + the caller's threads:
+ *                             Chromium's zygote checks it is single-
+ *                             threaded (3) before it forks. Empty for now.
  *   /proc/cmdline             the kernel's command line: for now the one
  *                             built in (make CMDLINE=...), e.g. "nodesktop",
  *                             which the login service reads
@@ -90,8 +94,10 @@ int procfs_mount(const char *path)
     self = vfs_add(proc, "self", 4, S_IFDIR | 0555);
     fd = self ? vfs_add(self, "fd", 2, S_IFDIR | 0555) : NULL;
     struct inode *exe = self ? vfs_add(self, "exe", 3, S_IFLNK | 0777) : NULL;
-    if (!fd || !exe)
+    struct inode *task = self ? vfs_add(self, "task", 4, S_IFDIR | 0555) : NULL;
+    if (!fd || !exe || !task)
         return -ENOMEM;
+    task->flags |= I_PROC_TASK;
     exe->flags |= I_PROC_EXE;
     exe->size = 64;                     /* Linux reports a path-sized link */
     for (int n = 0; n < FD_MAX; n++) {
@@ -120,6 +126,15 @@ int procfs_mount(const char *path)
     cmdline->size = sizeof cmdline_text - 1;
     cmdline->data = (const uint8_t *)cmdline_text;
     return 0;
+}
+
+uint32_t procfs_nlink(const struct inode *i)
+{
+    if (i->flags & I_PROC_TASK) {
+        struct process *p = proc_current();
+        return 2 + (p ? (uint32_t)p->nthreads : 1);    /* ".", "..", a thread each */
+    }
+    return i->nlink;
 }
 
 /* The path of the file the caller's fd is open on, or of its program. */

@@ -28,6 +28,7 @@
 #include <kheap.h>
 #include <kprintf.h>
 #include <proc.h>
+#include <serial.h>
 #include <signal.h>
 #include <string.h>
 #include <tty.h>
@@ -285,6 +286,7 @@ void tty_input(const char *bytes, int n)
 void tty_attach_keyboard(void)
 {
     keyboard_set_listener(tty_input);
+    serial_set_listener(tty_input);     /* typing on COM1 counts as the keyboard */
     vt_set_reply(tty_input);            /* the screen answers via the input */
 }
 

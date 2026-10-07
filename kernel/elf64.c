@@ -1,5 +1,9 @@
 /*
- * elf64.c — load static ELF64 executables (x86_64 only)
+ * elf64.c — load ELF64 programs (x86_64 only)
+ *
+ * elf_map maps a program file page by page on demand (the way elf.c does
+ * for i386); elf_load checks and copies an image already in memory (the
+ * self-tests' hand-made images).
  */
 #ifdef ARCH_X86_64
 
@@ -112,7 +116,7 @@ int elf_load(const void *image, uint32_t size, user_addr_t dyn_base, struct elf_
     if (eh->e_type == ET_DYN) {
         uint64_t base = dyn_base;
         if (dyn_base == ELF_BASE_ANY) {
-            base = mm_find_gap(mm_current(), (uint32_t)page_up(hi - lo));
+            base = mm_find_gap(mm_current(), page_up(hi - lo));
             if (!base)
                 return -ENOMEM;
         }
@@ -154,39 +158,167 @@ int elf_load(const void *image, uint32_t size, user_addr_t dyn_base, struct elf_
     return 0;
 }
 
-/* elf_map for a file in the tree: its bytes in one piece (in place from
-   the initramfs, else copied), loaded; the interpreter path copied out. */
+/* Does any PT_LOAD segment with flag `pf` touch this page? */
+static int page_has(const struct elf64_phdr *ph, int n, uint64_t page, uint32_t pf)
+{
+    for (int i = 0; i < n; i++)
+        if (ph[i].p_type == PT_LOAD && (ph[i].p_flags & pf) && ph[i].p_memsz &&
+            ph[i].p_vaddr < page + PAGE_SIZE && ph[i].p_vaddr + ph[i].p_memsz > page)
+            return 1;
+    return 0;
+}
+
+/* The furthest file offset that still holds real bytes of any segment
+   covering this page. Past that, the page is BSS: zeros. */
+static uint32_t page_limit(const struct elf64_phdr *ph, int n, uint64_t page)
+{
+    uint64_t limit = 0;
+    for (int i = 0; i < n; i++)
+        if (ph[i].p_type == PT_LOAD && ph[i].p_memsz &&
+            ph[i].p_vaddr < page + PAGE_SIZE && ph[i].p_vaddr + ph[i].p_memsz > page &&
+            ph[i].p_offset + ph[i].p_filesz > limit)
+            limit = ph[i].p_offset + ph[i].p_filesz;
+    return (uint32_t)limit;
+}
+
+/* Did an earlier PT_LOAD segment (one before `i`) already map this page?
+   Two segments can share the page where one ends and the next begins. */
+static int page_taken(const struct elf64_phdr *ph, int i, uint64_t page)
+{
+    for (int j = 0; j < i; j++)
+        if (ph[j].p_type == PT_LOAD && ph[j].p_memsz &&
+            (ph[j].p_vaddr & ~0xFFFull) <= page && ph[j].p_vaddr + ph[j].p_memsz > page)
+            return 1;
+    return 0;
+}
+
+/*
+ * Map a program file into the current address space, as the 32-bit loader
+ * (elf.c) does: only the headers are read now. Each segment becomes a
+ * file-backed area, and a page is read from the file (through the page
+ * cache) the first time the program touches it; past a segment's file
+ * bytes it is zeros (BSS). A 220 MB browser starts by reading the few
+ * pages it runs, not all of it, and needs no 220 MB buffer.
+ *
+ * Pages next to each other with the same rights and end-of-data go in as
+ * one area (one mm_add_file call per run, not per page).
+ */
 int elf_map(struct inode *ino, user_addr_t dyn_base, struct elf_info *info,
             char *interp, uint32_t interp_cap)
 {
-    if (ino->size < sizeof(struct elf64_ehdr))
+    struct elf64_ehdr eh;
+    if (!ino || ino->size < sizeof eh || file_copy_out(ino, 0, &eh, sizeof eh) < 0)
         return -ENOEXEC;
-    const uint8_t *bytes = ino->data;
-    uint8_t *tmp = NULL;
-    if (!bytes || ino->pages) {
-        tmp = kmalloc(ino->size);
-        if (!tmp)
-            return -ENOMEM;
-        if (file_copy_out(ino, 0, tmp, ino->size) < 0) {
-            kfree(tmp);
-            return -EIO;
+    if (memcmp(eh.e_ident, "\177ELF", 4) || eh.e_ident[4] != ELFCLASS64 ||
+        eh.e_ident[5] != ELFDATA2LSB || eh.e_machine != EM_X86_64 ||
+        (eh.e_type != ET_EXEC && eh.e_type != ET_DYN) ||
+        eh.e_phentsize != sizeof(struct elf64_phdr) ||
+        eh.e_phnum == 0 || eh.e_phnum > ELF_MAX_PHDRS ||
+        eh.e_phoff > ino->size ||
+        (uint64_t)eh.e_phnum * sizeof(struct elf64_phdr) > ino->size - eh.e_phoff)
+        return -ENOEXEC;
+    int n = eh.e_phnum;
+    struct elf64_phdr ph[ELF_MAX_PHDRS];
+    if (file_copy_out(ino, (uint32_t)eh.e_phoff, ph, n * sizeof ph[0]) < 0)
+        return -EIO;
+
+    /* 1. Check every segment against the file; the span they cover. */
+    info->interp = NULL;
+    uint64_t lo = ~0ull, hi = 0;
+    for (int i = 0; i < n; i++) {
+        if (ph[i].p_type == PT_INTERP) {
+            if (ph[i].p_offset > ino->size || ph[i].p_filesz > ino->size - ph[i].p_offset ||
+                ph[i].p_filesz < 2 || ph[i].p_filesz > interp_cap || ph[i].p_filesz > PATH_MAX)
+                return -ENOEXEC;
+            if (file_copy_out(ino, (uint32_t)ph[i].p_offset, interp, (uint32_t)ph[i].p_filesz) < 0)
+                return -EIO;
+            if (interp[ph[i].p_filesz - 1] != '\0')
+                return -ENOEXEC;
+            info->interp = interp;
         }
-        bytes = tmp;
+        if (ph[i].p_type != PT_LOAD || !ph[i].p_memsz)
+            continue;
+        /* A page holds file bytes at the same offset within the page as in
+           memory, or the file can't be mapped page by page (Linux refuses
+           such files too). */
+        if (ph[i].p_filesz > ph[i].p_memsz ||
+            ph[i].p_offset > ino->size || ph[i].p_filesz > ino->size - ph[i].p_offset ||
+            ph[i].p_vaddr + ph[i].p_memsz < ph[i].p_vaddr ||
+            (ph[i].p_vaddr & 0xFFF) != (ph[i].p_offset & 0xFFF))
+            return -ENOEXEC;
+        if ((ph[i].p_vaddr & ~0xFFFull) < lo)
+            lo = ph[i].p_vaddr & ~0xFFFull;
+        if (ph[i].p_vaddr + ph[i].p_memsz > hi)
+            hi = ph[i].p_vaddr + ph[i].p_memsz;
     }
-    int err = elf_load(bytes, ino->size, dyn_base, info);
-    if (!err && interp && interp_cap) {
-        if (info->interp) {
-            uint32_t n = 0;
-            while (info->interp[n] && n + 1 < interp_cap) {
-                interp[n] = info->interp[n];
-                n++;
+    if (hi == 0)
+        return -ENOEXEC;
+
+    /* 2. Where it goes: a position-independent file (ET_DYN) is shifted. */
+    uint64_t bias = 0;
+    if (eh.e_type == ET_DYN) {
+        uint64_t base = dyn_base;
+        if (dyn_base == ELF_BASE_ANY) {
+            base = mm_find_gap(mm_current(), page_up(hi - lo));
+            if (!base)
+                return -ENOMEM;
+        }
+        bias = base - lo;
+    }
+    if (lo + bias < USER_ADDR_MIN || hi + bias > USER_ADDR_END || hi + bias < lo + bias)
+        return -ENOEXEC;
+    for (int i = 0; i < n; i++)
+        ph[i].p_vaddr += bias;
+
+    /* 3. The areas, page runs of equal rights and end-of-data. */
+    info->phdr = 0;
+    for (int i = 0; i < n; i++) {
+        const struct elf64_phdr *p = &ph[i];
+        if (p->p_type == PT_PHDR)
+            info->phdr = p->p_vaddr;
+        if (p->p_type != PT_LOAD || !p->p_memsz)
+            continue;
+        uint64_t map_start = p->p_vaddr & ~0xFFFull;
+        uint64_t map_end = page_up(p->p_vaddr + p->p_memsz);
+        uint64_t file_off0 = p->p_offset - (p->p_vaddr - map_start);
+        uint64_t run = 0;               /* the run's first page (0: none open) */
+        uint32_t run_flags = 0, run_limit = 0;
+        for (uint64_t page = map_start; page <= map_end; page += PAGE_SIZE) {
+            uint32_t flags = 0, limit = 0;
+            int take = page < map_end && !page_taken(ph, i, page);
+            if (take) {
+                flags = VM_READ | (page_has(ph, n, page, PF_W) ? VM_WRITE : 0) |
+                        (page_has(ph, n, page, PF_X) ? VM_EXEC : 0);
+                limit = page_limit(ph, n, page);
             }
-            interp[n] = '\0';
-            info->interp = interp;      /* (the file bytes may go away) */
+            if (run && (!take || flags != run_flags || limit != run_limit)) {
+                int err = mm_add_file(mm_current(), run, page, run_flags, ino,
+                                      (uint32_t)(file_off0 + (run - map_start)), run_limit);
+                if (err)
+                    return err;
+                run = 0;
+            }
+            if (take && !run) {
+                run = page;
+                run_flags = flags;
+                run_limit = limit;
+            }
         }
+        /* No PT_PHDR: the headers are usually in the first segment (offset
+           0); musl needs them in memory (AT_PHDR) for thread-local storage. */
+        if (!info->phdr && p->p_offset == 0 && eh.e_phoff < p->p_filesz)
+            info->phdr = p->p_vaddr + eh.e_phoff;
     }
-    kfree(tmp);
-    return err;
+    info->entry = eh.e_entry + bias;
+    info->base = bias;
+    info->brk_start = page_up(hi + bias);
+    info->phnum = eh.e_phnum;
+    if (info->entry < USER_ADDR_MIN || info->entry >= USER_ADDR_END)
+        return -ENOEXEC;
+    /* The rest of the file waits until the program touches it. */
+    if (mm_fault(info->entry, 0) < 0 || !vmm_translate(info->entry))
+        return -ENOEXEC;
+    return 0;
 }
 
 #endif

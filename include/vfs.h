@@ -104,6 +104,8 @@ struct file_ops {
                                        program (the ELF that execve loaded) */
 #define I_MEMFD    128              /* memfd_create: fs_ino holds F_SEAL_* */
 #define I_WATCHED  256              /* inotify watches it (fs/inotify.c) */
+#define I_PROC_TASK 512             /* /proc/self/task: its link count says how
+                                       many threads the caller has */
 
 /*
  * A file system on a disk (ext2): what the VFS asks of it. The VFS keeps
@@ -450,6 +452,8 @@ int  pipe_create(struct file **rd, struct file **wr);         /* pipe.c */
 int  fifo_open(struct inode *i, uint32_t flags, struct file **out);  /* a named pipe */
 /* procfs.c: mount -t proc, and readlink of /proc/self/fd/N or /proc/self/exe. */
 int  procfs_mount(const char *path);
+/* A node's link count for stat(): /proc/self/task's depends on the caller. */
+uint32_t procfs_nlink(const struct inode *i);
 int  procfs_readlink(struct inode *link, char *buf, uint32_t size);
 /* sysfs.c: mount -t sysfs (just what Xorg checks: /sys/class/graphics/fb0). */
 int  sysfs_mount(const char *path);

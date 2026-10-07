@@ -379,8 +379,11 @@ user_addr_t mm_brk(user_addr_t new_brk)
 #define MAP_FIXED     0x10
 #define MAP_ANONYMOUS 0x20
 
-/* The lowest gap of len bytes at or above MMAP_BASE, below the stack. */
-user_addr_t mm_find_gap(struct mm *mm, uint32_t len)
+/* The lowest gap of len bytes at or above MMAP_BASE, below the stack.
+   Lengths are address-sized: a 64-bit program may reserve far more than
+   4 GiB of address space (Chromium's allocator asks for 32 GiB, untouched
+   and so costing nothing until used). */
+user_addr_t mm_find_gap(struct mm *mm, user_addr_t len)
 {
     user_addr_t addr = MMAP_BASE;
     for (int i = 0; i < mm->nareas; i++) {
@@ -396,7 +399,7 @@ user_addr_t mm_find_gap(struct mm *mm, uint32_t len)
     return addr;
 }
 
-intptr_t mm_mmap(user_addr_t addr, uint32_t len, uint32_t prot, uint32_t flags,
+intptr_t mm_mmap(user_addr_t addr, user_addr_t len, uint32_t prot, uint32_t flags,
                 struct inode *file, uint32_t off, uint32_t fmode)
 {
     if (!(flags & MAP_ANONYMOUS)) {
@@ -417,6 +420,8 @@ intptr_t mm_mmap(user_addr_t addr, uint32_t len, uint32_t prot, uint32_t flags,
     }
     if (len == 0 || (addr & (PAGE_SIZE - 1)))
         return -EINVAL;
+    if (len > USER_ADDR_END)
+        return -ENOMEM;                 /* (and PAGE_UP can't wrap) */
     len = PAGE_UP(len);
     uint32_t vflags = VM_READ | (prot & PROT_WRITE ? VM_WRITE : 0);
 
@@ -449,11 +454,13 @@ int vm_iomap_memory(struct vma *vma, phys_addr_t phys, uint32_t size)
     return 0;
 }
 
-intptr_t mm_mmap_device(user_addr_t addr, uint32_t len, uint32_t prot, uint32_t flags,
+intptr_t mm_mmap_device(user_addr_t addr, user_addr_t len, uint32_t prot, uint32_t flags,
                        struct file *f, uint32_t off)
 {
     if (len == 0 || ((addr | off) & (PAGE_SIZE - 1)))
         return -EINVAL;
+    if (len > 0xFFFFF000u)
+        return -ENOMEM;                 /* devices are mapped by 32-bit offsets */
     if ((f->flags & O_ACCMODE) == O_WRONLY)
         return -EACCES;
     if ((prot & PROT_WRITE) && (f->flags & O_ACCMODE) != O_RDWR)
@@ -485,9 +492,10 @@ intptr_t mm_mmap_device(user_addr_t addr, uint32_t len, uint32_t prot, uint32_t 
     return err ? err : (intptr_t)addr;
 }
 
-int32_t mm_munmap(user_addr_t addr, uint32_t len)
+int32_t mm_munmap(user_addr_t addr, user_addr_t len)
 {
-    if ((addr & (PAGE_SIZE - 1)) || len == 0 || addr + len > USER_ADDR_END)
+    if ((addr & (PAGE_SIZE - 1)) || len == 0 || len > USER_ADDR_END ||
+        addr + len > USER_ADDR_END)
         return -EINVAL;
     return mm_remove(current_mm, addr, addr + PAGE_UP(len));
 }
@@ -499,7 +507,7 @@ int32_t mm_munmap(user_addr_t addr, uint32_t len)
 #define MREMAP_MAYMOVE 1
 #define MREMAP_FIXED   2
 
-intptr_t mm_mremap(user_addr_t old, uint32_t old_len, uint32_t new_len,
+intptr_t mm_mremap(user_addr_t old, user_addr_t old_len, user_addr_t new_len,
                   uint32_t flags, user_addr_t new_addr)
 {
     struct mm *mm = current_mm;
@@ -509,6 +517,8 @@ intptr_t mm_mremap(user_addr_t old, uint32_t old_len, uint32_t new_len,
         return -EINVAL;
     if ((flags & MREMAP_FIXED) && !(flags & MREMAP_MAYMOVE))
         return -EINVAL;
+    if (old_len > USER_ADDR_END || new_len > USER_ADDR_END)
+        return -ENOMEM;
     old_len = PAGE_UP(old_len);
     new_len = PAGE_UP(new_len);
     if (new_len == 0)
@@ -571,8 +581,8 @@ intptr_t mm_mremap(user_addr_t old, uint32_t old_len, uint32_t new_len,
     if (add_area(mm, &nv) < 0)
         return -ENOMEM;
 
-    uint32_t copy = old_len < new_len ? old_len : new_len;
-    for (uint32_t off = 0; off < copy; off += PAGE_SIZE) {
+    user_addr_t copy = old_len < new_len ? old_len : new_len;
+    for (user_addr_t off = 0; off < copy; off += PAGE_SIZE) {
         user_addr_t src = old + off;
         uint32_t fl = vmm_get_flags(src);
         if (!(fl & PTE_PRESENT))
@@ -612,11 +622,13 @@ static int split_at(struct mm *mm, user_addr_t addr)
     return 0;
 }
 
-int32_t mm_mprotect(user_addr_t addr, uint32_t len, uint32_t prot)
+int32_t mm_mprotect(user_addr_t addr, user_addr_t len, uint32_t prot)
 {
     struct mm *mm = current_mm;
     if ((addr & (PAGE_SIZE - 1)) || addr + len < addr)
         return -EINVAL;
+    if (len > USER_ADDR_END || addr + len > USER_ADDR_END)
+        return -ENOMEM;
     user_addr_t end = PAGE_UP(addr + len);
     for (user_addr_t a = addr; a < end; ) {        /* all of it must be mapped */
         struct vma *v = find(mm, a);

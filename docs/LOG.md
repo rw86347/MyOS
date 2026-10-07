@@ -2438,3 +2438,40 @@ ran from the stick. The webcam (30c9:0042) and the AX201's Bluetooth
 (8087:0026) were listed. The stick connected at 480 Mb/s on USB 2 port 4:
 still to find out whether that was the USB 2.0 socket or a USB 3 link that
 did not come back after our reset.
+
+## 2026-10-07 — Chromium's first two walls, and a gap audit
+
+Chromium (x86_64, Alpine's 220 MB binary) wouldn't start on the MSI: "Out of
+memory" from execve. The 64-bit program loader was a port shortcut that
+read the whole file into one kmalloc block, then copied every segment.
+`kernel/elf64.c`'s elf_map now works like the 32-bit one: it reads the
+headers, adds each segment as a file-backed area (page runs with equal
+rights go in as one area), and pages come in on first touch.
+
+Next it died with "CPU exception 13" at a deliberate `int3` (Chromium's
+IMMEDIATE_CRASH) after PartitionAlloc failed to reserve its 32 GiB pool:
+the mmap family took 32-bit lengths. They are address-sized now (mmap,
+munmap, mremap, mprotect, the gap finder); the i386 build is unchanged.
+Not yet seen with a window. Why an `int3` shows as #GP: every x86_64 IDT
+gate is DPL 0 (now in docs/gaps.md).
+
+Then, at Rodger's request, `docs/gaps.md` was checked against the code and
+given an "At a glance" section: what a Linux program trips over, TCP/IP in
+one list. Stale entries fixed (USB, Wi-Fi, sockets, getrandom, GPT, FIFOs,
+inotify, eventfd, SysV semaphores/queues, TCP bind); new ones found
+(select sees fds 0-31 of 64, PROT_NONE and NX not enforced on x86_64,
+madvise a no-op, serial input never read, 2 GiB RAM on x86_64, no
+loopback, setsockopt ignored). `tools/syscall-coverage.py` counts system
+calls against Linux's own tables: x86_64 has 218 of 369, 3 ignored, 148
+missing.
+
+*Check:* `make ARCH=x86_64 test-uefi-shell` and `test-usb` pass with the new
+loader; both kernels build without warnings.
+
+Later the same day (docs/WORKLIST.md, 8/72): serial input (the UART's
+receive interrupt feeds the console, so a login on ttyS0 works and QEMU
+tests can type), SOCK_SEQPACKET and SCM_RIGHTS for Unix sockets,
+/proc/self/task (link count 2 + threads), /proc/self/fd listing only open
+fds, and 512 threads / 256 processes on x86_64 (256 / 128 on i386). The
+64-bit mmap entry still refused lengths over 4 GiB on its own; fixed.
+`make test` 215/215, `test-uefi-shell` pass.

@@ -1,5 +1,5 @@
 /*
- * serial.c — COM1 serial port output (16550 UART), interrupt-driven
+ * serial.c — COM1 serial port (16550 UART), interrupt-driven both ways
  *
  * The serial port is the kernel developer's best friend: it works before
  * anything else, and QEMU can show it in your terminal (-serial stdio).
@@ -18,6 +18,10 @@
  * Before interrupts are set up (serial_irq_init), and when the kernel
  * crashes (serial_flush), we fall back to polling, so nothing is lost.
  *
+ * Input: the "byte received" interrupt hands what arrives to a listener
+ * (the console terminal, as the keyboard does), so a login on ttyS0 — QEMU's
+ * -serial, or a null-modem cable — can be typed into.
+ *
  * Most laptops have no COM1 at all. Then nothing would ever empty the ring:
  * no UART, no interrupt. It fills during boot, and from then on the console
  * refuses programs' writes (fs/dev.c waits for room in it). So serial_init
@@ -29,7 +33,9 @@
 
 #define COM1        0x3F8
 #define SCRATCH     7           /* a spare register: keeps what we write */
+#define LSR_DR      0x01        /* line status: a received byte is waiting */
 #define LSR_THRE    0x20        /* line status: transmit FIFO empty */
+#define IER_RDA     0x01        /* interrupt enable: "received data available" */
 #define IER_THRE    0x02        /* interrupt enable: "transmit FIFO empty" */
 #define FIFO_SIZE   16
 #define TXBUF       8192        /* ring buffer size (power of two) */
@@ -39,6 +45,7 @@ static uint32_t head, tail;     /* write here / send from here; head - tail = us
 static int present;             /* a UART answers at COM1 */
 static int irq_mode;            /* 1 = interrupt-driven */
 static int tx_running;          /* the THRE interrupt is on and will come */
+static void (*listener)(const char *bytes, int n);   /* who gets what arrives */
 
 static int fifo_empty(void)
 {
@@ -75,16 +82,34 @@ static void fill_fifo(void)
 
     int more = tail != head;
     if (more != tx_running) {           /* port write only on a change */
-        outb(COM1 + 1, more ? IER_THRE : 0);
+        outb(COM1 + 1, (more ? IER_THRE : 0) | IER_RDA);
         tx_running = more;
     }
+}
+
+/* What arrived: at most a FIFO's worth per interrupt (the UART raises the
+   interrupt again while more is waiting). */
+static void receive(void)
+{
+    char buf[FIFO_SIZE];
+    int n = 0;
+    while (n < FIFO_SIZE && (inb(COM1 + 5) & LSR_DR))
+        buf[n++] = (char)inb(COM1);
+    if (n && listener)
+        listener(buf, n);
 }
 
 static void serial_irq(struct regs *r)
 {
     (void)r;
     inb(COM1 + 2);                      /* read IIR: acknowledges the UART */
+    receive();
     fill_fifo();
+}
+
+void serial_set_listener(void (*fn)(const char *bytes, int n))
+{
+    listener = fn;
 }
 
 int serial_present(void)
@@ -109,6 +134,7 @@ void serial_irq_init(void)
         return;
     irq_install(4, serial_irq);
     irq_mode = 1;
+    outb(COM1 + 1, IER_RDA);            /* tell us when a byte arrives */
 }
 
 /* Polling, for early boot and crashes: wait until the FIFO is empty. */

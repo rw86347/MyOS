@@ -18,6 +18,10 @@ size_t serial_space(void);
 /* 1 if a UART answered at COM1. */
 int serial_present(void);
 
+/* Who gets the bytes that arrive (the console terminal); called from the
+   interrupt, with interrupts off. */
+void serial_set_listener(void (*fn)(const char *bytes, int n));
+
 /* The timer tick's part: keeps output moving if the UART's interrupt never
    arrives. */
 void serial_tick(void);

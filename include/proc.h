@@ -24,7 +24,12 @@
  * parent collects the status with wait4() ("reaping") -> the slot is free.
  */
 
-#define PROC_MAX    64
+/* Processes in the whole system (a slot is ~2-3 KiB, static). */
+#ifdef ARCH_X86_64
+#define PROC_MAX    256
+#else
+#define PROC_MAX    128
+#endif
 #define PROC_FILES  64                  /* open files per process (fds 0-63) */
 
 struct file;
