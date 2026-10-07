@@ -11,7 +11,7 @@
  * net_rx_action itself (the packet may already be in the card's ring),
  * then sleeps on net_wait, which the e1000 interrupt wakes.
  *
- * Supported: AF_INET with SOCK_STREAM (TCP, client side: tcp.c), SOCK_DGRAM
+ * Supported: AF_INET with SOCK_STREAM (TCP, connect and listen: tcp.c), SOCK_DGRAM
  * (UDP) and SOCK_RAW + IPPROTO_ICMP (ping). AF_UNIX is in unix.c,
  * AF_NETLINK in netlink.c, AF_PACKET in packet.c. AF_INET6 says EAFNOSUPPORT, which musl's resolver expects on a
  * machine without IPv6.
@@ -585,6 +585,28 @@ static const struct file_ops sock_ops = {
 #define TO_PACKET(fn) \
     do { if (packet_fd(a1)) return fn(a1, a2, a3, a4, a5, a6); } while (0)
 
+/* Give a filled-in sock its open file and an fd (socket() and accept()).
+   On failure the sock is freed, with its connection. */
+static int sock_install(struct sock *s, uint32_t flags)
+{
+    struct file *f = file_new(&sock_ops, &sock_inode, O_RDWR | (flags & SOCK_NONBLOCK));
+    if (!f) {
+        if (s->tcp)
+            tcp_release(s->tcp);
+        kfree(s);
+        return -ENOMEM;
+    }
+    f->priv = s;
+    int fd = fd_install(f);
+    if (fd < 0) {
+        file_put(f);                /* release frees s */
+        return -EMFILE;
+    }
+    if (flags & SOCK_CLOEXEC)
+        proc_current()->cloexec |= 1ull << fd;
+    return fd;
+}
+
 /* int socket(int domain, int type, int protocol) */
 SYSCALL_DEF(sys_socket)
 {
@@ -620,23 +642,11 @@ SYSCALL_DEF(sys_socket)
         kfree(s);
         return -ENOMEM;             /* all TCP_MAX connections in use */
     }
-    struct file *f = file_new(&sock_ops, &sock_inode, O_RDWR | (a2 & SOCK_NONBLOCK));
-    if (!f) {
-        kfree(s);
-        return -ENOMEM;
-    }
-    f->priv = s;
-    int fd = fd_install(f);
-    if (fd < 0) {
-        file_put(f);                /* release frees s */
-        return -EMFILE;
-    }
-    if (type == SOCK_RAW) {
+    int fd = sock_install(s, a2);
+    if (fd >= 0 && type == SOCK_RAW) {
         s->raw_next = raw_list;
         raw_list = s;
     }
-    if (a2 & SOCK_CLOEXEC)
-        proc_current()->cloexec |= 1ull << fd;
     return fd;
 }
 
@@ -656,6 +666,13 @@ SOCK_SYSCALL(sys_bind)
         return rc;
     if (ip != 0 && ip != ipv4_addr)
         return -EADDRNOTAVAIL;
+    /* The ports below 1024 are root's (Linux: CAP_NET_BIND_SERVICE). They are
+       the ones clients trust: whoever holds 22 while sshd restarts is shown
+       every password typed at it. */
+    if (port && port < 1024 && s->type != SOCK_RAW && proc_current()->cred.euid != 0)
+        return -EACCES;
+    if (s->type == SOCK_STREAM)
+        return tcp_bind(s->tcp, port);
     if (s->type != SOCK_DGRAM)
         return 0;
     if (s->lport)
@@ -723,7 +740,8 @@ SOCK_SYSCALL(sys_getsockname)
         uint16_t lp, rp;
         uint32_t ra;
         tcp_names(s->tcp, &lp, &ra, &rp);
-        return write_addr(a2, a3, lp ? ipv4_addr : 0, lp);
+        /* A listener or a bound socket is on every address (0.0.0.0). */
+        return write_addr(a2, a3, tcp_connected(s->tcp) ? ipv4_addr : 0, lp);
     }
     return write_addr(a2, a3, s->connected ? ipv4_addr : 0, s->lport);
 }
@@ -950,20 +968,55 @@ SOCK_SYSCALL(sys_shutdown)
     return 0;
 }
 
+/* int listen(int fd, int backlog) */
 SOCK_SYSCALL(sys_listen)
 {
     TO_UNIX(unix_listen);
     TO_NETLINK(netlink_unsupported);
     TO_PACKET(packet_unsupported);
-    return sock_of(a1, 0) ? -EOPNOTSUPP : bad_fd(a1);
+    struct sock *s = sock_of(a1, 0);
+    if (!s)
+        return bad_fd(a1);
+    if (s->type != SOCK_STREAM)
+        return -EOPNOTSUPP;
+    return tcp_listen(s->tcp, (int32_t)a2);
 }
 
+/* int accept4(int fd, struct sockaddr *addr, socklen_t *len, int flags)
+   The new socket does not inherit O_NONBLOCK from the listener (Linux). */
 SOCK_SYSCALL(sys_accept4)
 {
     TO_UNIX(unix_accept4);
     TO_NETLINK(netlink_unsupported);
     TO_PACKET(packet_unsupported);
-    return sock_of(a1, 0) ? -EOPNOTSUPP : bad_fd(a1);
+    struct file *f;
+    struct sock *s = sock_of(a1, &f);
+    if (!s)
+        return bad_fd(a1);
+    if (a4 & ~(SOCK_NONBLOCK | SOCK_CLOEXEC))
+        return -EINVAL;
+    if (s->type != SOCK_STREAM)
+        return -EOPNOTSUPP;
+    struct tcp_conn *c;
+    int rc = tcp_accept(s->tcp, &c, f->flags & O_NONBLOCK, 0);
+    if (rc < 0)
+        return rc;
+    /* The peer's address before the fd: the copy can sleep, and an fd that
+       is already installed could be closed and reused by another thread in
+       the meantime, so an error path that then closed it would close theirs. */
+    uint16_t lp, rp;
+    uint32_t ra;
+    tcp_names(c, &lp, &ra, &rp);
+    rc = write_addr(a2, a3, ra, rp);
+    struct sock *n = rc < 0 ? 0 : kmalloc(sizeof *n);
+    if (!n) {
+        tcp_release(c);
+        return rc < 0 ? rc : -ENOMEM;
+    }
+    memset(n, 0, sizeof *n);
+    n->type = SOCK_STREAM;
+    n->tcp = c;
+    return sock_install(n, a4);
 }
 
 SYSCALL_DEF(sys_socketpair)

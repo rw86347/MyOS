@@ -226,9 +226,8 @@ when it's fixed. File references point at the comment that mentions the gap.
   AF_INET6 or AF_UNIX. Each socket queues 8 datagrams and drops the rest.
   `setsockopt` accepts and ignores every option. Sending to 127.x fails
   (ENETUNREACH): there is no loopback route. The kernel can also do a DNS A
-  lookup itself, and one TCP client connection. The address is
-  the QEMU user-net default, not DHCP. TCP is one connection, client only,
-  one segment in flight, no out-of-order queue, no listen. DNS is A records
+  lookup itself, and TCP (connect and listen; see Drivers). The address is
+  the QEMU user-net default, not DHCP. DNS is A records
   only. IP options and fragments are dropped. The receive queue holds 32
   packets; the neighbor table holds 8. `make test`'s DNS and HTTP lines need
   a path to example.com. QEMU ignores receives for one second after the
@@ -724,10 +723,12 @@ when it's fixed. File references point at the comment that mentions the gap.
   the two are told apart by whether `snd_wnd` is zero. Smaller and one timer fewer, but it
   means a connection that alternates between a shut window and real loss shares one counter
   between the two.
-- **TCP** (step 10e): client side only, no listen/accept. The live disk ships
-  OpenSSH (`sshd` under runit, `ssh` the client) and a static web server
-  (`darkhttpd`, off until `doas myos-httpd enable`). Neither can accept a
-  connection until listen/accept exist. Outbound `ssh` can still reach another host. No congestion control
+- **TCP** (step 10e): listen/accept are in (`net/tcp.c`). A listener answers a
+  SYN with a SYN cookie and keeps nothing until the peer's ACK; at most 8
+  finished connections wait for `accept`. The live disk's `sshd` (port 22)
+  and `darkhttpd` (off until `doas myos-httpd enable`) can take a connection.
+  Log in with this Mac's key: `tools/myos-ssh.sh setup` then `tools/myos-ssh.sh`.
+  No congestion control
   (no slow start): at most 4 segments in flight, a fixed limit, not a response to
   loss. No out-of-order queue, SACK, window scaling (16 KiB window), timestamps,
   or RTT estimate (retransmit timer 250 ms doubling to 4 s, 8 tries; a shut window

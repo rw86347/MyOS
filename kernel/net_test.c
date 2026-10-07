@@ -36,6 +36,7 @@ static int recv(struct sk_buff *skb)
 }
 
 static int polls;
+static void tcp_listen_selftest(void);
 
 static int test_poll(struct napi_struct *napi, int budget)
 {
@@ -185,5 +186,82 @@ void net_selftest(void)
             tcp_release(c);
         }
     }
+    tcp_listen_selftest();
     check(skb_live() == before, "net: ping did not leak a packet");
+}
+
+/*
+ * Passive open, end to end. make test forwards the host's port HAIRPIN_PORT
+ * to our port 7 (QEMU's hostfwd), and 10.0.2.2 is the host as QEMU's user
+ * network shows it. So a connection from here to 10.0.2.2:HAIRPIN_PORT goes
+ * out through the e1000, into the host, and back in through the forward to
+ * our own listener: both ends of one TCP connection, each through the card.
+ * Without the forward (tools/test-disks.sh) the connect is refused and the
+ * test says it was skipped. The port must match HAIRPIN_PORT in the Makefile.
+ */
+#define HAIRPIN_PORT 47007
+
+/* A segment from a stranger, built by hand: a forged handshake ACK. */
+static void forged_ack(uint16_t dport)
+{
+    uint8_t s[20];
+    /* 192.0.2.1 (TEST-NET-1): nobody, and off our subnet, so our reset goes
+       straight to the gateway rather than waiting in the ARP queue for an
+       answer that never comes (and counting as a leaked packet below). */
+    uint32_t src = 0xC0000201u;
+    memset(s, 0, sizeof s);
+    s[0] = 0x04, s[1] = 0xD2;       /* port 1234 */
+    s[2] = (uint8_t)(dport >> 8), s[3] = (uint8_t)dport;
+    s[4] = 0x11, s[7] = 0x01;       /* seq: anything */
+    s[8] = 0x22, s[11] = 0x02;      /* ack: a guess at our cookie */
+    s[12] = 5 << 4;
+    s[13] = 0x10;                   /* ACK */
+    s[14] = 0x40;                   /* window */
+    uint16_t sum = ip_transport_csum(src, ipv4_addr, IPPROTO_TCP, s, sizeof s);
+    s[16] = (uint8_t)(sum >> 8), s[17] = (uint8_t)sum;
+    tcp_input(src, ipv4_addr, s, sizeof s);
+}
+
+static void tcp_listen_selftest(void)
+{
+    struct tcp_conn *l = tcp_open();
+    int lr = l ? tcp_bind(l, 7) : -ENOMEM;
+    if (lr == 0)
+        lr = tcp_listen(l, 1);
+    check(lr == 0, "net: tcp listen on port 7");
+    if (lr != 0) {
+        if (l)
+            tcp_release(l);
+        return;
+    }
+    struct tcp_conn *a = 0;
+    forged_ack(7);
+    check(tcp_accept(l, &a, 1, 0) == -EAGAIN, "net: tcp a forged ACK makes no connection");
+
+    struct tcp_conn *cl = tcp_open();
+    int cr = cl ? tcp_connect(cl, 0x0A000202u, HAIRPIN_PORT, 0) : -ENOMEM;
+    if (cr != 0) {
+        kprintf("net: tcp listen test skipped: no port forward (%d)\n", cr);
+    } else {
+        char b[16];
+        int ar = tcp_accept(l, &a, 0, 5000);
+        check(ar == 0, "net: tcp accept");
+        int ok = ar == 0 && tcp_write(cl, "ping\n", 5, 0, 0) == 5 &&
+                 tcp_read(a, b, sizeof b, 0, 0, 0, 5000) == 5 && !memcmp(b, "ping\n", 5) &&
+                 tcp_write(a, "pong\n", 5, 0, 0) == 5 &&
+                 tcp_read(cl, b, sizeof b, 0, 0, 0, 5000) == 5 && !memcmp(b, "pong\n", 5);
+        check(ok, "net: tcp data both ways on an accepted connection");
+        if (ok) {
+            tcp_shutdown_write(a);      /* the server hangs up first */
+            ok = tcp_read(cl, b, sizeof b, 0, 0, 0, 5000) == 0;
+            check(ok, "net: tcp the client sees the server's FIN");
+        }
+        if (ok)
+            kprintf("net: tcp accept ok: ping, pong, and the server's FIN\n");
+        if (a)
+            tcp_release(a);
+    }
+    if (cl)
+        tcp_release(cl);
+    tcp_release(l);
 }

@@ -287,7 +287,12 @@ QEMU_FLAGS = -m 64M -cpu pentium3 \
              -drive format=raw,file=$(IMG),index=0,media=disk \
              -drive format=raw,file=$(USB),index=1,media=disk \
              -drive format=raw,file=$(DATA),index=2,media=disk \
-             -netdev user,id=net0 -device e1000,netdev=net0
+             -netdev user,id=net0$(HOSTFWD) -device e1000,netdev=net0
+# make test's forward: the kernel's TCP self-test connects to the host's
+# port HAIRPIN_PORT and comes back in to its own listener on port 7
+# (kernel/net_test.c). Only that target sets it, so two other QEMUs never
+# fight over the port.
+HAIRPIN_PORT := 47007
 
 .PHONY: run-uefi test-uefi-shell diskattacks verify-disktests verify-tests attacks all dist utm utm-hd hd live-root live-extra live-theme live-hd utm-live run-live run-hd test-hd run run-full run-text debug test check-selftests test-shell bench run-bench usb clean fuzz fuzz-build fuzz-replay diskfuzz diskfuzz-replay verify-racetests uefi run-uefi-text test-uefi live-uefi test-live-uefi test-usb live-login-initrd test-uefi-login
 
@@ -1227,6 +1232,7 @@ test:
 	@$(MAKE) --no-print-directory MODE=test check-selftests
 endif
 
+check-selftests: HOSTFWD = ,hostfwd=tcp:127.0.0.1:$(HAIRPIN_PORT)-:7
 check-selftests: $(IMG) $(USB)
 	$(call make-test-disk,$(DATA),1024)
 	@rm -f $(BUILD)/serial.log
@@ -1275,6 +1281,7 @@ check-selftests: $(IMG) $(USB)
 	  grep -q "net: ping 10.0.2.2 ok" $$L || { echo "FAIL: step 10 e1000 ping"; ok=0; }; \
 	  grep -q "net: dns example.com is " $$L || { echo "FAIL: step 10 DNS"; ok=0; }; \
 	  grep -q "net: tcp example.com HTTP ok" $$L || { echo "FAIL: step 10 TCP"; ok=0; }; \
+	  grep -q "net: tcp accept ok" $$L || { echo "FAIL: TCP listen/accept (port $(HAIRPIN_PORT) forwarded in)"; ok=0; }; \
 	  grep -q "ext2test: all [0-9]* checks passed" $$L || { echo "FAIL: step 9b ext2 (Linux-made files)"; ok=0; }; \
 	  grep -q "fstest /data/fst: all [0-9]* checks passed" $$L || { echo "FAIL: step 9b ext2 (fstest)"; ok=0; }; \
 	  grep -q "sigtest: all [0-9]* checks passed" $$L || { echo "FAIL: step 8 signals"; ok=0; }; \

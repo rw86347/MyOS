@@ -29,7 +29,8 @@ enum { S_read = 0, S_write = 1, S_open = 2, S_close = 3, S_lseek = 8, S_mmap = 9
        S_inotify_init1 = 294, S_syncfs = 306, S_copy_file_range = 326,
        S_getxattr = 191, S_fsetxattr = 190, S_flistxattr = 196,
        S_ioctl = 16, S_socket = 41, S_sendto = 44, S_recvfrom = 45, S_bind = 49, S_setsockopt = 54,
-       S_getsockname = 51 };
+       S_getsockname = 51, S_connect = 42, S_listen = 50, S_accept4 = 288, S_poll = 7,
+       S_setuid = 105 };
 enum { F_GETLK = 5, F_SETLK = 6 };
 #else
 #define X64 0
@@ -48,7 +49,8 @@ enum { S_read = 3, S_write = 4, S_open = 5, S_close = 6, S_lseek = 19, S_mmap = 
        S_inotify_init1 = 332, S_syncfs = 344, S_copy_file_range = 377,
        S_getxattr = 229, S_fsetxattr = 228, S_flistxattr = 234,
        S_ioctl = 54, S_socket = 359, S_bind = 361, S_getsockname = 367,
-       S_sendto = 369, S_recvfrom = 371, S_setsockopt = 366 };
+       S_sendto = 369, S_recvfrom = 371, S_setsockopt = 366, S_connect = 362,
+       S_listen = 363, S_accept4 = 364, S_poll = 168, S_setuid = 213 /* setuid32 */ };
 enum { F_GETLK = 12, F_SETLK = 13 };    /* the flock64 ones (musl) */
 #endif
 
@@ -159,8 +161,13 @@ static int wait_child(long pid)
 #define IPC_64 0x100
 #define EAGAIN 11
 #define EINTR 4
+#define EACCES 13
 #define EINVAL 22
 #define ENOMSG 42
+#define EOPNOTSUPP 95
+#define EADDRINUSE 98
+#define EISCONN 106
+#define ENOTCONN 107
 
 /* --- CPU time: times, getrusage ------------------------------------------- */
 
@@ -875,6 +882,86 @@ static void t_nl80211(void)
     SC1(S_close, fd);
 }
 
+/* --- TCP listen and accept ------------------------------------------------ */
+
+/* What needs no peer: this may run with no network at all (test-uefi-shell
+   has -net none). A real connection coming in is make test's kernel
+   self-test (kernel/net_test.c) and make test-ssh. */
+struct sockaddr_in4 { uint16_t family, port; uint32_t addr; uint8_t zero[8]; };
+#define AF_INET 2
+#define SOCK_STREAM 1
+#define SOCK_NONBLOCK 04000
+static uint16_t be16(uint16_t v) { return (uint16_t)(v << 8 | v >> 8); }
+
+static void t_tcp_listen(void)
+{
+    struct sockaddr_in4 a = { AF_INET, be16(7777), 0, { 0 } }, got;
+    uint32_t len = sizeof got;
+    long l = SC3(S_socket, AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    long b = SC3(S_bind, l, &a, sizeof a);
+    check(l >= 0 && b == 0 && SC2(S_listen, l, 4) == 0, "tcp: bind and listen", b);
+    fill(&got, 0, sizeof got);
+    long r = SC3(S_getsockname, l, &got, &len);
+    check(r == 0 && got.family == AF_INET && got.port == be16(7777) && got.addr == 0 && len == 16,
+          "tcp: getsockname on a listener (0.0.0.0:7777)", be16(got.port));
+    r = SC4(S_accept4, l, 0, 0, 0);
+    check(r == -EAGAIN, "tcp: accept4 with nobody waiting", r);
+    check(SC4(S_accept4, l, 0, 0, 1) == -EINVAL, "tcp: accept4 with an unknown flag", 0);
+    struct { int32_t fd; int16_t events, revents; } p = { (int32_t)l, 1 /* POLLIN */, 0 };
+    r = SC3(S_poll, &p, 1, 0);
+    check(r == 0 && p.revents == 0, "tcp: an empty listener is not readable", p.revents);
+    char buf[4];
+    r = SC3(S_read, l, buf, sizeof buf);
+    check(r == -ENOTCONN, "tcp: read on a listener", r);
+    struct sockaddr_in4 far = { AF_INET, be16(7), 0x010200C0 /* 192.0.2.1 */, { 0 } };
+    r = SC3(S_connect, l, &far, sizeof far);
+    check(r == -EISCONN, "tcp: connect on a listener", r);
+
+    /* Only one listener per port: Linux refuses the bind even with
+       SO_REUSEADDR (which only lets a port be reused past old connections). */
+    long l2 = SC3(S_socket, AF_INET, SOCK_STREAM, 0);
+    b = SC3(S_bind, l2, &a, sizeof a);
+    check(b == -EADDRINUSE, "tcp: one listener per port", b);
+    SC1(S_close, l2);
+    /* Two may bind it while neither listens; then the second listen() loses. */
+    struct sockaddr_in4 a8 = { AF_INET, be16(7778), 0, { 0 } };
+    long m1 = SC3(S_socket, AF_INET, SOCK_STREAM, 0), m2 = SC3(S_socket, AF_INET, SOCK_STREAM, 0);
+    b = SC3(S_bind, m1, &a8, sizeof a8) | SC3(S_bind, m2, &a8, sizeof a8);
+    r = SC2(S_listen, m1, 1);
+    long r2 = SC2(S_listen, m2, 1);
+    check(b == 0 && r == 0 && r2 == -EADDRINUSE, "tcp: two bound, one listens", r2);
+    SC1(S_close, m1);
+    SC1(S_close, m2);
+
+    long l3 = SC3(S_socket, AF_INET, SOCK_STREAM, 0);
+    fill(&got, 0, sizeof got);
+    len = sizeof got;
+    r = SC2(S_listen, l3, 1);
+    check(r == 0 && SC3(S_getsockname, l3, &got, &len) == 0 && got.port != 0,
+          "tcp: listen without bind picks a port", r);
+    SC1(S_close, l3);
+
+    long u = SC3(S_socket, AF_INET, SOCK_DGRAM, 0);
+    r = SC2(S_listen, u, 1);
+    check(r == -EOPNOTSUPP, "udp: listen", r);
+    SC1(S_close, u);
+
+    SC1(S_close, l);                    /* the port is free again */
+    long l4 = SC3(S_socket, AF_INET, SOCK_STREAM, 0);
+    b = SC3(S_bind, l4, &a, sizeof a);
+    check(b == 0 && SC2(S_listen, l4, 1) == 0, "tcp: a closed listener's port is free", b);
+    SC1(S_close, l4);
+
+    long pid = SC0(S_fork);
+    if (pid == 0) {                     /* ports below 1024 are root's */
+        struct sockaddr_in4 ssh = { AF_INET, be16(22), 0, { 0 } };
+        SC1(S_setuid, 1000);
+        long s = SC3(S_socket, AF_INET, SOCK_STREAM, 0);
+        child_exit(SC3(S_bind, s, &ssh, sizeof ssh) == -EACCES ? 0 : 1);
+    }
+    check(wait_child(pid) == 0, "tcp: a user may not bind port 22", 0);
+}
+
 void cmain(void)
 {
     t_cputime();
@@ -891,6 +978,7 @@ void cmain(void)
     t_netlink();
     t_packet();
     t_nl80211();
+    t_tcp_listen();
     /* Leave /tmp as we found it: its files are memory (`make test` counts
        every page after the programs have run). */
     SC1(S_unlink, "/tmp/sf_src");
