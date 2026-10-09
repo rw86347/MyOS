@@ -137,6 +137,20 @@ struct sig_origin {
 int  arch_signal_frame(int sig, const struct sig_origin *o, const struct k_sigaction *a,
                        uint64_t mask, struct regs *r);
 
+/* The alternate signal stack (sigaltstack), for the frame code:
+   sig_frame_top: where handler a's frame starts, given the stack pointer sp
+     the program was interrupted at (the alternate stack's top if a asks for
+     it and the thread isn't on it already; *alt says so).
+   sig_save_altstack: the settings to keep in the frame's uc_stack (Linux's
+     __save_altstack), then disarm an SS_AUTODISARM stack for the handler.
+   sig_restore_altstack: sigreturn puts uc_stack's settings back. */
+#define SS_ONSTACK    1
+#define SS_DISABLE    2
+#define SS_AUTODISARM (1u << 31)
+uintptr_t sig_frame_top(const struct k_sigaction *a, uintptr_t sp, int *alt);
+void sig_save_altstack(uintptr_t sp, user_addr_t *ss_sp, int32_t *ss_flags, user_addr_t *ss_size);
+void sig_restore_altstack(user_addr_t ss_sp, int32_t ss_flags, user_addr_t ss_size);
+
 /* A siginfo_t (128 bytes) as this CPU's programs read it (sigtimedwait). */
 #define SIGINFO_SIZE 128
 void arch_siginfo(void *si, int sig, const struct sig_origin *o);

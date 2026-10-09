@@ -58,6 +58,9 @@ SYSCALL_DEF(sys_personality);
 SYSCALL_DEF(sys_capget);
 SYSCALL_DEF(sys_capset);
 SYSCALL_DEF(sys_unshare);
+
+/* kernel/signal.c */
+SYSCALL_DEF(sys_sigaltstack);
 SYSCALL_DEF(sys_setns);
 SYSCALL_DEF(sys_swapon);
 SYSCALL_DEF(sys_syslog);                 /* kprintf.c: dmesg */

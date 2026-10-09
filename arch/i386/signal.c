@@ -98,8 +98,12 @@ int arch_signal_frame(int sig, const struct sig_origin *o, const struct k_sigact
     struct thread *t = thread_current();
 
     /* The FPU registers: save them below the frame (16-byte aligned for
-       fxsave), and give the handler a clean FPU. */
-    uint32_t sp = (r->user_esp - FPU_STATE_SIZE) & ~0xFu;
+       fxsave), and give the handler a clean FPU. All of it on the
+       alternate stack if the handler asked for it (SA_ONSTACK). */
+    int alt;
+    uint32_t sp = ((uint32_t)sig_frame_top(a, r->user_esp, &alt) - FPU_STATE_SIZE) & ~0xFu;
+    user_addr_t ss_sp, ss_size;
+    int32_t ss_flags;
     uint32_t fpstate = 0;
     if (t->uses_fpu) {
         fpu_save(t->fpu_state);
@@ -121,6 +125,10 @@ int arch_signal_frame(int sig, const struct sig_origin *o, const struct k_sigact
         fill_info(&f.info, sig, o);
         save_context(&f.uc.uc_mcontext, r, mask, fpstate);
         f.uc.uc_sigmask = mask;
+        sig_save_altstack(r->user_esp, &ss_sp, &ss_flags, &ss_size);
+        f.uc.ss_sp = ss_sp;
+        f.uc.ss_flags = (uint32_t)ss_flags;
+        f.uc.ss_size = ss_size;
         if (copy_to_user((void *)sp, &f, sizeof f) < 0)
             return -1;
         r->edx = f.pinfo;               /* (also in registers, as Linux does) */
@@ -136,6 +144,7 @@ int arch_signal_frame(int sig, const struct sig_origin *o, const struct k_sigact
         if (copy_to_user((void *)sp, &f, sizeof f) < 0)
             return -1;
         r->edx = r->ecx = 0;
+        sig_save_altstack(r->user_esp, &ss_sp, &ss_flags, &ss_size);  /* (disarms only) */
     }
 
     r->user_esp = sp;
@@ -155,16 +164,16 @@ intptr_t sys_sigreturn_impl(int rt)
     struct regs *r = t->uregs;
     struct sigcontext sc;
     uint64_t mask;
+    struct ucontext uc;
 
     /* The handler's `ret` popped pretcode; the restorer may have popped
        sig too (non-rt). That tells us where the frame starts. */
     if (rt) {
         uint32_t frame = r->user_esp - 4;
-        if (copy_from_user(&sc, (void *)(frame + offsetof(struct rt_sigframe, uc.uc_mcontext)),
-                           sizeof sc) < 0 ||
-            copy_from_user(&mask, (void *)(frame + offsetof(struct rt_sigframe, uc.uc_sigmask)),
-                           8) < 0)
+        if (copy_from_user(&uc, (void *)(frame + offsetof(struct rt_sigframe, uc)), sizeof uc) < 0)
             proc_exit(W_SIGNALED(SIGSEGV));
+        sc = uc.uc_mcontext;
+        mask = uc.uc_sigmask;
     } else {
         uint32_t frame = r->user_esp - 8, high;
         if (copy_from_user(&sc, (void *)(frame + offsetof(struct sigframe, sc)), sizeof sc) < 0 ||
@@ -189,6 +198,8 @@ intptr_t sys_sigreturn_impl(int rt)
     r->fs = gdt_user_seg_ok(sc.fs) ? sc.fs : GDT_USER_DATA;
     r->ds = r->es = GDT_USER_DATA;
     t->sig_blocked = mask & ~(SIGBIT(SIGKILL) | SIGBIT(SIGSTOP));
+    if (rt)
+        sig_restore_altstack(uc.ss_sp, (int32_t)uc.ss_flags, uc.ss_size);
 
     if (sc.fpstate && t->uses_fpu) {
         if (copy_from_user(t->fpu_state, (void *)sc.fpstate, FPU_STATE_SIZE) < 0)

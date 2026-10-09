@@ -237,6 +237,14 @@ uint32_t ramfs_page(struct inode *i, uint32_t idx)
     return i->pages[idx];
 }
 
+int ramfs_share(struct inode *i)
+{
+    int err = make_writable(i, i->size);
+    if (!err)
+        i->flags |= I_SHMAPPED;
+    return err;
+}
+
 int file_truncate(struct inode *i, uint32_t size)
 {
     int err = make_writable(i, min(size, i->size));
@@ -244,7 +252,11 @@ int file_truncate(struct inode *i, uint32_t size)
         return err;
     uint32_t keep = size / PAGE_SIZE + (size % PAGE_SIZE != 0);
     for (uint32_t p = keep; p < i->page_cap; p++) {
-        if (i->pages[p]) {
+        if (!i->pages[p])
+            continue;
+        if (i->flags & I_SHMAPPED)      /* a process may map it: zero it, keep it */
+            memset(P2V(i->pages[p]), 0, PAGE_SIZE);
+        else {
             page_drop(i->pages[p]);     /* shrinking gives pages back */
             i->pages[p] = 0;
         }

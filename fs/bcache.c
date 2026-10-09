@@ -140,6 +140,32 @@ void bforget(struct blockdev *dev, uint32_t block, uint32_t size)
     irq_restore(flags);
 }
 
+/* Forget every cached block of a disk and its partitions: something
+   changed them behind the cache's back (a program wrote /dev/sda, or the
+   partitions moved). What was dirty is written first. Not a hot path: a
+   walk of the whole cache, when a disk file is opened or closed for
+   writing and when a partition table is read again. Held buffers stay
+   (nobody holds one of a disk that isn't mounted). */
+void bcache_drop(struct blockdev *disk)
+{
+    bsync();
+    uint32_t flags = irq_save();
+    for (int k = 0; k < nbuf; k++) {
+        struct buf *b = &bufs[k];
+        if (!b->dev || b->refs || (b->dev != disk && b->dev->parent != disk))
+            continue;
+        if (b->dirty) {
+            b->dirty = 0;
+            ndirty--;
+        }
+        if (b->valid)
+            hash_remove(b);
+        b->dev = NULL;
+        b->valid = 0;
+    }
+    irq_restore(flags);
+}
+
 struct buf *bclear(struct blockdev *dev, uint32_t block, uint32_t size)
 {
     struct buf *b = get(dev, block, size, 0);
@@ -321,6 +347,9 @@ static void flusher(void *arg)
         pcache_sync();                  /* file data first, then metadata */
         if (ndirty)
             bsync();
+#ifdef STACK_DEPTH
+        thread_stack_report();          /* make STACKDEPTH=1: a debug build */
+#endif
     }
 }
 

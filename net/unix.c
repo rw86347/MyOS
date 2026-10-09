@@ -45,9 +45,14 @@
  * arrive with someone else's data (Linux's rule), and a plain read() that
  * passes a record drops its files.
  *
- * Not yet: credentials messages (SCM_CREDENTIALS is accepted and ignored),
- * and Linux's garbage collector for sockets passed over themselves (such a
- * cycle is never freed).
+ * Credentials (SO_PASSCRED): a receiver that asks gets an SCM_CREDENTIALS
+ * message with each message's sender (pid, effective uid and gid, taken
+ * when it was sent; what a sender writes in its own SCM_CREDENTIALS is
+ * ignored). On a stream it is the connected peer's. Crashpad, Chromium's
+ * crash reporter, learns which process crashed this way.
+ *
+ * Not yet: Linux's garbage collector for sockets passed over themselves
+ * (such a cycle is never freed).
  */
 #include <errno.h>
 #include <kheap.h>
@@ -83,9 +88,11 @@
 #define SO_ERROR      4
 #define SO_SNDBUF     7
 #define SO_RCVBUF     8
+#define SO_PASSCRED  16
 #define SO_PEERCRED  17
 #define SO_ACCEPTCONN 30
 #define SCM_RIGHTS    1
+#define SCM_CREDENTIALS 2
 
 #define FIONREAD 0x541B
 #define FIONBIO  0x5421
@@ -94,7 +101,11 @@
 #define POLLOUT 0x004
 #define POLLHUP 0x010
 
-#define BUF_SIZE    PAGE_SIZE       /* power of two: % is a mask */
+/* A stream's ring: one page to start, doubled while a writer finds it
+   full, up to RING_MAX (Linux lets about 208 KiB wait in a Unix socket).
+   Most sockets carry little and keep their page. Sizes are powers of two,
+   so % is a mask. See ring_grow. */
+#define RING_MAX    (256 * 1024)
 #define BACKLOG_MAX 16
 #define PATH_UN     108             /* sizeof sun_path */
 #define BOUND_MAX   32              /* bound sockets, machine-wide */
@@ -124,7 +135,9 @@ struct usock {
     uint32_t refs;
     struct usock *peer;             /* connected: the other end (NULL once it's gone) */
     uint8_t *buf;                   /* the bytes waiting for US to read */
+    uint32_t size;                  /* buf's size: PAGE_SIZE .. RING_MAX */
     uint32_t head, tail;            /* bytes ever written into buf / read out */
+    uint32_t copying;               /* copies into or out of buf under way */
     int rd_shut;                    /* no more bytes will come */
     int wr_shut;                    /* we said we won't write more */
     struct usock *backlog[BACKLOG_MAX];   /* listening: connections to accept */
@@ -139,12 +152,14 @@ struct usock {
     struct ufiles *fq, *fq_last;    /* stream: files with bytes in buf, in order */
     uint32_t dq_count, dq_bytes;
     int closed;                     /* its file is gone: sends to it are refused */
+    uint8_t passcred;               /* SO_PASSCRED: give receivers the sender */
 };
 
 /* A datagram waiting to be read, with its sender's name (for recvfrom). */
 struct udgram {
     struct udgram *next;
     struct ufiles *files;           /* passed with it, or NULL */
+    struct ucred cred;              /* who sent it */
     uint32_t len, fromlen;
     uint8_t from[PATH_UN];
     uint8_t data[];
@@ -183,11 +198,55 @@ static struct usock *usock_new(int type)
     s->type = type;
     s->refs = 1;
     s->buf = page ? P2V(page) : NULL;
+    s->size = PAGE_SIZE;
     my_cred(&s->cred);
     return s;
 }
 
 static void uget(struct usock *s) { s->refs++; }
+
+static void ring_free(uint8_t *buf, uint32_t size)
+{
+    for (uint32_t k = 0; k < size; k += PAGE_SIZE)
+        pmm_free(V2P(buf) + k);
+}
+
+/*
+ * Double p's ring (a writer found it full). Why it matters: X sends a big
+ * reply with non-blocking writes, and after each partial write it moves
+ * all the unsent rest to the front of its buffer. A 19 MB reply through a
+ * 4 KiB ring was 4,700 moves of up to 19 MB each: LibreOffice and the X
+ * server sat in memmove for minutes (2026-10-09). Through 256 KiB it is
+ * about 75.
+ *
+ * Not while a copy is under way: a copy can sleep on a page fault with a
+ * pointer into buf. The bytes keep their absolute positions (head and tail
+ * count bytes ever written and read, and files in flight are pinned to
+ * them), so they are copied to where those counts point in the new ring.
+ * Work: at most the bytes waiting, once per doubling.
+ */
+static void ring_grow(struct usock *p)
+{
+    if (p->size >= RING_MAX || p->copying)
+        return;
+    uint32_t size = p->size * 2;
+    uint32_t pa = pmm_alloc_run(size / PAGE_SIZE);
+    if (!pa)
+        return;                         /* no memory: the smaller ring still works */
+    uint8_t *nb = P2V(pa);
+    for (uint32_t i = p->tail; i != p->head; ) {
+        uint32_t from = i % p->size, to = i % size, k = p->head - i;
+        if (k > p->size - from)
+            k = p->size - from;
+        if (k > size - to)
+            k = size - to;
+        memcpy(nb + to, p->buf + from, k);
+        i += k;
+    }
+    ring_free(p->buf, p->size);
+    p->buf = nb;
+    p->size = size;
+}
 
 /* Close files that were in flight and will never be received. */
 static void files_drop(struct ufiles *u)
@@ -226,7 +285,7 @@ static void uput(struct usock *s)
 {
     if (--s->refs == 0) {
         if (s->buf)
-            pmm_free(V2P(s->buf));
+            ring_free(s->buf, s->size);
         dq_free(s);
         fq_free(s);
         kfree(s);
@@ -308,7 +367,7 @@ static int install(struct usock *s, uint32_t flags)
         return -EMFILE;
     }
     if (flags & SOCK_CLOEXEC)
-        proc_current()->cloexec |= 1ull << fd;
+        fd_set_cloexec(proc_current(), fd, 1);
     return fd;
 }
 
@@ -330,7 +389,11 @@ static int32_t usock_write(struct usock *s, const uint8_t *ubuf, uint32_t n,
                 signal_send(proc_current(), SIGPIPE);
             return done ? (int32_t)done : -EPIPE;
         }
-        uint32_t room = BUF_SIZE - (p->head - p->tail);
+        uint32_t room = p->size - (p->head - p->tail);
+        if (room < n - done && p->size < RING_MAX) {
+            ring_grow(p);               /* a big transfer: take it in bigger pieces */
+            room = p->size - (p->head - p->tail);
+        }
         if (room == 0) {
             if (nonblock)
                 return done ? (int32_t)done : -EAGAIN;
@@ -342,8 +405,8 @@ static int32_t usock_write(struct usock *s, const uint8_t *ubuf, uint32_t n,
             continue;
         }
         uint32_t k = n - done < room ? n - done : room;
-        uint32_t at = p->head % BUF_SIZE;
-        uint32_t first = k < BUF_SIZE - at ? k : BUF_SIZE - at;
+        uint32_t at = p->head % p->size;
+        uint32_t first = k < p->size - at ? k : p->size - at;
         /* Claim the space, then copy (pipe.c says why). p is held during
            the copy: if it sleeps and p's owner closes, the page stays ours. */
         uget(p);
@@ -359,8 +422,11 @@ static int32_t usock_write(struct usock *s, const uint8_t *ubuf, uint32_t n,
         }
         p->head += k;
         uint32_t claimed = p->head;
-        if (copy_from_user(p->buf + at, ubuf + done, first) < 0 ||
-            copy_from_user(p->buf, ubuf + done + first, k - first) < 0) {
+        p->copying++;                   /* buf can't move under the copy */
+        int bad = copy_from_user(p->buf + at, ubuf + done, first) < 0 ||
+                  copy_from_user(p->buf, ubuf + done + first, k - first) < 0;
+        p->copying--;
+        if (bad) {
             if (p->head == claimed)
                 p->head -= k;
             else {
@@ -414,12 +480,15 @@ static int32_t usock_read(struct usock *s, uint8_t *ubuf, uint32_t n, int nonblo
         else
             files_drop(mine);       /* read() has nowhere to put them */
     }
-    uint32_t at = s->tail % BUF_SIZE;
-    uint32_t first = n < BUF_SIZE - at ? n : BUF_SIZE - at;
+    uint32_t at = s->tail % s->size;
+    uint32_t first = n < s->size - at ? n : s->size - at;
     if (!peek)
         s->tail += n;               /* consume first: pipe.c says why */
-    if (copy_to_user(ubuf, s->buf + at, first) < 0 ||
-        copy_to_user(ubuf + first, s->buf, n - first) < 0)
+    s->copying++;                   /* buf can't move under the copy */
+    int bad = copy_to_user(ubuf, s->buf + at, first) < 0 ||
+              copy_to_user(ubuf + first, s->buf, n - first) < 0;
+    s->copying--;
+    if (bad)
         return -EFAULT;
     if (!peek)
         wake(s);                    /* room for the writer */
@@ -442,6 +511,7 @@ static int32_t dgram_send(struct usock *s, struct usock *to, const struct user_i
     if (!d)
         return -ENOBUFS;
     d->files = NULL;
+    my_cred(&d->cred);
     uint32_t at = 0;
     for (uint32_t i = 0; i < niov; i++) {
         if (copy_from_user(d->data + at, (const void *)(uintptr_t)iov[i].base,
@@ -491,8 +561,10 @@ static int32_t dgram_send(struct usock *s, struct usock *to, const struct user_i
    copied, or with MSG_TRUNC the datagram's real length, as Linux does. */
 static int32_t dgram_recv(struct usock *s, const struct user_iovec *iov, uint32_t niov,
                           uint32_t flags, int nonblock, uint8_t *from, uint32_t *fromlen,
-                          int *trunc, struct ufiles **files)
+                          int *trunc, struct ufiles **files, struct ucred *cred)
 {
+    *trunc = 0;                     /* also at end of file: nothing was cut */
+    *fromlen = 0;
     if (s->type == SOCK_SEQPACKET && s->state != U_CONNECTED)
         return -ENOTCONN;
     while (!s->dq) {
@@ -522,6 +594,8 @@ static int32_t dgram_recv(struct usock *s, const struct user_iovec *iov, uint32_
     }
     uint32_t len = d->len;
     *trunc = at < len;
+    if (cred)
+        *cred = d->cred;
     *fromlen = d->fromlen;
     memcpy(from, d->from, d->fromlen);
     if (flags & MSG_PEEK) {         /* back in front, for the next read */
@@ -604,7 +678,7 @@ static int32_t unix_read(struct file *f, void *ubuf, uint32_t n)
         uint8_t from[PATH_UN];
         uint32_t fromlen;
         int trunc;
-        return dgram_recv(s, &v, 1, 0, f->flags & O_NONBLOCK, from, &fromlen, &trunc, NULL);
+        return dgram_recv(s, &v, 1, 0, f->flags & O_NONBLOCK, from, &fromlen, &trunc, NULL, NULL);
     }
     return usock_read(s, ubuf, n, f->flags & O_NONBLOCK, 0, NULL);
 }
@@ -655,7 +729,7 @@ static uint32_t unix_poll(struct file *f)
         r |= POLLIN;
     if (!p)
         r |= POLLHUP;
-    else if (p->head - p->tail < BUF_SIZE)
+    else if (p->head - p->tail < p->size)
         r |= POLLOUT;
     return r;
 }
@@ -977,7 +1051,7 @@ SYSCALL_DEF(unix_recvfrom)
         uint32_t fromlen;
         int trunc;
         int32_t r = dgram_recv(s, &v, 1, a4, (f->flags & O_NONBLOCK) || (a4 & MSG_DONTWAIT),
-                               from, &fromlen, &trunc, NULL);
+                               from, &fromlen, &trunc, NULL, NULL);
         if (r >= 0) {
             int err = write_name(a5, a6, from, fromlen);
             if (err)
@@ -1070,16 +1144,34 @@ static struct ufiles *files_from_user(const struct user_msghdr *m, int *err)
     return u;
 }
 
-/* Received files become our fds, described in the caller's control buffer
-   (one SCM_RIGHTS message). Those that don't fit (or find no free fd) are
-   closed and MSG_CTRUNC says so. *clen: the control bytes used. */
-static int files_to_user(struct ufiles *u, const struct user_msghdr *m,
-                         uint32_t flags, uint32_t *mflags, user_addr_t *clen)
+/* One control message at *off in the caller's buffer (then *off moves past
+   it). One that doesn't fit is left out, and MSG_CTRUNC says so. */
+static int put_cmsg(const struct user_msghdr *m, user_addr_t *off, int32_t type,
+                    const void *data, uint32_t len, uint32_t *mflags)
 {
-    *clen = 0;
+    if (*off > m->controllen || m->controllen - *off < CMSG_HDR + len) {
+        *mflags |= MSG_CTRUNC;
+        return 0;
+    }
+    struct user_cmsghdr cm = { CMSG_HDR + len, SOL_SOCKET, type };
+    if (copy_to_user((void *)(uintptr_t)(m->control + *off), &cm, sizeof cm) < 0 ||
+        copy_to_user((void *)(uintptr_t)(m->control + *off + CMSG_HDR), data, len) < 0)
+        return -EFAULT;
+    user_addr_t used = CMSG_HDR + CMSG_ALIGN(len);
+    *off = used < m->controllen - *off ? *off + used : m->controllen;
+    return 0;
+}
+
+/* Received files become our fds, described in the caller's control buffer
+   at *off (one SCM_RIGHTS message). Those that don't fit (or find no free
+   fd) are closed and MSG_CTRUNC says so. */
+static int files_to_user(struct ufiles *u, const struct user_msghdr *m,
+                         uint32_t flags, uint32_t *mflags, user_addr_t *off)
+{
     if (!u)
         return 0;
-    uint32_t room = m->controllen > CMSG_HDR ? (uint32_t)(m->controllen - CMSG_HDR) / 4 : 0;
+    user_addr_t left = m->controllen > *off ? m->controllen - *off : 0;
+    uint32_t room = left > CMSG_HDR ? (uint32_t)(left - CMSG_HDR) / 4 : 0;
     int32_t fds[FD_PASS_MAX];
     uint32_t k = 0;
     struct process *me = proc_current();
@@ -1090,22 +1182,14 @@ static int files_to_user(struct ufiles *u, const struct user_msghdr *m,
         u->f[k] = NULL;
         fds[k] = fd;
         if (flags & MSG_CMSG_CLOEXEC)
-            me->cloexec |= 1ull << fd;
+            fd_set_cloexec(me, fd, 1);
         else
-            me->cloexec &= ~(1ull << fd);
+            fd_set_cloexec(me, fd, 0);
     }
     if (k < u->n)
         *mflags |= MSG_CTRUNC;
     files_drop(u);                      /* the ones left over */
-    if (!k)
-        return 0;
-    struct user_cmsghdr cm = { CMSG_HDR + k * 4, SOL_SOCKET, SCM_RIGHTS };
-    if (copy_to_user((void *)(uintptr_t)m->control, &cm, sizeof cm) < 0 ||
-        copy_to_user((void *)(uintptr_t)(m->control + CMSG_HDR), fds, k * 4) < 0)
-        return -EFAULT;
-    user_addr_t used = CMSG_HDR + CMSG_ALIGN(k * 4);
-    *clen = used < m->controllen ? used : m->controllen;
-    return 0;
+    return k ? put_cmsg(m, off, SCM_RIGHTS, fds, k * 4, mflags) : 0;
 }
 
 SYSCALL_DEF(unix_sendmsg)
@@ -1165,14 +1249,16 @@ SYSCALL_DEF(unix_recvmsg)
     user_addr_t clen = 0;
     if (msgs(s)) {
         uint8_t from[PATH_UN];
-        uint32_t fromlen;
-        int trunc;
+        uint32_t fromlen = 0;
+        int trunc = 0;
+        struct ucred who = { 0 };
         int32_t r = dgram_recv(s, iov, (uint32_t)m.iovlen, a3, nonblock, from, &fromlen, &trunc,
-                               &files);
+                               &files, &who);
         if (r < 0)
             return r;
         fl = trunc ? MSG_TRUNC : 0;
-        if ((err = files_to_user(files, &m, a3, &fl, &clen)) ||
+        if ((s->passcred && (err = put_cmsg(&m, &clen, SCM_CREDENTIALS, &who, sizeof who, &fl))) ||
+            (err = files_to_user(files, &m, a3, &fl, &clen)) ||
             (m.name && (err = write_name(m.name, a2 + offsetof(struct user_msghdr, namelen),
                                          from, fromlen))) ||
             copy_to_user((void *)(a2 + offsetof(struct user_msghdr, controllen)),
@@ -1200,7 +1286,9 @@ SYSCALL_DEF(unix_recvmsg)
             break;
     }
     uint32_t zero = 0;
-    if ((err = files_to_user(files, &m, a3, &fl, &clen)) ||
+    if ((done > 0 && s->passcred &&
+         (err = put_cmsg(&m, &clen, SCM_CREDENTIALS, &s->peercred, sizeof s->peercred, &fl))) ||
+        (err = files_to_user(files, &m, a3, &fl, &clen)) ||
         (m.name && copy_to_user((void *)(a2 + offsetof(struct user_msghdr, namelen)),
                                 &zero, 4) < 0) ||
         copy_to_user((void *)(a2 + offsetof(struct user_msghdr, controllen)),
@@ -1212,8 +1300,16 @@ SYSCALL_DEF(unix_recvmsg)
 
 SYSCALL_DEF(unix_setsockopt)
 {
-    (void)a1;
-    return 0;                       /* SO_PASSCRED, buffer sizes: accepted, ignored */
+    struct usock *s = usock_of(a1, NULL);
+    if (a2 == SOL_SOCKET && a3 == SO_PASSCRED) {
+        uint32_t on;
+        if (a5 < 4)
+            return -EINVAL;
+        if (get_user32(&on, a4) < 0)
+            return -EFAULT;
+        s->passcred = on != 0;
+    }
+    return 0;                       /* buffer sizes and the rest: accepted, ignored */
 }
 
 SYSCALL_DEF(unix_getsockopt)
@@ -1227,8 +1323,9 @@ SYSCALL_DEF(unix_getsockopt)
     case SO_TYPE:       val = (uint32_t)s->type; break;
     case SO_ERROR:      val = 0; break;
     case SO_SNDBUF:
-    case SO_RCVBUF:     val = msgs(s) ? DQ_BYTES : BUF_SIZE; break;
+    case SO_RCVBUF:     val = msgs(s) ? DQ_BYTES : RING_MAX; break;
     case SO_ACCEPTCONN: val = s->state == U_LISTEN; break;
+    case SO_PASSCRED:   val = s->passcred; break;
     case SO_PEERCRED:
         if (s->state != U_CONNECTED)
             return -ENOTCONN;

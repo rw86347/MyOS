@@ -38,6 +38,14 @@ isr_spurious:
     iretq
 
 isr_common:
+    ; The direction flag first. An interrupt or fault keeps the interrupted
+    ; code's flags, and a program may have DF set at that moment (musl's
+    ; memmove: std; rep movs; cld). With DF set, every kernel memcpy and
+    ; memset runs backwards, over whatever lies below its target — that
+    ; once wrote the console's grid back over the whole kernel image and
+    ; the IDT (a triple fault). C code expects it clear; iretq gives the
+    ; program its own flag back. (syscall clears it through SFMASK.)
+    cld
     push rax
     push rcx
     push rdx

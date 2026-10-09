@@ -35,11 +35,13 @@
 #define S_IFDIR   0040000           /* directory */
 #define S_IFLNK   0120000           /* symbolic link */
 #define S_IFCHR   0020000           /* character device (the console) */
+#define S_IFBLK   0060000           /* block device (a disk: /dev/sda) */
 #define S_IFIFO   0010000           /* pipe */
 #define S_IFSOCK  0140000           /* socket */
 #define S_ISDIR(m) (((m) & S_IFMT) == S_IFDIR)
 #define S_ISREG(m) (((m) & S_IFMT) == S_IFREG)
 #define S_ISCHR(m) (((m) & S_IFMT) == S_IFCHR)
+#define S_ISBLK(m) (((m) & S_IFMT) == S_IFBLK)
 #define S_ISLNK(m) (((m) & S_IFMT) == S_IFLNK)
 #define S_ISFIFO(m) (((m) & S_IFMT) == S_IFIFO)
 #define S_ISUID   04000             /* run as the file's owner */
@@ -89,6 +91,11 @@ struct file_ops {
     /* 1: write() fetches its bytes with file_copy_in, so sendfile can hand
        it kernel memory (file data straight from the page cache). */
     uint8_t kbuf_ok;
+    /* A file that is always readable but has something to say when it
+       changes (/proc/self/mountinfo): a count that moves on each change.
+       Epoll reports an edge-triggered entry on it only when the count
+       moved, as Linux does. NULL for everything else. */
+    uint32_t (*change_count)(struct file *f);
 };
 
 
@@ -104,6 +111,8 @@ struct file_ops {
                                        program (the ELF that execve loaded) */
 #define I_MEMFD    128              /* memfd_create: fs_ino holds F_SEAL_* */
 #define I_WATCHED  256              /* inotify watches it (fs/inotify.c) */
+#define I_SHMAPPED 1024             /* mapped MAP_SHARED once: shrinking keeps its
+                                       pages (a mapping may still use them) */
 #define I_PROC_TASK 512             /* /proc/self/task: its link count says how
                                        many threads the caller has */
 
@@ -149,6 +158,7 @@ struct mount {
     const char *type;               /* "ext2" (for /proc/mounts, df) */
     uint32_t magic;                 /* statfs f_type; 0 means ext2 */
     uint32_t dev_minor;             /* st_dev: 0:1 is the RAM file system */
+    char source[24];                /* "/dev/sda2": what /proc/mounts names */
 };
 
 struct inode {
@@ -304,6 +314,10 @@ int  vfs_dir_stop(struct file *f, struct inode *last);
 void vfs_dir_rewind(struct file *f);
 
 int  fd_install(struct file *f);                /* lowest free fd */
+int  fd_install_min(struct file *f, int min);   /* lowest free fd >= min (F_DUPFD) */
+void fd_table_init(struct process *p);          /* the built-in 64, empty */
+void fd_set_cloexec(struct process *p, int fd, int on);
+int  fd_get_cloexec(const struct process *p, int fd);
 int  fd_install_at(int fd, struct file *f);     /* dup2: exactly this fd */
 struct file *fd_get(int fd);                    /* NULL if not open */
 int  fd_close(int fd);
@@ -370,6 +384,9 @@ void    file_free(struct inode *i);
    archive): System V shared memory. Its frame, made zeroed on first use;
    0 when memory or the RAM-file limit runs out. Freed with the inode. */
 uint32_t ramfs_page(struct inode *i, uint32_t idx);
+/* Before a RAM file is mapped MAP_SHARED: its data in pages of its own
+   (not in the boot archive), and I_SHMAPPED. 0 or -ENOSPC. */
+int ramfs_share(struct inode *i);
 void    ramfs_usage(uint32_t *used_pages, uint32_t *max_pages);   /* statfs, df */
 uint32_t time_now(void);                    /* seconds since 1970 (sys_info.c) */
 
@@ -457,6 +474,27 @@ uint32_t procfs_nlink(const struct inode *i);
 int  procfs_readlink(struct inode *link, char *buf, uint32_t size);
 /* sysfs.c: mount -t sysfs (just what Xorg checks: /sys/class/graphics/fb0). */
 int  sysfs_mount(const char *path);
+struct net_device;
+void sysfs_net_add(struct net_device *d);       /* netdevice.c, as a link is listed */
+/* /proc/<pid>: made with the process, gone when it is reaped (procfs.c). */
+void procfs_pid_add(int pid);
+void procfs_pid_remove(int pid);
+/* The host's name (sethostname), for /proc/sys/kernel/hostname. */
+const char *uts_nodename(void);
+/* A RAM file system mounted with mount(2) (tmpfs, proc, sysfs): noted
+   for /proc/mounts, which ext2 and FAT mounts are in already. */
+void vfs_note_mount(const char *path, const char *type);
+int  vfs_noted_count(void);
+void vfs_noted_at(int i, const char **path, const char **type);
+/* Take a node out of its directory (a generated file system's own). */
+void vfs_remove(struct inode *i);
+uint32_t vfs_mount_gen(void);               /* bumped when the mount table changes */
+
+/* dev.c: /dev/sda and its partitions, whose positions pass 4 GiB. */
+struct blockdev;
+int32_t blkfile_rw(struct file *f, uintptr_t ubuf, uint32_t n, int writing, int64_t at);
+int64_t blkfile_seek(struct file *f, int64_t off, uint32_t whence);
+int     blkdev_busy(struct blockdev *d);    /* open for writing: not mountable */
 /* flock.c: drop f's flock() (its last fd closed). */
 void flock_release(struct file *f);
 extern struct wait_queue poll_wait;     /* poll.c: woken when a file's state changes */

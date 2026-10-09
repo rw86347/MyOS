@@ -12,9 +12,13 @@
  *                             1:1 at +0xC0000000. The kernel itself lives
  *                             here (physical 0x100000 -> 0xC0100000),
  *                             mapped with 4 MiB pages.
- *   0xF0000000 - 0xF3FFFFFF   kernel heap (kmalloc big blocks), 64 MiB, mapped
+ *   0xF0000000 - 0xF2FFFFFF   kernel heap (kmalloc big blocks), 48 MiB, mapped
  *                             page by page; its page tables exist from boot
  *                             so every process's page directory shares them
+ *   0xF3000000 - 0xF3FFFFFF   kernel stacks, one window per thread slot with
+ *                             an unmapped guard page under each stack
+ *                             (kernel/thread.c, "kernel stacks"); page
+ *                             tables from boot, like the heap's
  *   0xF4000000 - 0xF7FFFFFF   device registers, uncached (e1000, then pci_map_mmio)
  *   0xF8000000 - 0xFFFFFFFF   framebuffers, write-combined (ioremap_wc, pat.c),
  *                             4 MiB pages where the memory allows
@@ -33,7 +37,9 @@
 #define DIRECTMAP_LIMIT  0x30000000u    /* 768 MiB of physical RAM direct-mapped */
 #define DIRECTMAP_BASE   KERNEL_VBASE   /* same thing here: the kernel is in the direct map */
 #define KHEAP_START      0xF0000000u
-#define KHEAP_END        0xF4000000u
+#define KHEAP_END        0xF3000000u
+#define KSTACK_START     0xF3000000u    /* thread.c: guard page + stack per slot */
+#define KSTACK_END       0xF4000000u
 #define MMIO_BASE        0xF4000000u    /* e1000 first, then pci_map_mmio */
 #define MMIO_END         0xF8000000u
 

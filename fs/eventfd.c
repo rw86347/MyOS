@@ -138,7 +138,7 @@ SYSCALL_DEF(sys_eventfd2)
     if (a2 & EFD_CLOEXEC) {
         struct process *p = proc_current();
         if (p)
-            p->cloexec |= 1ull << fd;
+            fd_set_cloexec(p, fd, 1);
     }
     return fd;
 }

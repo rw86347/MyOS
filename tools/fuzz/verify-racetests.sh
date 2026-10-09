@@ -80,8 +80,8 @@ run_case "pipe_write claiming room after the copy instead of before it" \
     fs/pipe.c \
     '        p->head += k;
         uint32_t claimed = p->head;
-        if (copy_from_user(p->buf + at, src, first) < 0 ||
-            copy_from_user(p->buf, src + first, k - first) < 0) {
+        if (file_copy_in(f, p->buf + at, src, first) < 0 ||
+            file_copy_in(f, p->buf, src + first, k - first) < 0) {
             if (p->head == claimed)
                 p->head -= k;       /* nobody else claimed after us: take it back */
             else {
@@ -94,19 +94,19 @@ run_case "pipe_write claiming room after the copy instead of before it" \
             return done ? (int32_t)done : -EFAULT;
         }
         done += k;' \
-    '        if (copy_from_user(p->buf + at, src, first) < 0 ||
-            copy_from_user(p->buf, src + first, k - first) < 0)
+    '        if (file_copy_in(f, p->buf + at, src, first) < 0 ||
+            file_copy_in(f, p->buf, src + first, k - first) < 0)
             return done ? (int32_t)done : -EFAULT;
         p->head += k;
         done += k;' || fail=1
 
 run_case "wait4 copying the status before reaping the child" \
     kernel/proc.c \
-    '                int id = c->pid, status = c->status;
+    '                me->cstime += cs;
                 reap(c);
                 if (user_status && copy_to_user((void *)user_status, &status, 4) < 0)
                     return -EFAULT;' \
-    '                int id = c->pid, status = c->status;
+    '                me->cstime += cs;
                 if (user_status && copy_to_user((void *)user_status, &status, 4) < 0)
                     return -EFAULT;
                 reap(c);' || fail=1
@@ -132,15 +132,41 @@ run_case "getdents64 anchoring a cursor on a deleted entry" \
     '            if (0)
                 break;' || fail=1
 
+# (rw_at since pread/pwrite: the hold spans the position copy too.)
 run_case "read/write not holding the open file across the call" \
     kernel/syscall.c \
     '    file_get(f);
-    int32_t rc = writing ? f->ops->write(f, (const void *)buf, len)
-                         : f->ops->read(f, (void *)buf, len);
+    /*
+     * pread/pwrite leave the file'"'"'s position alone, even while a sibling
+     * thread reads the same open file. Every file system reads and writes
+     * at f->pos, so they get a copy of the open file that starts at `at`,
+     * and the copy'"'"'s position is thrown away.
+     */
+    struct file copy;
+    struct file *use = f;
+    if (at >= 0) {
+        copy = *f;
+        copy.pos = (uint32_t)at;
+        use = &copy;
+    }
+    int32_t rc = writing ? use->ops->write(use, (const void *)buf, len)
+                         : use->ops->read(use, (void *)buf, len);
+    if (rc > 0)
+        notify(f->inode, writing ? IN_MODIFY : IN_ACCESS);
     file_put(f);
     return rc;' \
-    '    return writing ? f->ops->write(f, (const void *)buf, len)
-                   : f->ops->read(f, (void *)buf, len);' || fail=1
+    '    struct file copy;
+    struct file *use = f;
+    if (at >= 0) {
+        copy = *f;
+        copy.pos = (uint32_t)at;
+        use = &copy;
+    }
+    int32_t rc = writing ? use->ops->write(use, (const void *)buf, len)
+                         : use->ops->read(use, (void *)buf, len);
+    if (rc > 0)
+        notify(f->inode, writing ? IN_MODIFY : IN_ACCESS);
+    return rc;' || fail=1
 
 run_case "epoll_ctl fetching the interest list before the copy instead of after" \
     fs/epoll.c \

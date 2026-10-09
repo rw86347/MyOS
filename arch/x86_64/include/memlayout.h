@@ -14,6 +14,9 @@
  *                        (-2 GiB: `-mcmodel=kernel` lets code address it with
  *                        32-bit sign-extended constants, so no 64-bit
  *                        immediates). Physical 0 maps here. (PML4 entry 511)
+ *   0xFFFFFFFFBE000000 - 0xFFFFFFFFBFFFFFFF  kernel stacks, one window per
+ *                        thread slot with an unmapped guard page under each
+ *                        stack (kernel/thread.c, "kernel stacks")
  *   0xFFFFFFFFC0000000 - 0xFFFFFFFFC3FFFFFF  kernel heap (kmalloc big blocks)
  *   0xFFFFFFFFC4000000 - 0xFFFFFFFFC7FFFFFF  device registers, uncached
  *   0xFFFFFFFFC8000000 - top                 framebuffers, write-combined
@@ -37,6 +40,8 @@
    The UEFI loader puts the initrd below it: KERNEL_RAM_LIMIT there. */
 #define DIRECTMAP_LIMIT  0x80000000ull          /* 2 GiB for now */
 
+#define KSTACK_START     0xFFFFFFFFBE000000ull  /* thread.c: guard page + stack per slot */
+#define KSTACK_END       0xFFFFFFFFC0000000ull
 #define KHEAP_START      0xFFFFFFFFC0000000ull
 #define KHEAP_END        0xFFFFFFFFC4000000ull
 #define MMIO_BASE        0xFFFFFFFFC4000000ull  /* e1000 first, then pci_map_mmio */

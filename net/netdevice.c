@@ -19,6 +19,7 @@
 #include <thread.h>
 #include <tcp.h>
 #include <timer.h>
+#include <vfs.h>
 
 #define NET_RX_MAX  32
 #define NET_PACKS   8
@@ -71,6 +72,7 @@ int netdev_add(struct net_device *dev)
             dev->ifindex = i + 1;
             if (i + 1 > ndevs)
                 ndevs = i + 1;
+            sysfs_net_add(dev);         /* /sys/class/net/<name> */
             return 0;
         }
     return -ENOMEM;

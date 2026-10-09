@@ -38,6 +38,9 @@ uint32_t vmm_pd_current(void);
 void     vmm_pd_switch(uint32_t pd);
 void     vmm_pd_destroy(uint32_t pd);
 uint32_t vmm_pd_fork(void);
+#ifdef PT_AUDIT
+void     vmm_audit(void);           /* make PTAUDIT=1: check every page table */
+#endif
 int      vmm_cow_fault(uintptr_t va);
 
 #endif

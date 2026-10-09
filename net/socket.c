@@ -323,8 +323,10 @@ static int raw_send_ok(const uint8_t *buf, uint32_t len)
 static int32_t send_k(struct sock *s, const uint8_t *buf, uint32_t len,
                       uint32_t ip, uint16_t port)
 {
-    if ((ip >> 24) == 127 || ip == 0)
-        return -ENETUNREACH;        /* no loopback IP yet */
+    /* UDP to 127/8 is delivered locally (udp.c); ping and TCP have no
+       loopback yet (docs/gaps.md). */
+    if (ip == 0 || ((ip >> 24) == 127 && s->type != SOCK_DGRAM))
+        return -ENETUNREACH;
     int rc;
     if (s->type == SOCK_DGRAM) {
         if (!port)
@@ -603,7 +605,7 @@ static int sock_install(struct sock *s, uint32_t flags)
         return -EMFILE;
     }
     if (flags & SOCK_CLOEXEC)
-        proc_current()->cloexec |= 1ull << fd;
+        fd_set_cloexec(proc_current(), fd, 1);
     return fd;
 }
 
@@ -664,7 +666,9 @@ SOCK_SYSCALL(sys_bind)
     int rc = read_addr(a2, a3, &ip, &port, 0);
     if (rc < 0)
         return rc;
-    if (ip != 0 && ip != ipv4_addr)
+    /* Any, ours, or loopback (127/8): local services bind there. A socket
+       is found by its port alone, so the address is only checked. */
+    if (ip != 0 && ip != ipv4_addr && (ip >> 24) != 127)
         return -EADDRNOTAVAIL;
     /* The ports below 1024 are root's (Linux: CAP_NET_BIND_SERVICE). They are
        the ones clients trust: whoever holds 22 while sshd restarts is shown
@@ -716,7 +720,10 @@ SOCK_SYSCALL(sys_connect)
     }
     if (s->type == SOCK_DGRAM && !port)
         return -EINVAL;
-    if ((ip >> 24) == 127 || ip == 0)
+    /* A UDP connect only names the far end: to 127/8 it must work (musl's
+       AI_ADDRCONFIG test connects one to 127.0.0.1, and without it every
+       lookup with that flag — all of Chromium's — fails). */
+    if (ip == 0 || ((ip >> 24) == 127 && s->type != SOCK_DGRAM))
         return -ENETUNREACH;
     rc = autobind(s);
     if (rc < 0)

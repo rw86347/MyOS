@@ -19,6 +19,7 @@
 #include <io.h>
 #include <keyboard.h>
 #include <power.h>
+#include <thread.h>
 
 #define KBD_DATA   0x60
 #define KBD_STATUS 0x64
@@ -157,6 +158,17 @@ static void keyboard_irq(struct regs *r)
     }
     int released = sc & 0x80;
     sc &= 0x7F;
+    /* Alt+SysRq+T, as on Linux: every thread and what it waits for
+       (thread_dump), even while the X server has the keyboard — the way
+       to see what a hung system is doing. SysRq is Alt+PrintScreen, which
+       the controller sends as 0x54. */
+    static int sysrq_alt, sysrq;
+    if (sc == SC_ALT)
+        sysrq_alt = !released;
+    else if (sc == 0x54 && !extended)
+        sysrq = !released;
+    else if (sc == 0x14 && !released && sysrq && sysrq_alt)
+        thread_dump();
     uint16_t key = linux_key(sc, extended);
     if (key)
         evdev_key(key, !released);

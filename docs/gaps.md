@@ -177,6 +177,21 @@ most likely to trip over, each item checked in the source on the date above.
   bash and dash have it built in.
 - **Coreutils is one program**: Alpine builds GNU coreutils as a single binary with
   `/bin/ls`, `/bin/cp`... as links to it (Debian has separate files). Same code.
+  Overlaying one of those names must replace the symlink, never write through it
+  (that replaces every applet). So ours are symlinks too: `/bin/rm` and
+  `/usr/bin/rm` point at `/usr/bin/myos-rm` (and `tools/mklivehd.sh` unlinks first
+  anyway). apk puts coreutils' `/bin/rm` back on an upgrade;
+  `/etc/apk/commit_hooks.d/myos-rm.post-commit` re-points it after every apk run.
+- **People's `rm` moves to `~/Trash`** (`live/myos-rm`): uid 1000-59999. Root and
+  system accounts get GNU rm exactly. It is a seat belt, not a lock: a person can
+  still delete their own files on purpose (`rm --reallyDelete`, `busybox rm`,
+  `coreutils --coreutils-prog=rm`, or any program's `unlink()`). Files in `/tmp`,
+  `/var/tmp`, `/dev/shm` and `/run` are deleted, not kept. Gaps: a file on another
+  disk (a USB stick) is copied into `~/Trash` (the Mac and freedesktop.org keep a
+  trash folder on each disk instead); `-i` on a folder asks once, not for each
+  file in it; the Trash is ours (`~/Trash`, `._NAME.where`), not freedesktop.org's
+  `~/.local/share/Trash`, so a GTK program's own "Move to Trash" lands somewhere
+  the Recycle can doesn't look.
 - **No device manager** (udev/mdev): the kernel makes the /dev nodes itself, and
   with no /sys udev would have nothing to read.
 
@@ -206,6 +221,12 @@ most likely to trip over, each item checked in the source on the date above.
   no-execute. The Makefile comment says to split permissions once paging is on — paging
   *is* on now, so this is due. (`Makefile`, `arch/i386/linker.ld`)
 - **Frame allocator is a linear bitmap scan.** Slow with lots of RAM; fine for now. (`mm/pmm.c`)
+- **Out of memory, the program that faults dies**, whichever it is: there is no OOM
+  killer choosing the biggest one (Linux's), and no swap. With the x86_64 kernel's 2 GiB
+  (B1), Chromium starting while the first boot still runs can starve small programs.
+  Probably what happened once on 2026-10-07: `update-mime-database` and `groupadd`
+  died on a NULL read during first boot, and `chromium` was "not found". Not seen in
+  nine boots since (USB and IDE, with and without serial typing).
 - **The heap never returns pages to the PMM.** Size-class pages stay with their class, and
   the big-block range never shrinks. Freed memory is reused, but never goes back to the
   page pool. (`mm/kheap.c`)
@@ -324,9 +345,12 @@ most likely to trip over, each item checked in the source on the date above.
   still filled in on a read fault (`mm_fault` checks only writes). Guard pages and
   reservations therefore never fault.
 - **No address-space randomisation**: static PIEs always load at 0x00400000.
-- **File mappings are private copies** (made per page on first touch), so `MAP_SHARED`
-  file mappings behave like `MAP_PRIVATE`: a program writing through one doesn't change
-  the file. Programs are mapped from their file and paged in on touch, on both CPUs
+- **Disk-file mappings are private copies** (made per page on first touch), not the
+  page cache's pages. Since 2026-10-09, `MAP_SHARED` of a disk file opened for writing
+  fails with ENODEV: as a copy it read stale pages after `write()`, and writes through
+  it never reached the disk. SQLite's memory-mapped I/O falls back to `read()`; LMDB,
+  which needs it, can't run. A read-only open still maps, as a snapshot. The real fix
+  is ROADMAP step 11's single page cache behind both `read()` and `mmap()`. Programs are mapped from their file and paged in on touch, on both CPUs
   (x86_64's loader read the whole file into one buffer until 2026-10-07).
 - **Dynamic linking**: one interpreter level; the interpreter is put at the first free
   place in the mmap area (no randomisation).
@@ -835,6 +859,63 @@ most likely to trip over, each item checked in the source on the date above.
   whatever mode the BIOS set up, checked by a test read at boot. Not yet tried on
   real hardware. LBA28 only (128 GiB).
 
+## Found running Chromium (2026-10-08)
+
+- **MAP_SHARED of a disk file is private** (ext2): writes never reach the file
+  or other processes. RAM files (memfd, /dev/shm, tmpfs) are really shared.
+- **A RAM file once mapped shared keeps its pages when shrunk** (zeroed), until
+  the file itself goes: a mapping may still point at them, and there is no
+  reverse map to unmap it. Linux sends SIGBUS past the new end instead.
+- **`/proc/self/fd` lists fds 0-63 only** (a node each, made at boot); fds up to
+  1023 work, they just aren't listed. No `/proc/<pid>/task` for other processes,
+  no `/proc/uptime`, no `/proc/<pid>` directories (`ps` complains).
+- **No `ptrace`**: Chromium's crash reporter (crashpad) can't take a dump.
+- **Memory areas are a sorted array**: lookup is a binary search, but adding or
+  splitting one moves the rest — with Chromium's thousands of areas that is a
+  memmove of up to a few hundred KiB per mprotect. A tree later, measured first.
+- **A GPU helper of Chromium dies of a page fault** (software GL); Chromium
+  carries on. Not investigated yet.
+- **Chromium runs without its sandbox** (`--no-sandbox`, `/etc/chromium/myos.conf`):
+  it needs seccomp-bpf and user namespaces, which we don't have. A page that
+  exploits a bug in Chromium's renderer gets the user's rights, not a jail's.
+  And `--disable-gpu`: no GL/Vulkan window surfaces, so it draws in software.
+- **Firefox does not start** (the Start menu used to run it; now Chromium).
+- **IceWM sometimes crashes at login, over and over** (a NULL read in a library,
+  the same address each restart), and once myos-desktop did: 4 boots in 11 on
+  2026-10-08, all while a second QEMU and builds loaded the Mac; none in 8 quiet
+  boots. Probably a race in the kernel, as racetest's was. The kernel's message
+  now names the library: catch it there next time.
+- **`madvise`**: DONTNEED and FREE drop pages; DONTFORK, WIPEONFORK and the rest
+  are accepted and ignored.
+- **Loopback is UDP only.** TCP to 127.0.0.1 (and ping) still says ENETUNREACH:
+  a local TCP connection needs both ends of the state machine in one kernel. A
+  socket bound to 127.0.0.1 is found by its port alone, so it also hears its
+  port on the outside address.
+- **No IPv6** (socket(AF_INET6) is EAFNOSUPPORT); and still no DHCP renewal.
+
+## Sound (2026-10-07, docs/SOUND-PLAN.md)
+
+- **One program at a time.** No `dmix` yet: alsa-lib's software mixer needs ALSA's
+  timer device (`/dev/snd/timer`) and user-added controls (`ELEM_ADD`, for
+  `softvol`), which we don't have, so `/etc/asound.conf` points `default` straight
+  at `plug:hw:0`. A second program gets EBUSY until a sound server (S5) mixes.
+- **No status/control page to map.** alsa-lib falls back to `SYNC_PTR` (one ioctl
+  where Linux reads memory). Measure before adding it: on i386, musl's 64-bit
+  time makes the mapped layout differ from what Linux's kernel offers anyway.
+- **Timestamps are monotonic** whatever `tstamp_type` asks for; no audio
+  timestamps (`audio_tstamp` = system time).
+- **Only interleaved access**, S16_LE and S32_LE (24 bits in 32 where the codec
+  has no 32), two channels, the codec's rates from 32 to 192 kHz; `plug`
+  converts the rest. No `WRITEN`/`READN`, `LINK`, suspend/resume.
+- **Generic codec only.** Speaker, headphone and line-out paths, Master and Capture,
+  Mic Boost, headphone and mic jacks — from the spec; no per-codec fixes (Linux
+  has none for the MSI either). A combo jack's headset mic needs Realtek's
+  undocumented COEF settings: not there. No HDMI audio, no S/PDIF, no beep.
+- **One playback and one capture stream** per card, 256 KiB each, allocated at
+  boot and never freed (so a mapped buffer can't vanish under a program).
+- **Jack switching and recording** run only on real hardware: QEMU's `wav` backend
+  can't record, and its codec has no jack sense. Checked on the MSI: not yet.
+
 ## Open files and the objects behind them (found 2026-10-04)
 
 All of these are fixed; what is left is the testing gap and the capability one.
@@ -856,11 +937,12 @@ All of these are fixed; what is left is the testing gap and the capability one.
   then needs the new file to land on the same heap address *and* at the same fd number, and
   its consequence is `epoll` polling the wrong file rather than touching freed memory. The
   64-bit version cost twice the memory per open file (size classes — `docs/performance.md`).
-- **`racetest`'s `wait` checks fail under host load.** They assert that an interleaving
-  *happened*, so when the Mac is busy — another QEMU running in the next window — the
-  sibling does not get scheduled in time and four checks fail. Nothing is wrong with the
-  kernel when that happens, but it is indistinguishable from a real failure at a glance,
-  which is the thing a test must not be.
+- ~~`racetest` checks failing under host load~~ (fixed 2026-10-07): the armed copy
+  yielded once, and the scheduler could pick another thread, so the interleaving
+  sometimes never happened. It now yields until the sibling's "done" flag is set (at
+  most 200 ms; `kernel/uaccess_test.c`). `make verify-racetests` passes again: three of
+  its mutations had stopped applying after the `pread`/`pwrite` and `file_copy_in`
+  changes of 2026-10-05, so those fixes went unverified until today.
 
 ## The graphical desktop (step 11b, 2026-10-04)
 
@@ -874,6 +956,14 @@ All of these are fixed; what is left is the testing gap and the capability one.
 - **`link()` is still missing**, so the X server cannot make its lock file and is
   started with `-nolock` (`live/myos-login/myos-login.c`). Two X servers on one
   display would not be noticed.
+- **The X server lets in any local program** (found 2026-10-09). myos-login starts it
+  with no `-auth` file, so X has no access control: any process on the machine, of any
+  user, can connect to `:0`, read the keyboard (passwords typed into a window
+  included), take screenshots and send input. A second account, a daemon, or someone
+  logged in over ssh gets the desktop of whoever sits at it. `tools/qemu-desktop.py`'s
+  `xdo` relies on this today, as the same user. The fix is Linux's: myos-login writes a
+  random cookie to a file only root reads, starts X with `-auth` on it, and gives the
+  session user `~/.Xauthority` (xauth); the test tool then sets `XAUTHORITY`.
 - **16 pseudo-terminals** (`PTY_MAX`, `drivers/pty.c`), each with a one-page ring in
   each direction. `/dev/pts` is an ordinary RAM directory, not devpts: the nodes are
   made and removed by hand, and a `mount -t devpts` still fails.
@@ -935,15 +1025,21 @@ All of these are fixed; what is left is the testing gap and the capability one.
   Windows key goes down and takes the keyboard, so no Windows-key combination
   reaches IceWM. Settings is in the Start menu and on Ctrl+Alt+S
   (`/etc/icewm/keys`); Win+I needs the menu to open on key *release*.
-- **Settings is mostly read-only.** Displays changes the scale and Mouse & Keyboard
-  the pointer's size; Network, About,
+- **Settings is mostly read-only.** Displays changes the scale, Wallpaper the
+  desktop picture (the theme landscape, plus the twenty scenes in
+  `/usr/share/myos/wallpapers`), and Mouse & Keyboard the pointer's size; Network, About,
   Storage, Date & Time and Users & Groups only show. The network page shows the
   address the system routes from (UDP connect + getsockname) and the DNS server:
   there are no interface ioctls (`SIOCGIF*`) to ask for more. The processor name
   comes from `cpuid` (no `/proc/cpuinfo`). Resolution can't be changed from it:
   X's fbdev driver can't switch modes while running.
-- **Most of the mockup's programs do not exist**: no network tool or help, so
-  there are no desktop icons and the Start menu (`live/myos-menu`) lists
+- **The desktop lists `~/Desktop`** (`myos-desktop`; the folder is created if it
+  is missing), in the same left-hand
+  column as the Recycle can (`myos-trash`, which keeps the fifth place).
+  Double-click opens a file the way My Files does. Right-click on the
+  wallpaper offers New Folder and Change Desktop Background…, which opens
+  Settings > Wallpaper. The Start menu programs are not planted as icons;
+  they stay on the Start menu (`live/myos-menu`):
   Terminal, My Files, Web Browser (Firefox), WritePerfect, AbiWord, Preview,
   Disks (My Files' disk view), Settings, Run..., Log off and Turn off.
 - **Firefox is on the disk but needs 1 GiB of RAM.** Alpine 3.20's 32-bit package
@@ -971,19 +1067,25 @@ All of these are fixed; what is left is the testing gap and the capability one.
   (cached as a hidden `._name` sidecar, the Mac's name on a disk that isn't HFS).
   A PDF's sidecar is its first page, used as the icon and as Columns' far-right
   preview. List does not unfold a folder in place (open it, or use Columns). Other
-  documents still use their type icon. No drag and drop, no cut/move (copy, then delete), no
-  properties window, no "Empty Recycle Bin" (the bin is the freedesktop one,
-  `~/.local/share/Trash`; open it with Ctrl+H, then `.local/share/Trash/files`).
+  documents still use their type icon. Drag a file onto the Recycle can (or
+  Delete) to put it in `~/Trash`; `rm` does the same, and remembers path,
+  owner and mode in `._name.where` so Put Back can restore them. Empty Trash
+  (right-click the can, or `rm --emptyTrash`) is the real delete; so is
+  Delete Permanently (`rm --reallyDelete`, which runs GNU rm). No cut/move (copy, then delete), no properties window.
   Without inotify it looks at the folder and its files every 2 s; in folders of
   more than 1000 files only the folder's own time is watched, so a file written
   over there needs F5. Disks finds other disks by `statfs` on the folders in `/`
   (no `/proc/mounts`).
 - **Evince draws its own title bar** (GTK's header bar), not the Golden Hour one, and
   (it used to warn that it couldn't watch its settings file; inotify is in now).
-  Its entries come from `MENU_LEFT` / `MENU_RIGHT` in `live/theme/make-live-theme.py`;
-  "All Programs" waits for something worth listing.
-- **The Start menu is a fixed picture.** Entries are drawn at build time, so adding a
-  program means rebuilding the theme; nothing reads `.desktop` files. The user's name
+- **All Programs** is the row above Log off. It opens the Programs folders the way
+  Windows XP did: `/usr/share/myos/programs`, then `~/.local/share/myos/programs` on top
+  of it, then any `.desktop` file in `/usr/share/applications` that is not already listed.
+  The pinned rows above it come from `MENU_LEFT` / `MENU_RIGHT` in
+  `live/theme/make-live-theme.py`.
+- **The Start menu's pinned rows are a fixed picture.** Those entries are drawn at build
+  time, so adding one there means rebuilding the theme. All Programs is the part that
+  reads the folders. The user's name
   is drawn in DejaVu Sans Bold, the rest of the menu in the theme's Trebuchet/Verdana
   (the build machine's fonts), so the header text is a slightly different face.
 - **Log off and Turn off don't ask "are you sure?"** IceWM's own confirmation box isn't
@@ -1017,3 +1119,54 @@ All of these are fixed; what is left is the testing gap and the capability one.
   "TaskBarMenu", and a taskbar button is its picture plus 5 px each way (how the
   151x35 placeholder makes a 156x40 button). A different IceWM may need these
   checked (`src/wmtaskbar.cc`, `YButton::updateSize`).
+
+## Kernel memory safety (found 2026-10-08)
+
+Guard pages under every thread's kernel stack, a double-fault stack of its
+own, `cld` on every entry and page-table checks are in (docs/LOG.md,
+2026-10-08). Still open:
+
+- **"main" (the boot thread) has no guard page.** Its stack is in the
+  kernel image, which is mapped with big pages (2 MiB / 4 MiB), so no
+  single page under it can be left out. It only idles after boot.
+- **The kernel image is writable and executable throughout.** Text is not
+  read-only and data is not no-execute (x86_64 has NX; non-PAE i386 has
+  none). A stray kernel write can change kernel code. Fix: map .text
+  read-only and the rest NX, which costs TLB entries unless the sections
+  are aligned to the big pages.
+- **The stack pool keeps its pages.** A window's pages stay with it after
+  its thread dies, for the next thread: the pages held are the most
+  threads ever alive at once (16 KiB each on x86_64), never given back.
+- **MEMDEBUG has no red zones.** It catches a write to freed memory (pages
+  and kmalloc objects), not an overrun into a neighbour that is in use.
+- **Not yet: stack canaries** (-fstack-protector-strong) against a buffer
+  overrun inside a frame overwriting a return address; SMEP/SMAP (the
+  kernel must not run, or quietly read, user pages).
+
+## Disk files and /proc per process (2026-10-09)
+
+- **Reading two partition tables at once isn't safe.** `partition_scan`
+  uses one static sector buffer. That only matters if BLKRRPART runs while
+  a USB disk is being plugged in.
+- **Only the first 16 sd disks get correct numbers.** sdq and later need
+  Linux's majors 65–71; ours put minor > 255 into an 8-bit rdev.
+  BLOCKDEV_MAX is 16, so this can't happen yet.
+- **No BLKDISCARD (TRIM).** mke2fs carries on without it.
+- **`umount` still always answers EBUSY.** The VFS doesn't count open
+  files per mount, so the installer can't unmount the new system to check
+  it.
+- **Some /proc/<pid> numbers are zeros.** RSS, page faults, context
+  switches, I/O bytes, and `environ` (the kernel doesn't keep a copy of a
+  program's environment). `ps` and `top` show 0 memory for each process.
+- **`/proc/<pid>/fd`, `exe` and `cwd` exist only under `/proc/self`.**
+  Another process's open files can't be listed yet (`lsof`, `ls -l
+  /proc/PID/fd`).
+- **EPOLLET is real only for change-count files** (the mount tables).
+  Everywhere else it is level-triggered, which costs extra wake-ups and
+  is right only for readers that read until EAGAIN.
+- **Chromium crashes in the browser process soon after loading a page**
+  (a use-after-free-looking read). Not yet found; see docs/LOG.md
+  2026-10-09. No `ptrace` (crashpad can't take its dump), and no
+  `/proc/<pid>/task` for other processes.
+- **A deleted file that is still open reports `st_nlink` 1** (Linux: 0). SQLite only
+  logs a warning about it.

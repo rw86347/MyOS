@@ -52,16 +52,19 @@ static void check(int ok, const char *what)
     }
 }
 
-/* Arm the next copy by this thread to yield before copying. */
-static int arm(void)
-{
-    return (int)syscall(NR_UACCESS_TEST, 1);
-}
-
 /* The sibling has to be runnable at the moment we yield, or the yield comes
    straight back to us and the interleaving never happens. It spins on a flag,
    and the timer preempts us so it gets to the spin in the first place. */
 static volatile int sib_ready, sib_go, sib_done;
+
+/* Arm the next copy by this thread to yield before copying — and to keep
+   yielding until the sibling has done its part (sib_done), so the
+   interleaving happens every time, not only when the scheduler happens to
+   pick the sibling first. */
+static int arm(void)
+{
+    return (int)syscall(NR_UACCESS_TEST, 1, &sib_done);
+}
 
 static void wait_for(volatile int *flag)
 {

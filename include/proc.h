@@ -30,7 +30,10 @@
 #else
 #define PROC_MAX    128
 #endif
-#define PROC_FILES  64                  /* open files per process (fds 0-63) */
+#define PROC_FILES  1024                /* open files per process: Linux's default
+                                           RLIMIT_NOFILE (Chromium needs hundreds) */
+#define PROC_FILES_BASE 64              /* built into the process; the table grows
+                                           past this only for programs that need it */
 
 struct file;
 struct inode;
@@ -48,11 +51,19 @@ struct process {
     int exiting;                        /* exit_group: the others must end */
     struct wait_queue thread_gone;      /* execve waits here for the others */
     struct mm *mm;
-    struct file *files[PROC_FILES];     /* open files, indexed by fd */
-    uint64_t cloexec;                   /* bit n: close fd n on execve */
+    /* Open files, indexed by fd: files_base, or a bigger table of nfiles
+       (doubled from 64 on demand, up to PROC_FILES) — Linux's fdtable. */
+    struct file **files;
+    uint32_t nfiles;
+    uint64_t *cloexec;                  /* bit n: close fd n on execve */
+    struct file *files_base[PROC_FILES_BASE];
+    uint64_t cloexec_base[PROC_FILES_BASE / 64];
     struct inode *cwd;                  /* current directory */
     struct inode *root;                 /* chroot(): its "/" (NULL: the real one) */
     struct inode *exe;                  /* the ELF execve loaded (/proc/self/exe) */
+    uint32_t start_ms;                  /* when it began (/proc/<pid>/stat) */
+    uint16_t cmdline_len;               /* bytes of cmdline */
+    char cmdline[256];                  /* its argv, NUL after each (/proc/<pid>/cmdline) */
     uint32_t umask;                     /* permission bits new files lose */
     int status;                         /* wait status, once a zombie */
     /* CPU time in ms (see thread.h): of its threads that have ended, and
@@ -100,6 +111,7 @@ struct process {
 struct process *proc_current(void);     /* NULL in a kernel thread */
 struct process *proc_find(int pid);     /* a live or zombie process, or NULL */
 struct process *proc_at(int i);         /* table slot i (0 <= i < PROC_MAX) */
+int proc_next_pid(void);                /* the pid the next process will get */
 
 /* The kernel starts a program (no parent). argv/envp in kernel memory. */
 struct process *proc_spawn(const char *path, const char *const argv[],
@@ -120,6 +132,7 @@ int  proc_execve(uintptr_t user_path, uintptr_t user_argv, uintptr_t user_envp);
 void proc_exit(int status) __attribute__((noreturn));        /* exit_group */
 void proc_thread_exit(int status) __attribute__((noreturn)); /* exit */
 int  proc_wait4(int pid, uintptr_t user_status, int options, uintptr_t user_rusage);
+int  proc_waitid(int idtype, int id, uintptr_t user_info, int options, uintptr_t user_rusage);
 /* Write a struct rusage with these CPU times (ms) to user memory. (sys_info.c) */
 int  rusage_to_user(uintptr_t user, uint32_t user_ms, uint32_t sys_ms);
 int  proc_setpgid(int pid, int pgid);

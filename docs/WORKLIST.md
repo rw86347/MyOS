@@ -17,13 +17,13 @@ networking depth, then hardware.
 - [x] A6. `/proc/self/task/` with a link count of 2 + threads (zygote: FATAL)
 - [x] A7. More threads and processes than 64 in the whole system
       (`pthread_create: Resource temporarily unavailable`)
-- [ ] A8. More than 64 open files per process; `select` past fd 31
+- [x] A8. More than 64 open files per process; `select` past fd 31
 - [x] A9. `/proc/self/fd` lists only open fds (crashpad closes the rest)
-- [ ] A10. `SO_PASSCRED` and `SCM_CREDENTIALS` (crashpad's handler)
-- [ ] A11. `sigaltstack`
-- [ ] A12. `/proc/cpuinfo`, `/proc/meminfo`, `/proc/sys/fs/inotify/*`
-- [ ] A13. `rt_sigqueueinfo` / `rt_tgsigqueueinfo`
-- [ ] A14. `int3` gives SIGTRAP, not a general-protection fault
+- [x] A10. `SO_PASSCRED` and `SCM_CREDENTIALS` (crashpad's handler)
+- [x] A11. `sigaltstack`
+- [x] A12. `/proc/cpuinfo`, `/proc/meminfo`, `/proc/sys/fs/inotify/*`
+- [x] A13. `rt_sigqueueinfo` / `rt_tgsigqueueinfo`
+- [x] A14. `int3` gives SIGTRAP, not a general-protection fault
 - [ ] A15. xHCI: no false "interrupt does not arrive" under load
 - [ ] A16. Chromium shows a window on the desktop (DISPLAY=:0)
 
@@ -94,5 +94,31 @@ Hardware
 - [ ] B52. The MSI's touchpad (I2C HID), two-finger scrolling
 - [ ] B53. ACPI: power off and reboot on real PCs
 - [ ] B54. Local APIC timer and IOAPIC
-- [ ] B55. Sound
+- B55. Sound: now part D below (`docs/SOUND-PLAN.md`)
 - [ ] B56. More than one CPU (SMP)
+
+## C. The installer (`docs/INSTALLER-PLAN.md`)
+
+What it needs beyond part B (FAT32 write B46, mounts B27, hard links B12 and
+real passwords B34 are there already), then the installer itself.
+- [ ] C1. The MSI's own SSD visible (Intel VMD/RST, or AHCI mode)
+- [ ] C2. Block device nodes; re-reading a partition table (`BLKRRPART`, sizes)
+- [ ] C3. UEFI runtime services: boot entries (`efivarfs`, `efibootmgr`)
+- [ ] C4. Console key maps; the hardware clock in local time (an option)
+- [ ] C5. `dosfstools`, `efibootmgr`, CJK fonts and pinyin on the live disk
+      (CJK fonts are in: Noto Sans/Serif CJK, `[fonts]` in live/packages.txt)
+- [ ] C6. `make test-install` in QEMU (helper and plan file exist)
+- [x] C7. `myos-install --text`
+- [x] C8. The GTK installer (the mockups' nine pages)
+
+## D. Sound (`docs/SOUND-PLAN.md`)
+
+- [ ] D1. S0: the MSI's sound facts (codec model, pins, DSP or not, digital mics)
+- [x] D2. S1: the HD Audio controller: CORB/RIRB, MSI, codecs found
+- [x] D3. S2: the sound core and the ALSA ABI (`/dev/snd`, PCM ioctls, mmap);
+      `make test-sound` plays a tone and checks the recording (both CPUs)
+- [ ] D4. S3: the generic codec driver (paths, mixer controls, jacks, mic) — written;
+      paths and mixer work in QEMU, jacks and recording wait for the MSI
+- [ ] D5. S4: speakers, headphones and headset mic on the MSI
+- [ ] D6. S5: alsa-lib and alsa-utils; a sound server; the volume icon and keys
+- [ ] D7. S6: HDMI audio (and SOF, only if the MSI has digital mics)

@@ -381,13 +381,18 @@ int usb_storage_probe(struct usb_device *d, const uint8_t *cfg, int len)
         goto drop;
     }
     struct blockdev bd = {
-        .sectors = lastlba == 0xFFFFFFFFu ? lastlba : lastlba + 1,
-        .read    = msd_read,
-        .write   = msd_write,
-        .flush   = msd_flush,
-        .rwv     = msd_rwv,
-        .priv    = m,
+        .sectors   = lastlba == 0xFFFFFFFFu ? lastlba : lastlba + 1,
+        .read      = msd_read,
+        .write     = msd_write,
+        .flush     = msd_flush,
+        .rwv       = msd_rwv,
+        .priv      = m,
+        .removable = 1,                 /* a stick: the installer won't offer it */
     };
+    size_t n = strlcpy(bd.model, vendor, sizeof bd.model);   /* "SanDisk Cruzer" */
+    if (n && product[0])
+        bd.model[n++] = ' ';
+    strlcpy(bd.model + n, product, sizeof bd.model - n);
     blockdev_sd_name(bd.name);
     if (!blockdev_register(&bd)) {
         kprintf("usb-storage: no room for another disk\n");

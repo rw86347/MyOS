@@ -291,7 +291,7 @@ int mm_fault(user_addr_t va, uint32_t err)
         if (off >= v->file_end)
             return -1;                  /* past the device: SIGSEGV (Linux: SIGBUS) */
         uint32_t flags = PTE_USER | PTE_SHARED | (v->flags & VM_WRITE ? PTE_WRITABLE : 0) |
-                         (v->flags & VM_WC ? pte_write_combining() : PTE_PCD);
+                         (v->flags & VM_RAM ? 0 : v->flags & VM_WC ? pte_write_combining() : PTE_PCD);
         return vmm_map(page, v->phys + off, flags) < 0 ? -1 : 0;
     }
 
@@ -402,9 +402,13 @@ user_addr_t mm_find_gap(struct mm *mm, user_addr_t len)
 intptr_t mm_mmap(user_addr_t addr, user_addr_t len, uint32_t prot, uint32_t flags,
                 struct inode *file, uint32_t off, uint32_t fmode)
 {
+    uint32_t shared = 0;                /* VM_SHARED: the file's own pages */
     if (!(flags & MAP_ANONYMOUS)) {
         /* A file, mapped privately: writes change our copy, never the
-           file (MAP_SHARED is treated the same: see docs/gaps.md). */
+           file. MAP_SHARED of a file in RAM (memfd, /dev/shm, /tmp in RAM)
+           maps the file's own pages instead: every process that maps it,
+           and read()/write(), see the same bytes — how Chromium's processes
+           share memory. A disk file's MAP_SHARED: see below. */
         if (!file || !S_ISREG(file->mode) || (file->ops && !file->fs))
             return -ENODEV;
         if (off & (PAGE_SIZE - 1))
@@ -415,6 +419,27 @@ intptr_t mm_mmap(user_addr_t addr, user_addr_t len, uint32_t prot, uint32_t flag
         if ((flags & MAP_SHARED) && (prot & PROT_WRITE) &&
             (fmode & O_ACCMODE) == O_RDONLY)
             return -EACCES;
+        /* A disk file can't be shared for real yet: its MAP_SHARED is a
+           private copy made at the first touch, so a program that writes
+           the file and reads the map sees old pages, and writes through
+           the map never reach the disk. SQLite's memory-mapped I/O does
+           exactly that: Chromium took its History database for corrupt
+           and crashed (2026-10-09). So a disk file opened for writing
+           can't be mapped shared: ENODEV, Linux's answer for a file
+           system without mmap, and SQLite falls back to read(). A
+           read-only open still maps (Chromium's resources.pak, fonts). */
+        if ((flags & MAP_SHARED) && file->fs && (fmode & O_ACCMODE) != O_RDONLY)
+            return -ENODEV;
+        /* Shared for real only where it can show: a mapping or file that
+           can be written, or a file already in pages of its own. A
+           read-only map of a read-only boot file stays zero-copy (the same
+           bytes). After every check: a refused mmap changes nothing. */
+        if ((flags & MAP_SHARED) && !file->fs &&
+            ((prot & PROT_WRITE) || (fmode & O_ACCMODE) != O_RDONLY || file->pages)) {
+            if (ramfs_share(file) < 0)
+                return -ENOMEM;
+            shared = VM_SHARED | ((fmode & O_ACCMODE) == O_RDWR ? VM_MAYWRITE : 0);
+        }
     } else {
         file = NULL;
     }
@@ -423,7 +448,27 @@ intptr_t mm_mmap(user_addr_t addr, user_addr_t len, uint32_t prot, uint32_t flag
     if (len > USER_ADDR_END)
         return -ENOMEM;                 /* (and PAGE_UP can't wrap) */
     len = PAGE_UP(len);
-    uint32_t vflags = VM_READ | (prot & PROT_WRITE ? VM_WRITE : 0);
+    uint32_t vflags = VM_READ | (prot & PROT_WRITE ? VM_WRITE : 0) | shared;
+    struct inode *anon = NULL;
+    if ((flags & (MAP_SHARED | MAP_ANONYMOUS)) == (MAP_SHARED | MAP_ANONYMOUS)) {
+        /* Shared anonymous memory (shared with children after fork): an
+           unnamed RAM file of that size, as Linux does, held by the mapping
+           alone. Pages appear, zeroed, at the first touch. */
+        if (len > 0xFFFFF000u)
+            return -ENOMEM;
+        anon = kmalloc(sizeof *anon);
+        if (!anon)
+            return -ENOMEM;
+        memset(anon, 0, sizeof *anon);
+        anon->mode = S_IFREG | 0600;
+        anon->flags = I_UNLINKED | I_SHMAPPED;
+        anon->name = "dev/zero";
+        anon->name_len = 8;
+        anon->size = (uint32_t)len;
+        file = anon;
+        off = 0;
+        vflags |= VM_SHARED | VM_MAYWRITE;
+    }
 
     if (flags & MAP_FIXED) {
         if (addr + len > USER_ADDR_END || addr + len < addr)
@@ -435,6 +480,11 @@ intptr_t mm_mmap(user_addr_t addr, user_addr_t len, uint32_t prot, uint32_t flag
             return -ENOMEM;
     }
     int err = mm_add_file(current_mm, addr, addr + len, vflags, file, off, ~0u);
+    if (anon) {
+        vfs_get(anon);
+        vfs_put(anon);                  /* the mapping's reference is the only one
+                                           (a failed mapping frees it here) */
+    }
     return err ? err : (intptr_t)addr;
 }
 
@@ -451,6 +501,18 @@ int vm_iomap_memory(struct vma *vma, phys_addr_t phys, uint32_t size)
     vma->flags |= VM_PFNMAP;
     vma->phys = phys - in_page;
     vma->file_end = (uint32_t)bytes;
+    return 0;
+}
+
+int vm_map_ram(struct vma *vma, uint32_t base, phys_addr_t phys, uint32_t size)
+{
+    uint32_t len = vma->end - vma->start, bytes = PAGE_UP(size);
+    if (vma->file_off < base || vma->file_off - base > bytes ||
+        len > bytes - (vma->file_off - base))
+        return -EINVAL;
+    vma->flags |= VM_PFNMAP | VM_RAM;
+    vma->phys = phys - base;            /* the fault adds the file offset back */
+    vma->file_end = base + bytes;
     return 0;
 }
 
@@ -498,6 +560,41 @@ int32_t mm_munmap(user_addr_t addr, user_addr_t len)
         addr + len > USER_ADDR_END)
         return -EINVAL;
     return mm_remove(current_mm, addr, addr + PAGE_UP(len));
+}
+
+/* madvise. MADV_DONTNEED is a promise programs build on, not a hint: the
+   pages go, and the next touch of private memory reads zeros (or the
+   file's bytes again) — Chromium's allocator hands memory back this way and
+   counts on fresh zeros when it takes it again. MADV_FREE may do the same
+   (it lets the kernel choose). A shared mapping keeps its bytes: they are
+   the file's. The rest (WILLNEED, HUGEPAGE, DONTDUMP...) asks for nothing
+   we must do. Linux's answers: EINVAL for a bad address or device memory,
+   ENOMEM where part of the range is not mapped. */
+#define MADV_DONTNEED 4
+#define MADV_FREE     8
+
+int32_t mm_madvise(user_addr_t addr, user_addr_t len, int advice)
+{
+    if ((addr & (PAGE_SIZE - 1)) || len > USER_ADDR_END || addr + len > USER_ADDR_END)
+        return -EINVAL;
+    user_addr_t end = PAGE_UP(addr + len);
+    if (advice != MADV_DONTNEED && advice != MADV_FREE)
+        return 0;
+    int missing = 0;
+    for (user_addr_t a = addr; a < end; ) {
+        struct vma *v = find(current_mm, a);
+        if (!v) {
+            missing = 1;
+            a += PAGE_SIZE;
+            continue;
+        }
+        if (v->flags & VM_PFNMAP)
+            return -EINVAL;
+        user_addr_t stop = v->end < end ? v->end : end;
+        vmm_unmap_range(a, stop);       /* the frames go back (shared ones stay the file's) */
+        a = stop;
+    }
+    return missing ? -ENOMEM : 0;
 }
 
 /* mremap: grow or shrink a mapping, or move it if MREMAP_MAYMOVE.
@@ -646,7 +743,7 @@ int32_t mm_mprotect(user_addr_t addr, user_addr_t len, uint32_t prot)
     for (int i = 0; i < mm->nareas; i++)
         if (mm->area[i].start >= addr && mm->area[i].end <= end)
             mm->area[i].flags = vflags | (mm->area[i].flags &
-                                          (VM_PFNMAP | VM_WC | VM_MAYWRITE | VM_SHARED));
+                                          (VM_PFNMAP | VM_WC | VM_RAM | VM_MAYWRITE | VM_SHARED));
     /* Pages that exist get the new write permission (a copy-on-write page
        stays read-only: its fault handler makes it writable). */
     for (user_addr_t a = addr; a < end; a += PAGE_SIZE) {

@@ -22,9 +22,11 @@
 #include <signal.h>
 #include <stddef.h>
 #include <string.h>
+#include <syscalls.h>
 #include <thread.h>
 #include <timer.h>
 #include <uaccess.h>
+#include <user.h>
 
 /* Signals whose default action is to do nothing. */
 static int default_ignored(int sig)
@@ -196,6 +198,107 @@ void signal_exec(struct process *p)
 }
 
 /* --- system calls --------------------------------------------------------------- */
+
+/* --- the alternate signal stack (sigaltstack) ---------------------------------- */
+
+/*
+ * A thread may name a second stack for signal handlers (sigaltstack), and a
+ * handler installed with SA_ONSTACK runs there. That is how a program
+ * reports a stack overflow: the overflowing stack has no room left for the
+ * handler's frame. Crash reporters (Chromium's crashpad), GNU grep and Go's
+ * runtime all set one up.
+ */
+#define MINSIGSTKSZ 2048
+
+struct user_stack {                     /* stack_t, the CPU's natural layout */
+    user_addr_t sp;
+    int32_t flags;
+    user_addr_t size;
+};
+
+/* Is sp on t's alternate stack? (Linux's on_sig_stack: sp points just past
+   what it pushed, so the top itself counts. A disarmed stack never does.) */
+static int on_altstack(const struct thread *t, uintptr_t sp)
+{
+    if (t->ss_flags & SS_AUTODISARM)
+        return 0;
+    return t->ss_size && sp > t->ss_sp && sp - t->ss_sp <= t->ss_size;
+}
+
+static int32_t altstack_flags(const struct thread *t, uintptr_t sp)
+{
+    if (!t->ss_size)
+        return SS_DISABLE;
+    return (int32_t)((on_altstack(t, sp) ? SS_ONSTACK : 0) | t->ss_flags);
+}
+
+/* Change t's alternate stack (sp: where the thread's user stack is now). */
+static int set_altstack(struct thread *t, uintptr_t sp, const struct user_stack *ss)
+{
+    if (on_altstack(t, sp))
+        return -EPERM;                  /* not while running on it */
+    uint32_t mode = (uint32_t)ss->flags & ~SS_AUTODISARM;
+    if (mode == SS_DISABLE) {
+        t->ss_sp = t->ss_size = 0;
+        t->ss_flags = 0;
+        return 0;
+    }
+    if (mode != 0 && mode != SS_ONSTACK) /* (SS_ONSTACK: old programs pass it) */
+        return -EINVAL;
+    if (ss->size < MINSIGSTKSZ)
+        return -ENOMEM;
+    if (ss->sp >= USER_ADDR_END || ss->size > USER_ADDR_END - ss->sp)
+        return -EFAULT;
+    t->ss_sp = ss->sp;
+    t->ss_size = ss->size;
+    t->ss_flags = (uint32_t)ss->flags & SS_AUTODISARM;
+    return 0;
+}
+
+/* int sigaltstack(const stack_t *ss, stack_t *old_ss) */
+SYSCALL_DEF(sys_sigaltstack)
+{
+    struct thread *t = thread_current();
+    uintptr_t sp = t->uregs ? regs_sp(t->uregs) : 0;
+    struct user_stack old = { t->ss_sp, altstack_flags(t, sp), t->ss_size };
+    if (a1) {
+        struct user_stack ss;
+        if (copy_from_user(&ss, (const void *)a1, sizeof ss) < 0)
+            return -EFAULT;
+        int err = set_altstack(t, sp, &ss);
+        if (err)
+            return err;
+    }
+    if (a2 && copy_to_user((void *)a2, &old, sizeof old) < 0)
+        return -EFAULT;
+    return 0;
+}
+
+uintptr_t sig_frame_top(const struct k_sigaction *a, uintptr_t sp, int *alt)
+{
+    struct thread *t = thread_current();
+    *alt = (a->flags & SA_ONSTACK) && t->ss_size && !on_altstack(t, sp);
+    return *alt ? t->ss_sp + t->ss_size : sp;
+}
+
+void sig_save_altstack(uintptr_t sp, user_addr_t *ss_sp, int32_t *ss_flags, user_addr_t *ss_size)
+{
+    struct thread *t = thread_current();
+    *ss_sp = t->ss_sp;
+    *ss_flags = altstack_flags(t, sp);
+    *ss_size = t->ss_size;
+    if (t->ss_flags & SS_AUTODISARM) {  /* the handler may set up another */
+        t->ss_sp = t->ss_size = 0;
+        t->ss_flags = 0;
+    }
+}
+
+void sig_restore_altstack(user_addr_t ss_sp, int32_t ss_flags, user_addr_t ss_size)
+{
+    struct thread *t = thread_current();
+    struct user_stack ss = { ss_sp, ss_flags & ~SS_ONSTACK, ss_size };
+    set_altstack(t, t->uregs ? regs_sp(t->uregs) : 0, &ss);    /* (as Linux: errors ignored) */
+}
 
 int32_t sys_rt_sigaction_impl(int sig, uintptr_t act, uintptr_t oact, uint32_t size)
 {

@@ -14,7 +14,11 @@
  *
  * Edge-triggered entries (EPOLLET) are reported like level-triggered ones:
  * a program that asked for edges reads until EAGAIN anyway, so it sees no
- * difference except an extra wake-up. EPOLLONESHOT turns an entry off
+ * difference except an extra wake-up. The exception is a file that is
+ * always readable and only says when it changed (file_ops.change_count:
+ * /proc/self/mountinfo). There an edge is a change, and level-triggered
+ * would report it forever: libmount's monitor (GLib, every file dialog)
+ * spun at 100% CPU that way (2026-10-09). EPOLLONESHOT turns an entry off
  * after one report, until EPOLL_CTL_MOD.
  */
 #include <errno.h>
@@ -52,6 +56,7 @@ struct entry {
     uint32_t serial;                /* ...and "matches" means this too, see below */
     uint32_t events;                /* wanted, plus EPOLLET / EPOLLONESHOT */
     uint32_t data[2];
+    uint32_t seen;                  /* change_count files: the count last reported */
 };
 
 struct epoll {
@@ -68,7 +73,7 @@ static const struct file_ops epoll_ops;
 /* What entry k reports now (0: nothing). An entry whose file was closed
    (or whose fd now names another file) is dropped, as Linux does when the
    file goes away. */
-static uint32_t entry_ready(struct epoll *ep, int k)
+static uint32_t entry_ready(struct epoll *ep, int k, int consume)
 {
     struct entry *e = &ep->e[k];
     struct file *f = fd_get(e->fd);
@@ -87,6 +92,13 @@ static uint32_t entry_ready(struct epoll *ep, int k)
         return 0;                   /* a one-shot that fired, not re-armed */
     if (f->ops == &epoll_ops)
         return 0;                   /* nested epolls: not supported */
+    if ((e->events & EPOLLET) && f->ops->change_count) {
+        uint32_t now = f->ops->change_count(f);
+        if (now == e->seen)
+            return 0;                   /* no change since the last report */
+        if (consume)                    /* (poll() on the epoll file only looks) */
+            e->seen = now;
+    }
     uint32_t r = f->ops->poll ? f->ops->poll(f) : (EPOLLIN | EPOLLOUT);
     return r & (e->events | EPOLLERR | EPOLLHUP);
 }
@@ -96,7 +108,7 @@ static int scan(struct epoll *ep, struct epoll_event *out, int max)
 {
     int got = 0;
     for (int k = 0; k < ep->n && got < max; ) {
-        uint32_t r = entry_ready(ep, k);
+        uint32_t r = entry_ready(ep, k, 1);
         if (r == ~0u)
             continue;
         if (r) {
@@ -110,6 +122,26 @@ static int scan(struct epoll *ep, struct epoll_event *out, int max)
         k++;
     }
     return got;
+}
+
+/* poll() on the epoll file itself: readable while an entry is ready, as on
+   Linux. GLib watches libmount's mount monitor this way (an epoll file with
+   /proc/self/mountinfo in it). Without this, every epoll file looked ready
+   forever: GLib's "gmain" thread spun at 100% asking libmount for a change
+   that never came, and the Save As dialog hung (2026-10-09). Work: one look
+   at each entry, like epoll_wait with timeout 0. */
+static uint32_t epoll_poll(struct file *f)
+{
+    struct epoll *ep = f->priv;
+    for (int k = 0; k < ep->n; ) {
+        uint32_t r = entry_ready(ep, k, 0);
+        if (r == ~0u)
+            continue;                   /* dropped: k is the next one now */
+        if (r)
+            return EPOLLIN | 0x040;     /* | EPOLLRDNORM */
+        k++;
+    }
+    return 0;
 }
 
 static int32_t epoll_read(struct file *f, void *b, uint32_t n)
@@ -130,7 +162,7 @@ static void epoll_release(struct file *f)
 }
 
 static const struct file_ops epoll_ops = {
-    .read = epoll_read, .write = epoll_write, .release = epoll_release,
+    .read = epoll_read, .write = epoll_write, .release = epoll_release, .poll = epoll_poll,
 };
 
 static struct epoll *epoll_of(uint32_t fd, int *err)
@@ -167,7 +199,7 @@ static int32_t create(uint32_t flags)
         return fd;
     }
     if (flags & EPOLL_CLOEXEC)
-        proc_current()->cloexec |= 1ull << fd;
+        fd_set_cloexec(proc_current(), fd, 1);
     return fd;
 }
 
@@ -224,6 +256,8 @@ SYSCALL_DEF(sys_epoll_ctl)
         ep->e[k].events = ev.events;
         ep->e[k].data[0] = ev.data[0];
         ep->e[k].data[1] = ev.data[1];
+        /* One report right away, as Linux gives a ready file on ADD/MOD. */
+        ep->e[k].seen = f->ops->change_count ? f->ops->change_count(f) - 1 : 0;
         break;
     case EPOLL_CTL_DEL:
         if (k == ep->n)

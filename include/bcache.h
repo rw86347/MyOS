@@ -45,6 +45,7 @@ void bforget(struct blockdev *dev, uint32_t block, uint32_t size);
 void bdirty(struct buf *b);
 void brelse(struct buf *b);
 int  bsync(void);               /* 0, or -EIO */
+void bcache_drop(struct blockdev *disk);    /* forget a disk and its partitions */
 
 /* For tests and benchmarks: disk reads and writes done so far, and pages
    the cache holds. */

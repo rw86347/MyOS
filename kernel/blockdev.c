@@ -22,7 +22,56 @@ struct blockdev *blockdev_register(const struct blockdev *dev)
         d = &devices[ndevices++];
     }
     irq_restore(flags);
+    if (d) {
+        sysfs_block_add(d);             /* /sys/block/<name> (fs/sysfs.c) */
+        dev_block_add(d);               /* /dev/<name> (fs/dev.c) */
+    }
     return d;
+}
+
+void blockdev_changed(struct blockdev *d)
+{
+    sysfs_block_remove(d);
+    dev_block_remove(d);
+    if (d->sectors) {
+        sysfs_block_add(d);
+        dev_block_add(d);
+    }
+}
+
+struct blockdev *blockdev_by_devnum(unsigned major, unsigned minor)
+{
+    for (int k = 0; k < ndevices; k++) {    /* a few disks: at open and mount only */
+        unsigned ma, mi;
+        blockdev_devnum(&devices[k], &ma, &mi);
+        if (ma == major && mi == minor && devices[k].sectors)
+            return &devices[k];
+    }
+    return NULL;
+}
+
+void blockdev_devnum(const struct blockdev *d, unsigned *major, unsigned *minor)
+{
+    const struct blockdev *disk = d->parent ? d->parent : d;
+    unsigned part = d->parent ? d->partno : 0;
+    const char *n = disk->name;
+    if (n[0] == 's' && n[1] == 'd') {
+        *major = 8;
+        *minor = (unsigned)(n[2] - 'a') * 16 + part;
+    } else if (n[0] == 'h' && n[1] == 'd') {
+        unsigned unit = (unsigned)(n[2] - 'a');
+        *major = unit < 2 ? 3 : 22;
+        *minor = (unit & 1) * 64 + part;
+    } else if (n[0] == 'v' && n[1] == 'd') {
+        *major = 252;
+        *minor = (unsigned)(n[2] - 'a') * 16 + part;
+    } else {                            /* nvme0n1: Linux numbers these in order */
+        *major = 259;
+        *minor = 0;
+        for (int i = 0; i < blockdev_count(); i++)
+            if (blockdev_get(i) == d)
+                *minor = (unsigned)i;
+    }
 }
 
 void blockdev_sd_name(char name[16])

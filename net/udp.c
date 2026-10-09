@@ -8,6 +8,7 @@
  * that, so we accept it. Anything else must match.
  */
 #include <errno.h>
+#include <interrupts.h>
 #include <ipv4.h>
 #include <kheap.h>
 #include <random.h>
@@ -95,12 +96,24 @@ int udp_sendto(uint32_t dst, uint16_t sport, uint16_t dport,
     pkt[7] = 0;
     if (len)
         memcpy(pkt + 8, data, len);
-    uint16_t sum = ip_transport_csum(ipv4_addr, dst, IPPROTO_UDP, pkt, ulen);
+    /* 127.0.0.0/8 is this machine (loopback): the datagram never reaches a
+       wire. It goes straight to the receiving socket, from 127.0.0.1, the
+       way Linux's lo delivers it — DNS caches, X and sound servers, and
+       musl's check that IPv4 works (AI_ADDRCONFIG) talk to themselves so. */
+    int loop = (dst >> 24) == 127;
+    uint32_t src = loop ? 0x7F000001u : ipv4_addr;
+    uint16_t sum = ip_transport_csum(src, dst, IPPROTO_UDP, pkt, ulen);
     if (sum == 0)
         sum = 0xFFFF;               /* a computed checksum is never stored as 0 */
     pkt[6] = (uint8_t)(sum >> 8);
     pkt[7] = (uint8_t)sum;
-    int rc = ip_send(dst, IPPROTO_UDP, pkt, ulen);
+    int rc = 0;
+    if (loop) {
+        unsigned long flags = irq_save();   /* as the net thread runs udp_input */
+        udp_input(src, dst, pkt, ulen);
+        irq_restore(flags);
+    } else
+        rc = ip_send(dst, IPPROTO_UDP, pkt, ulen);
     kfree(pkt);
     return rc;
 }

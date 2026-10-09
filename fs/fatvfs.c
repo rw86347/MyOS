@@ -219,6 +219,8 @@ int fat_vfs_mount(struct blockdev *dev, const char *path)
     fm->m.ops = &fat_fsops;
     fm->m.priv = fm;
     fm->m.type = "vfat";
+    strlcpy(fm->m.source, "/dev/", sizeof fm->m.source);
+    strlcpy(fm->m.source + 5, dev->name, sizeof fm->m.source - 5);
     fm->m.magic = MSDOS_MAGIC;
     int err = vfs_mount(path, &fm->m, fm->fat.root_cluster, 0755);
     if (err) {

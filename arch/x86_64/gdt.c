@@ -53,6 +53,13 @@ struct tss64 {
 static struct gdt_entry gdt[8];
 struct tss64 kernel_tss;
 
+/* A stack for the double fault alone (IST1, interrupts.c). A kernel stack
+   that runs off its end hits its guard page (thread.c); the CPU can't push
+   that page fault's frame onto the full stack, which makes it a double
+   fault — and taken there too, a triple fault: the machine resets with
+   nothing said. IST1 makes the CPU switch to this stack first. */
+static uint8_t df_stack[8192] __attribute__((aligned(16)));
+
 static void set_entry(int i, uint32_t base, uint32_t limit, uint8_t access, uint8_t flags)
 {
     gdt[i].limit_low   = limit & 0xFFFF;
@@ -96,6 +103,7 @@ void gdt_init(void)
     set_entry(5, 0, 0, 0xFA, 0xA);          /* user code, 64-bit, DPL 3 */
 
     kernel_tss.iomap_base = sizeof kernel_tss;  /* no I/O permission map */
+    kernel_tss.ist[0] = (uint64_t)(uintptr_t)(df_stack + sizeof df_stack);
     set_tss(6, (uint64_t)(uintptr_t)&kernel_tss, sizeof kernel_tss - 1);
 
     struct gdt_ptr ptr = { sizeof gdt - 1, (uint64_t)(uintptr_t)gdt };

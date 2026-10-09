@@ -13,7 +13,10 @@
  * constant amount of work (vfs.c). Deleting a big file is the exception:
  * freeing its pages is proportional to its size.
  */
+#include <blockdev.h>
 #include <errno.h>
+#include <ext2.h>
+#include <fat32.h>
 #include <kheap.h>
 #include <proc.h>
 #include <string.h>
@@ -84,12 +87,16 @@ SYSCALL_DEF(sys_mkdir)   { return do_mkdir(AT_FDCWD, a1, a2); }
 SYSCALL_DEF(sys_mkdirat) { return do_mkdir(a1, a2, a3); }
 
 /* int mknod(path, mode, dev) / mknodat(dirfd, path, mode, dev): an empty
-   file, a named pipe (mkfifo), or a device node (`mknod /dev/null c 1 3`).
-   Block devices come later (docs/gaps.md). */
+   file, a named pipe (mkfifo), or a device node (`mknod /dev/null c 1 3`,
+   `mknod /dev/sda b 8 0`). Device nodes are root's only, as on Linux
+   (CAP_MKNOD): anyone else could make a node for the raw disk somewhere
+   they own and read around every file's permissions. */
 static int32_t do_mknod(uint32_t dirfd, uintptr_t user_path, uint32_t mode, uint32_t dev)
 {
     uint32_t type = mode & S_IFMT ? mode & S_IFMT : S_IFREG;
-    if (type != S_IFREG && type != S_IFCHR && type != S_IFIFO)
+    if (type != S_IFREG && type != S_IFCHR && type != S_IFBLK && type != S_IFIFO)
+        return -EPERM;
+    if ((type == S_IFCHR || type == S_IFBLK) && proc_current()->cred.euid != 0)
         return -EPERM;
     char path[PATH_MAX];
     struct inode *dir, *i;
@@ -98,8 +105,8 @@ static int32_t do_mknod(uint32_t dirfd, uintptr_t user_path, uint32_t mode, uint
     int err = parent_of(dirfd, user_path, path, &dir, &name, &len);
     if (!err)                           /* rdev: (major << 8) | minor */
         err = vfs_create(dir, name, len, type | umasked(mode),
-                         type == S_IFCHR ? dev & 0xFFFF : 0, &i);
-    if (!err && type == S_IFCHR)
+                         type == S_IFCHR || type == S_IFBLK ? dev & 0xFFFF : 0, &i);
+    if (!err && (type == S_IFCHR || type == S_IFBLK))
         dev_attach(i);                  /* known numbers get their driver */
     return err;
 }
@@ -443,7 +450,7 @@ SYSCALL_DEF(sys_memfd_create)
         return fd;
     }
     if ((a2 & MFD_CLOEXEC) && p)
-        p->cloexec |= 1ull << fd;
+        fd_set_cloexec(p, fd, 1);
     return fd;
 }
 
@@ -599,12 +606,47 @@ static uint32_t tmpfs_mode(uintptr_t user_data)
     return mode;
 }
 
+/* ext2 or vfat from a disk file (/dev/sda2), as the installer mounts the
+   system it just made. Root only. Not a disk that is mounted already, nor
+   one a program has open for writing (dev.c): the two caches would
+   overwrite each other's work. */
+static int32_t mount_disk(uintptr_t user_source, const char *target, int ext2)
+{
+    char source[PATH_MAX];
+    struct inode *i;
+    if (proc_current()->cred.euid != 0)
+        return -EPERM;
+    int err = get_path(source, user_source);
+    if (!err)
+        err = vfs_lookup(source, &i);
+    if (err)
+        return err;
+    if (!S_ISBLK(i->mode))
+        return -ENOTBLK;
+    struct blockdev *d = blockdev_by_devnum(i->rdev >> 8, i->rdev & 0xFF);
+    if (!d)
+        return -ENXIO;
+    for (int k = 0; k < vfs_mount_count(); k++) {
+        struct mount *m = vfs_mount_at(k);
+        if (m && !strncmp(m->source, "/dev/", 5) && !strcmp(m->source + 5, d->name))
+            return -EBUSY;
+    }
+    if (blkdev_busy(d))
+        return -EBUSY;
+    return ext2 ? ext2_mount(d, target) : fat_vfs_mount(d, target);
+}
+
 /* mount(source, target, fstype, flags, data) */
 SYSCALL_DEF(sys_mount)
 {
     char target[PATH_MAX], type[16];
     struct inode *i;
     uint32_t flags = a4;
+    /* Root only, every kind (Linux: CAP_SYS_ADMIN). Anyone else could
+       mount an empty tmpfs over /etc, write their own passwd or
+       doas.conf there, and become root. */
+    if (proc_current()->cred.euid != 0)
+        return -EPERM;
     if ((flags & MS_MGC_MSK) == MS_MGC_VAL)
         flags &= ~MS_MGC_MSK;
     int err = get_path(target, a2);
@@ -629,14 +671,15 @@ SYSCALL_DEF(sys_mount)
         return -EFAULT;
     if (n < 0)
         return -ENODEV;                 /* too long to be a type we know */
-    if (strcmp(type, "tmpfs") == 0)
-        return vfs_mount_ram(target, tmpfs_mode(a5));
-    if (strcmp(type, "proc") == 0)
-        return procfs_mount(target);
-    if (strcmp(type, "sysfs") == 0)
-        return sysfs_mount(target);
+    if (strcmp(type, "tmpfs") == 0 || strcmp(type, "proc") == 0 || strcmp(type, "sysfs") == 0) {
+        err = type[0] == 't' ? vfs_mount_ram(target, tmpfs_mode(a5))
+            : type[0] == 'p' ? procfs_mount(target) : sysfs_mount(target);
+        if (!err)                       /* for /proc/mounts */
+            vfs_note_mount(target, type[0] == 't' ? "tmpfs" : type[0] == 'p' ? "proc" : "sysfs");
+        return err;
+    }
     if (strcmp(type, "ext2") == 0 || strcmp(type, "vfat") == 0)
-        return -ENOTBLK;                /* no block device files to name */
+        return mount_disk(a1, target, type[0] == 'e');
     return -ENODEV;
 }
 

@@ -49,12 +49,16 @@ extern const uint32_t isr_stub_table[32 + NR_IRQS];    /* from isr.asm */
 extern char isr_syscall[];
 extern char isr_spurious[];
 
+static void double_fault(void);
+
 /* type_attr 0x8E = present | ring 0 | 32-bit interrupt gate.
    An "interrupt gate" turns interrupts off while the handler runs, so a
    handler is never interrupted halfway by another IRQ.
    The ring ("DPL", bits 5-6) is who may trigger the vector with an `int`
-   instruction. Ring 0 for everything except int 0x80, which is ring 3
-   (0xEE): otherwise a user program could fake a page fault or timer tick. */
+   instruction. Ring 0 for everything except int 0x80, int3 and into, which
+   are ring 3 (0xEE) as on Linux: otherwise a user program could fake a page
+   fault or timer tick, and its int3 would be a protection fault, not the
+   SIGTRAP debuggers and Chromium's CHECKs expect. */
 static void set_gate(int vector, uint32_t handler, int user_allowed)
 {
     idt[vector].offset_low  = handler & 0xFFFF;
@@ -67,9 +71,13 @@ static void set_gate(int vector, uint32_t handler, int user_allowed)
 void idt_init(void)
 {
     for (int v = 0; v < 32 + NR_IRQS; v++)
-        set_gate(v, isr_stub_table[v], 0);
+        set_gate(v, isr_stub_table[v], v == 3 || v == 4);   /* int3, into: SIGTRAP, SIGSEGV */
     set_gate(0x80, (uint32_t)(uintptr_t)isr_syscall, 1);
     set_gate(0xFF, (uint32_t)(uintptr_t)isr_spurious, 0);
+    /* The double fault: a task gate (type 5), so it runs on a stack of its
+       own even when the kernel stack is the thing that broke (gdt.c). */
+    tss_double_fault_init(double_fault);
+    idt[8] = (struct idt_gate){ 0, GDT_DF_TSS, 0, 0x85, 0 };
     /* The other vectors stay empty (not present). Using one would cause a
        General Protection fault, which we do catch. */
 
@@ -207,6 +215,10 @@ static void exception(struct regs *r)
                 r->err_code & 1 ? "permission denied" : "page not mapped");
     }
     kprintf("EIP=%08lx  CS=%04lx  EFLAGS=%08lx  CR2=%08lx\n", r->eip, r->cs, r->eflags, cr2);
+    struct thread *over = thread_stack_guard(cr2);
+    if (r->vector == 14 && over)
+        kprintf("KERNEL STACK OVERFLOW: thread \"%s\" ran off the end of its %u-byte "
+                "stack (stopped at its guard page)\n", over->name, (unsigned)THREAD_STACK);
     kprintf("EAX=%08lx EBX=%08lx ECX=%08lx EDX=%08lx\n", r->eax, r->ebx, r->ecx, r->edx);
     kprintf("ESI=%08lx EDI=%08lx EBP=%08lx\n", r->esi, r->edi, r->ebp);
     /* Who called whom: return addresses on the stack (no frame pointers,
@@ -217,7 +229,8 @@ static void exception(struct regs *r)
         struct thread *t = thread_current();
         uint32_t sp = (uint32_t)&r->user_esp;
         uint32_t top = t && t->stack ? (uint32_t)t->stack + THREAD_STACK : (uint32_t)boot_stack_top;
-        if (sp < top && top - sp <= 16384) {
+        uint32_t bottom = t && t->stack ? (uint32_t)t->stack : top - 16384;
+        if (sp >= bottom && sp < top) {
             kprintf("In thread \"%s\"; called from (newest first):", t ? t->name : "?");
             int n = 0;
             for (const uint32_t *p = (const uint32_t *)sp; (uint32_t)p < top && n < 16; p++)
@@ -229,6 +242,39 @@ static void exception(struct regs *r)
     kprintf("System halted. (Look up EIP with: i686-elf-addr2line -e build/kernel.elf %lx)\n",
             r->eip);
     serial_flush();                 /* interrupts are off: send it all now */
+    for (;;)
+        __asm__ volatile ("cli; hlt");
+}
+
+/* The double-fault task (gdt.c): on its own stack, interrupts off. The
+   code that faulted left its registers in the kernel's TSS. Never returns:
+   a double fault in the kernel is always a bug. */
+static void double_fault(void)
+{
+    uint32_t cr2, eip, esp;
+    __asm__ volatile ("mov %%cr2, %0" : "=r"(cr2));
+    tss_saved_state(&eip, &esp);
+    struct thread *t = thread_current(), *over = thread_stack_guard(cr2);
+    kprintf("\n*** CPU EXCEPTION 8: Double fault ***\n");
+    kprintf("EIP=%08lx ESP=%08lx CR2=%08lx in thread \"%s\"\n", (unsigned long)eip,
+            (unsigned long)esp, (unsigned long)cr2, t ? t->name : "?");
+    if (over)
+        kprintf("KERNEL STACK OVERFLOW: thread \"%s\" ran off the end of its %u-byte "
+                "stack (stopped at its guard page)\n", over->name, (unsigned)THREAD_STACK);
+    /* The deepest calls: return addresses from the bottom of the stack. */
+    extern char __text_start[], __text_end[];
+    if (t && t->stack) {
+        kprintf("called from (newest first):");
+        int n = 0;
+        for (const uint32_t *p = t->stack; (uint8_t *)p < (uint8_t *)t->stack + THREAD_STACK
+             && n < 16; p++)
+            if (*p >= (uint32_t)__text_start && *p < (uint32_t)__text_end)
+                kprintf("%s%08lx", n++ % 6 ? " " : "\n  ", (unsigned long)*p);
+        kprintf("\n");
+    }
+    kprintf("System halted. (Look up EIP with: i686-elf-addr2line -e build/kernel.elf %lx)\n",
+            (unsigned long)eip);
+    serial_flush();
     for (;;)
         __asm__ volatile ("cli; hlt");
 }

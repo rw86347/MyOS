@@ -779,7 +779,10 @@ static void lease_thread(void *arg)
         dev->in4.gw = ipv4_gw = l.gw;
         dev->in4.dns = ipv4_dns = l.dns;
         print_ip("ipv4: ", ipv4_addr);
-        kprintf(" on %s\n", dev->name);
+        kprintf(" on %s", dev->name);
+        print_ip(" gateway ", ipv4_gw);
+        print_ip(" dns ", ipv4_dns);
+        kprintf("\n");
     }
     thread_exit();
 }

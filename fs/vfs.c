@@ -263,6 +263,57 @@ static void detach(struct inode *i)
         inode_free(i);                  /* else: when its last user is done */
 }
 
+#define NOTED_MAX 16
+static struct { char path[64]; const char *type; } noted[NOTED_MAX];
+static int nnoted;
+
+/* Bumped whenever the mount table changes: /proc/self/mountinfo's poll
+   tells watchers (GLib, libmount) "changed" from it, as Linux does. */
+static uint32_t mount_gen;
+
+uint32_t vfs_mount_gen(void) { return mount_gen; }
+
+static void mounts_changed(void)
+{
+    mount_gen++;
+    wq_wake_all(&poll_wait);            /* anyone poll()ing a mount table */
+}
+
+void vfs_note_mount(const char *path, const char *type)
+{
+    mounts_changed();
+    for (int k = 0; k < nnoted; k++)
+        if (!strcmp(noted[k].path, path)) {
+            noted[k].type = type;       /* mounted again over it */
+            return;
+        }
+    if (nnoted == NOTED_MAX)
+        return;
+    strlcpy(noted[nnoted].path, path, sizeof noted[0].path);
+    noted[nnoted++].type = type;
+}
+
+int vfs_noted_count(void) { return nnoted; }
+
+void vfs_noted_at(int i, const char **path, const char **type)
+{
+    *path = noted[i].path;
+    *type = noted[i].type;
+}
+
+void vfs_remove(struct inode *i)
+{
+    if (S_ISDIR(i->mode)) {
+        struct inode *next;
+        for (struct inode *c = i->children; c; c = next) {
+            next = c->next_sibling;
+            if (c->mode)                /* not an open listing's cursor */
+                vfs_remove(c);
+        }
+    }
+    detach(i);
+}
+
 /* Make the new node real: on the disk too, if dir is on one. If the disk
    says no (full, broken), the node goes away again. */
 static int commit_node(struct inode *dir, struct inode *i, struct inode **out)
@@ -507,6 +558,7 @@ int vfs_mount(const char *path, struct mount *m, uint32_t root_ino, uint32_t mod
     m->root = r;
     m->dev_minor = 2 + nmounts;         /* "device 0:2", 0:3, ... */
     mounts[nmounts++] = m;
+    mounts_changed();
     return 0;
 }
 
@@ -655,21 +707,15 @@ static int walk(struct inode *dir, const char *path, uint32_t len, int follow_la
         if (next->flags & I_PROC_FD) {
             /* Following one gives the open file's own inode, not a path
                looked up again (Linux's "magic" links): O(1), and right
-               even for a deleted file. Pipes and sockets aren't in the
-               tree and can't be opened again this way. */
+               even for a deleted file — memfd, and a deleted-but-open file
+               (Firefox reopens a memfd read-only this way). A pipe's or a
+               socket's inode too: stat() through the link describes it, as
+               on Linux (Chromium counts its fds so); open() refuses it. */
             struct file *f = fd_get(next->fs_ino);
             if (!f || !f->inode)
                 return -ENOENT;         /* the caller has no such fd */
-            if (!last || follow_last) {
-                struct inode *t = f->inode;
-                /* Pipes and sockets aren't in the tree and can't be opened
-                   again this way. An unlinked regular file can — memfd and
-                   a deleted-but-open file — which is how Firefox makes a
-                   read-only copy of a memfd. */
-                if (S_ISFIFO(t->mode) || (t->mode & S_IFMT) == S_IFSOCK)
-                    return -ENXIO;
-                next = t;
-            }
+            if (!last || follow_last)
+                next = f->inode;
         } else if (next->flags & I_PROC_EXE) {
             struct process *p = proc_current();
             if (!p || !p->exe)
@@ -857,6 +903,9 @@ int vfs_open_at(struct inode *dir, const char *path, uint32_t flags, uint32_t mo
     }
     if (S_ISLNK(i->mode))
         return -ELOOP;              /* O_NOFOLLOW on a symlink */
+    if ((i->mode & S_IFMT) == S_IFSOCK || (S_ISFIFO(i->mode) && !i->parent))
+        return -ENXIO;              /* a socket, or a pipe reached through
+                                       /proc/self/fd: not opened again */
     if ((flags & O_DIRECTORY) && !S_ISDIR(i->mode))
         return -ENOTDIR;
     int writing = (flags & O_ACCMODE) != O_RDONLY;
@@ -866,7 +915,9 @@ int vfs_open_at(struct inode *dir, const char *path, uint32_t flags, uint32_t mo
         return fifo_open(i, flags, out);
     if (!i->ops && !S_ISREG(i->mode) && !S_ISDIR(i->mode))
         return -ENXIO;              /* a device node with no driver */
-    if ((flags & O_TRUNC) && writing && S_ISREG(i->mode)) {
+    /* O_TRUNC means nothing to the kernel's own files (/proc, /sys): Linux
+       ignores it there, and `echo t > /proc/sysrq-trigger` asks for it. */
+    if ((flags & O_TRUNC) && writing && S_ISREG(i->mode) && !(i->ops && !i->fs)) {
         err = vfs_truncate(i, 0);
         if (err)
             return err;
@@ -907,26 +958,94 @@ void file_put(struct file *f)
 /* --- file descriptors ----------------------------------------------------- */
 /* An fd is an index into the current process's file table. */
 
-int fd_install(struct file *f)
+void fd_table_init(struct process *p)
 {
-    struct file **files = proc_current()->files;
-    for (int fd = 0; fd < FD_MAX; fd++) {       /* lowest free fd, like POSIX */
-        if (!files[fd]) {
-            files[fd] = f;
+    p->files = p->files_base;
+    p->nfiles = PROC_FILES_BASE;
+    p->cloexec = p->cloexec_base;
+    memset(p->files_base, 0, sizeof p->files_base);
+    memset(p->cloexec_base, 0, sizeof p->cloexec_base);
+}
+
+/* Double the table until fd fits (at most PROC_FILES). A new table is
+   copied whole: fds stay where they are, pointers into the old one don't
+   (nobody keeps any). Rare: only programs past 64 open files grow. */
+static int fd_grow(struct process *p, int fd)
+{
+    if (fd < (int)p->nfiles)
+        return 0;
+    if (fd >= PROC_FILES)
+        return -EMFILE;
+    uint32_t n = p->nfiles;
+    while ((int)n <= fd)
+        n *= 2;
+    struct file **files = kmalloc(n * sizeof *files);
+    uint64_t *cloexec = kmalloc(n / 64 * sizeof *cloexec);
+    if (!files || !cloexec) {
+        kfree(files);
+        kfree(cloexec);
+        return -EMFILE;
+    }
+    memcpy(files, p->files, p->nfiles * sizeof *files);
+    memset(files + p->nfiles, 0, (n - p->nfiles) * sizeof *files);
+    memcpy(cloexec, p->cloexec, p->nfiles / 64 * sizeof *cloexec);
+    memset(cloexec + p->nfiles / 64, 0, (n - p->nfiles) / 64 * sizeof *cloexec);
+    if (p->files != p->files_base) {
+        kfree(p->files);
+        kfree(p->cloexec);
+    }
+    p->files = files;
+    p->cloexec = cloexec;
+    p->nfiles = n;
+    return 0;
+}
+
+void fd_set_cloexec(struct process *p, int fd, int on)
+{
+    if (fd < 0 || fd >= (int)p->nfiles)
+        return;
+    if (on)
+        p->cloexec[fd / 64] |= 1ull << (fd % 64);
+    else
+        p->cloexec[fd / 64] &= ~(1ull << (fd % 64));
+}
+
+int fd_get_cloexec(const struct process *p, int fd)
+{
+    return fd >= 0 && fd < (int)p->nfiles && (p->cloexec[fd / 64] >> (fd % 64) & 1);
+}
+
+int fd_install_min(struct file *f, int min)
+{
+    struct process *p = proc_current();
+    if (min < 0 || min >= PROC_FILES)
+        return -EINVAL;
+    for (int fd = min; fd < (int)p->nfiles; fd++)  /* lowest free fd, like POSIX */
+        if (!p->files[fd]) {
+            p->files[fd] = f;
+            fd_set_cloexec(p, fd, 0);
             return fd;
         }
-    }
-    return -EMFILE;
+    int fd = (int)p->nfiles > min ? (int)p->nfiles : min;
+    if (fd_grow(p, fd) < 0)
+        return -EMFILE;
+    p->files[fd] = f;
+    return fd;
+}
+
+int fd_install(struct file *f)
+{
+    return fd_install_min(f, 0);
 }
 
 int fd_install_at(int fd, struct file *f)
 {
-    if (fd < 0 || fd >= FD_MAX)
-        return -EBADF;
     struct process *p = proc_current();
+    if (fd < 0 || fd >= FD_MAX || fd_grow(p, fd) < 0)
+        return -EBADF;
     struct file *old = p->files[fd];
     p->files[fd] = f;
-    p->cloexec &= ~(1ull << fd);
+    fd_set_cloexec(p, fd, 0);
     if (old) {
         lock_close(p, old->inode);
         file_put(old);              /* dup2 closes what was there */
@@ -937,7 +1056,7 @@ int fd_install_at(int fd, struct file *f)
 struct file *fd_get(int fd)
 {
     struct process *p = proc_current();
-    if (fd < 0 || fd >= FD_MAX || !p)
+    if (!p || fd < 0 || fd >= (int)p->nfiles)
         return NULL;
     return p->files[fd];
 }
@@ -949,7 +1068,7 @@ int fd_close(int fd)
         return -EBADF;
     struct process *p = proc_current();
     p->files[fd] = NULL;
-    p->cloexec &= ~(1ull << fd);
+    fd_set_cloexec(p, fd, 0);
     lock_close(p, f->inode);            /* POSIX: any close drops its record locks */
     file_put(f);
     return 0;
@@ -963,21 +1082,31 @@ void fd_open_console(struct process *p)
     }
 }
 
+/* fork: the child gets a table as big as the parent's, the same open
+   files (shared) and the same close-on-exec bits. */
 void fd_copy_all(struct process *dst, struct process *src)
 {
-    for (int fd = 0; fd < FD_MAX; fd++) {
+    if (src->nfiles > dst->nfiles && fd_grow(dst, (int)src->nfiles - 1) < 0)
+        return;                         /* (cannot happen for 64; else: no files) */
+    for (uint32_t fd = 0; fd < src->nfiles; fd++) {
         dst->files[fd] = src->files[fd];
         if (dst->files[fd])
             dst->files[fd]->refs++;     /* fork: both share the open file */
     }
+    memcpy(dst->cloexec, src->cloexec, src->nfiles / 64 * sizeof *src->cloexec);
 }
 
 void fd_close_all(struct process *p)
 {
-    for (int fd = 0; fd < FD_MAX; fd++) {
+    for (uint32_t fd = 0; fd < p->nfiles; fd++) {
         if (p->files[fd]) {
             file_put(p->files[fd]);
             p->files[fd] = NULL;
         }
+    }
+    if (p->files != p->files_base) {    /* back to the built-in table */
+        kfree(p->files);
+        kfree(p->cloexec);
+        fd_table_init(p);
     }
 }

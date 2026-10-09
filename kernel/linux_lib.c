@@ -375,60 +375,11 @@ void print_hex_dump(const char *level, const char *prefix, int type, int rowsize
 
 /* --- strings -------------------------------------------------------------- */
 
-int strncmp(const char *a, const char *b, size_t n)
-{
-    for (; n; n--, a++, b++) {
-        if (*a != *b)
-            return (unsigned char)*a - (unsigned char)*b;
-        if (!*a)
-            return 0;
-    }
-    return 0;
-}
 
-int strncasecmp(const char *a, const char *b, size_t n)
-{
-    for (; n; n--, a++, b++) {
-        int x = *a >= 'A' && *a <= 'Z' ? *a + 32 : *a, y = *b >= 'A' && *b <= 'Z' ? *b + 32 : *b;
-        if (x != y)
-            return x - y;
-        if (!x)
-            return 0;
-    }
-    return 0;
-}
 
-size_t strnlen(const char *s, size_t max)
-{
-    size_t n = 0;
-    while (n < max && s[n])
-        n++;
-    return n;
-}
 
-char *strncpy(char *dst, const char *src, size_t n)
-{
-    size_t k = 0;
-    for (; k < n && src[k]; k++)
-        dst[k] = src[k];
-    for (; k < n; k++)
-        dst[k] = '\0';
-    return dst;
-}
 
-char *strcpy(char *dst, const char *src)
-{
-    char *d = dst;
-    while ((*d++ = *src++))
-        ;
-    return dst;
-}
 
-char *strcat(char *dst, const char *src)
-{
-    strcpy(dst + strlen(dst), src);
-    return dst;
-}
 
 /* Copy with a NUL always written: the length, or -E2BIG if src was cut. */
 ssize_t strscpy(char *dst, const char *src, size_t size)
@@ -445,62 +396,11 @@ ssize_t strscpy(char *dst, const char *src, size_t size)
     return (ssize_t)n;
 }
 
-size_t strlcpy(char *dst, const char *src, size_t size)
-{
-    size_t n = strlen(src);
-    if (size) {
-        size_t k = n < size - 1 ? n : size - 1;
-        memcpy(dst, src, k);
-        dst[k] = '\0';
-    }
-    return n;
-}
 
-char *strchr(const char *s, int c)
-{
-    for (;; s++) {
-        if (*s == (char)c)
-            return (char *)s;
-        if (!*s)
-            return NULL;
-    }
-}
 
-char *strrchr(const char *s, int c)
-{
-    const char *last = NULL;
-    for (;; s++) {
-        if (*s == (char)c)
-            last = s;
-        if (!*s)
-            return (char *)last;
-    }
-}
 
-char *strnstr(const char *h, const char *n, size_t len)
-{
-    size_t m = strlen(n);
-    if (!m)
-        return (char *)h;
-    for (; len >= m && *h; h++, len--)
-        if (!memcmp(h, n, m))
-            return (char *)h;
-    return NULL;
-}
 
-char *strstr(const char *h, const char *n)
-{
-    return strnstr(h, n, strlen(h));
-}
 
-void *memchr(const void *s, int c, size_t n)
-{
-    const unsigned char *p = s;
-    for (; n; n--, p++)
-        if (*p == (unsigned char)c)
-            return (void *)p;
-    return NULL;
-}
 
 /* The first byte that is NOT c, or NULL if all are. */
 void *memchr_inv(const void *s, int c, size_t n)

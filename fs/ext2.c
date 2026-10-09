@@ -1496,6 +1496,8 @@ int ext2_mount(struct blockdev *dev, const char *path)
     fs->m.ops = &ext2_ops;
     fs->m.priv = fs;
     fs->m.type = "ext2";
+    strlcpy(fs->m.source, "/dev/", sizeof fs->m.source);
+    strlcpy(fs->m.source + 5, fs->dev->name, sizeof fs->m.source - 5);
     struct ext2_inode *rdi;
     struct buf *rb = get_inode(fs, ROOT_INO, &rdi);
     int err = rb ? vfs_mount(path, &fs->m, ROOT_INO, rdi->mode) : -EIO;

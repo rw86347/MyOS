@@ -17,7 +17,15 @@
 #else
 #define THREAD_MAX      256
 #endif
-#define THREAD_STACK    8192          /* bytes of kernel stack per thread */
+/* Bytes of kernel stack per thread (and a guard page under each: thread.c).
+   64-bit code takes about twice the stack of 32-bit code (8-byte words and
+   return addresses, more registers saved), so x86_64 has 16 KiB as Linux
+   does, and i386 8 KiB as Linux had. */
+#ifdef ARCH_X86_64
+#define THREAD_STACK    16384
+#else
+#define THREAD_STACK    8192
+#endif
 
 struct process;
 struct regs;
@@ -50,6 +58,10 @@ struct thread {
     uint64_t sig_pending, sig_blocked;
     uint64_t sig_saved;               /* sigsuspend: mask to restore */
     int sig_restore;
+    /* sigaltstack: where handlers with SA_ONSTACK run (ss_size 0: none),
+       and SS_AUTODISARM if it was asked for. */
+    uintptr_t ss_sp, ss_size;
+    uint32_t ss_flags;
     /* Non-zero while this thread's or its process's pending set may be
        non-empty: the one word SIGNAL_CHECK reads on every return to user
        mode (Linux's TIF_SIGPENDING). Set by whoever makes a signal
@@ -67,6 +79,7 @@ struct thread {
                                          syscall (fork copies them) */
     struct wait_queue *wq;            /* the queue it sleeps on (or NULL) */
     struct thread *wq_next;           /* next sleeper on the same wait queue */
+    struct thread *dead_next;         /* exited, its stack not yet handed back (thread.c) */
     struct thread *rq_next, *rq_prev; /* the run queue: all READY threads */
     uint8_t owns_slot;                /* has slots in the slot table (sched.c) */
     uint8_t is_idle;                  /* the idle thread */
@@ -79,6 +92,18 @@ struct thread {
                                          (GDT entries 6-8; set_thread_area) */
     uint32_t wake_at;                 /* timed sleep: wake at this ms (0: none) */
     struct thread *timer_next;        /* the list of timed sleepers */
+#ifdef SYS_TRACE
+    /* make SYSTRACE=1: its last SYSTRACE_N system calls, printed when it
+       faults (thread_trace_dump) — what a crashing program asked for last. */
+#define SYSTRACE_N 32
+    struct {
+        uint32_t ms;                  /* when it returned (timer_ms) */
+        uint16_t nr;
+        intptr_t ret;
+        uintptr_t a[4];
+    } trace[SYSTRACE_N];
+    uint32_t trace_at;                /* calls recorded so far */
+#endif
     uint8_t fpu_state[FPU_STATE_SIZE] __attribute__((aligned(16)));
 };
 
@@ -118,6 +143,13 @@ int thread_id(const struct thread *t);
 
 /* The i-th entry of the thread table (0 <= i < THREAD_MAX). */
 struct thread *thread_at(int i);
+#ifdef SYS_TRACE
+/* The calls t made last (all SYSTRACE_N of them, or the last `n`). */
+void thread_trace_dump(struct thread *t, uint32_t n);
+/* The faulting thread's recorder, then the last few calls of every other
+   thread of its process: who did what, just before. */
+void thread_trace_process(struct thread *t);
+#endif
 
 /* Rename a thread (execve: the new program's name). */
 void thread_set_name(struct thread *t, const char *name);
@@ -128,6 +160,24 @@ uint32_t thread_generation(void);
 
 /* The thread with this name, or NULL. (Dead threads are skipped.) */
 struct thread *thread_find(const char *name);
+
+/* The thread whose stack's guard page holds `addr` — the one that ran off
+   the end of its kernel stack — or NULL. For the crash report. O(1). */
+struct thread *thread_stack_guard(uintptr_t addr);
+
+/* Every thread, one line each: its state, the system call it waits in,
+   a futex it waits on, its kernel call chain (Alt+SysRq+T, or "t" into
+   /proc/sysrq-trigger). For hangs. */
+void thread_dump(void);
+
+/* Pages the kernel stacks hold. Like the heap, the pool keeps them for the
+   next thread (thread.c), so they are not a leak. */
+uint32_t thread_stack_pages(void);
+
+#ifdef STACK_DEPTH
+/* make STACKDEPTH=1: print the deepest any kernel stack has gone yet. */
+void thread_stack_report(void);
+#endif
 
 /* The live user thread with this tid, or NULL (tkill/tgkill; not a hot
    path: a scan of THREAD_MAX entries). */

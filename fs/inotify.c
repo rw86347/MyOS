@@ -292,7 +292,7 @@ SYSCALL_DEF(sys_inotify_init1)
         return fd;
     }
     if (a1 & IN_CLOEXEC)
-        proc_current()->cloexec |= 1ull << fd;
+        fd_set_cloexec(proc_current(), fd, 1);
     return fd;
 }
 

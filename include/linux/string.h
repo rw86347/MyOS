@@ -1,24 +1,12 @@
 #ifndef LINUX_STRING_H
 #define LINUX_STRING_H
 
-/* The kernel's string.h (memcpy, strlen, ...) plus what Linux drivers add. */
+/* The kernel's string.h (memcpy, strncpy, strchr, ...) plus what only Linux has. */
 #include <linux/types.h>
 #include <string.h>
 
-int    strncmp(const char *a, const char *b, size_t n);
-char  *strncpy(char *dst, const char *src, size_t n);
 ssize_t strscpy(char *dst, const char *src, size_t size);
 #define strscpy_pad(d, s, n)  ({ memset(d, 0, n); strscpy(d, s, n); })
-size_t strlcpy(char *dst, const char *src, size_t size);
-size_t strnlen(const char *s, size_t max);
-char  *strchr(const char *s, int c);
-char  *strrchr(const char *s, int c);
-char  *strstr(const char *h, const char *n);
-char  *strnstr(const char *h, const char *n, size_t len);
-char  *strcpy(char *dst, const char *src);
-char  *strcat(char *dst, const char *src);
-int    strncasecmp(const char *a, const char *b, size_t n);
-void  *memchr(const void *s, int c, size_t n);
 void  *memchr_inv(const void *s, int c, size_t n);
 #define memzero_explicit(p, n) do { memset(p, 0, n); barrier(); } while (0)
 int    sysfs_streq(const char *a, const char *b);

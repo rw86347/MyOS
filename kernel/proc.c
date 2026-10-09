@@ -19,6 +19,7 @@
 #include <proc.h>
 #include <string.h>
 #include <thread.h>
+#include <timer.h>
 #include <uaccess.h>
 #include <usermode.h>
 #include <vfs.h>
@@ -46,6 +47,8 @@ struct process *proc_find(int pid)
     return NULL;
 }
 
+int proc_next_pid(void) { return next_pid; }
+
 void proc_set_init(struct process *p)
 {
     init_proc = p;
@@ -58,12 +61,15 @@ static struct process *proc_alloc(void)
         struct process *p = &procs[i];
         if (p->state == PROC_FREE) {
             memset(p, 0, sizeof *p);
+            fd_table_init(p);
             p->pid = next_pid++;
             p->state = PROC_ALIVE;
             p->cwd = vfs_root();
             vfs_get(p->cwd);
             p->umask = 022;
             p->pgid = p->sid = p->pid;  /* its own group and session */
+            p->start_ms = timer_ms();
+            procfs_pid_add(p->pid);     /* /proc/<pid> */
             return p;
         }
     }
@@ -89,6 +95,7 @@ static void reap(struct process *p)
         p->root = NULL;
     }
     proc_clear_exe(p);
+    procfs_pid_remove(p->pid);
     p->state = PROC_FREE;
 }
 
@@ -293,6 +300,8 @@ static int clone_thread(uint32_t flags, uintptr_t new_sp, uintptr_t parent_tid,
         t->tls[slot] = desc;
     if (flags & CLONE_CHILD_CLEARTID)
         t->clear_tid = child_tid;
+    t->ss_sp = t->ss_size = 0;          /* a thread starts without the */
+    t->ss_flags = 0;                    /* creator's alternate stack (Linux) */
     t->sig_check = p->sig_pending != 0; /* (blocked ones it may take) */
     irq_restore(irq);
     /* Same address space, so writing the tid here is the same as the child
@@ -359,9 +368,10 @@ int proc_fork_frame(const struct regs *frame, struct process **child_out)
     child->cred = parent->cred;         /* same users and groups */
     child->pgid = parent->pgid;         /* same job, same session */
     child->sid = parent->sid;
+    memcpy(child->cmdline, parent->cmdline, parent->cmdline_len);
+    child->cmdline_len = parent->cmdline_len;
     signal_fork(child, parent);
-    child->cloexec = parent->cloexec;
-    fd_copy_all(child, parent);         /* same open files, shared */
+    fd_copy_all(child, parent);         /* same open files, shared, same close-on-exec */
     if (parent->exe) {
         vfs_get(parent->exe);
         child->exe = parent->exe;
@@ -547,19 +557,30 @@ int proc_execve(uintptr_t user_path, uintptr_t user_argv, uintptr_t user_envp)
     struct thread *me = thread_current();
     me->tid = p->pid;                   /* it now is the main thread */
     me->clear_tid = 0;
+    me->ss_sp = me->ss_size = 0;        /* the old program's signal stack */
+    me->ss_flags = 0;
 
     /* 4. Point of no return: the old program is gone. */
     p->mm = new_mm;
     p->cred = cred;
     mm_destroy(old_mm);
-    for (int fd = 0; fd < PROC_FILES; fd++)
-        if (p->cloexec & (1ull << fd))
-            fd_close(fd);               /* close-on-exec files */
-    p->cloexec = 0;
+    for (int fd = 0; fd < (int)p->nfiles; fd++)
+        if (fd_get_cloexec(p, fd))
+            fd_close(fd);               /* close-on-exec files (clears the bit) */
     signal_exec(p);                     /* handlers were in the old program */
     proc_clear_exe(p);
     p->exe = exe;                       /* reference from program_load */
     thread_set_name(thread_current(), base_name(prog));
+    /* Its command line, as /proc/<pid>/cmdline shows it: each argument and
+       a NUL, as much as fits (ps, top, pgrep -f read it). */
+    p->cmdline_len = 0;
+    for (int k = 0; a->argv[k]; k++) {
+        uint32_t n = (uint32_t)strlen(a->argv[k]) + 1;
+        if (p->cmdline_len + n > sizeof p->cmdline)
+            break;
+        memcpy(p->cmdline + p->cmdline_len, a->argv[k], n);
+        p->cmdline_len = (uint16_t)(p->cmdline_len + n);
+    }
 #ifdef TRACE_EXEC
     /* make TRACE=1: every program started, on the screen, for machines
        with no serial port to read a log from (docs/LOG.md, 2026-10-06). */
@@ -695,9 +716,20 @@ void proc_thread_exit(int status)
     thread_leave(p);
 }
 
-#define WNOHANG 1
+#define WNOHANG  1
+#define WEXITED  4
+#define WNOWAIT  0x01000000             /* waitid: look, but leave the zombie */
 
-int proc_wait4(int pid, uintptr_t user_status, int options, uintptr_t user_rusage)
+/* What a finished child left: wait4 and waitid report it differently. */
+struct child_end {
+    int pid, status;                    /* status in wait4's encoding */
+    uint32_t uid, utime, stime;
+};
+
+/* The waiting wait4 and waitid share: a child that has ended — pid > 0 that
+   one, -1 any, 0 one in our process group, < -1 one in group -pid. Fills
+   *end and returns 1; 0 if none has ended yet and WNOHANG; or -errno. */
+static int wait_child(int pid, int options, struct child_end *end)
 {
     struct process *me = proc_current();
     for (;;) {
@@ -706,30 +738,27 @@ int proc_wait4(int pid, uintptr_t user_status, int options, uintptr_t user_rusag
             struct process *c = &procs[i];
             if (c->state == PROC_FREE || c->parent != me)
                 continue;
-            if (pid > 0 && c->pid != pid)
-                continue;               /* (pid 0 / < -1 = process groups:
-                                            any child, for now) */
+            if (pid > 0 ? c->pid != pid : pid == 0 ? c->pgid != me->pgid :
+                pid < -1 && c->pgid != -pid)
+                continue;
             have_children = 1;
-            if (c->state == PROC_ZOMBIE) {
-                /* Claim the child before the copy, because the copy can
-                   sleep: a sibling thread (clone(CLONE_THREAD)) waiting on
-                   the same child would otherwise see this zombie too, reap
-                   it, and let a fork reuse the slot — and then our reap
-                   would drop a *live* process's cwd reference and mark its
-                   slot free. Copy from locals so the freed slot is not
-                   read. The status is lost if the copy fails, which is what
-                   Linux does with a bad wait4 pointer as well. */
-                int id = c->pid, status = c->status;
-                uint32_t cu = c->utime + c->cutime, cs = c->stime + c->cstime;
-                me->cutime += cu;       /* times(): children's, with theirs */
-                me->cstime += cs;
-                reap(c);
-                if (user_status && copy_to_user((void *)user_status, &status, 4) < 0)
-                    return -EFAULT;
-                if (user_rusage && rusage_to_user(user_rusage, cu, cs) < 0)
-                    return -EFAULT;
-                return id;
-            }
+            if (c->state != PROC_ZOMBIE || !(options & WEXITED))
+                continue;
+            *end = (struct child_end){ c->pid, c->status, c->cred.uid,
+                                       c->utime + c->cutime, c->stime + c->cstime };
+            if (options & WNOWAIT)
+                return 1;
+            /* Reap before the caller copies anything out, because the copy
+               can sleep: a sibling thread (clone(CLONE_THREAD)) waiting on
+               the same child would otherwise see this zombie too, reap it,
+               and let a fork reuse the slot — and then our reap would drop
+               a *live* process's cwd reference and mark its slot free. The
+               status is lost if the copy fails, which is what Linux does
+               with a bad pointer as well. */
+            me->cutime += end->utime;   /* times(): children's, with theirs */
+            me->cstime += end->stime;
+            reap(c);
+            return 1;
         }
         if (!have_children)
             return -ECHILD;
@@ -739,6 +768,56 @@ int proc_wait4(int pid, uintptr_t user_status, int options, uintptr_t user_rusag
             return -EINTR;
         wq_sleep(&me->child_wait);      /* a child's exit wakes us */
     }
+}
+
+int proc_wait4(int pid, uintptr_t user_status, int options, uintptr_t user_rusage)
+{
+    struct child_end end;
+    int found = wait_child(pid, (options & WNOHANG) | WEXITED, &end);
+    if (found <= 0)
+        return found;
+    if (user_status && copy_to_user((void *)user_status, &end.status, 4) < 0)
+        return -EFAULT;
+    if (user_rusage && rusage_to_user(user_rusage, end.utime, end.stime) < 0)
+        return -EFAULT;
+    return end.pid;
+}
+
+/* waitid(idtype, id, siginfo_t *info, options, rusage): the same, answered
+   as a SIGCHLD siginfo — si_status is the exit code or the signal, not
+   wait4's packed status. Returns 0; info->si_pid 0 means nobody yet. */
+int proc_waitid(int idtype, int id, uintptr_t user_info, int options, uintptr_t user_rusage)
+{
+    enum { P_ALL, P_PID, P_PGID };
+    if (!(options & WEXITED) || idtype > P_PGID || (idtype == P_PID && id <= 0) || id < 0)
+        return -EINVAL;                 /* we never report stopped children */
+    int pid = idtype == P_ALL ? -1 : idtype == P_PID ? id : id ? -id : 0;
+    struct child_end end = { 0 };
+    int found = wait_child(pid, options, &end);
+    if (found < 0)
+        return found;
+    struct {                            /* siginfo_t's SIGCHLD fields */
+        int32_t signo, err, code;
+#ifdef ARCH_X86_64
+        int32_t pad;                    /* the union is 8-aligned there */
+#endif
+        int32_t pid;
+        uint32_t uid;
+        int32_t status;
+    } si = { 0 };
+    if (found) {
+        int sig = end.status & 0x7F;
+        si.signo = SIGCHLD;
+        si.code = !sig ? 1 : end.status & 0x80 ? 3 : 2;     /* CLD_EXITED, _DUMPED, _KILLED */
+        si.pid = end.pid;
+        si.uid = end.uid;
+        si.status = sig ? sig : (end.status >> 8) & 0xFF;
+    }
+    if (user_info && copy_to_user((void *)user_info, &si, sizeof si) < 0)
+        return -EFAULT;
+    if (found && user_rusage && rusage_to_user(user_rusage, end.utime, end.stime) < 0)
+        return -EFAULT;
+    return 0;
 }
 
 /* --- process groups and sessions ------------------------------------------- */

@@ -126,7 +126,7 @@ int32_t packet_socket(uint32_t type, uint32_t protocol)
         return -EMFILE;
     }
     if (type & SOCK_CLOEXEC)
-        proc_current()->cloexec |= 1ull << fd;
+        fd_set_cloexec(proc_current(), fd, 1);
     return fd;
 }
 

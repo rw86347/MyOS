@@ -29,6 +29,7 @@
 #include <syscall.h>
 #include <syscall64.h>
 #include <thread.h>
+#include <timer.h>
 #include <tty.h>
 #include <uaccess.h>
 #include <vfs.h>
@@ -79,7 +80,7 @@ int32_t rw_at(uint32_t fd, uintptr_t buf, uintptr_t len, int writing, int64_t at
             return -ESPIPE;
         if (S_ISDIR(m))
             return -EISDIR;
-        if (at > 0xFFFFFFFFll)          /* past the end of any file we can have */
+        if (at > 0xFFFFFFFFll && !S_ISBLK(m))   /* past the end of any file we can have */
             return writing ? -EFBIG : 0;
     }
     if (!user_range_ok(buf, len))
@@ -102,6 +103,11 @@ int32_t rw_at(uint32_t fd, uintptr_t buf, uintptr_t len, int writing, int64_t at
      * at f->pos, so they get a copy of the open file that starts at `at`,
      * and the copy's position is thrown away.
      */
+    if (at >= 0 && S_ISBLK(f->inode->mode)) {     /* a disk: positions past 4 GiB */
+        int32_t rc = blkfile_rw(f, buf, len, writing, at);
+        file_put(f);
+        return rc;
+    }
     struct file copy;
     struct file *use = f;
     if (at >= 0) {
@@ -109,8 +115,14 @@ int32_t rw_at(uint32_t fd, uintptr_t buf, uintptr_t len, int writing, int64_t at
         copy.pos = (uint32_t)at;
         use = &copy;
     }
-    int32_t rc = writing ? use->ops->write(use, (const void *)buf, len)
-                         : use->ops->read(use, (void *)buf, len);
+    /* A file may go one way only (sysrq-trigger has no read, /proc/uptime
+       no write, epoll neither): -EINVAL, as on Linux — never a call through
+       NULL, which any program could use to bring the kernel down. Free: the
+       pointer is loaded for the call anyway. */
+    int32_t (*rd)(struct file *, void *, uint32_t) = use->ops->read;
+    int32_t (*wr)(struct file *, const void *, uint32_t) = use->ops->write;
+    int32_t rc = writing ? (wr ? wr(use, (const void *)buf, len) : -EINVAL)
+                         : (rd ? rd(use, (void *)buf, len) : -EINVAL);
     if (rc > 0)
         notify(f->inode, writing ? IN_MODIFY : IN_ACCESS);
     file_put(f);
@@ -337,7 +349,7 @@ int32_t do_open(struct inode *dir, uintptr_t user_path, uint32_t flags, uint32_t
     if (fd < 0)
         file_put(f);
     else if (flags & O_CLOEXEC)
-        proc_current()->cloexec |= 1ull << fd;    /* closed by execve */
+        fd_set_cloexec(proc_current(), fd, 1);    /* closed by execve */
     return fd;
 }
 
@@ -373,6 +385,8 @@ static int64_t do_seek(uint32_t fd, int64_t off, uint32_t whence)
     struct file *f = fd_get(fd);
     if (!f)
         return -EBADF;
+    if (S_ISBLK(f->inode->mode))
+        return blkfile_seek(f, off, whence);    /* a disk: its own 64-bit position */
     if (S_ISCHR(f->inode->mode) || S_ISFIFO(f->inode->mode))
         return -ESPIPE;             /* the console and pipes have no position */
     if (S_ISDIR(f->inode->mode)) {
@@ -505,7 +519,7 @@ static int32_t do_pipe(uintptr_t user_fds, uint32_t flags)
         return fds[1] < 0 ? -EMFILE : -EFAULT;
     }
     if (flags & O_CLOEXEC)
-        proc_current()->cloexec |= (1ull << fds[0]) | (1ull << fds[1]);
+        fd_set_cloexec(proc_current(), fds[0], 1), fd_set_cloexec(proc_current(), fds[1], 1);
     return 0;
 }
 
@@ -535,7 +549,7 @@ static int32_t do_dup2(uint32_t oldfd, uint32_t newfd, uint32_t flags)
     f->refs++;
     fd_install_at(newfd, f);            /* closes what was at newfd */
     if (flags & O_CLOEXEC)
-        proc_current()->cloexec |= 1ull << newfd;
+        fd_set_cloexec(proc_current(), newfd, 1);
     return newfd;
 }
 
@@ -562,24 +576,24 @@ SYSCALL(sys_fcntl)
         return -EBADF;
     switch (a2) {
     case F_DUPFD:
-    case F_DUPFD_CLOEXEC:
-        for (uint32_t fd = a3; fd < FD_MAX; fd++) {     /* lowest free >= arg */
-            if (!p->files[fd]) {
-                p->files[fd] = f;
-                f->refs++;
-                if (a2 == F_DUPFD_CLOEXEC)
-                    p->cloexec |= 1ull << fd;
-                return fd;
-            }
-        }
-        return -EMFILE;
+    case F_DUPFD_CLOEXEC: {
+        if (a3 >= FD_MAX)
+            return -EINVAL;
+        int fd = fd_install_min(f, (int)a3);           /* lowest free >= arg */
+        if (fd < 0)
+            return fd;
+        f->refs++;
+        if (a2 == F_DUPFD_CLOEXEC)
+            fd_set_cloexec(p, fd, 1);
+        return fd;
+    }
     case F_GETFD:
-        return (p->cloexec >> a1) & 1 ? FD_CLOEXEC : 0;
+        return fd_get_cloexec(p, (int)a1) ? FD_CLOEXEC : 0;
     case F_SETFD:
         if (a3 & FD_CLOEXEC)
-            p->cloexec |= 1ull << a1;
+            fd_set_cloexec(p, a1, 1);
         else
-            p->cloexec &= ~(1ull << a1);
+            fd_set_cloexec(p, a1, 0);
         return 0;
     case F_GETFL:
         return f->flags;
@@ -824,7 +838,7 @@ SYSCALL(sys_getcwd)
    `make test` only — docs/security.md explains why it has to exist. */
 SYSCALL(sys_uaccess_test)
 {
-    uaccess_test_arm((int)a1);
+    uaccess_test_arm((int)a1, a2);      /* a2: the sibling's "done" flag, or 0 */
     return 0;
 }
 #endif
@@ -832,7 +846,7 @@ SYSCALL(sys_uaccess_test)
 /* ssize_t writev / readv(int fd, const struct iovec *iov, int count):
    several buffers in one call (musl's printf writes this way). Stops at
    the first short transfer, like Linux. */
-static int32_t do_iov(uint32_t fd, uintptr_t user_iov, uint32_t count, int writing)
+static int32_t do_iov(uint32_t fd, uintptr_t user_iov, uint32_t count, int writing, int64_t pos)
 {
     if (!fd_get(fd))
         return -EBADF;
@@ -848,21 +862,57 @@ static int32_t do_iov(uint32_t fd, uintptr_t user_iov, uint32_t count, int writi
             len = 0x7FFFF000;           /* Linux's limit for one transfer */
         if (len == 0)
             continue;
-        /* One buffer at a time through rw(), so each gets the clamp and the
+        /* One buffer at a time through rw_at(), so each gets the clamp and the
            pre-fault. Faulting them all in first would be wrong anyway: a
            short transfer stops the loop and the rest is never touched. */
-        int32_t n = rw(fd, base, len, writing);
+        int32_t n = rw_at(fd, base, len, writing, pos);    /* pos -1: the file's own */
         if (n < 0)
             return total ? total : n;
         total += n;
+        if (pos >= 0)
+            pos += n;
         if ((uint32_t)n < len)
             break;
     }
     return total;
 }
 
-SYSCALL(sys_writev) { return do_iov(a1, a2, a3, 1); }
-SYSCALL(sys_readv)  { return do_iov(a1, a2, a3, 0); }
+SYSCALL(sys_writev) { return do_iov(a1, a2, a3, 1, -1); }
+SYSCALL(sys_readv)  { return do_iov(a1, a2, a3, 0, -1); }
+
+/* preadv / pwritev(fd, iov, count, pos_l, pos_h): the same at an offset,
+   leaving the file's position alone. x86_64 passes the whole offset in
+   pos_l; i386 splits it. The "2" versions add flags (none supported) and
+   take offset -1 to mean "at the position, and move it", like readv. */
+static int64_t iov_pos(uintptr_t lo, uintptr_t hi)
+{
+#ifdef ARCH_X86_64
+    (void)hi;
+    return (int64_t)lo;
+#else
+    return off64(lo, hi);
+#endif
+}
+SYSCALL(sys_preadv)
+{
+    int64_t at = iov_pos(a4, a5);
+    return at < 0 ? -EINVAL : do_iov(a1, a2, a3, 0, at);
+}
+SYSCALL(sys_pwritev)
+{
+    int64_t at = iov_pos(a4, a5);
+    return at < 0 ? -EINVAL : do_iov(a1, a2, a3, 1, at);
+}
+SYSCALL(sys_preadv2)
+{
+    int64_t at = iov_pos(a4, a5);
+    return a6 ? -EOPNOTSUPP : at < -1 ? -EINVAL : do_iov(a1, a2, a3, 0, at);
+}
+SYSCALL(sys_pwritev2)
+{
+    int64_t at = iov_pos(a4, a5);
+    return a6 ? -EOPNOTSUPP : at < -1 ? -EINVAL : do_iov(a1, a2, a3, 1, at);
+}
 
 /* ssize_t readlink(const char *path, char *buf, size_t size) — and
    readlinkat with AT_FDCWD. No NUL is added (that's how Linux does it). */
@@ -926,7 +976,10 @@ SYSCALL(sys_faccessat)
     return err ? err : do_access(dir, a2, a3);
 }
 
-/* madvise, set_robust_list...: nothing to do, success. */
+/* int madvise(void *addr, size_t len, int advice) (mm.c). */
+SYSCALL(sys_madvise) { return mm_madvise(a1, a2, (int)a3); }
+
+/* set_robust_list...: nothing to do, success. */
 SYSCALL(sys_nop) { return 0; }
 
 /* int mincore(void *addr, size_t length, unsigned char *vec): one byte per
@@ -1027,6 +1080,138 @@ SYSCALL(sys_getaffinity)
     return copy_to_user((void *)a3, &mask, 4) < 0 ? -EFAULT : 4;
 }
 
+/* sched_setaffinity(pid, size, mask): fine as long as CPU 0 is in it. */
+SYSCALL(sys_setaffinity)
+{
+    uint8_t first;
+    if (a2 < 1 || copy_from_user(&first, (const void *)a3, 1) < 0)
+        return a2 < 1 ? -EINVAL : -EFAULT;
+    return first & 1 ? 0 : -EINVAL;
+}
+
+/* The scheduler's policy calls (sched_*, 142-148 on x86_64). Everyone runs
+   as SCHED_OTHER at priority 0 for now, so that is the answer; a request
+   for real-time (FIFO, RR) gets EPERM, which is what Linux tells a user
+   without CAP_SYS_NICE — Chromium's thread pool and PulseAudio carry on. */
+#define SCHED_OTHER 0
+#define SCHED_FIFO  1
+#define SCHED_RR    2
+#define SCHED_BATCH 3
+#define SCHED_IDLE  5
+static int sched_pid_ok(intptr_t pid)
+{
+    return pid < 0 ? -EINVAL : pid && !proc_find((int)pid) ? -ESRCH : 0;
+}
+static int sched_policy(uintptr_t policy)
+{
+    policy &= ~0x40000000u;             /* SCHED_RESET_ON_FORK */
+    return policy == SCHED_FIFO || policy == SCHED_RR ? 1 :
+           policy == SCHED_OTHER || policy == SCHED_BATCH || policy == SCHED_IDLE ? 0 : -1;
+}
+SYSCALL(sys_sched_getparam)             /* (pid, struct sched_param *) */
+{
+    int32_t prio = 0, err = sched_pid_ok((intptr_t)a1);
+    return err ? err : copy_to_user((void *)a2, &prio, 4) < 0 ? -EFAULT : 0;
+}
+SYSCALL(sys_sched_setparam)
+{
+    int32_t prio, err = sched_pid_ok((intptr_t)a1);
+    if (err)
+        return err;
+    if (copy_from_user(&prio, (const void *)a2, 4) < 0)
+        return -EFAULT;
+    return prio ? -EINVAL : 0;
+}
+SYSCALL(sys_sched_getscheduler)
+{
+    int err = sched_pid_ok((intptr_t)a1);
+    return err ? err : SCHED_OTHER;
+}
+SYSCALL(sys_sched_setscheduler)         /* (pid, policy, struct sched_param *) */
+{
+    int32_t prio, err = sched_pid_ok((intptr_t)a1), rt = sched_policy(a2);
+    if (err)
+        return err;
+    if (rt < 0)
+        return -EINVAL;
+    if (rt)
+        return -EPERM;
+    if (copy_from_user(&prio, (const void *)a3, 4) < 0)
+        return -EFAULT;
+    return prio ? -EINVAL : 0;
+}
+SYSCALL(sys_sched_prio_max)
+{
+    int rt = sched_policy(a1);
+    return rt < 0 ? -EINVAL : rt ? 99 : 0;
+}
+SYSCALL(sys_sched_prio_min)
+{
+    int rt = sched_policy(a1);
+    return rt < 0 ? -EINVAL : rt ? 1 : 0;
+}
+/* (pid, struct timespec *): the round-robin slice, in native longs. */
+SYSCALL(sys_sched_rr_interval)
+{
+    long ts[2] = { 0, 100000000 };      /* 100 ms */
+    int err = sched_pid_ok((intptr_t)a1);
+    return err ? err : copy_to_user((void *)a2, ts, sizeof ts) < 0 ? -EFAULT : 0;
+}
+
+/* getcpu(unsigned *cpu, unsigned *node, cache): one CPU, one node. */
+SYSCALL(sys_getcpu)
+{
+    uint32_t zero = 0;
+    if ((a1 && copy_to_user((void *)a1, &zero, 4) < 0) ||
+        (a2 && copy_to_user((void *)a2, &zero, 4) < 0))
+        return -EFAULT;
+    return 0;
+}
+
+/* mlock, munlock, mlockall, munlockall, mlock2: keep memory in RAM. There
+   is no swap, so it always is — nothing to do. (gnome-keyring asks.) */
+SYSCALL(sys_mlock_ok) { return 0; }
+SYSCALL(sys_mlockall)
+{
+    return !a1 || (a1 & ~7u) ? -EINVAL : 0;     /* MCL_CURRENT | FUTURE | ONFAULT */
+}
+
+/* msync(addr, len, flags): shared mappings are the file's own RAM pages
+   (mm.c, ramfs_page), so there is nothing to write back. */
+SYSCALL(sys_msync)
+{
+    if ((a1 & (PAGE_SIZE - 1)) || (a3 & ~7u) || (a3 & 5) == 5)
+        return -EINVAL;                 /* MS_ASYNC and MS_SYNC both */
+    return 0;
+}
+
+/* close_range(first, last, flags): close fds first..last — or with
+   CLOSE_RANGE_CLOEXEC, mark them close-on-exec. login and systemd-style
+   launchers call it before exec. (CLOSE_RANGE_UNSHARE: the table is ours
+   already unless threads share it; accepted.) The work is the range asked
+   for, capped at the table's size. */
+#define CLOSE_RANGE_UNSHARE 2
+#define CLOSE_RANGE_CLOEXEC 4
+SYSCALL(sys_close_range)
+{
+    struct process *p = proc_current();
+    if ((a3 & ~(uintptr_t)(CLOSE_RANGE_UNSHARE | CLOSE_RANGE_CLOEXEC)) || a1 > a2)
+        return -EINVAL;
+    uintptr_t last = a2 < p->nfiles - 1 ? a2 : p->nfiles - 1;
+    for (uintptr_t fd = a1; fd <= last; fd++) {
+        if (!fd_get(fd))
+            continue;
+        if (a3 & CLOSE_RANGE_CLOEXEC)
+            fd_set_cloexec(p, fd, 1);
+        else
+            fd_close(fd);
+    }
+    return 0;
+}
+
+/* waitid(idtype, id, siginfo_t *, options, struct rusage *) */
+SYSCALL(sys_waitid) { return proc_waitid((int)a1, (int)a2, a3, (int)a4, a5); }
+
 /* mode_t umask(mode_t mask) */
 SYSCALL(sys_umask)
 {
@@ -1073,6 +1258,42 @@ SYSCALL(sys_tkill)
 
 SYSCALL(sys_tgkill)
 {
+    struct thread *t = thread_by_tid(a2);
+    if (!t || t->proc->pid != (int)a1)
+        return -ESRCH;
+    return signal_send_thread(t, a3);
+}
+
+/* rt_sigqueueinfo(tgid, sig, info) / rt_tgsigqueueinfo(tgid, tid, sig, info):
+   a signal with the sender's own siginfo (sigqueue; Chromium's crash
+   reporter re-raises a crash this way). Signals here are one bit each, so
+   the info's payload isn't kept (docs/gaps.md). Linux's rule stands: another
+   process may not be handed a code the kernel itself uses (si_code >= 0, or
+   SI_TKILL) — that would be a forged kill() or fault. */
+#define SI_TKILL (-6)
+static int32_t queueinfo_check(int tgid, uintptr_t uinfo)
+{
+    int32_t head[3];                    /* si_signo, si_errno, si_code */
+    if (copy_from_user(head, (const void *)uinfo, sizeof head) < 0)
+        return -EFAULT;
+    if ((head[2] >= 0 || head[2] == SI_TKILL) && tgid != proc_current()->pid)
+        return -EPERM;
+    return 0;
+}
+
+SYSCALL(sys_rt_sigqueueinfo)
+{
+    if ((int)a1 <= 0)
+        return -ESRCH;                  /* one process, not a group */
+    int32_t err = queueinfo_check((int)a1, a3);
+    return err ? err : sys_kill_impl((int)a1, (int)a2);
+}
+
+SYSCALL(sys_rt_tgsigqueueinfo)
+{
+    int32_t err = queueinfo_check((int)a1, a4);
+    if (err)
+        return err;
     struct thread *t = thread_by_tid(a2);
     if (!t || t->proc->pid != (int)a1)
         return -ESRCH;
@@ -1509,7 +1730,7 @@ static const syscall_fn syscall_table[] U = {     /* (x86_64: unused, dropped) *
     [NR_setfsgid32] = sys_setfsgid,
     [NR_mincore]    = sys_mincore,
     [NR_readahead]  = sys_nop,
-    [NR_madvise]    = sys_nop,
+    [NR_madvise]    = sys_madvise,
     [NR_sched_getaffinity] = sys_getaffinity,
     [NR_set_thread_area] = sys_set_thread_area,
     [NR_get_thread_area] = sys_get_thread_area,
@@ -1608,8 +1829,30 @@ static const syscall_fn syscall_table[] U = {     /* (x86_64: unused, dropped) *
     [NR_getpgid]    = sys_getpgid,
     [NR_getsid]     = sys_getsid,
     [NR_sched_yield] = sys_sched_yield,
+    [NR_msync]      = sys_msync,
+    [NR_mlock]      = sys_mlock_ok,
+    [NR_munlock]    = sys_mlock_ok,
+    [NR_mlockall]   = sys_mlockall,
+    [NR_munlockall] = sys_mlock_ok,
+    [NR_mlock2]     = sys_mlock_ok,
+    [NR_sched_setparam]     = sys_sched_setparam,
+    [NR_sched_getparam]     = sys_sched_getparam,
+    [NR_sched_setscheduler] = sys_sched_setscheduler,
+    [NR_sched_getscheduler] = sys_sched_getscheduler,
+    [NR_sched_get_priority_max] = sys_sched_prio_max,
+    [NR_sched_get_priority_min] = sys_sched_prio_min,
+    [NR_sched_rr_get_interval]  = sys_sched_rr_interval,
+    [NR_sched_setaffinity] = sys_setaffinity,
+    [NR_waitid]     = sys_waitid,
+    [NR_getcpu]     = sys_getcpu,
+    [NR_preadv]     = sys_preadv,
+    [NR_pwritev]    = sys_pwritev,
+    [NR_preadv2]    = sys_preadv2,
+    [NR_pwritev2]   = sys_pwritev2,
+    [NR_close_range] = sys_close_range,
     [NR_rt_sigreturn]   = sys_rt_sigreturn,
     [NR_rt_sigaction]   = sys_rt_sigaction,
+    [NR_sigaltstack]    = sys_sigaltstack,
     [NR_rt_sigprocmask] = sys_rt_sigprocmask,
     [NR_alarm]      = sys_alarm,
     [NR_pause]      = sys_pause,
@@ -1621,6 +1864,8 @@ static const syscall_fn syscall_table[] U = {     /* (x86_64: unused, dropped) *
     [NR_rt_sigtimedwait_time64] = sys_rt_sigtimedwait64,
     [NR_tkill]      = sys_tkill,
     [NR_tgkill]     = sys_tgkill,
+    [NR_rt_sigqueueinfo]   = sys_rt_sigqueueinfo,
+    [NR_rt_tgsigqueueinfo] = sys_rt_tgsigqueueinfo,
     [NR__llseek]    = sys_llseek,
     [NR_vfork]      = sys_fork,
     [NR_mmap2]      = sys_mmap2,
@@ -1660,6 +1905,7 @@ static const syscall_fn syscall_table64[] = {
     [NR64_munmap]       = sys_munmap,
     [NR64_brk]          = sys_brk,
     [NR64_rt_sigaction] = sys_rt_sigaction,
+    [NR64_sigaltstack]  = sys_sigaltstack,
     [NR64_rt_sigprocmask] = sys_rt_sigprocmask,
     [NR64_rt_sigreturn] = sys_rt_sigreturn,
     [NR64_ioctl]        = sys_ioctl,
@@ -1670,9 +1916,31 @@ static const syscall_fn syscall_table64[] = {
     [NR64_access]       = sys_access,
     [NR64_pipe]         = sys_pipe,
     [NR64_sched_yield]  = sys_sched_yield,
+    [NR64_msync]        = sys_msync,
+    [NR64_mlock]        = sys_mlock_ok,
+    [NR64_munlock]      = sys_mlock_ok,
+    [NR64_mlockall]     = sys_mlockall,
+    [NR64_munlockall]   = sys_mlock_ok,
+    [NR64_mlock2]       = sys_mlock_ok,
+    [NR64_vhangup]      = sys_vhangup,
+    [NR64_sched_setparam]     = sys_sched_setparam,
+    [NR64_sched_getparam]     = sys_sched_getparam,
+    [NR64_sched_setscheduler] = sys_sched_setscheduler,
+    [NR64_sched_getscheduler] = sys_sched_getscheduler,
+    [NR64_sched_get_priority_max] = sys_sched_prio_max,
+    [NR64_sched_get_priority_min] = sys_sched_prio_min,
+    [NR64_sched_rr_get_interval]  = sys_sched_rr_interval,
+    [NR64_sched_setaffinity] = sys_setaffinity,
+    [NR64_waitid]       = sys_waitid,
+    [NR64_getcpu]       = sys_getcpu,
+    [NR64_preadv]       = sys_preadv,
+    [NR64_pwritev]      = sys_pwritev,
+    [NR64_preadv2]      = sys_preadv2,
+    [NR64_pwritev2]     = sys_pwritev2,
+    [NR64_close_range]  = sys_close_range,
     [NR64_mremap]       = sys_mremap,
     [NR64_mincore]      = sys_mincore,
-    [NR64_madvise]      = sys_nop,
+    [NR64_madvise]      = sys_madvise,
     [NR64_dup]          = sys_dup,
     [NR64_dup2]         = sys_dup2,
     [NR64_nanosleep]    = sys_nanosleep_x64,
@@ -1838,6 +2106,8 @@ static const syscall_fn syscall_table64[] = {
     [NR64_epoll_wait]   = sys_epoll_wait,
     [NR64_epoll_ctl]    = sys_epoll_ctl,
     [NR64_tgkill]       = sys_tgkill,
+    [NR64_rt_sigqueueinfo]   = sys_rt_sigqueueinfo,
+    [NR64_rt_tgsigqueueinfo] = sys_rt_tgsigqueueinfo,
     [NR64_openat]       = sys_openat,
     [NR64_mkdirat]      = sys_mkdirat,
     [NR64_mknodat]      = sys_mknodat,
@@ -1878,8 +2148,20 @@ static const syscall_fn syscall_table64[] = {
 intptr_t syscall_dispatch(uint32_t nr, uintptr_t a1, uintptr_t a2, uintptr_t a3,
                           uintptr_t a4, uintptr_t a5, uintptr_t a6)
 {
-    if (nr < NSYSCALLS && TABLE[nr])
+    if (nr < NSYSCALLS && TABLE[nr]) {
+#ifdef SYS_TRACE
+        intptr_t rv = TABLE[nr](a1, a2, a3, a4, a5, a6);
+        struct thread *t = thread_current();
+        uint32_t k = t->trace_at++ % SYSTRACE_N;
+        t->trace[k].ms = timer_ms();
+        t->trace[k].nr = (uint16_t)nr;
+        t->trace[k].ret = rv;
+        t->trace[k].a[0] = a1, t->trace[k].a[1] = a2, t->trace[k].a[2] = a3, t->trace[k].a[3] = a4;
+        return rv;
+#else
         return TABLE[nr](a1, a2, a3, a4, a5, a6);
+#endif
+    }
 
     /* Not implemented. Log it to serial — once per number — so running
        real programs shows us which syscalls to write next (docs/DESIGN.md).

@@ -7,12 +7,15 @@
  * the terminal and pipes wake whenever their state changes, and look again.
  */
 #include <errno.h>
+#include <kheap.h>
+#include <proc.h>
 #include <signal.h>
 #include <string.h>
 #include <syscalls.h>
 #include <thread.h>
 #include <timer.h>
 #include <uaccess.h>
+#include <user.h>
 #include <vfs.h>
 #ifdef BENCH
 #include <bench.h>
@@ -132,41 +135,55 @@ SYSCALL_DEF(sys_ppoll64)                /* (fds, nfds, timespec64 *, sigmask *, 
     return err ? err : poll_user(a1, a2, ms);
 }
 
-/* select(): fd_set bitmaps instead of a list. Converted to poll. */
+/* select(): fd_set bitmaps instead of a list. Converted to poll. The sets
+   are arrays of longs (a program's long: 4 or 8 bytes), nfds bits used,
+   read and written in whole longs as Linux does. Up to PROC_FILES fds
+   (FD_SETSIZE, 1024). */
 static int32_t do_select(uint32_t nfds, uintptr_t rd, uintptr_t wr, uintptr_t ex, int32_t ms)
 {
-    if (nfds > 32)
-        nfds = 32;                      /* the fd_set we read is 32 bits */
-    uint32_t in[3] = { 0, 0, 0 };
+    if (nfds > PROC_FILES)
+        nfds = PROC_FILES;
+    uint32_t lbits = 8 * sizeof(user_addr_t);   /* a program's long */
+    uint32_t bytes = (nfds + lbits - 1) / lbits * (lbits / 8);
+    uint32_t in[3][PROC_FILES / 32], out[3][PROC_FILES / 32];
     uintptr_t user[3] = { rd, wr, ex };
+    memset(in, 0, sizeof in);
+    memset(out, 0, sizeof out);
     for (int k = 0; k < 3; k++)
-        if (user[k] && get_user32(&in[k], user[k]) < 0)
+        if (user[k] && bytes && copy_from_user(in[k], (const void *)user[k], bytes) < 0)
             return -EFAULT;
 
-    struct pollfd p[32];
+    /* Few fds (the usual case): the list on the stack; else the heap. */
+    struct pollfd small[32], *p = small;
+    uint32_t want = 0;
+    for (uint32_t fd = 0; fd < nfds; fd++)
+        want += ((in[0][fd / 32] | in[1][fd / 32] | in[2][fd / 32]) >> (fd % 32)) & 1;
+    if (want > 32 && !(p = kmalloc(want * sizeof *p)))
+        return -ENOMEM;
     uint32_t n = 0;
     for (uint32_t fd = 0; fd < nfds; fd++) {
-        int16_t ev = ((in[0] >> fd) & 1 ? POLLIN : 0) | ((in[1] >> fd) & 1 ? POLLOUT : 0);
-        if (ev || ((in[2] >> fd) & 1))
+        uint32_t w = fd / 32, b = 1u << (fd % 32);
+        int16_t ev = (in[0][w] & b ? POLLIN : 0) | (in[1][w] & b ? POLLOUT : 0);
+        if (ev || (in[2][w] & b))
             p[n++] = (struct pollfd){ (int32_t)fd, ev, 0 };
     }
     int32_t r = do_poll(p, n, ms);
+    int count = 0;
+    for (uint32_t i = 0; r >= 0 && i < n; i++) {
+        uint32_t w = (uint32_t)p[i].fd / 32, b = 1u << (p[i].fd % 32);
+        if ((p[i].revents & (POLLIN | POLLHUP | POLLERR)) && (in[0][w] & b))
+            out[0][w] |= b, count++;
+        if ((p[i].revents & (POLLOUT | POLLERR)) && (in[1][w] & b))
+            out[1][w] |= b, count++;
+        if (p[i].revents & POLLNVAL)
+            r = -EBADF;
+    }
+    if (p != small)
+        kfree(p);
     if (r < 0)
         return r;
-
-    uint32_t out[3] = { 0, 0, 0 };
-    int count = 0;
-    for (uint32_t i = 0; i < n; i++) {
-        uint32_t bit = 1u << p[i].fd;
-        if ((p[i].revents & (POLLIN | POLLHUP | POLLERR)) && (in[0] & bit))
-            out[0] |= bit, count++;
-        if ((p[i].revents & (POLLOUT | POLLERR)) && (in[1] & bit))
-            out[1] |= bit, count++;
-        if ((p[i].revents & POLLNVAL))
-            return -EBADF;
-    }
     for (int k = 0; k < 3; k++)
-        if (user[k] && copy_to_user((void *)user[k], &out[k], 4) < 0)
+        if (user[k] && bytes && copy_to_user((void *)user[k], out[k], bytes) < 0)
             return -EFAULT;
     return count;
 }

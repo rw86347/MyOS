@@ -1,5 +1,9 @@
 # MyOS Network Security
 
+Open holes across the whole system (users, X, passwords, NX, the
+browser) are listed in `docs/SECURITY-HOLES.md`. This file is the
+network threat model, the rules, and the bugs that were found and fixed.
+
 The goal: a stack that an attacker with a wire to the machine cannot get code execution on,
 and cannot knock off the network. Small helps here — 3,400 lines of network code can be read
 end to end and fuzzed exhaustively in a way that Linux's 1.5 million cannot. That is the one

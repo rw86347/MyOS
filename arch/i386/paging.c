@@ -34,7 +34,9 @@
 #include <memlayout.h>
 #include <paging.h>
 #include <pmm.h>
+#include <serial.h>
 #include <string.h>
+#include <thread.h>
 
 #define PDE_INDEX(va)  ((va) >> 22)             /* top 10 bits */
 #define PTE_INDEX(va)  (((va) >> 12) & 0x3FF)   /* middle 10 bits */
@@ -137,10 +139,11 @@ void vmm_init(void)
         __asm__ volatile ("mov %0, %%cr4" : : "r"(cr4) : "memory");
     }
 
-    /* 5. Page tables for the whole kernel heap range, now, so that every
-       process's copy of the kernel's directory already points at them.
-       (After step 4: they're empty, nothing to mark global.) */
-    for (uint32_t va = KHEAP_START; va < KHEAP_END; va += BIG_PAGE) {
+    /* 5. Page tables for the whole kernel heap and stack range, now, so
+       that every process's copy of the kernel's directory already points
+       at them. (After step 4: they're empty, nothing to mark global.) */
+    _Static_assert(KHEAP_END == KSTACK_START, "one run of tables for both");
+    for (uint32_t va = KHEAP_START; va < KSTACK_END; va += BIG_PAGE) {
         uint32_t pt = pmm_alloc();
         memset(P2V(pt), 0, PAGE_SIZE);
         kernel_pd[PDE_INDEX(va)] = pt | PTE_PRESENT | PTE_WRITABLE;
@@ -279,10 +282,36 @@ uint32_t vmm_pd_current(void)
     return cur_pd_phys;
 }
 
+/* A page directory that can't be right: stop, and say who wanted it. */
+static void __attribute__((noreturn, noinline)) bad_table(const char *what, uint32_t phys)
+{
+    struct thread *t = thread_current();
+    kprintf("\n*** PAGE TABLE CHECK: %s %08lx (thread \"%s\", called from %08lx) ***\n",
+            what, (unsigned long)phys, t ? t->name : "?",
+            (unsigned long)(uintptr_t)__builtin_return_address(0));
+    serial_flush();
+    for (;;)
+        __asm__ volatile ("cli; hlt");
+}
+
+/* The kernel half of every directory is the kernel's (vmm_pd_create copies
+   it). Two entries set at boot and never changed stand for it: the start
+   of the direct map and the heap. A directory without them is freed or
+   written over, and loading it would take the kernel away under the CPU —
+   a triple fault, a reset, nothing said. Two compares. */
+static int kernel_half_ok(uint32_t phys)
+{
+    const uint32_t *pd = P2V(phys);
+    return pd[PDE_INDEX(KERNEL_VBASE)] == kernel_pd[PDE_INDEX(KERNEL_VBASE)] &&
+           pd[PDE_INDEX(KHEAP_START)] == kernel_pd[PDE_INDEX(KHEAP_START)];
+}
+
 void vmm_pd_switch(uint32_t phys)
 {
     if (phys == cur_pd_phys)
         return;                 /* same address space: keep the TLB */
+    if (!kernel_half_ok(phys))
+        bad_table("switch to a broken or freed address space", phys);
     __asm__ volatile ("mov %0, %%cr3" : : "r"(phys) : "memory");
     cur_pd = P2V(phys);
     cur_pd_phys = phys;
@@ -290,6 +319,9 @@ void vmm_pd_switch(uint32_t phys)
 
 void vmm_pd_destroy(uint32_t phys)
 {
+    if (phys == cur_pd_phys || !kernel_half_ok(phys))
+        bad_table(phys == cur_pd_phys ? "freeing the address space in use"
+                                      : "freeing a broken or freed address space", phys);
     uint32_t *pd = P2V(phys);
     for (uint32_t i = 0; i < USER_PDES; i++) {
         if (!(pd[i] & PTE_PRESENT))
@@ -300,6 +332,9 @@ void vmm_pd_destroy(uint32_t phys)
                 pmm_free(FRAME(pt[j]));         /* drops one owner */
         pmm_free(FRAME(pd[i]));                 /* the page table */
     }
+    /* Unhook the kernel half: a switch to this directory after the free
+       (until the page is reused) then fails the check above, loudly. */
+    pd[PDE_INDEX(KERNEL_VBASE)] = pd[PDE_INDEX(KHEAP_START)] = 0;
     pmm_free(phys);
 }
 

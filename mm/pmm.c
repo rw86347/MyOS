@@ -45,7 +45,73 @@ static uint32_t refs_phys, refs_pages;
 
 extern char __kernel_end[];         /* from linker.ld (virtual address) */
 
+#ifdef MEM_DEBUG
+/* make MEMDEBUG=1 — Solaris's kmem "0xdeadbeef" idea, a page at a time. A
+   page that is freed gets filled with 0xDEADBEEF; when it is handed out
+   again, every word is checked. A page that was written while it was free
+   — through a mapping that should be gone, by a DMA that came late, by a
+   pointer kept after the free — is reported: which page, where in it, what
+   was written there, and who is taking it now. (The writer itself is long
+   gone by then; the bytes usually say who it was.) Debug builds only: it
+   touches every page twice. Pages free since boot were never filled, so a
+   bit per frame says which ones to check. */
+#include <thread.h>
+#define DEAD 0xDEADBEEFu
+static uint32_t poisoned[MAX_FRAMES / 32];
+static uint32_t bad_pages;
+
+static void poison(uint32_t f)
+{
+    if (!extra_refs)
+        return;                         /* early boot: not all RAM is mapped yet */
+    uint32_t *w = P2V((phys_addr_t)f * PAGE_SIZE);
+    for (uint32_t k = 0; k < PAGE_SIZE / 4; k++)
+        w[k] = DEAD;
+    poisoned[f / 32] |= 1u << (f % 32);
+}
+
+static void check(uint32_t f)
+{
+    if (!(poisoned[f / 32] & (1u << (f % 32))))
+        return;
+    poisoned[f / 32] &= ~(1u << (f % 32));
+    const uint32_t *w = P2V((phys_addr_t)f * PAGE_SIZE);
+    uint32_t first = PAGE_SIZE / 4, n = 0;
+    for (uint32_t k = 0; k < PAGE_SIZE / 4; k++)
+        if (w[k] != DEAD) {
+            if (first == PAGE_SIZE / 4)
+                first = k;
+            n++;
+        }
+    if (!n)
+        return;
+    struct thread *t = thread_current();
+    kprintf("MEMDEBUG: page %08lx was written while it was free: %lu words changed, "
+            "the first at +%03lx (now taken by \"%s\"):\n", (unsigned long)f * PAGE_SIZE,
+            (unsigned long)n, (unsigned long)first * 4, t ? t->name : "?");
+    for (uint32_t k = first & ~7u; k < (first & ~7u) + 16 && k < PAGE_SIZE / 4; k += 4)
+        kprintf("  +%03lx: %08lx %08lx %08lx %08lx\n", (unsigned long)k * 4,
+                (unsigned long)w[k], (unsigned long)w[k + 1], (unsigned long)w[k + 2],
+                (unsigned long)w[k + 3]);
+    bad_pages++;
+}
+#endif
+
 static int  is_used(uint32_t f) { return bitmap[f / 32] & (1u << (f % 32)); }
+
+#ifdef PT_AUDIT
+/* The page-table audit (make PTAUDIT=1): owners of the frame at phys —
+   0 if it is free, -1 if it is not RAM we manage (device memory). */
+int pmm_owners(uint32_t phys)
+{
+    uint32_t f = phys / PAGE_SIZE;
+    if (f >= nframes)
+        return -1;
+    if (!is_used(f))
+        return 0;
+    return 1 + (extra_refs ? extra_refs[f] : 0);
+}
+#endif
 static void set_used(uint32_t f) { bitmap[f / 32] |= 1u << (f % 32); }
 static void set_free(uint32_t f) { bitmap[f / 32] &= ~(1u << (f % 32)); }
 
@@ -220,6 +286,9 @@ static uint32_t take(void)
         set_used(f);
         free_frames--;
         search_from = f + 1;
+#ifdef MEM_DEBUG
+        check(f);
+#endif
         return f * PAGE_SIZE;
     }
     search_from = nframes;
@@ -246,6 +315,10 @@ uint32_t pmm_alloc_run(uint32_t pages)
         if (run == pages) {
             uint32_t first = f + 1 - pages;
             mark_range((uint64_t)first * PAGE_SIZE, (uint64_t)pages * PAGE_SIZE, 0);
+#ifdef MEM_DEBUG
+            for (uint32_t k = first; k <= f; k++)
+                check(k);
+#endif
             return first * PAGE_SIZE;
         }
     }
@@ -263,6 +336,9 @@ void pmm_free(uint32_t phys)
         extra_refs[f]--;            /* someone else still uses it */
         return;
     }
+#ifdef MEM_DEBUG
+    poison(f);
+#endif
     set_free(f);
     free_frames++;
     if (f < search_from)

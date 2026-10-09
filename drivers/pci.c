@@ -11,9 +11,13 @@
  *   bits 10-8   function (one card can be several functions)
  *   bits 7-2    register number (a 32-bit register)
  *
- * Empty slots read as 0xFFFF. We walk bus 0 only: that is the bus QEMU's
- * i440FX and a typical old PC put the NIC on. Bridges to other buses come
- * with the machines that have them.
+ * Empty slots read as 0xFFFF. We start at bus 0 and follow every
+ * PCI-to-PCI bridge to the bus behind it. A laptop's NVMe SSD, its
+ * Ethernet chip and its graphics card each sit behind a PCI Express root
+ * port, on bus 1, 2, 3... (the MSI showed only bus 0 and no SSD,
+ * 2026-10-09). The firmware has numbered those buses and given their
+ * devices addresses already: a bridge's register 0x18 says which bus is
+ * behind it (secondary) and the highest one below it (subordinate).
  */
 #include <apic.h>
 #include <errno.h>
@@ -27,10 +31,12 @@
 
 #define PCI_ADDR 0xCF8
 #define PCI_DATA 0xCFC
-#define PCI_MAX  32
+#define PCI_MAX  64
 
 static struct pci_dev devs[PCI_MAX];
 static int ndevs;
+/* Linux's struct pci_bus for each bus number: which bridge leads to it. */
+static struct pci_bus buses[256];
 
 static uint32_t cfg_read(uint8_t bus, uint8_t slot, uint8_t func, uint8_t offset)
 {
@@ -72,9 +78,9 @@ static void add(uint8_t bus, uint8_t slot, uint8_t func, uint32_t id)
     d->device = (uint16_t)(id >> 16);
     d->class_rev = cfg_read(bus, slot, func, 0x08);
     /* Linux's names for the same facts (linux/pci.h). */
-    static struct pci_bus bus0 = { 0, NULL, NULL };
     uint32_t sub = cfg_read(bus, slot, func, 0x2c);
-    d->bus = &bus0;
+    buses[bus].number = bus;
+    d->bus = &buses[bus];
     d->devfn = (unsigned)slot << 3 | func;
     d->subsystem_vendor = (uint16_t)sub;
     d->subsystem_device = (uint16_t)(sub >> 16);
@@ -90,22 +96,79 @@ static void add(uint8_t bus, uint8_t slot, uint8_t func, uint32_t id)
             bus, slot, func, d->vendor, d->device, d->class_rev >> 8, d->irq);
 }
 
-void pci_init(void)
+#define PCI_COMMAND_IO     0x1
+#define PCI_COMMAND_MEMORY 0x2
+#define PCI_COMMAND_MASTER 0x4
+
+static uint8_t scanned[256 / 8];        /* buses walked (a loop can't recurse forever) */
+
+static void scan_bus(uint8_t bus, int depth);
+
+/* A PCI-to-PCI bridge (header type 1): walk the bus behind it. It must
+   forward the memory and DMA of the devices there, so it gets memory,
+   I/O and bus-master on — what Linux does when a device below it is
+   enabled. */
+static void bridge(uint8_t bus, uint8_t slot, uint8_t func, int dev, int depth)
 {
+    struct pci_dev *self = dev >= 0 ? &devs[dev] : NULL;   /* (the table may be full) */
+    uint32_t nums = cfg_read(bus, slot, func, 0x18);
+    uint8_t secondary = (uint8_t)(nums >> 8), subordinate = (uint8_t)(nums >> 16);
+    if (secondary <= bus || subordinate < secondary) {
+        kprintf("pci: bridge %02x:%02x.%x: no bus behind it (the firmware didn't number it)\n",
+                bus, slot, func);
+        return;
+    }
+    kprintf("pci: bridge %02x:%02x.%x -> bus %02x-%02x\n", bus, slot, func, secondary, subordinate);
+    if (self) {
+        uint32_t cmd = pci_read_config(self, 0x04);
+        pci_write_config(self, 0x04, (cmd & 0xFFFF) | PCI_COMMAND_IO | PCI_COMMAND_MEMORY |
+                                     PCI_COMMAND_MASTER);
+        buses[secondary].self = self;
+    }
+    buses[secondary].number = secondary;
+    buses[secondary].parent = &buses[bus];
+    scan_bus(secondary, depth + 1);
+}
+
+/* Every device on the bus first, then the buses behind its bridges, so
+   bus 0 keeps the order it always had (the first xHCI, the first HD Audio
+   chip) and what is behind a bridge comes after it. */
+static void scan_bus(uint8_t bus, int depth)
+{
+    if (depth > 8 || (scanned[bus / 8] & (1u << (bus % 8))))
+        return;
+    scanned[bus / 8] |= (uint8_t)(1u << (bus % 8));
+    struct { uint8_t slot, func; int dev; } br[16];
+    int nbr = 0;
     for (uint8_t slot = 0; slot < 32; slot++) {
-        uint32_t id = cfg_read(0, slot, 0, 0);
+        uint32_t id = cfg_read(bus, slot, 0, 0);
         if ((uint16_t)id == 0xFFFF)
             continue;
-        add(0, slot, 0, id);
-        uint8_t header = (uint8_t)(cfg_read(0, slot, 0, 0x0c) >> 16);
-        if (!(header & 0x80))
-            continue;                   /* a single function */
-        for (uint8_t func = 1; func < 8; func++) {
-            id = cfg_read(0, slot, func, 0);
-            if ((uint16_t)id != 0xFFFF)
-                add(0, slot, func, id);
+        uint8_t header = (uint8_t)(cfg_read(bus, slot, 0, 0x0c) >> 16);
+        for (uint8_t func = 0; func < ((header & 0x80) ? 8 : 1); func++) {
+            if (func) {
+                id = cfg_read(bus, slot, func, 0);
+                if ((uint16_t)id == 0xFFFF)
+                    continue;
+            }
+            int before = ndevs;
+            add(bus, slot, func, id);
+            uint8_t type = (uint8_t)(cfg_read(bus, slot, func, 0x0c) >> 16) & 0x7F;
+            if (type == 1 && nbr < 16) {
+                br[nbr].slot = slot;
+                br[nbr].func = func;
+                br[nbr++].dev = ndevs > before ? before : -1;
+            }
         }
     }
+    for (int k = 0; k < nbr; k++)
+        bridge(bus, br[k].slot, br[k].func, br[k].dev, depth);
+}
+
+void pci_init(void)
+{
+    buses[0].number = 0;
+    scan_bus(0, 0);
 }
 
 struct pci_dev *pci_find(uint16_t vendor, uint16_t device)

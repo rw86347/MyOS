@@ -30,9 +30,17 @@
    of them and by read(). VM_MAYWRITE: the file was opened read-write. */
 #define VM_SHARED 0x800
 #define VM_SHM    0x1000                /* VM_SHARED, attached by shmat (kernel/shm.c) */
+/* VM_PFNMAP of ordinary RAM a driver owns (a sound card's buffer): mapped
+   cached, as the kernel itself sees it — not uncached like device memory,
+   which would make every sample a trip to RAM and give one page two
+   different memory types. */
+#define VM_RAM    0x2000
 
 #define MM_AREAS_FIRST  32             /* areas a new address space has room for */
-#define MM_AREAS_MAX  1024              /* it doubles up to this (GTK programs: ~400) */
+#define MM_AREAS_MAX  65536             /* it doubles up to this: Linux's vm.max_map_count
+                                           (65530). GTK programs need ~400; Chromium's
+                                           browser more than 1024 (its allocator's
+                                           guard pages split its reservations) */
 
 /* Where things go in a program's memory:
      0x08048000   code and data (from the ELF file), then the heap (brk)
@@ -102,6 +110,9 @@ user_addr_t mm_brk(user_addr_t new_brk);
 intptr_t mm_mmap(user_addr_t addr, user_addr_t len, uint32_t prot, uint32_t flags,
                  struct inode *file, uint32_t off, uint32_t fmode);
 int32_t  mm_munmap(user_addr_t addr, user_addr_t len);
+/* madvise: MADV_DONTNEED/MADV_FREE drop the pages (the next touch gives
+   zeros, or the file's bytes again); the other advice is only advice. */
+int32_t  mm_madvise(user_addr_t addr, user_addr_t len, int advice);
 intptr_t mm_mremap(user_addr_t old, user_addr_t old_len, user_addr_t new_len,
                    uint32_t flags, user_addr_t new_addr);
 
@@ -115,6 +126,10 @@ intptr_t mm_mmap_device(user_addr_t addr, user_addr_t len, uint32_t prot, uint32
    starting at the vma's file offset (Linux: vm_iomap_memory). 0, or
    -EINVAL if the vma reaches past size rounded up to whole pages. */
 int vm_iomap_memory(struct vma *vma, phys_addr_t phys, uint32_t size);
+/* For a device's .mmap of kernel RAM it owns and never frees (sound
+   buffers): file offsets [base, base + size) are physical [phys, ...),
+   cached (VM_RAM). -EINVAL if the vma reaches outside that range. */
+int vm_map_ram(struct vma *vma, uint32_t base, phys_addr_t phys, uint32_t size);
 int32_t  mm_mprotect(user_addr_t addr, user_addr_t len, uint32_t prot);
 
 /* shmdt: remove the shared-memory attach that starts at addr — every area

@@ -30,7 +30,9 @@ enum { S_read = 0, S_write = 1, S_open = 2, S_close = 3, S_lseek = 8, S_mmap = 9
        S_getxattr = 191, S_fsetxattr = 190, S_flistxattr = 196,
        S_ioctl = 16, S_socket = 41, S_sendto = 44, S_recvfrom = 45, S_bind = 49, S_setsockopt = 54,
        S_getsockname = 51, S_connect = 42, S_listen = 50, S_accept4 = 288, S_poll = 7,
-       S_setuid = 105 };
+       S_setuid = 105, S_sigaltstack = 131, S_socketpair = 53, S_sendmsg = 46,
+       S_recvmsg = 47, S_getsockopt = 55, S_gettid = 186, S_rt_sigqueueinfo = 129,
+       S_rt_tgsigqueueinfo = 297, S_epoll_create1 = 291, S_epoll_ctl = 233 };
 enum { F_GETLK = 5, F_SETLK = 6 };
 #else
 #define X64 0
@@ -50,7 +52,10 @@ enum { S_read = 3, S_write = 4, S_open = 5, S_close = 6, S_lseek = 19, S_mmap = 
        S_getxattr = 229, S_fsetxattr = 228, S_flistxattr = 234,
        S_ioctl = 54, S_socket = 359, S_bind = 361, S_getsockname = 367,
        S_sendto = 369, S_recvfrom = 371, S_setsockopt = 366, S_connect = 362,
-       S_listen = 363, S_accept4 = 364, S_poll = 168, S_setuid = 213 /* setuid32 */ };
+       S_listen = 363, S_accept4 = 364, S_poll = 168, S_setuid = 213 /* setuid32 */,
+       S_sigaltstack = 186, S_socketpair = 360, S_sendmsg = 370, S_recvmsg = 372,
+       S_getsockopt = 365, S_gettid = 224, S_rt_sigqueueinfo = 178,
+       S_rt_tgsigqueueinfo = 335, S_epoll_create1 = 329, S_epoll_ctl = 255 };
 enum { F_GETLK = 12, F_SETLK = 13 };    /* the flock64 ones (musl) */
 #endif
 
@@ -264,6 +269,7 @@ static void t_copy_range(void)
 
 #define SA_SIGINFO  4
 #define SA_RESTORER 0x04000000
+#define SA_ONSTACK  0x08000000
 #define SIGUSR1 10
 #define SIGALRM 14
 static volatile int got_sig, got_signo, got_ctx;
@@ -276,6 +282,18 @@ static void on_info(int sig, void *info, void *uc)
 }
 
 static void on_alarm(int sig) { got_sig = sig; }
+
+/* sigaltstack: the handler notes where its own stack is. */
+static char altstack[16384] __attribute__((aligned(16)));
+static volatile long handler_sp;
+
+static void on_alt(int sig, void *info, void *uc)
+{
+    volatile char here;
+    (void)info, (void)uc;
+    handler_sp = (long)&here;
+    got_sig = sig;
+}
 
 static long sigaction_k(int sig, void *handler, unsigned long flags)
 {
@@ -305,6 +323,31 @@ static void t_signals(void)
     long took = now_ms() - start;
     check(r == 0 && p == -EINTR && got_sig == SIGALRM && took >= 20 && took < 1000,
           "setitimer + pause", took);
+
+    /* A handler with SA_ONSTACK runs on the alternate stack; afterwards the
+       stack is still set, and not in use (flags 0). */
+    struct { void *sp; int flags; unsigned long size; } ss = { altstack, 0, sizeof altstack }, old;
+    long s1 = SC2(S_sigaltstack, &ss, 0);
+    sigaction_k(SIGUSR1, (void *)on_alt, SA_SIGINFO | SA_ONSTACK);
+    handler_sp = 0;
+    SC2(S_kill, SC0(S_getpid), SIGUSR1);
+    long s2 = SC2(S_sigaltstack, 0, &old);
+    int on = handler_sp > (long)altstack && handler_sp < (long)altstack + (long)sizeof altstack;
+    ss.flags = 2;                       /* SS_DISABLE */
+    long s3 = SC2(S_sigaltstack, &ss, &old);
+    ss.flags = 0, ss.size = 100;        /* too small */
+    long s4 = SC2(S_sigaltstack, &ss, 0);
+    check(s1 == 0 && s2 == 0 && on && old.flags == 0 && old.size == sizeof altstack &&
+          s3 == 0 && s4 == -12, "sigaltstack + SA_ONSTACK", on ? s4 : handler_sp);
+
+    /* A signal with our own info (SI_QUEUE) to our own thread arrives; a
+       kernel-style code (SI_USER) for another process is refused. */
+    int info[32] = { SIGUSR1, 0, -1 }, fake[32] = { SIGUSR1, 0, 0 };
+    sigaction_k(SIGUSR1, (void *)on_info, SA_SIGINFO);
+    got_sig = 0;
+    long q1 = SC4(S_rt_tgsigqueueinfo, SC0(S_getpid), SC0(S_gettid), SIGUSR1, info);
+    long q2 = SC3(S_rt_sigqueueinfo, 1, SIGUSR1, fake);
+    check(q1 == 0 && got_sig == SIGUSR1 && q2 == -1, "rt_tgsigqueueinfo + EPERM rule", q1 ? q1 : q2);
 }
 
 /* --- System V IPC ------------------------------------------------------------ */
@@ -404,6 +447,44 @@ static void t_shm(void)                 /* the direct calls, on both CPUs */
     wait_child(pid);
     check(id >= 0 && (long)p > 0 && p[1] == 'c', "shmget/shmat direct", (long)p);
     check(SC1(S_shmdt, p) == 0 && SC3(S_shmctl, id, IPC_RMID, 0) == 0, "shmdt + shmctl", 0);
+}
+
+/* --- the direction flag ------------------------------------------------------ */
+
+/* A program may have the direction flag set (std) at the moment an
+   interrupt or a fault takes it into the kernel — musl's memmove does, for
+   a moment. The kernel must clear it for itself: with DF set, its own
+   memset and memcpy run backwards, over whatever lies below their target.
+   (The x86_64 kernel did not, until 2026-10-08: the console's grid was
+   once copied back over the whole kernel image.) Here: dirty some pages
+   and give them back, so a recycled frame is not zero by luck; then, with
+   DF set, the first touch of each fresh page — a page fault, whose handler
+   zero-fills the new frame. Every page must read back as zeros. */
+#define PROT_RW       3
+#define MAP_PRIV_ANON 0x22
+static void t_dirflag(void)
+{
+    const long n = 64, len = 64 * 4096;
+    char *dirty = (char *)SC6(S_mmap, 0, len, PROT_RW, MAP_PRIV_ANON, -1, 0);
+    char *p = (char *)SC6(S_mmap, 0, len, PROT_RW, MAP_PRIV_ANON, -1, 0);
+    if ((unsigned long)dirty > -4096UL || (unsigned long)p > -4096UL) {
+        check(0, "direction flag: mmap", (long)p);
+        return;
+    }
+    fill(dirty, 0xA5, len);
+    SC2(S_munmap, dirty, len);          /* its frames go back, dirty */
+    long bad = 0;
+    for (long k = 0; k < n; k++) {
+        volatile char *page = p + k * 4096;
+        __asm__ volatile ("std\n\tmovb $1, (%0)\n\tcld" : : "r"(page) : "memory");
+        for (int b = 1; b < 4096; b++)
+            if (page[b]) {
+                bad++;
+                break;
+            }
+    }
+    check(bad == 0, "direction flag: a page fault while DF is set zero-fills the page", bad);
+    SC2(S_munmap, p, len);
 }
 
 /* --- inotify ----------------------------------------------------------------- */
@@ -962,6 +1043,132 @@ static void t_tcp_listen(void)
     check(wait_child(pid) == 0, "tcp: a user may not bind port 22", 0);
 }
 
+/* --- Unix sockets: SOCK_SEQPACKET, passing a file, the sender's credentials --- */
+
+struct u_iov { const void *base; unsigned long len; };
+struct u_msg {                          /* struct msghdr, natural layout on both CPUs */
+    void *name; unsigned int namelen;
+    struct u_iov *iov; unsigned long iovlen;
+    void *control; unsigned long controllen;
+    int flags;
+};
+struct u_cmsg { unsigned long len; int level, type; };     /* + data, word aligned */
+#define CMSG_AL(n) (((n) + sizeof(long) - 1) & ~(sizeof(long) - 1))
+
+static void t_unix_pass(void)
+{
+    int sv[2] = { -1, -1 }, p[2] = { -1, -1 }, one = 1, got = 0;
+    unsigned int glen = 4;
+    long r1 = SC4(S_socketpair, 1, 5, 0, sv);           /* AF_UNIX, SOCK_SEQPACKET */
+    long r2 = SC5(S_setsockopt, sv[1], 1, 16, &one, 4); /* SO_PASSCRED */
+    long r3 = SC5(S_getsockopt, sv[1], 1, 16, &got, &glen);
+    SC1(S_pipe, p);
+    SC3(S_write, p[1], "fd!", 3);
+
+    /* One message carrying the pipe's read end; then our copy is closed. */
+    long ctl[8] = { 0 };
+    struct u_cmsg *cm = (struct u_cmsg *)ctl;
+    cm->len = sizeof *cm + 4, cm->level = 1, cm->type = 1;   /* SOL_SOCKET, SCM_RIGHTS */
+    *(int *)(cm + 1) = p[0];
+    struct u_iov iov = { "hi", 2 };
+    struct u_msg m = { 0, 0, &iov, 1, ctl, sizeof *cm + CMSG_AL(4), 0 };
+    long r4 = SC3(S_sendmsg, sv[0], &m, 0);
+    SC1(S_close, p[0]);
+
+    char buf[8];
+    long ctl2[16] = { 0 };
+    struct u_iov iov2 = { buf, sizeof buf };
+    struct u_msg m2 = { 0, 0, &iov2, 1, ctl2, sizeof ctl2, 0 };
+    long r5 = SC3(S_recvmsg, sv[1], &m2, 0);
+
+    /* First the credentials (SCM_CREDENTIALS: pid, uid, gid), then the file. */
+    struct u_cmsg *c1 = (struct u_cmsg *)ctl2;
+    struct u_cmsg *c2 = (struct u_cmsg *)((char *)ctl2 + CMSG_AL(c1->len));
+    int pid_ok = c1->type == 2 && ((int *)(c1 + 1))[0] == SC0(S_getpid);
+    int fd = c2->type == 1 ? *(int *)(c2 + 1) : -1;
+    char got3[4] = { 0 };
+    long n = fd >= 0 ? SC3(S_read, fd, got3, 3) : -1;
+    check(r1 == 0 && r2 == 0 && r3 == 0 && got == 1 && r4 == 2 && r5 == 2 && pid_ok &&
+          n == 3 && same(got3, "fd!", 3), "SOCK_SEQPACKET + SCM_RIGHTS + SCM_CREDENTIALS",
+          r1 ? r1 : r3 ? r3 : r4 != 2 ? r4 : r5 != 2 ? r5 : n);
+    if (fd >= 0)
+        SC1(S_close, fd);
+    SC1(S_close, p[1]);
+    SC1(S_close, sv[0]);
+    SC1(S_close, sv[1]);
+}
+
+/* 3 MB through a stream socketpair in odd-sized pieces, a child checking
+   every byte: the ring grows from one page while both ends are busy, and
+   wraps at every size (net/unix.c, ring_grow). */
+static unsigned char big_out[100003], big_in[65536];
+static unsigned char big_byte(unsigned long i) { return (unsigned char)(i * 7 + i / 4096); }
+
+static void t_unix_big(void)
+{
+    int sv[2] = { -1, -1 };
+    long r = SC4(S_socketpair, 1, 1, 0, sv);            /* AF_UNIX, SOCK_STREAM */
+    if (r) {
+        check(0, "unix stream: 3 MB, every byte", r);
+        return;
+    }
+    const unsigned long total = 3u << 20;
+    long pid = SC0(S_fork);
+    if (pid == 0) {                                     /* the reader */
+        SC1(S_close, sv[0]);
+        unsigned long got = 0;
+        int bad = 0;
+        for (;;) {
+            long n = SC3(S_read, sv[1], big_in, sizeof big_in - 1000);
+            if (n <= 0)
+                break;
+            for (long k = 0; k < n; k++)
+                bad |= big_in[k] != big_byte(got + (unsigned long)k);
+            got += (unsigned long)n;
+        }
+        SC1(S_exit, bad ? 2 : got == total ? 0 : 3);
+    }
+    SC1(S_close, sv[1]);
+    unsigned long sent = 0;
+    long w = 0, t0 = now_ms();
+    while (sent < total) {
+        unsigned long k = total - sent < sizeof big_out ? total - sent : sizeof big_out;
+        for (unsigned long j = 0; j < k; j++)
+            big_out[j] = big_byte(sent + j);
+        w = SC3(S_write, sv[0], big_out, k);
+        if (w <= 0)
+            break;
+        sent += (unsigned long)w;                       /* a short write: the rest next time */
+    }
+    SC1(S_close, sv[0]);
+    int status = -1;
+    SC4(S_wait4, pid, &status, 0, 0);
+    check(sent == total && status == 0, "unix stream: 3 MB, every byte",
+          sent != total ? w : status);
+    out("  (3 MB in "), outn(now_ms() - t0), out(" ms)\n");
+}
+
+/* poll() on an epoll file: ready only while something inside is (GLib
+   watches libmount's monitor so; "always ready" spun the Save As dialog). */
+static void t_epoll_poll(void)
+{
+    int p[2] = { -1, -1 };
+    SC1(S_pipe, p);
+    long ep = SC1(S_epoll_create1, 0);
+    unsigned int ev[3] = { 1, 7, 0 };                   /* EPOLLIN, data 7 */
+    long add = SC4(S_epoll_ctl, ep, 1, p[0], ev);       /* EPOLL_CTL_ADD */
+    struct { int fd; short events, revents; } pf = { (int)ep, 1, 0 };
+    long before = SC3(S_poll, &pf, 1, 0);               /* empty pipe: nothing */
+    SC3(S_write, p[1], "x", 1);
+    pf.revents = 0;
+    long after = SC3(S_poll, &pf, 1, 0);
+    check(ep >= 0 && add == 0 && before == 0 && after == 1 && (pf.revents & 1),
+          "poll on an epoll file: ready only when an entry is", before ? before : after);
+    SC1(S_close, ep);
+    SC1(S_close, p[0]);
+    SC1(S_close, p[1]);
+}
+
 void cmain(void)
 {
     t_cputime();
@@ -972,6 +1179,7 @@ void cmain(void)
     t_sem();
     t_msg();
     t_shm();
+    t_dirflag();
     t_inotify();
     t_locks();
     t_misc();
@@ -979,6 +1187,9 @@ void cmain(void)
     t_packet();
     t_nl80211();
     t_tcp_listen();
+    t_unix_pass();
+    t_unix_big();
+    t_epoll_poll();
     /* Leave /tmp as we found it: its files are memory (`make test` counts
        every page after the programs have run). */
     SC1(S_unlink, "/tmp/sf_src");

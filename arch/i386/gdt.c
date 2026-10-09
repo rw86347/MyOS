@@ -19,6 +19,7 @@
  *   5      0x28      TSS (Task State Segment)
  *   6-8    0x33...   thread-local storage (TLS): set per thread by the
  *                    set_thread_area syscall; musl points GS at entry 6
+ *   9      0x48      the double fault's TSS (below)
  *
  * The TSS: when an interrupt or `int 0x80` arrives while a USER program
  * runs, the CPU switches to ring 0 — and must not keep using the program's
@@ -56,9 +57,20 @@ struct tss {
     uint16_t trap, iomap_base;
 } __attribute__((packed));
 
-static struct gdt_entry gdt[9];
+static struct gdt_entry gdt[10];
 /* Not static: sysentry.asm reads esp0 from it directly. */
 struct tss kernel_tss;
+
+/* The double fault's task. A kernel stack that runs off its end hits its
+   guard page (thread.c); the CPU then can't even push the page fault's
+   frame, and that is a double fault — which, taken on the same full stack,
+   would be a triple fault: the machine resets, nothing said. i386 has no
+   "switch to this stack for that vector" (x86_64's IST), but it has task
+   gates: the CPU saves every register into the current TSS (kernel_tss)
+   and loads all of them from another one — this one, with a stack of its
+   own. Used for this alone, as Linux does. */
+static struct tss df_tss;
+static uint8_t df_stack[8192] __attribute__((aligned(16)));
 
 static void set_entry(int i, uint32_t base, uint32_t limit, uint8_t access, uint8_t flags)
 {
@@ -112,6 +124,26 @@ void gdt_init(void)
 void tss_set_kernel_stack(uint32_t esp0)
 {
     kernel_tss.esp0 = esp0;
+}
+
+void tss_double_fault_init(void (*fn)(void))
+{
+    uint32_t cr3;
+    __asm__ volatile ("mov %%cr3, %0" : "=r"(cr3));   /* the kernel's own directory */
+    df_tss.cr3 = cr3;
+    df_tss.eip = (uint32_t)(uintptr_t)fn;
+    df_tss.eflags = 0x2;                /* interrupts off (bit 1 is always set) */
+    df_tss.esp = (uint32_t)(uintptr_t)(df_stack + sizeof df_stack);
+    df_tss.cs = GDT_KERNEL_CODE;
+    df_tss.ss = df_tss.ds = df_tss.es = df_tss.fs = df_tss.gs = GDT_KERNEL_DATA;
+    df_tss.iomap_base = sizeof df_tss;
+    set_entry(GDT_DF_TSS >> 3, (uint32_t)(uintptr_t)&df_tss, sizeof df_tss - 1, 0x89, 0x0);
+}
+
+void tss_saved_state(uint32_t *eip, uint32_t *esp)
+{
+    *eip = kernel_tss.eip;
+    *esp = kernel_tss.esp;
 }
 
 /* --- thread-local storage -------------------------------------------------- */

@@ -50,6 +50,12 @@ struct blockdev {
     struct blockdev *parent;    /* for partitions: the whole disk */
     uint32_t offset;            /* for partitions: first sector on the parent */
     void    *priv;              /* driver's private data */
+
+    /* What /sys/block shows (fs/sysfs.c), for the installer and lsblk. */
+    char     model[41];         /* the drive's own name ("QEMU HARDDISK"); "" unknown */
+    char     label[37];         /* a GPT partition's name ("myos-root"); "" none */
+    uint8_t  removable;         /* a USB stick: it may be pulled out */
+    uint8_t  partno;            /* a partition's slot in its table (sda3: 3) */
 };
 
 /* Add a device to the global list. Returns it, or NULL if the list is full. */
@@ -58,6 +64,26 @@ struct blockdev *blockdev_register(const struct blockdev *dev);
 /* The next SCSI-style disk name, "sda", "sdb", ... (AHCI and USB disks
    share the letters, as on Linux). */
 void blockdev_sd_name(char name[16]);
+
+/* Show a newly registered disk or partition in /sys/block (fs/sysfs.c);
+   nothing until /sys is mounted, which adds the ones before it. */
+int  sysfs_block_add(struct blockdev *d);
+void sysfs_block_remove(struct blockdev *d);
+
+/* /dev/<name>, the disk or partition as a file (fs/dev.c): made as it is
+   registered, or when /dev is made for the ones before. */
+void dev_block_add(struct blockdev *d);
+void dev_block_remove(struct blockdev *d);
+
+/* A partition moved, appeared or went (sectors 0): show it again. */
+void blockdev_changed(struct blockdev *d);
+
+/* The disk or partition with Linux's numbers (a /dev node's rdev), or NULL. */
+struct blockdev *blockdev_by_devnum(unsigned major, unsigned minor);
+
+/* Linux's device numbers for a disk or partition: sd 8, hd 3/22, vd 252,
+   nvme 259 (/proc/partitions, /sys/.../dev, the /dev files). */
+void blockdev_devnum(const struct blockdev *d, unsigned *major, unsigned *minor);
 
 int  blockdev_count(void);
 struct blockdev *blockdev_get(int index);

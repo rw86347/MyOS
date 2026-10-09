@@ -30,6 +30,8 @@ void idt_init(void);
 void irq_install(int irq, isr_fn_t handler);
 
 static inline void interrupts_enable(void)  { __asm__ volatile ("sti"); }
+/* A user-mode frame's stack pointer (regs that came from ring 3). */
+static inline uint32_t regs_sp(const struct regs *r) { return r->user_esp; }
 static inline void interrupts_disable(void) { __asm__ volatile ("cli"); }
 
 /* Turn interrupts off and return the old EFLAGS, so irq_restore() can put

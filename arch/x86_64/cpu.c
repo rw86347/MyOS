@@ -21,10 +21,15 @@
 uint32_t cpu_features;
 static uint32_t per_us;
 
-static void cpuid(uint32_t leaf, uint32_t r[4])
+void cpu_cpuid(uint32_t leaf, uint32_t sub, uint32_t r[4])
 {
     __asm__ volatile ("cpuid" : "=a"(r[0]), "=b"(r[1]), "=c"(r[2]), "=d"(r[3])
-                      : "a"(leaf));
+                      : "a"(leaf), "c"(sub));
+}
+
+static void cpuid(uint32_t leaf, uint32_t r[4])
+{
+    cpu_cpuid(leaf, 0, r);
 }
 
 void cpu_init(void)

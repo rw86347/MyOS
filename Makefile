@@ -98,6 +98,43 @@ ifeq ($(TRACE),1)
   BUILD := $(BUILD)/trace
 endif
 
+# make STACKDEPTH=1 <target>: every kernel stack starts filled with a
+# pattern, and every few seconds the kernel prints the deepest any thread
+# has gone yet ("stack: ... has used N of its M bytes") — for sizing
+# THREAD_STACK (kernel/thread.c, "kernel stacks"). A build folder of its own.
+ifeq ($(STACKDEPTH),1)
+  MODE_FLAGS += -DSTACK_DEPTH
+  BUILD := $(BUILD)/stackdepth
+endif
+
+# make PTAUDIT=1 <target>: when a program faults, print its registers and
+# the memory around them, and check every process's page tables against
+# the page allocator (arch/x86_64/paging.c, vmm_audit): a frame mapped while
+# free, or shared by more mappings than it has owners. Fault time only: it
+# doesn't change the timing that leads to a crash. A build folder of its own.
+ifeq ($(PTAUDIT),1)
+  MODE_FLAGS += -DPT_AUDIT
+  BUILD := $(BUILD)/ptaudit
+endif
+
+# make SYSTRACE=1 <target>: every thread keeps its last 32 system calls
+# (number, arguments, result, time) and a user fault prints them, with the
+# last few of every other thread in the process — what a crashing program
+# asked the kernel for just before. A build folder of its own.
+ifeq ($(SYSTRACE),1)
+  MODE_FLAGS += -DSYS_TRACE
+  BUILD := $(BUILD)/systrace
+endif
+
+# make MEMDEBUG=1 <target>: freed pages and freed kmalloc objects are
+# filled with 0xDEADBEEF and checked when they are handed out again, so a
+# write to memory after it was freed is reported (mm/pmm.c, mm/kheap.c).
+# Slow. A build folder of its own.
+ifeq ($(MEMDEBUG),1)
+  MODE_FLAGS += -DMEM_DEBUG
+  BUILD := $(BUILD)/memdebug
+endif
+
 # make CMDLINE=word <target>: the kernel's command line (/proc/cmdline),
 # built in until a boot loader passes one. "nodesktop": the login service
 # doesn't start X, so the text console shows everything (with TRACE=1, the
@@ -149,7 +186,7 @@ BENCH_SRCS := kernel/bench.c
 C_SRCS  := $(filter-out $(TEST_SRCS) $(BENCH_SRCS), \
              $(wildcard arch/i386/*.c kernel/*.c drivers/*.c fs/*.c mm/*.c net/*.c \
                         drivers/gpu/drm/*.c drivers/gpu/drm/tiny/*.c drivers/video/*.c \
-                        drivers/usb/*.c net/wireless/*.c))
+                        drivers/usb/*.c drivers/sound/*.c net/wireless/*.c))
 ifeq ($(MODE),test)
   C_SRCS += $(TEST_SRCS)
 endif
@@ -172,6 +209,7 @@ USER_LIB  := $(BUILD)/user/lib/crt0.o $(BUILD)/user/lib/mini.o
 # user/sys/systest.c, raw system calls for either CPU (rule below): test
 # builds carry it too, as /bin/rawsystest.
 SYSTEST   := $(BUILD)/user/sys/systest
+SNDTEST   := $(BUILD)/user/sys/sndtest
 # Alpine Linux packages, unpacked (tools/fetch-alpine.sh; see the initramfs).
 ALPINE := build/ext/alpine
 ALPINE_STAMP := $(ALPINE)/.fetched
@@ -200,7 +238,7 @@ ifeq ($(ARCH),x86_64)
     C_SRCS  := $(filter-out $(TEST_SRCS) $(BENCH_SRCS) arch/x86_64/early.c kernel/elf.c, \
                $(wildcard arch/x86_64/*.c kernel/*.c drivers/*.c fs/*.c mm/*.c net/*.c \
                           drivers/gpu/drm/*.c drivers/gpu/drm/tiny/*.c drivers/video/*.c \
-                          drivers/usb/*.c net/wireless/*.c))
+                          drivers/usb/*.c drivers/sound/*.c net/wireless/*.c))
     ifeq ($(MODE),test)
       C_SRCS += $(TEST_SRCS)
     endif
@@ -615,10 +653,17 @@ $(SYSTEST): user/sys/systest.c
 	$(CC) -std=c11 -ffreestanding -nostdlib -static -O2 -Wall -Wextra -fno-pic -fno-pie \
 	  $(SYSTEST_FLAGS) $< -o $@ -lgcc
 
-$(TEST_INITRD): $(INITRD) $(SYSTEST)
+# user/sys/sndtest.c: the sound card through raw ALSA ioctls (test-sound).
+$(SNDTEST): user/sys/sndtest.c include/sound/asound.h
+	@mkdir -p $(dir $@)
+	$(CC) -std=c11 -ffreestanding -nostdlib -static -O2 -Wall -Wextra -fno-pic -fno-pie \
+	  $(SYSTEST_FLAGS) $< -o $@ -lgcc
+
+$(TEST_INITRD): $(INITRD) $(SYSTEST) $(SNDTEST)
 	@rm -rf $(BUILD)/initramfs-test
 	cp -R $(BUILD)/initramfs $(BUILD)/initramfs-test
 	cp $(SYSTEST) $(BUILD)/initramfs-test/bin/systest
+	cp $(SNDTEST) $(BUILD)/initramfs-test/bin/sndtest
 	cd $(BUILD)/initramfs-test && find . -mindepth 1 ! -name .DS_Store | sort \
 	  | cpio -o -H newc -R 0:0 --quiet > ../$(notdir $(TEST_INITRD))
 
@@ -685,6 +730,30 @@ test-uefi-shell: $(UEFI_TEST_IMG) $(USB)
 	  fi; \
 	  [ $$ok = 1 ] && echo "UEFI SHELL TEST OK ($(ARCH))" || exit 1
 
+# Sound (docs/SOUND-PLAN.md): QEMU's Intel HD Audio controller with a
+# laptop-like codec (hda-micro: a speaker and a mic) whose speaker is
+# written to a WAV file. sndtest plays 440 Hz through write() and through
+# the mapped buffer; tools/check-tone.py finds the tone in the file.
+SOUND_WAV := $(BUILD)/sound-test.wav
+test-sound: QEMU_UEFI_DISK = $(UEFI_TEST_IMG)
+test-sound: $(UEFI_TEST_IMG)
+	@rm -f $(BUILD)/sound.log $(SOUND_WAV)
+	@cp $(OVMF_VARS) $(BUILD)/ovmf-vars.fd
+	@(sleep 15; for c in "ls -l /dev/snd" sndtest; do \
+	    tools/qemu-type.sh "$$c" | while read k; do echo "$$k"; sleep 0.05; done; sleep 2; \
+	  done; sleep 10; echo quit) \
+	  | $(QEMU64) $(QEMU_UEFI_FLAGS) -display none \
+	    -audiodev wav,id=snd0,path=$(SOUND_WAV) \
+	    -device ich9-intel-hda -device hda-micro,audiodev=snd0 \
+	    -serial file:$(BUILD)/sound.log -monitor stdio >/dev/null || true
+	@perl -pe 's/\e\[[0-9;?]*[A-Za-z]//g; s/\r//g' $(BUILD)/sound.log > $(BUILD)/sound.txt
+	@grep -E "^(hda|sound):|^sndtest|^ok |^FAIL|^c.* (control|pcm)C" $(BUILD)/sound.txt; echo
+	@L=$(BUILD)/sound.txt; ok=1; \
+	  grep -q "^sound: card 0: " $$L || { echo "FAIL: no sound card"; ok=0; }; \
+	  grep -q "^sndtest: all ok" $$L || { echo "FAIL: sndtest"; ok=0; }; \
+	  python3 tools/check-tone.py $(SOUND_WAV) 440 0.8 || ok=0; \
+	  [ $$ok = 1 ] && echo "SOUND TEST OK ($(ARCH))" || exit 1
+
 # Login-only initramfs (rules sit with live-hd: they need LOGIN_BIN).
 # x86_64 paths match tools/fetch-live.py --arch x86_64 (not build/x86_64/live).
 ifeq ($(ARCH),x86_64)
@@ -695,7 +764,7 @@ ifeq ($(ARCH),x86_64)
   LIVE_LOGIN_INITRD := build/live/login-initrd-x86_64.cpio
   LIVE_LOCK         := live/packages.x86_64.lock
   LIVE_HD           := $(BUILD)/myos-live-root.img
-  LIVE_MB           := 2048
+  LIVE_MB           := 3072
   MUSL_LDSO         := /lib/ld-musl-x86_64.so.1
   LIVE_MARCH        := -march=x86-64
   ALPINE_TRIPLET    := x86_64-alpine-linux-musl
@@ -921,13 +990,15 @@ $(LOGIN_BIN): live/myos-login/myos-login.c live/common/xpic.h | $(LIVE_SYSROOT)/
 
 # The Start menu (live/myos-menu): the same libraries, less PAM.
 MENU_BIN := $(LIVE_EXTRA)/usr/bin/myos-menu
-$(MENU_BIN): live/myos-menu/myos-menu.c live/common/xpic.h | $(LIVE_SYSROOT)/.done
+$(MENU_BIN): live/myos-menu/myos-menu.c live/myos-menu/programs.c live/myos-menu/programs.h \
+             live/common/xpic.h | $(LIVE_SYSROOT)/.done
 	@mkdir -p $(dir $@) $(BUILD)/live
-	$(CC) $(LOGIN_CFLAGS) -Ilive/common -c $< -o $(BUILD)/live/myos-menu.o
+	$(CC) $(LOGIN_CFLAGS) -Ilive/common -Ilive/myos-menu -c live/myos-menu/myos-menu.c -o $(BUILD)/live/myos-menu.o
+	$(CC) $(LOGIN_CFLAGS) -Ilive/common -Ilive/myos-menu -c live/myos-menu/programs.c -o $(BUILD)/live/programs.o
 	$(CC) -nostdlib -Wl,-z,noexecstack -Wl,-dynamic-linker,$(MUSL_LDSO) \
 	  -Wl,-rpath-link,$(LIVE_SYSROOT)/usr/lib:$(LIVE_SYSROOT)/lib \
 	  $(LIVE_SYSROOT)/usr/lib/crt1.o $(LIVE_SYSROOT)/usr/lib/crti.o \
-	  $(BUILD)/live/myos-menu.o -L$(LIVE_SYSROOT)/usr/lib -L$(LIVE_SYSROOT)/lib \
+	  $(BUILD)/live/myos-menu.o $(BUILD)/live/programs.o -L$(LIVE_SYSROOT)/usr/lib -L$(LIVE_SYSROOT)/lib \
 	  -lX11 -lXft -lImlib2 -lc -lgcc $(LIVE_SYSROOT)/usr/lib/crtn.o -o $@
 
 # Settings (live/myos-settings): a GTK3 program, and myos-xsettings, which
@@ -943,10 +1014,12 @@ LIVE_LINK = $(CC) -nostdlib -Wl,-z,noexecstack -Wl,-dynamic-linker,$(MUSL_LDSO) 
 	  $(LIVE_SYSROOT)/usr/lib/crt1.o $(LIVE_SYSROOT)/usr/lib/crti.o \
 	  $(1) -L$(LIVE_SYSROOT)/usr/lib -L$(LIVE_SYSROOT)/lib \
 	  $(2) -lc -lgcc $(LIVE_SYSROOT)/usr/lib/crtn.o -o $@
-$(SETTINGS_BIN): live/myos-settings/myos-settings.c live/myos-settings/scale.h | $(LIVE_SYSROOT)/.done
+$(SETTINGS_BIN): live/myos-settings/myos-settings.c live/myos-settings/scale.h \
+                 live/myos-settings/wallpaper.h | $(LIVE_SYSROOT)/.done
 	@mkdir -p $(dir $@) $(BUILD)/live
-	$(CC) $(LOGIN_CFLAGS) $(GTK_CFLAGS) -Wno-deprecated-declarations -c $< -o $(BUILD)/live/myos-settings.o
-	$(call LIVE_LINK,$(BUILD)/live/myos-settings.o,-lgtk-3 -lgdk-3 -lgobject-2.0 -lglib-2.0 -lcairo -lX11 -lm)
+	$(CC) $(LOGIN_CFLAGS) $(GTK_CFLAGS) -Wno-deprecated-declarations -Wno-format-truncation -c $< -o $(BUILD)/live/myos-settings.o
+	$(call LIVE_LINK,$(BUILD)/live/myos-settings.o,-lgtk-3 -lgdk-3 -lgdk_pixbuf-2.0 -lgio-2.0 \
+	  -lgobject-2.0 -lglib-2.0 -lcairo -lpango-1.0 -lpangocairo-1.0 -lX11 -lm)
 # The Wi-Fi tray icon (live/myos-wifi): GTK3, wpa_supplicant's control
 # socket. Started by IceWM's startup script.
 WIFI_BIN := $(LIVE_EXTRA)/usr/bin/myos-wifi
@@ -956,6 +1029,18 @@ $(WIFI_BIN): live/myos-wifi/myos-wifi.c live/myos-settings/scale.h | $(LIVE_SYSR
 	  -c $< -o $(BUILD)/live/myos-wifi.o
 	$(call LIVE_LINK,$(BUILD)/live/myos-wifi.o,-lgtk-3 -lgdk-3 -lgdk_pixbuf-2.0 -lgobject-2.0 \
 	  -lglib-2.0 -lcairo -lpango-1.0 -lX11 -lm)
+# The desktop icons (live/myos-desktop): files in ~/Desktop, and the
+# right-click that opens Settings > Wallpaper. Started by IceWM's startup.
+DESKTOP_BIN := $(LIVE_EXTRA)/usr/bin/myos-desktop
+$(DESKTOP_BIN): live/myos-desktop/myos-desktop.c live/myos-settings/scale.h \
+                live/myos-settings/wallpaper.h | $(LIVE_SYSROOT)/.done
+	@mkdir -p $(dir $@) $(BUILD)/live
+	$(CC) $(LOGIN_CFLAGS) $(GTK_CFLAGS) -isystem $(LIVE_SYSROOT)/usr/include/librsvg-2.0 \
+	  -isystem $(LIVE_SYSROOT)/usr/include/poppler/glib \
+	  -Ilive/myos-settings -Wno-deprecated-declarations -Wno-format-truncation \
+	  -c live/myos-desktop/myos-desktop.c -o $(BUILD)/live/myos-desktop.o
+	$(call LIVE_LINK,$(BUILD)/live/myos-desktop.o,-lgtk-3 -lgdk-3 -lgdk_pixbuf-2.0 -lgio-2.0 \
+	  -lgobject-2.0 -lglib-2.0 -lpango-1.0 -lpangocairo-1.0 -lcairo -lrsvg-2 -lpoppler-glib -lX11 -lm)
 # My Files (live/myos-files): GTK3 for the window, cairo and pango for
 # the drawing, librsvg for the theme's SVG icons.
 FILES_BIN := $(LIVE_EXTRA)/usr/bin/myos-files
@@ -973,6 +1058,60 @@ $(FILES_BIN): live/myos-files/myos-files.c live/myos-settings/scale.h $(HEIF_PIX
 	$(call LIVE_LINK,$(BUILD)/live/myos-files.o $(HEIF_PIXBUF_OBJ),-lgtk-3 -lgdk-3 -lgdk_pixbuf-2.0 \
 	  -lpoppler-glib -lheif -lgobject-2.0 -lglib-2.0 -lgio-2.0 -lpango-1.0 -lpangocairo-1.0 \
 	  -lcairo -lrsvg-2 -lX11 -lm)
+# rm (live/myos-rm): people's rm moves to ~/Trash; root and system accounts
+# get GNU rm (coreutils). /bin/rm and /usr/bin/rm are symlinks to it, laid
+# over Alpine's symlink to coreutils: a symlink replaces a symlink when the
+# tar is unpacked, where a file would be written through it (into coreutils).
+RM_BIN := $(LIVE_EXTRA)/usr/bin/myos-rm
+$(RM_BIN): live/myos-rm/myos-rm.c | $(LIVE_SYSROOT)/.done
+	@mkdir -p $(dir $@) $(LIVE_EXTRA)/bin $(BUILD)/live
+	$(CC) $(LOGIN_CFLAGS) -Wno-format-truncation -c $< -o $(BUILD)/live/myos-rm.o
+	$(call LIVE_LINK,$(BUILD)/live/myos-rm.o,)
+	ln -sfn /usr/bin/myos-rm $(LIVE_EXTRA)/bin/rm
+	ln -sfn /usr/bin/myos-rm $(LIVE_EXTRA)/usr/bin/rm
+# The Recycle can on the desktop: drops go to rm, Empty is --emptyTrash.
+TRASH_BIN := $(LIVE_EXTRA)/usr/bin/myos-trash
+$(TRASH_BIN): live/myos-trash/myos-trash.c live/myos-settings/scale.h | $(LIVE_SYSROOT)/.done
+	@mkdir -p $(dir $@) $(BUILD)/live
+	$(CC) $(LOGIN_CFLAGS) $(GTK_CFLAGS) -isystem $(LIVE_SYSROOT)/usr/include/librsvg-2.0 \
+	  -Ilive/myos-settings -Wno-deprecated-declarations \
+	  -c $< -o $(BUILD)/live/myos-trash.o
+	$(call LIVE_LINK,$(BUILD)/live/myos-trash.o,-lgtk-3 -lgdk-3 -lgdk_pixbuf-2.0 -lgobject-2.0 \
+	  -lglib-2.0 -lgio-2.0 -lcairo -lrsvg-2 -lX11 -lm)
+# The speaker in the tray (live/myos-volume): the volume pop-up, and the
+# wheel's steps. The sound card's controls through include/sound/asound.h
+# (quoted: Alpine's linux-headers has its own, with other field names).
+VOLUME_BIN := $(LIVE_EXTRA)/usr/bin/myos-volume
+$(VOLUME_BIN): live/myos-volume/myos-volume.c include/sound/asound.h | $(LIVE_SYSROOT)/.done
+	@mkdir -p $(dir $@) $(BUILD)/live
+	$(CC) $(LOGIN_CFLAGS) $(GTK_CFLAGS) -iquote include/sound -Wno-deprecated-declarations \
+	  -c $< -o $(BUILD)/live/myos-volume.o
+	$(call LIVE_LINK,$(BUILD)/live/myos-volume.o,-lgtk-3 -lgdk-3 -lgobject-2.0 -lglib-2.0)
+# Force Quit (live/myos-forcequit): kill -9 a program that stopped
+# answering; Ctrl+Shift+Esc (etc/icewm/keys) and All Programs → System Tools.
+FORCEQUIT_BIN := $(LIVE_EXTRA)/usr/bin/myos-forcequit
+$(FORCEQUIT_BIN): live/myos-forcequit/myos-forcequit.c | $(LIVE_SYSROOT)/.done
+	@mkdir -p $(dir $@) $(BUILD)/live
+	$(CC) $(LOGIN_CFLAGS) $(GTK_CFLAGS) -Wno-deprecated-declarations \
+	  -c $< -o $(BUILD)/live/myos-forcequit.o
+	$(call LIVE_LINK,$(BUILD)/live/myos-forcequit.o,-lgtk-3 -lgdk-3 -lgobject-2.0 -lglib-2.0 -lX11)
+# An Open panel for shell scripts (live/myos-choose): myos-mplayer asks
+# which file to play with it when started from the menu.
+CHOOSE_BIN := $(LIVE_EXTRA)/usr/bin/myos-choose-file
+$(CHOOSE_BIN): live/myos-choose/myos-choose-file.c | $(LIVE_SYSROOT)/.done
+	@mkdir -p $(dir $@) $(BUILD)/live
+	$(CC) $(LOGIN_CFLAGS) $(GTK_CFLAGS) -Wno-deprecated-declarations \
+	  -c $< -o $(BUILD)/live/myos-choose-file.o
+	$(call LIVE_LINK,$(BUILD)/live/myos-choose-file.o,-lgtk-3 -lgdk-3 -lgobject-2.0 -lglib-2.0)
+# Player (live/myos-player): QuickTime Player's look over mplayer, which
+# plays in slave mode inside its window. Menus, My Files and the desktop
+# open films and music with it (usr/bin/myos-mplayer).
+PLAYER_BIN := $(LIVE_EXTRA)/usr/bin/myos-player
+$(PLAYER_BIN): live/myos-player/myos-player.c | $(LIVE_SYSROOT)/.done
+	@mkdir -p $(dir $@) $(BUILD)/live
+	$(CC) $(LOGIN_CFLAGS) $(GTK_CFLAGS) -Wno-deprecated-declarations \
+	  -c $< -o $(BUILD)/live/myos-player.o
+	$(call LIVE_LINK,$(BUILD)/live/myos-player.o,-lgtk-3 -lgdk-3 -lgobject-2.0 -lglib-2.0 -lcairo -lX11 -lm)
 # Preview (live/myos-preview): the Mac's Preview — PDFs through poppler
 # (qpdf, run as a program, rewrites their pages), pictures through
 # gdk-pixbuf's loaders, and TIFF, JPEG 2000, OpenEXR, Photoshop and HEIC/HEIF
@@ -992,6 +1131,7 @@ $(PREVIEW_BIN): $(PREVIEW_OBJS) $(HEIF_PIXBUF_OBJ) live/myos-preview/preview.des
 	  -lOpenEXR-3_1 -lX11 -lm)
 	ln -sf myos-preview $(dir $@)preview
 	install -m 644 live/myos-preview/preview.desktop $(LIVE_EXTRA)/usr/share/applications/
+	install -m 644 live/overlay/usr/share/applications/mimeapps.list $(LIVE_EXTRA)/usr/share/applications/
 $(XSETTINGS_BIN): live/myos-settings/myos-xsettings.c live/myos-settings/scale.h | $(LIVE_SYSROOT)/.done
 	@mkdir -p $(dir $@) $(BUILD)/live
 	$(CC) $(LOGIN_CFLAGS) -c $< -o $(BUILD)/live/myos-xsettings.o
@@ -1004,6 +1144,33 @@ $(ADDUSER_BIN): live/myos-settings/myos-adduser.c | $(LIVE_SYSROOT)/.done
 	$(CC) $(LOGIN_CFLAGS) -c $< -o $(BUILD)/live/myos-adduser.o
 	$(call LIVE_LINK,$(BUILD)/live/myos-adduser.o,-lpam)
 	chmod 4755 $@
+
+# The installer (live/myos-install): GTK + --text writes a plan; the
+# setuid helper is the only process that may write a disk.
+INSTALL_BIN := $(LIVE_EXTRA)/usr/bin/myos-install
+HELPER_BIN  := $(LIVE_EXTRA)/usr/libexec/myos-install-helper
+INSTALL_COMMON := live/myos-install/plan.c live/myos-install/disks.c \
+                  live/myos-install/plan.h live/myos-install/disks.h
+$(BUILD)/live/install/%.o: live/myos-install/%.c $(INSTALL_COMMON) | $(LIVE_SYSROOT)/.done
+	@mkdir -p $(dir $@)
+	$(CC) $(LOGIN_CFLAGS) $(GTK_CFLAGS) -Ilive/myos-install -Ilive/myos-settings \
+	  -Wno-deprecated-declarations -Wno-format-truncation -c $< -o $@
+# The time zone page's map (made by tools/make-worldmap.py).
+$(BUILD)/live/install/myos-install.o: live/myos-install/worldmap.h
+$(HELPER_BIN): $(BUILD)/live/install/plan.o $(BUILD)/live/install/disks.o \
+               $(BUILD)/live/install/myos-install-helper.o
+	@mkdir -p $(dir $@)
+	$(call LIVE_LINK,$(BUILD)/live/install/plan.o $(BUILD)/live/install/disks.o \
+	  $(BUILD)/live/install/myos-install-helper.o,)
+	chmod 4755 $@
+$(INSTALL_BIN): $(BUILD)/live/install/plan.o $(BUILD)/live/install/disks.o \
+                $(BUILD)/live/install/myos-install.o live/overlay/usr/share/applications/myos-install.desktop
+	@mkdir -p $(dir $@) $(LIVE_EXTRA)/usr/share/applications
+	$(call LIVE_LINK,$(BUILD)/live/install/plan.o $(BUILD)/live/install/disks.o \
+	  $(BUILD)/live/install/myos-install.o,-lgtk-3 -lgdk-3 -lgobject-2.0 -lglib-2.0 -lgio-2.0 \
+	  -lcairo -lX11 -lm)
+	install -m 644 live/overlay/usr/share/applications/myos-install.desktop \
+	  $(LIVE_EXTRA)/usr/share/applications/
 
 # WritePerfect: Rodger's WordPerfect 5.1 work-alike, a separate project
 # built from its own tree (WP_DIR) into /usr/lib/writeperfect, with its
@@ -1098,11 +1265,14 @@ $(LIVE_THEME): live/theme/make-live-theme.py assets/themes/golden-hour/make-them
 	@touch $@
 
 live-theme: $(LIVE_THEME)
-live-extra: $(FW_STAMP) $(LIVE_THEME) $(LOGIN_BIN) $(MENU_BIN) $(SETTINGS_BIN) $(XSETTINGS_BIN) $(ADDUSER_BIN) $(FILES_BIN) $(PREVIEW_BIN) $(WIFI_BIN) $(WP_BIN)
+live-extra: $(FW_STAMP) $(LIVE_THEME) $(LOGIN_BIN) $(MENU_BIN) $(SETTINGS_BIN) $(XSETTINGS_BIN) $(ADDUSER_BIN) $(INSTALL_BIN) $(HELPER_BIN) $(FILES_BIN) $(PREVIEW_BIN) $(WIFI_BIN) $(DESKTOP_BIN) $(WP_BIN) $(RM_BIN) $(TRASH_BIN) $(VOLUME_BIN) $(FORCEQUIT_BIN) $(CHOOSE_BIN) $(PLAYER_BIN)
 
 # The live disk: like `make hd`, but myos-root holds the live userland
 # (tools/mklivehd.sh: owners, setuid bits and case-only names kept).
-$(LIVE_TAR): $(FW_STAMP) $(LIVE_THEME) $(LOGIN_BIN) $(MENU_BIN) $(SETTINGS_BIN) $(XSETTINGS_BIN) $(ADDUSER_BIN) $(FILES_BIN) $(PREVIEW_BIN) $(WIFI_BIN) $(WP_BIN) $(LIVE_LOCK) $(shell find live/overlay -type f) $(shell find live/overlay.local -type f 2>/dev/null)
+# Every overlay file is a prerequisite. Names may have spaces ("My Files.desktop"
+# in the Programs menu): find's output is escaped so make keeps each one whole.
+OVERLAY_DEPS := $(shell find live/overlay live/overlay.local -type f 2>/dev/null | sed 's/ /\\ /g')
+$(LIVE_TAR): $(FW_STAMP) $(LIVE_THEME) $(LOGIN_BIN) $(MENU_BIN) $(SETTINGS_BIN) $(XSETTINGS_BIN) $(ADDUSER_BIN) $(INSTALL_BIN) $(HELPER_BIN) $(FILES_BIN) $(PREVIEW_BIN) $(WIFI_BIN) $(DESKTOP_BIN) $(WP_BIN) $(RM_BIN) $(TRASH_BIN) $(VOLUME_BIN) $(FORCEQUIT_BIN) $(CHOOSE_BIN) $(PLAYER_BIN) $(LIVE_LOCK) $(OVERLAY_DEPS)
 	python3 tools/fetch-live.py --arch $(ALPINE_ARCH)
 ifeq ($(ARCH),x86_64)
 $(LIVE_HD): $(LIVE_TAR) tools/mklivehd.sh
@@ -1116,8 +1286,8 @@ live-hd: $(LIVE_HD)
 # RAM login for a UEFI stick when the kernel cannot see the ext2 root.
 # The Pentium floppy initrd stays BusyBox. WritePerfect is left on disk.
 $(LIVE_LOGIN_TAR): $(FW_STAMP) $(LIVE_THEME) $(LOGIN_BIN) $(MENU_BIN) $(XSETTINGS_BIN) $(WIFI_BIN) \
-                   $(LIVE_LOCK) tools/fetch-live.py \
-                   $(shell find live/overlay -type f) $(shell find live/overlay.local -type f 2>/dev/null)
+                   $(RM_BIN) $(LIVE_LOCK) tools/fetch-live.py \
+                   $(OVERLAY_DEPS)
 	python3 tools/fetch-live.py --arch $(ALPINE_ARCH) --login-root
 	@tar -tf $@ | grep -q '^usr/bin/myos-login$$' \
 	  || { echo "login-root.tar has no myos-login"; exit 1; }

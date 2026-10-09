@@ -723,3 +723,18 @@ path, the IN_OPEN / IN_CLOSE checks and the record-lock check at close — and 1
 `statx` (the lookup refactored into `stat_target`, shared with x86_64's
 `newfstatat`). `disk read 64 KiB, CPU work` moved between runs of the SAME build
 (1299, 1550, 1582 before; 2018, 1313 after), so that row is noise here.
+
+## Unix stream sockets: a ring that grows (2026-10-09)
+
+The receive ring was one 4 KiB page, so a writer moved at most 4 KiB per
+wake-up. Now it doubles while a writer finds it full, up to 256 KiB, and
+quiet sockets keep their single page.
+
+| systest `unix stream: 3 MB` (i386, QEMU, 100,003-byte writes) | time |
+|---|---|
+| before (ring fixed at 4 KiB) | 52 ms |
+| after (grows to 256 KiB) | 23 ms |
+
+The bigger win is X: after each partial write, Xorg moves its whole unsent
+rest to the front. A 19 MB reply took about 4,700 such moves at 4 KiB per
+write, and takes about 75 at 256 KiB.

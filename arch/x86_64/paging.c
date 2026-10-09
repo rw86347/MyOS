@@ -25,7 +25,9 @@
 #include <memlayout.h>
 #include <paging.h>
 #include <pmm.h>
+#include <serial.h>
 #include <string.h>
+#include <thread.h>
 #include <types.h>
 #include <user.h>
 
@@ -298,10 +300,36 @@ uint32_t vmm_pd_current(void)
     return (uint32_t)cur_pml4_phys;
 }
 
+/* A page table that can't be right: stop, and say who wanted it. */
+static void __attribute__((noreturn, noinline)) bad_table(const char *what, uint64_t phys)
+{
+    struct thread *t = thread_current();
+    kprintf("\n*** PAGE TABLE CHECK: %s %lx (thread \"%s\", called from %lx) ***\n",
+            what, (unsigned long)phys, t ? t->name : "?",
+            (unsigned long)(uintptr_t)__builtin_return_address(0));
+    serial_flush();
+    for (;;)
+        __asm__ volatile ("cli; hlt");
+}
+
+/* The kernel half of every address space is the kernel's own (two PML4
+   entries, copied by vmm_pd_create, never changed). One that isn't is a
+   freed table someone still points at, or one written over: loading it
+   would pull the kernel's code and stacks out from under the CPU — a
+   triple fault, a reset, nothing said. Two compares. */
+static int kernel_half_ok(phys_addr_t phys)
+{
+    const uint64_t *t = table_at(phys);
+    return t[PML4_INDEX(DIRECTMAP_BASE)] == kernel_pml4[PML4_INDEX(DIRECTMAP_BASE)] &&
+           t[PML4_INDEX(KERNEL_VBASE)] == kernel_pml4[PML4_INDEX(KERNEL_VBASE)];
+}
+
 void vmm_pd_switch(uint32_t phys)
 {
     if ((phys_addr_t)phys == cur_pml4_phys)
         return;                 /* same address space: keep the TLB */
+    if (!kernel_half_ok(phys))
+        bad_table("switch to a broken or freed address space", phys);
     __asm__ volatile ("mov %0, %%cr3" : : "r"((phys_addr_t)phys) : "memory");
     cur_pml4 = table_at(phys);
     cur_pml4_phys = phys;
@@ -326,10 +354,16 @@ static void free_tree(phys_addr_t table, int level)
 
 void vmm_pd_destroy(uint32_t phys)
 {
+    if ((phys_addr_t)phys == cur_pml4_phys || !kernel_half_ok(phys))
+        bad_table(phys == cur_pml4_phys ? "freeing the address space in use"
+                                        : "freeing a broken or freed address space", phys);
     uint64_t *pml4 = table_at(phys);
     for (int i = 0; i < USER_PML4ES; i++)
         if (pml4[i] & PTE_PRESENT)
             free_tree(PTE_ADDR(pml4[i]), 3);
+    /* Unhook the kernel half: a switch to this table after the free (until
+       the page is reused) then fails the check above, loudly. */
+    pml4[PML4_INDEX(DIRECTMAP_BASE)] = pml4[PML4_INDEX(KERNEL_VBASE)] = 0;
     pmm_free(phys);
 }
 
@@ -366,6 +400,105 @@ static int fork_tree(uint64_t *src, uint64_t *dst_entry, uint64_t src_entry, int
     }
     return 0;
 }
+
+#ifdef PT_AUDIT
+#include <kheap.h>
+#include <proc.h>
+#include <mm.h>
+/*
+ * make PTAUDIT=1: when a program faults, check every process's page tables
+ * against the page allocator. A frame a process maps must be in use, and a
+ * private (copy-on-write) frame must have at least as many owners as there
+ * are mappings of it — else it will be freed, and handed to someone else,
+ * while still mapped. Runs at fault time only, so it can't change the
+ * timing that leads up to a crash.
+ */
+static uint16_t *audit_maps;
+static int audit_report;
+
+static void audit_walk(int pid, uint64_t *pml4, int count, uint32_t want)
+{
+    for (int a = 0; a < USER_PML4ES; a++) {
+        if (!(pml4[a] & PTE_PRESENT))
+            continue;
+        uint64_t *pdpt = table_at(PTE_ADDR(pml4[a]));
+        for (int b = 0; b < 512; b++) {
+            if (!(pdpt[b] & PTE_PRESENT) || (pdpt[b] & PTE_PS))
+                continue;
+            uint64_t *pd = table_at(PTE_ADDR(pdpt[b]));
+            for (int c = 0; c < 512; c++) {
+                if (!(pd[c] & PTE_PRESENT) || (pd[c] & PTE_PS))
+                    continue;
+                uint64_t *pt = table_at(PTE_ADDR(pd[c]));
+                for (int d = 0; d < 512; d++) {
+                    uint64_t e = pt[d];
+                    if (!(e & PTE_PRESENT))
+                        continue;
+                    uint64_t va = ((uint64_t)a << 39) | ((uint64_t)b << 30) |
+                                  ((uint64_t)c << 21) | ((uint64_t)d << 12);
+                    uint32_t phys = (uint32_t)PTE_ADDR(e);
+                    int own = pmm_owners(phys);
+                    if (own < 0)
+                        continue;           /* device memory */
+                    if (want) {             /* pass 2: who maps a bad frame */
+                        if (phys == want)
+                            kprintf("  audit:   pid %d va %lx flags %lx\n", pid,
+                                    (unsigned long)va, (unsigned long)(e & 0xFFF));
+                        continue;
+                    }
+                    if (own == 0 && audit_report++ < 20)
+                        kprintf("  audit: pid %d va %lx maps FREE frame %x (flags %lx)\n",
+                                pid, (unsigned long)va, phys, (unsigned long)(e & 0xFFF));
+                    if (count && !(e & (PTE_SHARED | PTE_MAPSHARED)) && audit_maps[phys / PAGE_SIZE] < 0xFFFF)
+                        audit_maps[phys / PAGE_SIZE]++;
+                }
+            }
+        }
+    }
+}
+
+void vmm_audit(void)
+{
+    uint32_t nf = pmm_end() / PAGE_SIZE;
+    audit_maps = kmalloc(nf * sizeof *audit_maps);
+    audit_report = 0;
+    if (!audit_maps) {
+        kprintf("  audit: no memory for the count\n");
+        return;
+    }
+    memset(audit_maps, 0, nf * sizeof *audit_maps);
+    int procs = 0;
+    for (int i = 0; i < PROC_MAX; i++) {
+        struct process *p = proc_at(i);
+        if (p->state != PROC_ALIVE || !p->mm || !p->mm->pd)
+            continue;
+        procs++;
+        audit_walk(p->pid, table_at(p->mm->pd), 1, 0);
+    }
+    uint32_t low = 0, frames = 0;
+    for (uint32_t f = 0; f < nf; f++) {
+        if (!audit_maps[f])
+            continue;
+        frames++;
+        int own = pmm_owners(f * PAGE_SIZE);
+        if (own >= 0 && audit_maps[f] > own) {
+            if (low++ < 5) {
+                kprintf("  audit: frame %x is mapped %u times but has %d owner(s):\n",
+                        f * PAGE_SIZE, audit_maps[f], own);
+                for (int i = 0; i < PROC_MAX; i++) {
+                    struct process *p = proc_at(i);
+                    if (p->state == PROC_ALIVE && p->mm && p->mm->pd)
+                        audit_walk(p->pid, table_at(p->mm->pd), 0, f * PAGE_SIZE);
+                }
+            }
+        }
+    }
+    kprintf("  audit: %d processes, %u private frames mapped, %d free-but-mapped, "
+            "%u with too few owners\n", procs, frames, audit_report, low);
+    kfree(audit_maps);
+    audit_maps = NULL;
+}
+#endif
 
 uint32_t vmm_pd_fork(void)
 {

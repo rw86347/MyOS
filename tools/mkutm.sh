@@ -44,15 +44,30 @@
 # ext2 myos-root, `make hd`) — an installed MyOS, where everything you
 # change survives a restart. That disk holds your files, so it's made only
 # once: running this again keeps it (delete it for a fresh one).
+# And with --x86_64, the 64-bit machine, for the x86_64 live disk (GPT:
+# an EFI system partition and myos-root):
+#
+#   tools/mkutm.sh --x86_64 build/x86_64/myos-live-uefi.img "out.utm" [uuid]
+#
+#   - a q35 chipset booting through UEFI, QEMU's qemu64 CPU (what
+#     `make test-usb` and the Chromium runs use), 4 GiB (Chromium wants it)
+#   - the disk on q35's SATA controller: UTM's "IDE" on q35 is the ICH9
+#     AHCI, which drivers/ahci.c runs
+#   - std VGA, the e1000, PS/2 keyboard and mouse as above, and Intel HD
+#     Audio with UTM's duplex codec (drivers/sound)
+#   - two disks: the live system (changes kept in it), and an empty 32 GB
+#     one to install MyOS on (made once; a rebuild keeps it)
 set -e
 installed=0
 replace_disk=0
+x64=0
 memory=256
 net=Shared
 debug_port=
 while :; do
     case "$1" in
     --installed) installed=1; shift ;;
+    --x86_64) x64=1; installed=1; replace_disk=1; memory=4096; shift ;;
     # Overwrite the system disk even if this VM already exists. Default for
     # --installed is to keep it (your files). The live image is the software
     # on the disk, so `make utm-live` always replaces it.
@@ -85,7 +100,10 @@ out=$2
     exit 1; }
 MKE2FS=${MKE2FS:-/opt/homebrew/opt/e2fsprogs/sbin/mke2fs}
 
-if [ $installed = 1 ]; then
+if [ $x64 = 1 ]; then
+    VM_UUID=${3:-0C6F4B2A-9E1D-4C37-B85A-64F2D1E0A9C3}
+    DISK_UUID=7D2E4A91-3B6C-4F05-9A18-E5C0B7D24F66
+elif [ $installed = 1 ]; then
     VM_UUID=${3:-9B2C4E61-7D3A-4F58-A1E6-2C8D5B0F7A93}
     DISK_UUID=3E7A9C15-52B4-4D0E-8F61-A7C2D9E04B38
 else
@@ -121,7 +139,27 @@ else
     mv -f "$out/Data/$DISK_UUID.qcow2.new" "$out/Data/$DISK_UUID.qcow2"
 fi
 DATA_DRIVE=
-if [ $installed = 0 ]; then
+if [ $x64 = 1 ]; then
+    # The disk to install on: empty, 32 GB, sparse (qcow2 grows as it is
+    # written). Kept across rebuilds like the data disk.
+    TARGET_UUID=E3B1C7A4-5D28-4F9E-8A06-2C4F7B91D5E8
+    [ -f "$out/Data/$TARGET_UUID.qcow2" ] ||
+        qemu-img create -q -f qcow2 "$out/Data/$TARGET_UUID.qcow2" 32G
+    DATA_DRIVE="		<dict>
+			<key>Identifier</key>
+			<string>$TARGET_UUID</string>
+			<key>ImageName</key>
+			<string>$TARGET_UUID.qcow2</string>
+			<key>ImageType</key>
+			<string>Disk</string>
+			<key>Interface</key>
+			<string>IDE</string>
+			<key>InterfaceVersion</key>
+			<integer>1</integer>
+			<key>ReadOnly</key>
+			<false/>
+		</dict>"
+elif [ $installed = 0 ]; then
     DATA_DRIVE="		<dict>
 			<key>Identifier</key>
 			<string>$DATA_UUID</string>
@@ -144,6 +182,19 @@ if [ $installed = 0 ] && [ ! -f "$out/Data/$DATA_UUID.qcow2" ]; then
     qemu-img convert -q -f raw -O qcow2 "$tmp" "$out/Data/$DATA_UUID.qcow2"
     rm -f "$tmp"
     echo "New data disk (256 MiB, ext2) in $out"
+fi
+
+# The machine itself: an old PC, or (--x86_64) a modern UEFI one.
+if [ $x64 = 1 ]; then
+    ARCH=x86_64 CPU=qemu64 TARGET=q35 UEFI="<true/>"
+    SOUND="
+		<dict>
+			<key>Hardware</key>
+			<string>intel-hda</string>
+		</dict>
+	"
+else
+    ARCH=i386 CPU=pentium3,+sse2 TARGET=pc UEFI="<false/>" SOUND=
 fi
 
 EXTRA_ARGS=
@@ -253,7 +304,7 @@ $DATA_DRIVE
 		<key>TSO</key>
 		<false/>
 		<key>UEFIBoot</key>
-		<false/>
+		$UEFI
 	</dict>
 	<key>Serial</key>
 	<array/>
@@ -267,13 +318,13 @@ $DATA_DRIVE
 		<false/>
 	</dict>
 	<key>Sound</key>
-	<array/>
+	<array>$SOUND</array>
 	<key>System</key>
 	<dict>
 		<key>Architecture</key>
-		<string>i386</string>
+		<string>$ARCH</string>
 		<key>CPU</key>
-		<string>pentium3,+sse2</string>
+		<string>$CPU</string>
 		<key>CPUCount</key>
 		<integer>1</integer>
 		<key>CPUFlagsAdd</key>
@@ -287,7 +338,7 @@ $DATA_DRIVE
 		<key>MemorySize</key>
 		<integer>$memory</integer>
 		<key>Target</key>
-		<string>pc</string>
+		<string>$TARGET</string>
 	</dict>
 </dict>
 </plist>

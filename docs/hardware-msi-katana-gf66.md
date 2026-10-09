@@ -286,7 +286,10 @@ small blob. Bring it up before Wi-Fi.
 - Userspace: ALSA, `/dev/snd/pcmC*D*`.
 
 Prefer the HDA fallback first. SOF is more moving parts for the same
-speakers.
+speakers. Linux 7.2 agrees: for Tiger Lake-H it takes SOF only when there
+are digital mics or SoundWire (`intel-dsp-config.c`), and its Realtek
+drivers have no fix-up for this laptop's `1462:12ea` (the BIOS pin
+configuration is used as it is). Plan: `docs/SOUND-PLAN.md`.
 
 ## Webcam: uvcvideo
 

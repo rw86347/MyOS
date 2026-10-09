@@ -681,12 +681,11 @@ void ata_init(void)
                 .rwv     = ata_rwv,
                 .priv    = d,
             };
-            char model[41];
-            get_model(id, model);
+            get_model(id, bd.model);
             set_multiple(d, id);
             if (blockdev_register(&bd))
                 kprintf("ata: %s: %lu sectors (%lu MiB) \"%s\", %lu sectors per IRQ\n",
-                        bd.name, sectors, sectors / 2048, model, (uint32_t)d->multi);
+                        bd.name, sectors, sectors / 2048, bd.model, (uint32_t)d->multi);
             if (!first)
                 first = d;
         }

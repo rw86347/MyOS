@@ -35,6 +35,8 @@ static char uts[6][65] = {
 #endif
 };
 
+const char *uts_nodename(void) { return uts[1]; }
+
 #define PER_LINUX32 0x0008
 
 SYSCALL_DEF(sys_uname)

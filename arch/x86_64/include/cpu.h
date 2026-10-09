@@ -21,6 +21,10 @@
 #define CPU_SSE   (1u << 25)
 #define CPU_SSE2  (1u << 26)
 
+/* The cpuid instruction: leaf (EAX) and sub-leaf (ECX) in, EAX..EDX out
+   (r[0..3]). /proc/cpuinfo is made from it. */
+void cpu_cpuid(uint32_t leaf, uint32_t sub, uint32_t r[4]);
+
 /* What MyOS can't run without: a Pentium Pro / Pentium II or later.
    (CMOV: the kernel is compiled for i686, so the compiler uses it.) */
 #define CPU_REQUIRED (CPU_FPU | CPU_PSE | CPU_TSC | CPU_MSR | CPU_CMOV)

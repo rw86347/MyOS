@@ -7,7 +7,9 @@
  * for the byte layout.) Type 0xEE means a GPT disk: the real table is at
  * LBA 1. Extended/logical MBR partitions still come later.
  */
+#include <bcache.h>
 #include <blockdev.h>
+#include <errno.h>
 #include <kprintf.h>
 #include <partition.h>
 #include <string.h>
@@ -32,6 +34,7 @@ static const char *type_name(uint8_t type)
     case 0x83: return "Linux";
     case 0xEE: return "GPT protective";
     case 0xEF: return "EFI System";
+    case 0xDA: return "other (GPT)";
     default:   return "unknown";
     }
 }
@@ -62,15 +65,68 @@ static const uint8_t guid_linux[16] = {
     0xAF, 0x3D, 0xC6, 0x0F, 0x83, 0x84, 0x72, 0x47,
     0x8E, 0x79, 0x3D, 0x69, 0xD8, 0x47, 0x7D, 0xE4
 };
+static const uint8_t guid_msdata[16] = {        /* Microsoft basic data: NTFS, exFAT, FAT */
+    0xA2, 0xA0, 0xD0, 0xEB, 0xE5, 0xB9, 0x33, 0x44,
+    0x87, 0xC0, 0x68, 0xB6, 0xB7, 0x26, 0x99, 0xC7
+};
 
-static int add_part(struct blockdev *disk, int n, uint32_t lba, uint32_t sectors, uint8_t type)
+/* A GPT entry's name: 36 UTF-16 units at byte 56. Plain ASCII is kept,
+   anything else becomes '?'. */
+static void gpt_name(const uint8_t *e, char out[37])
 {
+    int k;
+    for (k = 0; k < 36; k++) {
+        uint16_t c = (uint16_t)(e[56 + 2 * k] | e[57 + 2 * k] << 8);
+        if (!c)
+            break;
+        out[k] = c >= 32 && c < 127 ? (char)c : '?';
+    }
+    out[k] = 0;
+}
+
+/* BLKRRPART (partition_rescan): the disk whose table is being read again,
+   and which slots it still has. Its partitions are updated in place — the
+   devices array never shrinks, and an open /dev/sda2 or a cached block
+   keeps pointing at the same struct — and a slot that is gone gets 0
+   sectors, so every read or write of it fails. */
+static struct blockdev *rescan;
+static uint8_t seen[256 / 8];
+
+static struct blockdev *part_of(struct blockdev *disk, int n)
+{
+    for (int k = 0; k < blockdev_count(); k++) {
+        struct blockdev *d = blockdev_get(k);
+        if (d->parent == disk && d->partno == n)
+            return d;
+    }
+    return NULL;
+}
+
+static int add_part(struct blockdev *disk, int n, uint32_t lba, uint32_t sectors, uint8_t type,
+                    const char *label)
+{
+    struct blockdev *old = rescan == disk ? part_of(disk, n) : NULL;
+    if (rescan == disk)
+        seen[n / 8] |= (uint8_t)(1u << (n % 8));
+    if (old) {
+        old->offset = lba;
+        old->sectors = sectors;
+        old->priv = (void *)(uintptr_t)type;
+        strlcpy(old->label, label ? label : "", sizeof old->label);
+        kprintf("part: %s: start %lu, %lu sectors (%lu MiB), type %02x %s\n",
+                old->name, (unsigned long)lba, (unsigned long)sectors,
+                (unsigned long)(sectors / 2048), type, type_name(type));
+        return 1;
+    }
     struct blockdev part = {
         .sectors = sectors,
         .parent  = disk,
         .offset  = lba,
         .priv    = (void *)(uintptr_t)type,
+        .partno  = (uint8_t)n,
     };
+    if (label)
+        strlcpy(part.label, label, sizeof part.label);
     if (!part_name(part.name, sizeof part.name, disk->name, n) || !blockdev_register(&part))
         return 0;
     kprintf("part: %s: start %lu, %lu sectors (%lu MiB), type %02x %s\n",
@@ -117,19 +173,25 @@ static int gpt_scan(struct blockdev *disk)
         slba = (uint32_t)first;
         if (slba >= disk->sectors)
             continue;
+        /* Every used entry is a partition, numbered by its slot as on
+           Linux (an installer formats /dev/sda3 meaning the third slot:
+           counting only the ones we can mount would name another). Only
+           0x83 and 0xEF are ever mounted; the type says which these are. */
         if (!memcmp(ent + off, guid_linux, 16))
             type = 0x83;
         else if (!memcmp(ent + off, guid_esp, 16))
             type = 0xEF;
+        else if (!memcmp(ent + off, guid_msdata, 16))
+            type = 0x07;
         else
-            type = 0x00;
-        if (!type)
-            continue;
+            type = 0xDA;                        /* other data */
+        char label[37];
+        gpt_name(ent + off, label);
         last_lo = (last > 0xFFFFFFFFull) ? 0xFFFFFFFF : (uint32_t)last;
         lba64_lo = last_lo - slba + 1;
         if (lba64_lo > disk->sectors - slba)
             lba64_lo = disk->sectors - slba;
-        found += add_part(disk, (int)found + 1, slba, lba64_lo, type);
+        found += add_part(disk, (int)i + 1, slba, lba64_lo, type, label);
     }
     return (int)found;
 }
@@ -163,19 +225,31 @@ int partition_scan(struct blockdev *disk)
             continue;
         }
 
-        struct blockdev part = {
-            .sectors = e.sectors,
-            .parent  = disk,
-            .offset  = e.lba_first,
-            .priv    = (void *)(uintptr_t)e.type,   /* remember the type byte */
-        };
-        if (part_name(part.name, sizeof part.name, disk->name, i + 1) &&
-            blockdev_register(&part)) {
-            kprintf("part: %s: start %lu, %lu sectors (%lu MiB), type %02x %s\n",
-                    part.name, e.lba_first, e.sectors, e.sectors / 2048,
-                    e.type, type_name(e.type));
-            found++;
-        }
+        found += add_part(disk, i + 1, e.lba_first, e.sectors, e.type, NULL);
     }
     return found;
+}
+
+/* BLKRRPART: read disk's table again (sfdisk wrote a new one). The caller
+   made sure nothing on the disk is mounted. Afterwards /sys/block and
+   /dev show the new partitions, and the block cache has forgotten the
+   disk — a cached block of the old sda2 is not one of the new sda2. */
+int partition_rescan(struct blockdev *disk)
+{
+    if (disk->parent || rescan)
+        return -EINVAL;                 /* partitions have no table; one at a time */
+    rescan = disk;
+    memset(seen, 0, sizeof seen);
+    int found = partition_scan(disk);
+    rescan = NULL;
+    for (int k = 0; k < blockdev_count(); k++) {
+        struct blockdev *d = blockdev_get(k);
+        if (d->parent != disk)
+            continue;
+        if (found < 0 || !(seen[d->partno / 8] & (1u << (d->partno % 8))))
+            d->sectors = 0;             /* gone */
+        blockdev_changed(d);            /* /sys/block and /dev catch up */
+    }
+    bcache_drop(disk);
+    return found < 0 ? -EIO : 0;
 }

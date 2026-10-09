@@ -119,6 +119,8 @@ void vt_clear(void)
 /* Move every line up by one and blank the bottom line. */
 static void scroll(void)
 {
+    if (rows < 1)
+        return;                 /* (vt_set_backend never allows it; cheap to be sure) */
     memmove(grid, at(1, 0), (size_t)(rows - 1) * VT_MAX_COLS * sizeof grid[0]);
     uint16_t b = blank();
     uint16_t *last = at(rows - 1, 0);
@@ -405,12 +407,23 @@ void vt_set_backend(const struct vt_ops *new_ops, int nc, int nr)
     if (nr > VT_MAX_ROWS)
         nr = VT_MAX_ROWS;
     uint32_t flags = irq_save();
+    if (nc < 1 || nr < 1) {
+        /* A screen with no room for one character (a mode smaller than a
+           cell): show nothing, and keep the text and its size. A grid of
+           0 rows once made scroll() move -1 rows — a memmove of 2^64
+           bytes over the kernel. */
+        ops = NULL;
+        irq_restore(flags);
+        return;
+    }
 
     /* A shorter screen keeps the lines up to the cursor: drop lines off
        the top until the cursor's line fits. */
     int shift = row >= nr ? row - nr + 1 : 0;
     int kept = rows - shift;            /* rows of old text still shown */
-    if (shift)
+    if (kept < 0)
+        kept = 0;
+    if (shift && kept)
         memmove(grid, at(shift, 0), (size_t)kept * VT_MAX_COLS * sizeof grid[0]);
     row -= shift;
     saved_row = saved_row >= shift ? saved_row - shift : 0;

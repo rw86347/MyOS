@@ -110,7 +110,7 @@ void initramfs_load(const uint8_t *a, uint32_t size)
                 i->data = a + data_off;     /* zero-copy: points into the archive
                                                (a symlink's data is its target) */
             }
-            if (S_ISCHR(mode)) {
+            if (S_ISCHR(mode) || S_ISBLK(mode)) {
                 i->rdev = rdev;
                 dev_attach(i);              /* /dev/null & co. */
             }

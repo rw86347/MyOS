@@ -24,5 +24,8 @@ uint32_t pmm_end(void);              /* physical end of usable RAM (bytes) */
 /* Called by pmm_alloc when no frame is free: free up to `want` frames
    (the page cache's clean pages) and say how many. */
 void     pmm_set_reclaim(uint32_t (*fn)(uint32_t want));
+#ifdef PT_AUDIT
+int      pmm_owners(uint32_t phys);  /* 0 free, -1 not ours, else owners */
+#endif
 
 #endif

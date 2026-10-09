@@ -15,9 +15,10 @@
 #include <cycles.h>
 #include <gdt.h>
 #include <interrupts.h>
-#include <kheap.h>
 #include <kprintf.h>
+#include <memlayout.h>
 #include <mm.h>
+#include <paging.h>
 #include <pmm.h>
 #include <proc.h>
 #include <sched.h>
@@ -40,6 +41,35 @@ static int nready;
 
 /* The TLS descriptors now in the GDT: reload only when they differ. */
 static uint64_t loaded_tls[3];
+
+#ifdef SYS_TRACE
+void thread_trace_dump(struct thread *t, uint32_t n)
+{
+    uint32_t have = t->trace_at < SYSTRACE_N ? t->trace_at : SYSTRACE_N;
+    if (n > have)
+        n = have;
+    for (uint32_t j = t->trace_at - n; j != t->trace_at; j++) {
+        uint32_t k = j % SYSTRACE_N;
+        kprintf("  %s/%d %lu ms: sc %lu (%lx, %lx, %lx, %lx) = %ld\n", t->name, t->tid,
+                (unsigned long)t->trace[k].ms, (unsigned long)t->trace[k].nr,
+                (unsigned long)t->trace[k].a[0], (unsigned long)t->trace[k].a[1],
+                (unsigned long)t->trace[k].a[2], (unsigned long)t->trace[k].a[3],
+                (long)t->trace[k].ret);
+    }
+}
+
+void thread_trace_process(struct thread *t)
+{
+    kprintf("systrace: the last calls of %s/%d:\n", t->name, t->tid);
+    thread_trace_dump(t, SYSTRACE_N);
+    if (!t->proc)
+        return;
+    kprintf("systrace: its process's other threads, last 6 each:\n");
+    for (struct thread *o = t->proc->threads; o; o = o->proc_next)
+        if (o != t)
+            thread_trace_dump(o, 6);
+}
+#endif
 
 void thread_load_tls(struct thread *t)
 {
@@ -123,10 +153,9 @@ void thread_init(void)
     set_ready(current);
 }
 
-/* Find a free table slot. A DEAD thread's slot is reused, and its stack
-   freed here: a thread can't free its own stack while it's still running on
-   it (in thread_exit), but once it's dead and someone else is running, it's
-   safe. ("Lazy reaping".) Interrupts off. */
+/* Find a free table slot. A DEAD thread's slot is reused once no UNUSED
+   one is left (its stack went back to the pool already: stack_get).
+   Interrupts off. */
 static struct thread *alloc_slot(void)
 {
     for (int i = 0; i < THREAD_MAX; i++)
@@ -134,9 +163,7 @@ static struct thread *alloc_slot(void)
             return &threads[i];
     for (int i = 0; i < THREAD_MAX; i++) {
         struct thread *t = &threads[i];
-        if (t->state == THREAD_DEAD && t != current) {
-            kfree(t->stack);
-            t->stack = NULL;
+        if (t->state == THREAD_DEAD && t != current && !t->stack) {
             t->state = THREAD_UNUSED;
             return t;
         }
@@ -144,25 +171,206 @@ static struct thread *alloc_slot(void)
     return NULL;
 }
 
+/* --- kernel stacks -----------------------------------------------------------
+ *
+ * Every thread has a kernel stack of its own: where its system calls run,
+ * and the interrupts that arrive while it runs. A stack grows down, and
+ * when a call chain goes deeper than the stack, the next push lands on
+ * whatever lies below. In a kernel that is the worst kind of bug: silent,
+ * and a way in — whoever can make the kernel run off its stack can write
+ * kernel memory with it. (It happened: an x86_64 thread overflowed its
+ * 8 KiB and wrote over the stack below it, the write-back thread's, which
+ * then crashed on a pointer that was really an ext2 inode — docs/LOG.md.)
+ *
+ * So the stacks are not in the heap, packed together. They live in the
+ * KSTACK area (memlayout.h), cut into THREAD_MAX windows, and the bottom
+ * page of every window is never mapped — a "guard page":
+ *
+ *     KSTACK_START + w * KSTACK_WIN:  [ guard page | THREAD_STACK ]
+ *
+ * Running off the end touches the guard page and the CPU stops right
+ * there with a page fault. That fault can't be reported on the stack that
+ * is full, so it turns into a double fault, which the CPU takes on a stack
+ * of its own (x86_64: IST1; i386: a task gate, gdt.c), and the report
+ * names the thread. Linux does the same (CONFIG_VMAP_STACK).
+ *
+ * The windows are a pool: a free list, last in first out. A new thread
+ * takes the window on top — usually the one a thread that just exited gave
+ * back, its pages still mapped, so it costs nothing. A window gets pages
+ * the first time it is used, and keeps them. So the pages in use are the
+ * most threads ever alive at once, not every thread ever made. An exiting
+ * thread is still standing on its stack, so it goes on the dead list, and
+ * the next new_thread hands its window back. Every step is O(1).
+ */
+#define KSTACK_WIN ((uintptr_t)THREAD_STACK + PAGE_SIZE)
+_Static_assert((uint64_t)THREAD_MAX * KSTACK_WIN <= KSTACK_END - KSTACK_START,
+               "a window for every thread");
+
+static uint16_t free_win[THREAD_MAX];   /* the pool: window numbers, top last */
+static int nfree_win = -1;              /* -1: not filled in yet */
+static uint8_t win_mapped[THREAD_MAX];  /* its pages are there */
+static struct thread *win_owner[THREAD_MAX];
+static struct thread *dead_list;        /* exited; stacks to hand back */
+static uint32_t stack_pages;            /* mapped, in all windows */
+
+#ifdef STACK_DEPTH
+#define STACK_PAINT 0x5A                /* untouched stack reads as this */
+#endif
+
+static uintptr_t win_base(uint32_t w)   /* the stack's lowest byte */
+{
+    return KSTACK_START + w * KSTACK_WIN + PAGE_SIZE;
+}
+
+/* Put the stacks of threads that have exited (and are off them now) back
+   in the pool. Interrupts off. */
+static void reap_stacks(void)
+{
+    struct thread **pp = &dead_list;
+    while (*pp) {
+        struct thread *t = *pp;
+        if (t == current) {             /* still on its way out */
+            pp = &t->dead_next;
+            continue;
+        }
+        uint32_t w = (uint32_t)(((uintptr_t)t->stack - KSTACK_START) / KSTACK_WIN);
+        win_owner[w] = NULL;
+        free_win[nfree_win++] = (uint16_t)w;
+        t->stack = NULL;
+        *pp = t->dead_next;
+        t->dead_next = NULL;
+    }
+}
+
+/* A window for t: off the pool, mapped if it never was. Interrupts off
+   (pmm_alloc doesn't sleep: its reclaim only drops clean cache pages).
+   NULL: no window or no RAM. */
+static void *stack_get(struct thread *t)
+{
+    if (nfree_win < 0) {                /* first use: every window, 0 on top */
+        for (int k = 0; k < THREAD_MAX; k++)
+            free_win[k] = (uint16_t)(THREAD_MAX - 1 - k);
+        nfree_win = THREAD_MAX;
+    }
+    if (!nfree_win)
+        return NULL;
+    uint32_t w = free_win[--nfree_win];
+    uintptr_t base = win_base(w);
+    if (!win_mapped[w]) {
+        for (uint32_t off = 0; off < THREAD_STACK; off += PAGE_SIZE) {
+            uint32_t frame = pmm_alloc();
+            if (!frame || vmm_map(base + off, frame, PTE_WRITABLE) < 0) {
+                if (frame)
+                    pmm_free(frame);
+                while (off) {           /* give back what we did get */
+                    off -= PAGE_SIZE;
+                    pmm_free(vmm_unmap(base + off));
+                }
+                free_win[nfree_win++] = (uint16_t)w;
+                return NULL;
+            }
+        }
+        win_mapped[w] = 1;
+        stack_pages += THREAD_STACK / PAGE_SIZE;
+    }
+    win_owner[w] = t;
+    t->stack = (void *)base;
+#ifdef STACK_DEPTH
+    memset(t->stack, STACK_PAINT, THREAD_STACK);
+#endif
+    return t->stack;
+}
+
+uint32_t thread_stack_pages(void) { return stack_pages; }
+
+void thread_dump(void)
+{
+    extern char __text_start[], __text_end[];
+    static const char *const state[] = { "unused", "ready", "asleep", "dead" };
+    uint32_t flags = irq_save();
+    kprintf("--- threads (Alt+SysRq+T): slot name pid/tid state [syscall nr, user ip] "
+            "[futex] [kernel calls]\n");
+    for (int i = 0; i < THREAD_MAX; i++) {
+        struct thread *t = &threads[i];
+        if (t->state == THREAD_UNUSED)
+            continue;
+        kprintf("%3d %-15s %d/%d %s%s", i, t->name, t->proc ? t->proc->pid : 0, t->tid,
+                t->state <= THREAD_DEAD ? state[t->state] : "?", t == current ? " (running)" : "");
+        if (t->proc && t->uregs && t->state == THREAD_BLOCKED)
+#ifdef ARCH_X86_64
+            kprintf(" syscall %lu ip %lx", (unsigned long)t->uregs->rax, (unsigned long)t->uregs->rip);
+#else
+            kprintf(" syscall %lu ip %lx", (unsigned long)t->uregs->eax, (unsigned long)t->uregs->eip);
+#endif
+        if (t->futex_addr)
+            kprintf(" futex %lx", (unsigned long)t->futex_addr);
+        /* Where in the kernel it sleeps: the return addresses on its stack,
+           newest first (look them up with addr2line). */
+        if (t->stack && t != current && t->state == THREAD_BLOCKED) {
+            const uintptr_t *p = (const uintptr_t *)t->esp;
+            const uintptr_t *top = (const uintptr_t *)((char *)t->stack + THREAD_STACK);
+            int n = 0;
+            for (; p >= (const uintptr_t *)t->stack && p < top && n < 5; p++)
+                if (*p >= (uintptr_t)__text_start && *p < (uintptr_t)__text_end) {
+                    kprintf(n++ ? " %lx" : " <- %lx", (unsigned long)*p);
+                }
+        }
+        kprintf("\n");
+    }
+    irq_restore(flags);
+}
+
+struct thread *thread_stack_guard(uintptr_t addr)
+{
+    if (addr < KSTACK_START || addr - KSTACK_START >= THREAD_MAX * KSTACK_WIN)
+        return NULL;
+    uintptr_t off = addr - KSTACK_START;
+    return off % KSTACK_WIN < PAGE_SIZE ? win_owner[off / KSTACK_WIN] : NULL;
+}
+
+#ifdef STACK_DEPTH
+/* The deepest any stack has gone: the lowest byte that is no longer the
+   paint. A scan of every stack — debug builds only. */
+void thread_stack_report(void)
+{
+    static uint32_t deepest;
+    for (int i = 0; i < THREAD_MAX; i++) {
+        const uint8_t *s = threads[i].stack;
+        if (!s || threads[i].state == THREAD_UNUSED)
+            continue;
+        uint32_t k = 0;
+        while (k < THREAD_STACK && s[k] == STACK_PAINT)
+            k++;
+        if (THREAD_STACK - k > deepest) {
+            deepest = THREAD_STACK - k;
+            kprintf("stack: \"%s\" has used %u of its %u bytes\n", threads[i].name,
+                    (unsigned)deepest, (unsigned)THREAD_STACK);
+        }
+    }
+}
+#endif
+
 /* A new thread whose stack is ready except for the top part, which the
    caller fills in. Not READY yet. */
 static struct thread *new_thread(struct process *proc, const char *name)
 {
     uint32_t flags = irq_save();        /* the scheduler reads the table too */
+    reap_stacks();
     struct thread *t = alloc_slot();
-    if (t)
+    if (t) {
         t->state = THREAD_BLOCKED;      /* reserved, but not runnable yet */
+        if (!stack_get(t)) {
+            t->state = THREAD_UNUSED;
+            irq_restore(flags);
+            kprintf("thread: no stack for %s (%u bytes free)\n", name,
+                    (unsigned)pmm_free_count());
+            return NULL;
+        }
+    }
     irq_restore(flags);
     if (!t)
         return NULL;
 
-    t->stack = kmalloc(THREAD_STACK);
-    if (!t->stack) {
-        kprintf("thread: no stack for %s (%u bytes free)\n", name,
-                (unsigned)pmm_free_count());
-        t->state = THREAD_UNUSED;
-        return NULL;
-    }
     thread_set_name(t, name);
     t->proc = proc;
     t->proc_next = NULL;
@@ -170,6 +378,8 @@ static struct thread *new_thread(struct process *proc, const char *name)
     t->clear_tid = 0;
     t->sig_pending = t->sig_blocked = t->sig_saved = 0;
     t->sig_restore = 0;
+    t->ss_sp = t->ss_size = 0;
+    t->ss_flags = 0;
     t->sig_check = 0;
     t->utime = t->stime = 0;
     t->futex_mm = NULL;
@@ -279,6 +489,9 @@ struct thread *thread_fork(struct process *proc, const char *name,
        registers too. */
     memcpy(t->tls, current->tls, sizeof t->tls);
     t->sig_blocked = current->sig_blocked;
+    t->ss_sp = current->ss_sp;          /* fork keeps the alternate signal */
+    t->ss_size = current->ss_size;      /* stack (a new thread drops it: */
+    t->ss_flags = current->ss_flags;    /* proc.c's clone) */
     if (current->uses_fpu) {
         fpu_save(t->fpu_state);
         t->uses_fpu = 1;
@@ -373,10 +586,14 @@ void cpu_idle(void)                     /* interrupts off, and off again after *
 
 void thread_exit(void)
 {
-    /* We can't free our own stack — we're standing on it. new_thread()
-       frees it later, when it reuses this slot. */
+    /* We can't give up our own stack — we're standing on it. The next
+       new_thread puts it back in the pool (reap_stacks). */
     irq_save();
     set_state(current, THREAD_DEAD);
+    if (current->stack) {
+        current->dead_next = dead_list;
+        dead_list = current;
+    }
     generation++;
     for (;;) {
         thread_switch(sched_pick(1));

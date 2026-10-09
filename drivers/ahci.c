@@ -289,8 +289,6 @@ static void add_port(int n)
         return;
     }
     uint32_t sectors = id[102] || id[103] ? 0xFFFFFFFFu : ((uint32_t)id[101] << 16 | id[100]);
-    pmm_free(idframe);
-
     struct blockdev dev = {
         .sectors = sectors,
         .read    = ahci_read,
@@ -299,6 +297,15 @@ static void add_port(int n)
         .rwv     = ahci_rwv,
         .priv    = p,
     };
+    /* The model: IDENTIFY words 27-46, two characters per word with their
+       bytes swapped, padded with spaces (as ata.c reads it). */
+    for (int k = 0; k < 20; k++) {
+        dev.model[2 * k] = (char)(id[27 + k] >> 8);
+        dev.model[2 * k + 1] = (char)(id[27 + k] & 0xFF);
+    }
+    for (int k = 40; k > 0 && (dev.model[k - 1] == ' ' || !dev.model[k - 1]); k--)
+        dev.model[k - 1] = 0;
+    pmm_free(idframe);
     blockdev_sd_name(dev.name);
     blockdev_register(&dev);
     kprintf("ahci: %s: port %d, %lu MiB\n", dev.name, n, sectors / 2048);

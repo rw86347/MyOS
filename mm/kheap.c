@@ -77,6 +77,33 @@ static int class_of(uint32_t size)
     return c;                           /* at most 7 steps */
 }
 
+#ifdef MEM_DEBUG
+/* make MEMDEBUG=1: a free object past its link and mark is 0xDEADBEEF
+   (filled by kfree), and kmalloc checks it before handing the object out:
+   a write after free, or an overrun from the object below, shows up as a
+   changed word. pmm.c does the same for whole pages. */
+#define DEAD 0xDEADBEEFu
+static void obj_fill(struct free_obj *o, uint32_t size)
+{
+    uint32_t *w = (uint32_t *)(o + 1);
+    for (uint32_t k = 0; k < (size - sizeof *o) / 4; k++)
+        w[k] = DEAD;
+}
+
+static void obj_check(struct free_obj *o, uint32_t size)
+{
+    const uint32_t *w = (const uint32_t *)(o + 1);
+    for (uint32_t k = 0; k < (size - sizeof *o) / 4; k++)
+        if (w[k] != DEAD || o->mark != FREE_MARK) {
+            kprintf("MEMDEBUG: a free %lu-byte object at %p was written: +%lx = %08lx "
+                    "(mark %08lx)\n", (unsigned long)size, (void *)o,
+                    (unsigned long)(sizeof *o + k * 4), (unsigned long)w[k],
+                    (unsigned long)o->mark);
+            return;
+        }
+}
+#endif
+
 /* Cut a fresh page into objects of class c and put them on its free list. */
 static int refill(int c)
 {
@@ -91,6 +118,9 @@ static int refill(int c)
     uint32_t size = class_size[c];
     for (uint32_t off = sizeof *page; off + size <= PAGE_SIZE; off += size) {
         struct free_obj *o = (struct free_obj *)((uint8_t *)page + off);
+#ifdef MEM_DEBUG
+        obj_fill(o, size);
+#endif
         o->mark = FREE_MARK;
         o->next = free_list[c];
         free_list[c] = o;
@@ -98,12 +128,16 @@ static int refill(int c)
     return 0;
 }
 
+
 static void *small_alloc(uint32_t size)
 {
     int c = class_of(size);
     if (!free_list[c] && refill(c) < 0)
         return NULL;
     struct free_obj *o = free_list[c];
+#ifdef MEM_DEBUG
+    obj_check(o, class_size[c]);
+#endif
     free_list[c] = o->next;
     o->mark = 0;
     small_in_use += class_size[c];
@@ -122,6 +156,9 @@ static void small_free(void *ptr)
         kprintf("kfree: %p freed twice (ignored)\n", ptr);
         return;
     }
+#ifdef MEM_DEBUG
+    obj_fill(o, class_size[page->cls]);
+#endif
     o->mark = FREE_MARK;
     o->next = free_list[page->cls];
     free_list[page->cls] = o;

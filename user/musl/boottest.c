@@ -144,8 +144,10 @@ static void tmpfs(void)
     mkdir("/sys", 0555);
     check(mount("sys", "/sys", "sysfs", 0, NULL) == 0 &&
           stat("/sys/class/graphics", &st) == 0 && S_ISDIR(st.st_mode), "mount -t sysfs");
-    check(fails(mount("/dev/sda1", dir, "ext2", 0, NULL), ENOTBLK),
-          "ext2 from a device: ENOTBLK");
+    check(fails(mount("/bin/boottest", dir, "ext2", 0, NULL), ENOTBLK),
+          "ext2 from a plain file: ENOTBLK");
+    check(fails(mount("/dev/boottest-none", dir, "ext2", 0, NULL), ENOENT),
+          "ext2 from a missing device: ENOENT");
     check(mount(NULL, dir, NULL, MS_REMOUNT | MS_NOSUID, NULL) == 0, "remount nosuid");
     check(fails(mount(NULL, "/", NULL, MS_REMOUNT | MS_RDONLY, NULL), EBUSY),
           "remount / read-only: EBUSY");

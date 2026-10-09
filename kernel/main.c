@@ -46,6 +46,7 @@
 #include <sched.h>
 #include <serial.h>
 #include <shim.h>
+#include <sound/hdaudio.h>
 #include <sysenter.h>
 #include <thread.h>
 #include <syscalls.h>
@@ -268,6 +269,8 @@ void kernel_main(void)
     shim_init();            /* Linux's timers and work queues, for drivers */
     pci_init();             /* which PCI devices are fitted: the IDE controller, the NIC */
     drm_init();             /* a display card: the console moves to pixels, /dev/fb0 */
+    hda_intel_init();       /* HD Audio: the sound card, /dev/snd (before the
+                               root disk: its nodes go in the boot /dev) */
     storage_init();         /* IDE disks and their partitions */
     net_init();             /* loopback, then the e1000 and IPv4 if the card is there */
 #if defined(WIFI_SIM) && !defined(SELFTEST)

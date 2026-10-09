@@ -12,7 +12,9 @@
 #include <sched.h>
 #include <syscall.h>
 #include <thread.h>
+#include <paging.h>
 #include <uaccess.h>
+#include <vfs.h>
 
 
 struct idt_gate64 {
@@ -37,12 +39,16 @@ static isr_fn_t irq_handlers[NR_IRQS][IRQ_SHARE];
 extern const uint64_t isr_stub_table[32 + NR_IRQS];
 extern char isr_spurious[];
 
-static void set_gate(int vector, uint64_t handler)
+/* type_attr 0x8E: present, ring 0, interrupt gate. A program may only
+   use `int N` on a ring-3 gate (0xEE); the breakpoint (int3, vector 3) is
+   one, as on Linux, so a program's int3 is a SIGTRAP — Chromium's CHECK
+   failures and debuggers' breakpoints — not a protection fault. */
+static void set_gate(int vector, uint64_t handler, int user_allowed)
 {
     idt[vector].offset_low  = handler & 0xFFFF;
     idt[vector].selector    = GDT_KERNEL_CODE;
     idt[vector].ist         = 0;
-    idt[vector].type_attr   = 0x8E;
+    idt[vector].type_attr   = user_allowed ? 0xEE : 0x8E;
     idt[vector].offset_mid  = (handler >> 16) & 0xFFFF;
     idt[vector].offset_high = (uint32_t)(handler >> 32);
     idt[vector].reserved    = 0;
@@ -51,8 +57,9 @@ static void set_gate(int vector, uint64_t handler)
 void idt_init(void)
 {
     for (int v = 0; v < 32 + NR_IRQS; v++)
-        set_gate(v, isr_stub_table[v]);
-    set_gate(0xFF, (uint64_t)(uintptr_t)isr_spurious);
+        set_gate(v, isr_stub_table[v], v == 3);
+    idt[8].ist = 1;                     /* the double fault: on its own stack (gdt.c) */
+    set_gate(0xFF, (uint64_t)(uintptr_t)isr_spurious, 0);
     struct idt_ptr64 ptr = { sizeof idt - 1, (uint64_t)(uintptr_t)idt };
     __asm__ volatile ("lidt %0" : : "m"(ptr));
     pic_init();
@@ -115,17 +122,89 @@ static void user_exception(struct regs *r, uint64_t cr2)
     struct thread *t = thread_current();
     int sig = exception_signal(r->vector);
     user_addr_t h = t->proc->sig_action[sig - 1].handler;
-    if (h != SIG_DFL && h != SIG_IGN && !(t->sig_blocked & SIGBIT(sig))) {
+    int handled = h != SIG_DFL && h != SIG_IGN && !(t->sig_blocked & SIGBIT(sig));
+    /* A handled fault is logged too, like i386 does: a crash reporter
+       (Chromium's crashpad) catches the fault, then ends the program with
+       a plain kill, and this is the only trace of where it went wrong.
+       Only the first 50: some programs fault on purpose (V8's WebAssembly
+       bounds checks), and the log must not become the work. */
+    static uint32_t handled_logged;
+    if (handled && handled_logged >= 50) {
         t->sig_pending |= SIGBIT(sig);
         t->sig_check = 1;
         return;
     }
-    kprintf("%s: killed by CPU exception %lu (%s) at RIP %lx", t->name, r->vector,
-            exception_names[r->vector < 32 ? r->vector : 0], regs_ip(r));
+    handled_logged += (uint32_t)handled;
+    kprintf("%s[%d]: %s CPU exception %lu (%s) at RIP %lx", t->name, t->proc->pid,
+            handled ? "its handler gets" : "killed by",
+            r->vector, exception_names[r->vector < 32 ? r->vector : 0], regs_ip(r));
     if (r->vector == 14)
         kprintf(", %s of %lx (%s)", r->err_code & 2 ? "write" : "read", cr2,
                 r->err_code & 1 ? "not allowed" : "not mapped");
-    kprintf("\n");
+    /* Which file the instruction is in, and where — Linux's "in libfoo.so"
+       — so the crash can be looked up: objdump -d at that file offset. */
+    struct mm *mm = mm_current();
+    for (int k = 0; mm && k < mm->nareas; k++) {
+        struct vma *v = &mm->area[k];
+        if (regs_ip(r) < v->start || regs_ip(r) >= v->end || !v->file || !v->file->name)
+            continue;
+        char nm[48];
+        uint32_t n = v->file->name_len < sizeof nm - 1 ? v->file->name_len : sizeof nm - 1;
+        memcpy(nm, v->file->name, n);
+        nm[n] = 0;
+        kprintf(" in %s at file offset %lx", nm,
+                (unsigned long)(v->file_off + (regs_ip(r) - v->start)));
+        break;
+    }
+    kprintf(" sp %lx\n", (unsigned long)r->rsp);
+    /* Who called it: words on the user stack that point into a mapped
+       file's code, as file + offset — return addresses, mostly (some are
+       stale). With the program's symbols, that is the call chain. */
+    for (int k = 0, shown = 0; mm && k < 400 && shown < 14; k++) {
+        uint64_t w;
+        if (copy_from_user(&w, (const void *)(uintptr_t)(r->rsp + (uint64_t)k * 8), 8) < 0)
+            break;
+        for (int j = 0; j < mm->nareas; j++) {
+            struct vma *v = &mm->area[j];
+            if (w < v->start || w >= v->end || !(v->flags & VM_EXEC) || !v->file || !v->file->name)
+                continue;
+            char nm[32];
+            uint32_t n = v->file->name_len < sizeof nm - 1 ? v->file->name_len : sizeof nm - 1;
+            memcpy(nm, v->file->name, n);
+            nm[n] = 0;
+            kprintf("  stack+%x: %s+%lx\n", k * 8, nm,
+                    (unsigned long)(v->file_off + (w - v->start)));
+            shown++;
+            break;
+        }
+    }
+#ifdef PT_AUDIT
+    {   /* the registers, and the memory the bad pointer came from */
+        kprintf("  rax %lx rbx %lx rcx %lx rdx %lx rsi %lx rdi %lx rbp %lx\n",
+                r->rax, r->rbx, r->rcx, r->rdx, r->rsi, r->rdi, r->rbp);
+        kprintf("  r8 %lx r9 %lx r10 %lx r11 %lx r12 %lx r13 %lx r14 %lx r15 %lx\n",
+                r->r8, r->r9, r->r10, r->r11, r->r12, r->r13, r->r14, r->r15);
+        uint64_t at[4] = { r->rdi, r->rsi, r->rbx, r->r12 };
+        const char *nm[4] = { "rdi", "rsi", "rbx", "r12" };
+        for (int k = 0; k < 4; k++) {
+            uint64_t w[6];
+            if (at[k] < 0x1000 || at[k] >= USER_ADDR_END ||
+                copy_from_user(w, (const void *)(uintptr_t)(at[k] & ~7ull), sizeof w) < 0)
+                continue;
+            kprintf("  [%s] %lx: %lx %lx %lx %lx %lx %lx  (frame %x)\n", nm[k], at[k],
+                    w[0], w[1], w[2], w[3], w[4], w[5], vmm_translate(at[k] & ~0xFFFull));
+        }
+        vmm_audit();
+    }
+#endif
+#ifdef SYS_TRACE
+    thread_trace_process(t);
+#endif
+    if (handled) {
+        t->sig_pending |= SIGBIT(sig);
+        t->sig_check = 1;
+        return;
+    }
     proc_exit(W_SIGNALED(sig));
 }
 
@@ -141,7 +220,10 @@ static void stack_scan(uint64_t sp)
 {
     struct thread *t = thread_current();
     uint64_t top = t && t->stack ? (uint64_t)t->stack + THREAD_STACK : (uint64_t)boot_stack_top;
-    if (sp & 7 || sp >= top || top - sp > 16384)
+    uint64_t bottom = t && t->stack ? (uint64_t)t->stack : top - 16384;
+    if (sp < bottom && top - bottom <= 16384)
+        sp = bottom;                    /* it ran off the end: the deepest calls */
+    if (sp & 7 || sp >= top || sp < bottom)
         return;
     kprintf("in thread \"%s\"; called from (newest first):", t ? t->name : "?");
     int n = 0;
@@ -166,6 +248,10 @@ static void exception(struct regs *r)
     kprintf("\n*** CPU EXCEPTION %lu: %s ***\n", r->vector,
             exception_names[r->vector < 32 ? r->vector : 0]);
     kprintf("RIP=%016lx CR2=%016lx error code %lx\n", regs_ip(r), cr2, r->err_code);
+    struct thread *over = thread_stack_guard(cr2);
+    if ((r->vector == 8 || r->vector == 14) && over)
+        kprintf("KERNEL STACK OVERFLOW: thread \"%s\" ran off the end of its %u-byte "
+                "stack (stopped at its guard page)\n", over->name, (unsigned)THREAD_STACK);
     stack_scan(regs_sp(r));
     serial_flush();
     for (;;)

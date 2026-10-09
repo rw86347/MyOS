@@ -2475,3 +2475,620 @@ tests can type), SOCK_SEQPACKET and SCM_RIGHTS for Unix sockets,
 fds, and 512 threads / 256 processes on x86_64 (256 / 128 on i386). The
 64-bit mmap entry still refused lengths over 4 GiB on its own; fixed.
 `make test` 215/215, `test-uefi-shell` pass.
+
+## 2026-10-07 — Installer wizard and helper
+
+`myos-install` (GTK, nine pages from the Golden Hour mockups; also `--text`)
+writes a plan; `myos-install-helper` (setuid root) checks it and would
+partition, format, copy, configure and make the disk bootable. On this
+kernel it stops before writing: no block device nodes, and the MSI's SSD
+is still hidden. Start menu: Install MyOS. `make test-install` is not
+built yet (WORKLIST C6).
+
+## 2026-10-07 — All Programs
+
+The Start menu's left column ends with All Programs, as on Windows XP: rest
+the pointer on it (or click it) and the Programs folders open beside it.
+A folder opens another menu to the right; a program runs. The tree is
+`/usr/share/myos/programs`, with `~/.local/share/myos/programs` merged on
+top (Hidden=true removes a name), and any `.desktop` file under
+`/usr/share/applications` that is not already listed, filed by category.
+
+## 2026-10-07 — WritePerfect Preview opens MyOS Preview
+
+File > Preview (Ctrl+Shift+P) built a PDF and then asked GTK to open it.
+Nothing on the disk claimed `application/pdf` (no mimeapps.list), and the
+fallback was Evince, which we no longer ship. The Mac opens that PDF in
+Preview.app by name. Linux now starts `/usr/bin/myos-preview` the same way,
+writes the PDF to `/tmp` if the document's folder is not writable, and
+`/usr/share/applications/mimeapps.list` makes Preview the default for PDFs
+and pictures.
+
+The first ship still failed in the VM: xsession has no D-Bus, so
+GtkApplication's `HANDLES_OPEN` never delivered the file and Preview
+showed its Open dialog (or quit). Preview now opens command-line paths
+itself and does not ask GApplication to carry them.
+
+## 2026-10-09 — Claude Code on the 64-bit disk
+
+Claude Code has no 32-bit build, so it is not on `build/myos-live.img`.
+The 64-bit disks get the musl binary (2.1.295) at `/usr/lib/claude/claude`,
+with `/usr/bin/claude` telling it to use Alpine's `rg` instead of the
+glibc ripgrep packed inside it. `ripgrep` is pinned in
+`live/packages.x86_64.lock`. It prints `2.1.295 (Claude Code)` on a CPU
+with SSSE3 and POPCNT (the MSI and the Pocket 4; a Pentium 4 does not
+have those, and it is not the machine this binary runs on). Python,
+gcc, g++ and Java already ran on both disks: `python 42`, `c-ok`,
+`cpp-ok`, `java-ok` (OpenJDK 8 on i386, OpenJDK 17 on x86_64).
+
+## 2026-10-07 — files on the desktop, and Wallpaper
+
+Twenty more nature pictures live in `/usr/share/myos/wallpapers` and show under
+Desktop Pictures, next to the theme's own landscape.
+
+`~/Desktop` is created if it isn't there, and drawn on the wallpaper: one icon per file, down the left,
+the same size and spacing as the Recycle can, which keeps the fifth place.
+Double-click opens the file. Right-click on the wallpaper has New Folder
+and Change Desktop Background…, the Mac's item. That opens Settings on
+Wallpaper: the picture as it will look, Fill Screen and the other fits,
+Add Photo…, the pictures you have, and a row of colours. myos-desktop
+paints the choice, because the root pixmap has to outlive Settings.
+
+## 2026-10-07 — rm goes to ~/Trash
+
+Unix `rm` unlinks the name. Ours (`live/myos-rm`, installed as both
+`/bin/rm` and `/usr/bin/rm`) is the only `rm`. A logged-in user gets a
+rename into `~/Trash` plus `._name.where` (path, uid, gid, mode, mtime)
+so Put Back can restore it. Root and `--reallyDelete` exec Alpine's
+`/usr/bin/coreutils` as `rm`, so first-boot scripts see GNU rm exactly.
+
+The first overlay of `/bin/rm` followed Alpine's symlink into the one
+coreutils binary and replaced `mkdir`, `chmod` and `touch` with our rm
+(the boot lines `invalid option '-p'` / `'-m'`). Unpack now unlinks
+before writing. That clobber also left `/etc/shadow` half-written, so
+the live login (Enter, empty password) failed. The Recycle can
+(`myos-trash`) takes drops and its right-click Empty Trash runs
+`rm --emptyTrash`. My Files Delete and drag use the same `rm`.
+
+
+Later still (WORKLIST 12/80): sigaltstack (A11; frames on the alternate
+stack, SS_AUTODISARM, uc_stack restored by sigreturn), SO_PASSCRED and
+SCM_CREDENTIALS (A10), /proc/cpuinfo and /proc/meminfo made up when read,
+the inotify limits, /sys/devices/system/cpu (A12), rt_sigqueueinfo and
+rt_tgsigqueueinfo (A13). systest checks each, on both CPUs. The flaky
+racetest is fixed (the armed copy yields until the sibling has acted), and
+verify-racetests catches all eight reintroduced bugs again (three of its
+patches had gone stale on 2026-10-05). The Makefile's overlay dependency
+list keeps file names with spaces whole ("My Files.desktop").
+Chromium in QEMU now ends in a segmentation fault (139) instead of exit 191.
+
+## 2026-10-07 — Two rm's: people's goes to the Trash, root's is GNU's
+
+`/usr/bin/myos-rm` is people's rm (uid 1000-59999); `/bin/rm` and
+`/usr/bin/rm` are symlinks to it, so `rm` by any name or path arrives there.
+Root and system accounts are handed to GNU rm (`/usr/bin/coreutils` as
+`rm`), with a guard: if coreutils turns out to be this program (the
+2026-10-07 clobber), it says so instead of calling itself forever. Files in
+the scratch folders (`/tmp`, `/var/tmp`, `/dev/shm`, `/run`) are deleted,
+not kept: scripts clean up there all the time. GNU's options now work
+(`-i`, `-I`, `-v`, `-d` empty folders only, `--interactive=`), unknown
+ones are errors, messages read like GNU's, and the record in `._NAME.where`
+is written before the move, so a file never lands in the Trash without it.
+An apk commit hook re-points `/bin/rm` when a coreutils upgrade replaces it.
+Because ours are symlinks, unpacking the tar replaces Alpine's link instead
+of writing through it into coreutils (checked with a plain `extractall`).
+33 host tests (scratchpad) pass; it builds for both CPUs. Not yet run on
+MyOS itself: that needs the live image rebuilt.
+
+The live user's Documents now has `Sound-test.wav` (`live/overlay/etc/skel`):
+48 kHz 16-bit stereo, made with Python's `wave` module — 440 Hz in the left
+speaker, then the right, then C-E-G and the C major chord in both, at
+-10 dBFS. Nothing plays it yet; it is for docs/SOUND-PLAN.md S2 onward.
+
+## 2026-10-07 — Sound plays (S1–S3 of docs/SOUND-PLAN.md)
+
+The HD Audio controller driver (`drivers/sound/hda_intel.c`) resets the
+controller, runs the CORB/RIRB command rings, finds the codecs, and plays and
+records through DMA streams: one buffer descriptor list entry per period, an
+MSI interrupt per period, the DMA position read from the position buffer.
+The generic codec driver (`hda_codec.c`) walks the codec's widget graph from
+each speaker, headphone and line-out pin back to a DAC, and from the ADC to
+the mics, turns the paths on (power, selectors, amps, pins, EAPD), makes
+Linux's controls (Master and Capture volume and switch, Mic Boost, Headphone
+and Mic Jack) with dB scales, and moves sound between speaker and headphones
+on the codec's jack messages. The sound core (`core.c`, `pcm.c`) is Linux's
+ALSA interface: `/dev/snd/controlC0`, `pcmC0D0p`, `pcmC0D0c`, the control and
+PCM ioctls, hw_params negotiation (our own interval arithmetic), read/write,
+mmap of the buffer, poll. `include/sound/asound.h` matches Linux's header
+exactly on both CPUs (`tools/check-asound.sh` compares 103 sizes, offsets and
+ioctl numbers each). `make test-sound` plays 440 Hz in QEMU through write()
+and through the mapped buffer, and finds the tone in what QEMU recorded; it
+passes on i386 and x86_64. Bugs found on the way: QEMU's controller holds the
+command ring until the response status is cleared (the RIRB interrupt is now
+on from the start, as in Linux), and the VFS keeps device names by pointer.
+The kernel's string library took over strncmp, strncpy, strlcpy, strchr and
+the rest from the Linux shim. `/etc/asound.conf` sends `default` to the card
+through `plug` (no dmix yet: docs/gaps.md).
+
+## 2026-10-08 — Chromium runs (headless, in QEMU)
+
+`chromium --headless --dump-dom` prints the page and exits 0. Six kernel bugs
+stood between it and that, found one at a time by running it in QEMU over the
+serial console:
+
+- `recvmsg` on a message socket at end of file left its "truncated" flag
+  unset (garbage): MSG_TRUNC on EOF, so the zygote spun on EMSGSIZE.
+- `int3` from a program was a protection fault (SIGSEGV): the breakpoint gate
+  is now ring 3 on both CPUs, so it is SIGTRAP, as on Linux (WORKLIST A14).
+  Chromium's CHECK failures end in int3: that showed which ones failed.
+- At most 1024 memory areas per process: Chromium's allocator splits its
+  reservations with guard pages and needs more; `mprotect` said ENOMEM. Now
+  Linux's 65536 (the array still grows only as needed).
+- 64 open files per process: now 1024, Linux's default (WORKLIST A8). The table
+  is built in for 64 and doubles on demand, like Linux's fdtable; close-on-exec
+  is a bitmap beside it. `select` handles all 1024 fds (it stopped at 31).
+- `stat()` through `/proc/self/fd/N` of a pipe or socket was ENXIO; it now
+  describes the pipe or socket, as Linux does (`open()` still refuses).
+- MAP_SHARED of a file was private. For files in RAM (memfd, /dev/shm) it now
+  maps the file's own pages, so processes and read()/write() see the same
+  bytes; MAP_SHARED|MAP_ANONYMOUS is an unnamed RAM file of its own. Disk files
+  are still private (docs/gaps.md).
+
+A GPU helper process still dies of a page fault and Chromium carries on
+without it (software drawing). Not yet tried: the windowed browser on the MSI.
+
+Later the same day: Chromium in a window. It crashed in its allocator while
+Mesa parsed its XML settings: `madvise` was a no-op, and MADV_DONTNEED is a
+promise (the pages go; the next touch reads zeros), which Chromium's
+allocator builds on when it gives memory back and takes it again. Now
+MADV_DONTNEED and MADV_FREE drop the pages (`mm_madvise`). With that, Chromium
+opens its first-run window on our X display (QEMU screenshot). The Start
+menu's "Web Browser", My Files and the desktop now start Chromium (they ran
+Firefox, which does not start yet); `/etc/chromium/myos.conf` adds
+`--no-sandbox --disable-gpu` to every start.
+
+## 2026-10-08 — The installer's time zone map is the Earth
+
+The time zone page drew three green blobs (copied from the mockup) with the
+city dots placed by eye. It now draws the real coastlines: Natural Earth's
+public-domain 1:110m land, made into a C table by `tools/make-worldmap.py`
+(`live/myos-install/worldmap.h`: 125 outlines, 2956 points, about 12 KB;
+cut off at 84°S, detail under 0.2° dropped). The projection is
+equirectangular, so each city's dot is one multiply from its latitude and
+longitude; the map keeps its shape at any window size.
+
+The installer offered 21 hand-typed cities. It now reads tzdata's own list
+when it starts (`/usr/share/zoneinfo/zone.tab`, on the live disk already):
+all 418 zones of tzdata 2026b, each with its city's coordinates and its
+country (`iso3166.tab`: "Kolkata, India"), so every inhabited country has a
+city and every zone a dot; only Bouvet Island and Heard & McDonald Islands,
+which nobody lives on, have no zone. Plus UTC. Region, then City; `--text`
+asks the same two questions. A host test read the image's tzdata through
+the installer's own code: no zone missing, every coordinate equal to
+zone.tab's. Traditional Chinese now defaults to Asia/Taipei (it was Hong
+Kong, for want of Taipei in the old list).
+
+Bugs on the page went with it: a click on the map changed City but left
+Region showing the old region; picking a language reset Region to America
+(German gave New York); and the setuid helper put whatever the plan said
+after `/usr/share/zoneinfo/` and copied that path as root, with only an
+`access()` check (the real user's rights, racy) between a name with `..` in
+it and other files. `plan_check` now takes only tzdata's characters (no
+`.`). Builds for both CPUs, no warnings. Not yet seen in
+the installer itself on MyOS (the live image needs rebuilding).
+
+The Start menu's pinned "Web Browser" still ran Firefox: the left column is
+made by live/theme/make-live-theme.py (MENU_LEFT), apart from the All Programs
+entries. Now `chromium`; the overlay's firefox.desktop is called "Firefox"
+again. Checked as the user does it, in QEMU: log in, Start, Web Browser
+(clicks through QEMU's monitor): Chromium's window opens. A program killed by
+a CPU exception now gets the file it was in, and the offset, in the kernel's
+message ("in libfoo.so at file offset ..."), as Linux's "segfault ... in".
+
+## 2026-10-08 — MPlayer on the 64-bit live disk
+
+Alpine 3.20's `mplayer` (community) is in `live/packages.x86_64.txt` under
+`[desktop]`. There is no i386 package. All Programs has Entertainment →
+MPlayer; My Files opens the usual video and audio names with it.
+
+## 2026-10-08 — LibreOffice on the 64-bit live disk
+
+Alpine has no Apache OpenOffice package. The suite on the stick is
+LibreOffice 7.6 (`libreoffice` + `libreoffice-gtk` in
+`live/packages.x86_64.txt` [office]). The live root grew to 3072 MiB so
+it fits. All Programs files Writer, Calc, Impress and the rest under
+Office; My Files opens .odt/.ods/.odp/.xlsx/.pptx with `libreoffice`.
+
+## 2026-10-08 — The network on the MSI: DNS, the route, loopback
+
+"baidu.com can't be reached" was three things. /etc/resolv.conf was copied
+from /proc/net/dns at early boot, and /proc/net/dns itself was filled in
+when /proc was mounted: on the MSI both came before Wi-Fi's DHCP lease, so
+neither ever named a nameserver. /proc/net/dns is now made when it is read,
+from the kernel's nameserver of the moment, and /etc/resolv.conf is a link
+to it (musl reads it afresh for every lookup). And UDP to 127.0.0.1 failed
+(ENETUNREACH: no loopback at all): musl's AI_ADDRCONFIG test connects a UDP
+socket to 127.0.0.1, took the failure for "no IPv4", and refused every
+lookup with that flag — all of Chromium's. UDP to 127/8 is now delivered
+locally (udp.c), and bind() to 127/8 works. New: /proc/net/route in Linux's
+format (`route -n` shows the default route), and the kernel log names the
+gateway and nameserver of a Wi-Fi lease. Chromium uses musl's lookup
+(--disable-features=AsyncDns, /etc/chromium/myos.conf). In QEMU: musl's
+AI_ADDRCONFIG lookup, a UDP echo over 127.0.0.1, and headless Chromium
+loading https://example.com all work.
+
+
+## 2026-10-08 — Two kernel crashes found, and the holes behind them closed
+
+**Kernel stacks have guard pages.** First boot of the x86_64 live disk once
+died in the write-back thread ("flush") on a pointer that was really the
+start of an ext2 inode: another thread's kernel stack had run past its
+8 KiB and written over the stack below it. Kernel stacks were kmalloc
+blocks packed end to end, so an overflow was silent — and in a kernel,
+whatever can be made to overflow a stack can write kernel memory with it.
+Now (kernel/thread.c, "kernel stacks") every stack lives in a window of
+the new KSTACK area (memlayout.h) with an unmapped guard page beneath it;
+running off the end stops the CPU at the guard page, the double fault is
+taken on a stack of its own (x86_64: IST1; i386: a task gate, gdt.c), and
+the report says "KERNEL STACK OVERFLOW: thread X". The windows are a pool
+(O(1) take and give back; pages kept, so the pages in use are the most
+threads alive at once). x86_64 stacks are 16 KiB as on Linux; i386 stays 8.
+`make STACKDEPTH=1` measures: first boot reached 5992 bytes (73% of the old
+8 KiB) before Chromium even started. Tested by a temporary kernel thread
+that recursed forever, on both CPUs: stopped at its guard page, named.
+
+**The direction flag.** Starting the desktop then sometimes reset the
+machine outright (a triple fault). With QEMU set to pause instead of reset,
+the registers showed memcpy copying *backwards* (DF set) with a length of
+-480 bytes, from the console's grid down over the whole kernel image and
+its IDT. Two bugs: x86_64's isr.asm did not clear the direction flag on
+entry (a program may have it set when an interrupt or fault arrives —
+musl's memmove does — and then every kernel memcpy/memset runs backwards:
+a way for any program to scribble on the kernel), and the console accepted
+a screen with 0 rows, whose scroll() moved -1 rows. isr.asm now starts with
+`cld` (i386's always did; syscall and sysenter clear it already), and a
+screen with no room for a character detaches the console. systest checks
+it: page faults taken with DF set must still zero-fill the page.
+
+Also new, as hardening and for hunting: switching to or freeing a page
+table checks that its kernel half is the kernel's (two compares; a freed
+or overwritten table stops with "PAGE TABLE CHECK" instead of a reset), and
+`make MEMDEBUG=1` fills freed pages and kmalloc objects with 0xDEADBEEF and
+checks them when they are handed out again (Rodger's suggestion, after
+Solaris's kmem debugging). Neither fired here; both stay for the next one.
+
+The Web Browser launchers run `myos-browser` (Chromium if the disk has it,
+else Firefox): this morning's `chromium` would have done nothing on the
+32-bit disk, where Alpine has no Chromium.
+
+## 2026-10-09 — Closer to Linux: /proc per process, disk files, 22 system calls
+
+`tools/linux-audit.sh` found 86 things Linux programs use that MyOS lacked
+(docs/LINUX-COMPAT.md). Fixed in one go:
+
+**/proc.** One folder per process, `/proc/<pid>/` (stat, status, statm,
+cmdline, comm, environ, maps, limits, mounts, mountinfo, cgroup,
+oom_score_adj, io, wchan; `/proc/self/` has the same files for whoever
+reads). The folder is made with the process and removed when it is
+reaped, and every file is written out when it is read, in Linux's format
+(52 fields in stat). So `ps`, `top`, `pgrep` and `pkill` have something
+to read. Also uptime, loadavg, stat, mounts, partitions, filesystems,
+swaps, devices, interrupts, net/{dev,tcp,udp,unix},
+sys/kernel/{hostname,osrelease,ostype,pid_max,random/uuid,boot_id}, and
+the rest of the small fixed files. Only the owner or root may read another
+process's `maps`, as on Linux: it would give away where that program's
+memory is.
+
+**Disks as files.** `/dev/sda`, `/dev/sda2`, and so on (root:disk, 0660),
+with Linux's device numbers. Each open keeps its own 64-bit position
+(struct file's is 32-bit; mke2fs writes across a whole 32 GB partition).
+Bytes go through a sector-sized bounce buffer. The ioctls disk tools use:
+BLKGETSIZE64, BLKSSZGET, HDIO_GETGEO, BLKFLSBUF, and BLKRRPART, which
+reads the table again and updates the partitions in place (one that is
+gone gets 0 sectors, so every read or write of it fails). Safety rules:
+- A mounted disk can't be opened for writing (EBUSY), and a disk open for
+  writing can't be mounted.
+- The block cache forgets the disk when a writer opens it and again when it
+  closes.
+- `mount -t ext2|vfat /dev/sdXN` works now (root only).
+- `/sys/block` gained `dev` files, plus `/sys/dev/block` and
+  `/sys/class/block` links.
+
+**Security holes closed on the way:**
+- `mount` had no root check. Any user could mount an empty tmpfs over
+  `/etc`, write a `passwd` of their own there, and become root. It is now
+  root only, as on Linux.
+- `mknod` of a device node is root only too. Anyone could otherwise make a
+  node for the raw disk in their own folder.
+
+**/dev and /sys.** `/dev/stdin`, `stdout`, `stderr` and `fd` link into
+`/proc/self/fd` (bash's `<(…)`), and `/dev/full` exists. In `/sys`:
+- `class/net/<if>/` (address, operstate, carrier, mtu, …), read live;
+- `firmware/efi` on the 64-bit kernel, so the installer knows it is a
+  UEFI machine;
+- `devices/system/cpu/cpu0`, `fs/cgroup`, and
+  `kernel/mm/transparent_hugepage`.
+
+`/etc/mtab` links to `/proc/self/mounts`.
+
+**System calls** (x86_64 222 → 244 of Linux's 369):
+- `close_range`, `waitid`, `preadv`/`pwritev` (and the "2" versions);
+- `getcpu`, the `sched_*` policy calls (everyone is SCHED_OTHER;
+  real-time gets EPERM, as for a normal user on Linux);
+- `mlock*` and `msync` (no swap, and shared mappings are the file's own
+  pages: nothing to do);
+- `vhangup` on x86_64.
+
+`wait4(0, …)` and `wait4(-pgid, …)` now wait for that process group, where
+before they took any child.
+
+Found while testing, and fixed:
+- **Any program could crash the kernel by reading a write-only file.**
+  `/proc/sysrq-trigger` was one; writing a read-only one like
+  `/proc/uptime` did it too. `read`/`write` called the file's function
+  without checking it existed. It answers EINVAL now, at no cost: the
+  pointer is loaded for the call anyway. sshd found it through the new
+  `preadv`.
+- **Disk-file permissions.** The VFS doesn't check permissions yet
+  (WORKLIST B30), so the disk files check their own mode bits. Until then,
+  user `myos` could read the raw disk.
+- `/proc/cmdline` is never empty. `ps` names a process after its main
+  thread (Xorg was showing as "InputThread"). The load average counts
+  program threads only (an idle machine read 2.00).
+
+Checked on the 64-bit live disk in QEMU:
+- `tools/linux-audit.sh`: **85 present, 25 missing** (was 24 / 86).
+- `ps -e`, `top -b`, `uptime`, `free`, `df`, `mount` and `lsblk` all work.
+- `mount` as `myos`: "must be superuser".
+- `/proc/1/maps` as `myos`: permission denied.
+
+i386 `make test`: 215/215.
+
+## 2026-10-09 — "LibreOffice froze": the X server was moving 19 MB, 4 KiB at a time
+
+In UTM, LibreOffice seemed to hang while the OS kept running. QEMU's
+monitor (read-only `info registers`, plus the kernel's `current` thread
+name read with `x`) showed **Xorg**, not LibreOffice, inside musl's memcpy.
+Every sample had RSI = RDI + 4096, over a buffer of about 19 MB.
+
+That is X's FlushClient. After a partial non-blocking write to a client, it
+moves all the unsent rest to the front of its buffer. Our Unix stream
+sockets held one page, so every write was 4 KiB, and a 19 MB reply became
+about 4,700 moves of up to 19 MB each: tens of GB of copying, minutes under
+emulation. Linux lets about 208 KiB wait in a Unix socket.
+
+The fix: a stream socket's ring starts at one page and **doubles while a
+writer finds it full, up to 256 KiB** (net/unix.c, ring_grow). Quiet sockets
+(most of them) keep their page. It never grows while a copy is in or out of
+the ring, because a copy can sleep on a page fault holding a pointer into
+it. Bytes keep their absolute positions, which files in flight are pinned
+to. systest checks it: 3 MB through a socketpair in 100,003-byte writes,
+with a child checking every byte. That took 52 ms through the old 4 KiB
+ring and 23 ms now (i386, QEMU). For X's case the moves drop 64-fold. i386
+`make test` 215/215.
+
+## 2026-10-09 — "Save As" hung LibreOffice: libmount's edge-triggered epoll
+
+LibreOffice's Save As dialog stopped answering ("Kill Client?"). The VM's
+monitor showed a thread named `gmain` (GLib's worker) going around
+`epoll_pwait` at 100% CPU. `gio mount -o` reproduced it with no GUI:
+15.7 s of CPU in 16 s. A temporary syscall trace (taken out again) showed
+the cause. libmount's mount monitor, which GLib uses for every file
+dialog, opens `/proc/self/mountinfo` and adds it to an epoll with
+**EPOLLIN | EPOLLET**. That file is always readable. On Linux an
+edge-triggered entry fires only when the mount table changes. Our epoll
+treats EPOLLET as level-triggered, so it said "changed" on every call,
+and libmount re-read the table forever. `/proc/self/mountinfo` only
+appeared this morning, so this was new.
+
+Fixes:
+- **Edge-triggered epoll for change-count files** (new
+  `file_ops.change_count`, used only by the mount tables for now): an edge
+  is a change of the count. Pipes and sockets keep the level behavior
+  their readers expect.
+- **`poll()` on an epoll file** reports readable only while an entry is
+  ready. Before, it always said readable.
+- **The mount tables are pollable as on Linux**: always readable, plus
+  POLLPRI | POLLERR once after the table changed. Mounting bumps a count
+  and wakes pollers.
+- **O_TRUNC is ignored on the kernel's own files.** `echo t >
+  /proc/sysrq-trigger` failed with EINVAL, because bash opens with
+  O_TRUNC.
+
+After: `gio mount -o` uses 0.05 s of CPU in 16 s. systest checks the
+epoll poll. i386 `make test` 215/215.
+
+## 2026-10-09 — Chromium's crash: caught, not yet fixed
+
+Reproduced in QEMU: `chromium --no-first-run https://example.com` with
+networking dies about 2 s in, every time with today's 256 KiB socket rings.
+Headless, and the first-run page without networking, survive. The browser
+process faults in a C++ virtual call on a garbage vtable pointer (an object
+freed and reused). Two runs faulted in different places. One bad address
+looked like a pointer with bit 44 set, which is how PartitionAlloc
+scrambles its free-list pointers. Chromium's crash reporter catches the
+fault and kills the process itself, so nothing was logged.
+
+Bisected: with the socket ring held at 4 KiB, one run of two survived. The
+bigger ring makes the crash more frequent but didn't cause it. It is the
+intermittent crash seen before. `madvise(MADV_DONTNEED)` already zeroes
+pages as Chromium expects. Still open.
+
+On the way:
+- x86_64 now logs a fault that the program's own handler catches, like
+  i386 does (first 50 per boot). The log shows the thread, pid, RIP,
+  address, `in <file> at file offset`, and sp.
+- `/proc/<pid>/oom_score_adj` takes writes (0644), as on Linux. Chromium
+  sets it for every renderer.
+
+## 2026-10-09 — Fonts for every language, and tests that click where they mean
+
+**Fonts.** The installer's first page showed 中文 and 日本語 as boxes: the
+live disks had DejaVu, Open Sans and bitmap fonts, none with a CJK letter.
+A new `[fonts]` group in live/packages.txt brings Noto Sans CJK and Noto
+Serif CJK (font-noto-cjk, 93 MB, regular and bold; Simplified and
+Traditional Chinese, Japanese and Korean shapes, chosen by the text's
+language) and Open Sans (3 MB, the free stand-in for the mockups' Trebuchet
+MS headings; the 64-bit disk had it only through Chromium). Not in the RAM
+login image. Pinned in both locks with `--add`; the 32-bit lock had fallen
+behind packages.txt (group moves, five Python extras) and caught up with no
+version changed. The 64-bit disk is 2237 MiB of 3072.
+
+**xdotool, and the desktop tests over ssh.** tools/qemu-desktop.py drove a
+PS/2 mouse: relative moves that X speeds up, so `moveto` crept 4 px at a
+time and checked screenshots, and `type` knew letters, digits and '-'. Now:
+- `type` sends any text tools/qemu-type.sh has a key for;
+- `sshkey` types a one-time public key into the open terminal and waits for
+  sshd; then `sh CMD` runs a command in the machine, `xdo ARGS` runs
+  xdotool on `:0` (in [desktop], so in the login image too), `text TEXT`
+  types any characters, and `get PATH` copies a file out;
+- a script that uses them gets an e1000 on QEMU's user network with ssh
+  forwarded to a free port; the serial and monitor ports are free ones too;
+- the disk is opened with snapshot=on, so a run never writes the image (the
+  test key can't end up on a stick).
+
+`xdotool type` drops every non-ASCII character here, even slowed down or
+with LC_ALL=C.UTF-8, while `xdotool key udiaeresis` works: so `text` sends
+ASCII runs with `type` and every other character as its Unicode keysym
+(`key U4E16`), 200 ms apart. Without the pause, xterm read some keys before
+it saw the spare key code's new mapping and lost them.
+
+Checked on the 64-bit live disk in QEMU: `xdo mousemove 300 205 click 1`
+selected Deutsch in the installer's list in one step;
+`text echo "Grüße, 世界! It's 5 > 4 & x=$((2+3))" > /tmp/t8` arrived exactly
+(bash evaluated the 5); `xdo search --name 'Install MyOS'
+getwindowgeometry` gave the window; `get` brought files out.
+
+Found on the way: the X server has no access control (no `-auth`), so any
+local program can read the desktop's keys. In docs/gaps.md, with the fix.
+
+## 2026-10-09 — Hunting Chromium's crash: where it is, what it isn't
+
+Where it is: the call chain (new: the fault log lists return addresses on
+the user stack as file + offset) goes through Chromium's History database
+(`CREATE TABLE visits`), sql::Database turning on SQLite's memory-mapped
+I/O, SQLite B-tree code, and finally Chromium's SQLite VFS wrapper calling
+`xFetch` (slot 0x88 of sqlite3_io_methods) through a file whose method
+pointer is garbage. A freed or overwritten SQLite file structure.
+
+How it behaves: the address is the same every time (MyOS has no
+randomisation), but whether it happens is timing. It crashed nearly every
+time on the normal kernel and 2 of 3 under MEMDEBUG. It did not crash in
+4 runs under SYSTRACE, 3 under PTAUDIT, or with Chromium's own logging on.
+
+Ruled out, with evidence:
+- FS-base/TLS switching: the cache is right on every path.
+- Global TLB entries on user pages: global_for() gives the bit only to
+  kernel addresses, and the software PTE bits are 9–11.
+- CR0.WP: it is set.
+- The FPU save area: 512 bytes, FXSAVE.
+- madvise: DONTNEED zeroes.
+- System calls returning with interrupts on (the red-zone window before
+  sysret): a check on every return never fired.
+- Repeated randomness: boot_id and urandom differ every boot.
+- Inode numbers reused while a deleted file is still open: they aren't.
+- Pages written after being freed: MEMDEBUG reported nothing.
+
+The `MAP_SHARED` theory looked confirmed by two clean runs, then failed on
+the next two. Its fix stays anyway, because the bug it closes is real: a
+disk file opened for writing can no longer be mapped shared (ENODEV). Its
+"shared" map was a private copy that read stale pages and dropped writes.
+
+New debug builds: `make SYSTRACE=1` (each thread's last 32 system calls,
+printed when it faults) and `make PTAUDIT=1` (registers, the memory they
+point at, and every page table checked against the allocator when a
+program faults).
+
+Small differences found:
+- A deleted file that is still open reports 1 link; Linux reports 0.
+
+## 2026-10-09 — Workspace buttons on the taskbar, for good this time
+
+They came back because of our own program. myos-desktop saved the
+wallpaper for IceWM's background helper as a `~/.icewm/preferences`
+holding only the three wallpaper lines. IceWM reads the *first*
+preferences file it finds, and `~/.icewm` comes before `/etc/icewm`. So
+once a wallpaper had been set, every MyOS IceWM setting was gone,
+`TaskBarShowWorkspaces=0` included, and IceWM's defaults put the workspace
+buttons back.
+
+Fixes:
+- myos-desktop now builds the user's file from `/etc/icewm/preferences`
+  at every login, swapping in only the wallpaper lines.
+- The new `/etc/icewm/prefoverride` forces `TaskBarShowWorkspaces=0`.
+  IceWM applies it after the preferences and the theme.
+
+Checked in QEMU: logged in graphically with a hostile user file
+(`TaskBarShowWorkspaces=1`) already in place. The taskbar showed no
+workspace buttons, and the user file was rebuilt from the system file
+(52 lines).
+
+The workspaces themselves are still there, for Mission Control above the
+screen later. The one remaining hole is a `~/.icewm/prefoverride`, which
+would shadow the system one. Closing that needs a patched IceWM (its
+source, 3.5.0, isn't in the tree).
+
+## 2026-10-09 — "WP's .docx looks corrupted": AbiWord can't read any .docx here
+
+A `.docx` opened from the desktop showed as `PK????…`, 43 pages, in
+AbiWord. The file itself (copied out of the VM over the serial console)
+was valid: 10 parts, every CRC good, written by LibreOffice 7.6, text
+"test". WP's own `.docx` output (wp51 `tests/out`: font, plain, round,
+style) is valid too, and macOS's textutil reads every one correctly. (The
+other four files there are minimal inputs the tests write for WP's
+importer.)
+
+The cause: Alpine's AbiWord on our disks has only its OpenDocument plugin,
+no Word importer. It loads any `.docx` as plain text. The desktop and My
+Files both sent `.doc`/`.docx`/`.odt`/`.rtf` straight to `abiword`. They
+now run `myos-office`, a launcher like `myos-browser`: LibreOffice where
+the disk has it (64-bit), else AbiWord. The 32-bit disk has no LibreOffice,
+so `.docx` there still needs a Word importer for AbiWord.
+
+## 2026-10-09 — security holes, written down
+
+`docs/SECURITY-HOLES.md` is the open list: no permission checks, empty
+live passwords that accept anything, X with no cookie, unsandboxed
+Chromium, no NX/ASLR/`PROT_NONE`, raw ICMP for every user, USB auto-mount,
+and what is still open on the network after the work in
+`docs/security.md`. Not a claim the machine is safe. A map of where it
+is not.
+
+## 2026-10-09 — The MSI's SSD was invisible: PCI stopped at bus 0
+
+On the MSI (over SSH, 192.168.1.69), MyOS listed only bus-0 PCI devices.
+No NVMe device of class 010802 at all, and only the USB stick in
+`/proc/partitions`. Intel's RAID mode (VMD) is off and the SATA controller
+is in AHCI mode, so the firmware wasn't hiding the disk. drivers/pci.c
+said it plainly: "We walk bus 0 only". The SSD, the Ethernet chip and the
+NVIDIA GPU sit behind PCI Express root ports (00:01.0, 00:1d.0, 00:1d.4),
+on buses the firmware has already numbered.
+
+pci_init now follows every PCI-to-PCI bridge: register 0x18 gives the
+secondary and subordinate bus. Each bus is walked before the buses behind
+it, so bus 0 keeps its old order. A bridge with devices behind it gets
+memory, I/O and bus-master on, so their DMA is forwarded. Each device
+points at its own struct pci_bus (number, bridge, parent). The table
+holds 64 devices, up from 32.
+
+Checked in QEMU, with an NVMe behind a pcie-root-port (OVMF numbers the
+bus as a PC's firmware does): "pci: bridge 00:04.0 -> bus 01-01", then
+nvme0n1 with MSI-X. i386 `make test` 215/215. Next: the MSI itself.
+
+## 2026-10-09 — The installer can't pick the disk it runs from
+
+The disk list used to let you select the live disk and only complained
+after Next. It also called *every* removable disk "the stick", so a
+second USB disk could never be the target. Now:
+- A disk is "in use" when anything is mounted from it (`/proc/mounts`:
+  the live "/", a boot partition, /data). That also covers UTM's live
+  disk, which isn't removable.
+- Its row says "MyOS is running from this disk" and is faded, not
+  selectable and inactive, with a tooltip saying why.
+- Text mode marks it `[can't choose]` and asks again if picked.
+- The install helper still refuses it, as a last check.
+
+The old `removable` guess remains only if `/proc/mounts` can't be read.
+
+Checked in QEMU: in the GUI, clicking the live disk's row leaves the
+selection on the empty disk. In text mode, choosing it re-asks.

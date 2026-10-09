@@ -65,11 +65,13 @@ static int run(const char *path, const char *const argv[])
     return code;
 }
 
-/* Pages in use that neither the heap nor the caches account for: what a
-   program that leaked would leave behind (printed per program below). */
+/* Pages in use that neither the heap, the caches nor the kernel-stack pool
+   account for: what a program that leaked would leave behind (printed per
+   program below). */
 static long held_pages(void)
 {
-    return -(long)pmm_free_count() - (long)kheap_pages() - (long)bcache_pages() - (long)pcache_pages();
+    return -(long)pmm_free_count() - (long)kheap_pages() - (long)bcache_pages() -
+           (long)pcache_pages() - (long)thread_stack_pages();
 }
 
 static int run_counted(const char *path, const char *const argv[])
@@ -179,6 +181,7 @@ void user_selftest(void)
     static const char *const args[] = { "args", "one", "two", NULL };
     uint32_t free_before = pmm_free_count(), heap_before = kheap_pages();
     uint32_t cache_before = bcache_pages(), pc_before = pcache_pages();
+    uint32_t stacks_before = thread_stack_pages();
     sched_set_preempt(1);               /* programs share the CPU, as for real */
 
     static const char *const files_args[] = { "files", NULL };
@@ -251,15 +254,18 @@ void user_selftest(void)
 
     check(vmm_translate(0x08048000) == 0, "user: program memory unmapped");
     /* Every page comes back — exactly. The only pages allowed to stay
-       missing are the ones the kernel heap took to grow, and the two
-       caches (both keep them). */
+       missing are the ones the kernel heap took to grow, the two caches,
+       and the kernel-stack pool (all keep them). */
     long missing = (long)free_before - (long)(pmm_free_count() + (kheap_pages() - heap_before) +
-                   (bcache_pages() - cache_before) + (pcache_pages() - pc_before));
+                   (bcache_pages() - cache_before) + (pcache_pages() - pc_before) +
+                   (thread_stack_pages() - stacks_before));
     if (missing)
-        kprintf("user: %ld pages missing (free %lu -> %lu, heap +%lu, caches +%lu +%lu)\n", missing,
+        kprintf("user: %ld pages missing (free %lu -> %lu, heap +%lu, caches +%lu +%lu, "
+                "stacks +%lu)\n", missing,
                 (unsigned long)free_before, (unsigned long)pmm_free_count(),
                 (unsigned long)(kheap_pages() - heap_before),
                 (unsigned long)(bcache_pages() - cache_before),
-                (unsigned long)(pcache_pages() - pc_before));
+                (unsigned long)(pcache_pages() - pc_before),
+                (unsigned long)(thread_stack_pages() - stacks_before));
     check(missing == 0, "user: every program page freed (none leaked)");
 }

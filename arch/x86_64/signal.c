@@ -97,7 +97,13 @@ int arch_signal_frame(int sig, const struct sig_origin *o, const struct k_sigact
     if (!(a->flags & SA_RESTORER) || a->handler >= USER_ADDR_END)
         return -1;
 
-    uint64_t sp = r->rsp - RED_ZONE;
+    /* On the alternate stack if the handler asked for it (SA_ONSTACK); the
+       red zone belongs to the interrupted code, so it's only skipped on
+       the stack that code was using. */
+    int alt;
+    uint64_t sp = sig_frame_top(a, r->rsp, &alt);
+    if (!alt)
+        sp -= RED_ZONE;
     uint64_t fpstate = 0;
     if (t->uses_fpu) {
         sp = (sp - FPU_STATE_SIZE) & ~(uint64_t)63;
@@ -128,6 +134,12 @@ int arch_signal_frame(int sig, const struct sig_origin *o, const struct k_sigact
     sc->oldmask = mask;
     sc->fpstate = fpstate;
     f.uc.uc_sigmask = mask;
+    user_addr_t ss_sp, ss_size;
+    int32_t ss_flags;
+    sig_save_altstack(r->rsp, &ss_sp, &ss_flags, &ss_size);
+    f.uc.ss_sp = ss_sp;
+    f.uc.ss_flags = ss_flags;
+    f.uc.ss_size = ss_size;
     fill_info(&f.info, sig, o);
     if (copy_to_user((void *)sp, &f, sizeof f) < 0)
         return -1;
@@ -156,11 +168,11 @@ intptr_t sys_sigreturn_impl(int rt)
     uint64_t frame = r->rsp - 8;
     struct sigcontext sc;
     uint64_t mask;
-    if (copy_from_user(&sc, (void *)(frame + offsetof(struct rt_sigframe, uc.uc_mcontext)),
-                       sizeof sc) < 0 ||
-        copy_from_user(&mask, (void *)(frame + offsetof(struct rt_sigframe, uc.uc_sigmask)),
-                       sizeof mask) < 0)
+    struct ucontext uc;
+    if (copy_from_user(&uc, (void *)(frame + offsetof(struct rt_sigframe, uc)), sizeof uc) < 0)
         proc_exit(W_SIGNALED(SIGSEGV));
+    sc = uc.uc_mcontext;
+    mask = uc.uc_sigmask;
     /* The way back to user mode is iretq, which faults IN THE KERNEL on a
        return address that isn't canonical. The frame is the program's to
        write: such a frame is a broken program, not a kernel crash. */
@@ -178,6 +190,7 @@ intptr_t sys_sigreturn_impl(int rt)
     r->cs = GDT_USER_CODE;
     r->ss = GDT_USER_DATA;
     t->sig_blocked = mask & ~(SIGBIT(SIGKILL) | SIGBIT(SIGSTOP));
+    sig_restore_altstack(uc.ss_sp, uc.ss_flags, uc.ss_size);
 
     if (sc.fpstate && t->uses_fpu) {
         if (copy_from_user(t->fpu_state, (void *)sc.fpstate, FPU_STATE_SIZE) < 0)

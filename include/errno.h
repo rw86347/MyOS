@@ -48,6 +48,7 @@
 #define ENOPROTOOPT 92  /* that socket option does not exist */
 #define EPROTONOSUPPORT 93 /* protocol not supported */
 #define ESOCKTNOSUPPORT 94 /* socket type not supported */
+#define EBADFD    77    /* file descriptor in bad state (a sound stream not set up) */
 #define EOPNOTSUPP 95   /* not supported on this socket */
 #define EAFNOSUPPORT 97 /* address family not supported */
 #define EADDRINUSE 98   /* address already in use */
