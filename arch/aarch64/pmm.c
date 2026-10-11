@@ -95,7 +95,54 @@ void arm64_pmm_init(uintptr_t dtb)
         mark_range(0, base, 0);
     /* Kernel image (physical == linked address while MMU is off). */
     mark_range((uint64_t)(uintptr_t)_start, (uint64_t)(__kernel_end - _start), 0);
+    mark_range(ARM64_USER_MIN, 0x200000ULL, 0);
+    mark_range(ARM64_USER_IMAGE_PA, ARM64_USER_IMAGE_SIZE, 0);
+    mark_range(ARM64_STACK_BLOCK, ARM64_STACK_BLOCK_SIZE, 0);
+    mark_range(ARM64_MMAP_BASE, ARM64_MMAP_END - ARM64_MMAP_BASE, 0);
+    mark_range(ARM64_INTERP_VA, ARM64_INTERP_SIZE, 0);
     search_from = (uint32_t)((uintptr_t)_start / PAGE_SIZE);
+}
+
+uint64_t arm64_pmm_alloc_contig(uint64_t bytes, uint64_t align)
+{
+    uint32_t need, step, f, i;
+
+    if (!bytes)
+        return 0;
+    if (!align)
+        align = PAGE_SIZE;
+    need = (uint32_t)((bytes + PAGE_SIZE - 1) / PAGE_SIZE);
+    step = (uint32_t)(align / PAGE_SIZE);
+    if (!step)
+        step = 1;
+    for (f = 0; f + need <= nframes; f += step) {
+        int ok = 1;
+
+        for (i = 0; i < need; i++) {
+            if (is_used(f + i)) {
+                ok = 0;
+                break;
+            }
+        }
+        if (!ok)
+            continue;
+        for (i = 0; i < need; i++) {
+            set_used(f + i);
+            if (free_frames)
+                free_frames--;
+        }
+        return (uint64_t)f * PAGE_SIZE;
+    }
+    return 0;
+}
+
+void arm64_pmm_free_contig(uint64_t pa, uint64_t bytes)
+{
+    uint64_t end = pa + bytes;
+
+    pa &= ~(uint64_t)(PAGE_SIZE - 1);
+    for (; pa < end; pa += PAGE_SIZE)
+        arm64_pmm_free((uint32_t)pa);
 }
 
 static uint32_t take_frame(void)

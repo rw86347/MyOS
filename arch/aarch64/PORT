@@ -8,16 +8,17 @@ Done:
   - Embedded virt.dtb, FDT /memory + host unit test
   - EL1 vector table + sync fault print
   - PMM bitmap (2 GiB frame index space)
-  - EL1 MMU: TTBR0 identity, 1 GiB blocks (low MMIO + RAM bank)
-  - GICv2 @ 0x08000000 + architected timer (1 kHz, IRQ vector @ 0x280)
-  - Slab kheap (≤1 KiB) + kprintf → PL011; pmm_alloc/free
-  - EL0 + SVC @ 0x400; write(64) + uaccess; sync_el0 saves x0–x5/x8
-  - Alpine aarch64 musl-dev fetch; ELF64 load @ 0x40400000; static musl hello test
-  - `make ARCH=arm64 test` greps `musl hello from MyOS`
+  - EL1 MMU: TTBR0 identity, L0→L1→L2 4K, user alias for ET_EXEC @ 0x400000
+  - GICv2 + architected timer
+  - Slab kheap + kprintf
+  - EL0 + SVC; write + uaccess
+  - newc initramfs, BusyBox echo/cat, ash, fork/exec/wait/pipes
+  - Alpine aarch64 bash (dynamic musl + readline) as the login shell
+  - `make ARCH=arm64 test` greps `bash from MyOS` and `bash-5.2`
+  - `make ARCH=arm64 utm-arm64` — native UTM virt VM (serial terminal)
 
-Next (14b):
-  - Fix EL0 data mapping (full musl crt / GOT — docs/gaps.md)
-  - initramfs + exec from cpio; Alpine aarch64 busybox.static as /init
-  - Grow syscall set (open, read, brk, mmap, exit_group, …)
+Next (14b rest / 14c):
+  - Real VFS + writable files; job control; signals that actually deliver
+  - Raspberry Pi bare metal (14c)
 
 Apple Silicon (step 15): m1n1 hand-off, Apple devices under arch/aarch64/apple/.

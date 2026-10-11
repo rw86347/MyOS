@@ -288,16 +288,23 @@ ifeq ($(ARCH),arm64)
              arch/aarch64/exceptions.c arch/aarch64/pmm.c arch/aarch64/paging.c \
              arch/aarch64/gic.c arch/aarch64/timer.c arch/aarch64/kheap.c \
              arch/aarch64/kprintf.c arch/aarch64/memcpy.c arch/aarch64/syscall.c \
-             arch/aarch64/uaccess.c arch/aarch64/elf64_load.c kernel/string.c
+             arch/aarch64/uaccess.c arch/aarch64/elf64_load.c arch/aarch64/cpio.c \
+             arch/aarch64/proc.c \
+             kernel/string.c
   C_OBJS  := $(patsubst %.c,$(BUILD)/%.o,$(C_SRCS))
   ALPINE_MUSL_ARM64 := build/ext/alpine-arm64-musl
   ALPINE_MUSL_STAMP := $(ALPINE_MUSL_ARM64)/.fetched-musl
+  ALPINE_BB_ARM64   := build/ext/alpine-arm64-busybox
+  ALPINE_BB_STAMP   := $(ALPINE_BB_ARM64)/.fetched-busybox
+  ALPINE_BB_BIN     := $(ALPINE_BB_ARM64)/bin/busybox.static
+  ALPINE_ROOT_ARM64 := build/ext/alpine-arm64-root
+  ALPINE_ROOT_STAMP := $(ALPINE_ROOT_ARM64)/.fetched-root
   MUSL_ARM64_CFLAGS := -std=c11 -O2 -Wall -Wextra -nostdinc \
                        -isystem $(ALPINE_MUSL_ARM64)/usr/include
   MUSL_ARM64_LIB    := $(ALPINE_MUSL_ARM64)/usr/lib
   OBJS    := $(BUILD)/arch/aarch64/entry.o $(BUILD)/arch/aarch64/vectors.o \
              $(BUILD)/arch/aarch64/mmu.o $(BUILD)/arch/aarch64/user_stub.o \
-             $(BUILD)/arch/aarch64/user_write.o $(BUILD)/arch/aarch64/musl_hello.o \
+             $(BUILD)/arch/aarch64/user_write.o $(BUILD)/arch/aarch64/initrd.o \
              $(BUILD)/arch/aarch64/dtb.o $(C_OBJS)
   LIBS    := -lgcc
   VIRT_DTB      := $(BUILD)/virt.dtb
@@ -380,7 +387,7 @@ QEMU_FLAGS = -m 64M -cpu pentium3 \
 # fight over the port.
 HAIRPIN_PORT := 47007
 
-.PHONY: run-uefi test-uefi-shell diskattacks verify-disktests verify-tests attacks all dist utm utm-hd hd live-root live-extra live-theme live-hd utm-live run-live run-hd test-hd run run-full run-text debug test check-selftests test-shell bench run-bench usb clean fuzz fuzz-build fuzz-replay diskfuzz diskfuzz-replay verify-racetests uefi run-uefi-text test-uefi live-uefi test-live-uefi test-usb live-login-initrd test-uefi-login test-arm64 test-arm64-fdt
+.PHONY: run-uefi test-uefi-shell diskattacks verify-disktests verify-tests attacks all dist utm utm-hd hd live-root live-extra live-theme live-hd utm-live utm-arm64 run-live run-hd test-hd run run-full run-text debug test check-selftests test-shell bench run-bench usb clean fuzz fuzz-build fuzz-replay diskfuzz diskfuzz-replay verify-racetests uefi run-uefi-text test-uefi live-uefi test-live-uefi test-usb live-login-initrd test-uefi-login test-arm64 test-arm64-fdt test-arm64-cpio
 
 ifeq ($(ARCH),arm64)
 all: $(BUILD)/kernel.elf $(BUILD)/virt.dtb
@@ -471,6 +478,23 @@ $(BUILD)/user/musl/hello.elf: user/musl/hello.c user/arm64/musl-elf.ld | $(ALPIN
 $(BUILD)/arch/aarch64/musl_hello.o: arch/aarch64/musl_hello.S $(BUILD)/user/musl/hello.elf
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -DMUSL_HELLO_ELF=\"$(abspath $(BUILD)/user/musl/hello.elf)\" \
+	  -c $< -o $@
+
+$(ALPINE_BB_STAMP):
+	chmod +x tools/fetch-alpine-arm64-busybox.sh
+	tools/fetch-alpine-arm64-busybox.sh $(ALPINE_BB_ARM64)
+
+$(ALPINE_ROOT_STAMP):
+	chmod +x tools/fetch-alpine-arm64-root.sh
+	tools/fetch-alpine-arm64-root.sh $(ALPINE_ROOT_ARM64)
+
+$(BUILD)/arm64-initrd.cpio: $(ALPINE_BB_STAMP) $(ALPINE_ROOT_STAMP) tools/pack-arm64-initrd.py
+	@mkdir -p $(dir $@)
+	python3 tools/pack-arm64-initrd.py $(ALPINE_BB_BIN) $(ALPINE_ROOT_ARM64) $@
+
+$(BUILD)/arch/aarch64/initrd.o: arch/aarch64/initrd.S $(BUILD)/arm64-initrd.cpio
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -DARM64_INITRD_PATH=\"$(abspath $(BUILD)/arm64-initrd.cpio)\" \
 	  -c $< -o $@
 endif
 
@@ -731,8 +755,8 @@ $(BUILD)/arch/aarch64/dtb.o: arch/aarch64/dtb.S $(BUILD)/virt-embed.dtb
 	  -c $< -o $@
 
 run-arm64: $(BUILD)/kernel.elf
-	$(QEMU_ARM64) $(QEMU_ARM64_BASE) -nographic \
-	  -kernel $(BUILD)/kernel.elf -serial mon:stdio
+	chmod +x tools/run-arm64.sh
+	tools/run-arm64.sh
 
 # Host-side unit test (FDT /memory on virt-embed.dtb).
 test-arm64-fdt: $(VIRT_DTB_EMBED)
@@ -741,9 +765,15 @@ test-arm64-fdt: $(VIRT_DTB_EMBED)
 	  tools/test-arm64-fdt.c arch/aarch64/fdt.c
 	$(BUILD)/test-arm64-fdt $(abspath $(VIRT_DTB_EMBED))
 
-test-arm64: test-arm64-fdt $(BUILD)/kernel.elf
+test-arm64-cpio:
+	@mkdir -p $(BUILD)
+	gcc -Wall -Wextra -Iarch/aarch64/include -o $(BUILD)/test-arm64-cpio \
+	  tools/test-arm64-cpio.c arch/aarch64/cpio.c
+	$(BUILD)/test-arm64-cpio
+
+test-arm64: test-arm64-fdt test-arm64-cpio $(BUILD)/kernel.elf
 	@rm -f $(BUILD)/arm64-serial.log
-	@(sleep 5; echo quit) \
+	@(sleep 8; echo quit) \
 	  | $(QEMU_ARM64) $(QEMU_ARM64_BASE) -display none \
 	    -kernel $(BUILD)/kernel.elf \
 	    -serial file:$(BUILD)/arm64-serial.log -monitor stdio >/dev/null || true
@@ -764,9 +794,21 @@ test-arm64: test-arm64-fdt $(BUILD)/kernel.elf
 	  || { echo "FAIL: kheap line missing"; exit 1; }
 	@grep -q "EL0: data access ok" $(BUILD)/arm64-serial.log \
 	  || { echo "FAIL: EL0 data access"; exit 1; }
-	@grep -q "musl hello from MyOS" $(BUILD)/arm64-serial.log \
-	  || { echo "FAIL: musl static hello missing"; exit 1; }
-	@echo "ARM64 OK: FDT + PMM + MMU + timer + kheap + musl hello on QEMU virt"
+	@grep -q "initramfs: /init" $(BUILD)/arm64-serial.log \
+	  || { echo "FAIL: initramfs /init missing"; exit 1; }
+	@grep -q "cat from initramfs" $(BUILD)/arm64-serial.log \
+	  || { echo "FAIL: BusyBox cat /hello.txt missing"; exit 1; }
+	@grep -q "bash from MyOS" $(BUILD)/arm64-serial.log \
+	  || { echo "FAIL: bash login banner missing"; exit 1; }
+	@grep -q "bash-5.2" $(BUILD)/arm64-serial.log \
+	  || { echo "FAIL: bash prompt missing"; exit 1; }
+	@echo "ARM64 OK: FDT + PMM + MMU + timer + kheap + initramfs /init + bash on QEMU virt"
+
+utm-arm64: $(BUILD)/kernel.elf
+	chmod +x tools/mkutm-arm64.sh
+	@mkdir -p $(BUILD)
+	tools/mkutm-arm64.sh $(BUILD)/kernel.elf $(BUILD)/MyOS-ARM64.utm
+	@echo "Open $(BUILD)/MyOS-ARM64.utm in UTM (serial terminal)."
 
 # user/sys/systest.c: the system call layer checked from a program's side,
 # with raw syscalls (no C library), for whichever CPU ARCH is. It goes only
@@ -1540,8 +1582,8 @@ DISPLAY_OPTS := -display cocoa,zoom-to-fit=on
 
 ifeq ($(ARCH),arm64)
 run: $(BUILD)/kernel.elf
-	$(QEMU_ARM64) $(QEMU_ARM64_BASE) -nographic \
-	  -kernel $(BUILD)/kernel.elf -serial mon:stdio
+	chmod +x tools/run-arm64.sh
+	tools/run-arm64.sh
 else
 run: $(IMG) $(USB) $(DATA)
 	$(QEMU) $(QEMU_FLAGS) $(DISPLAY_OPTS) -serial stdio

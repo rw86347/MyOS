@@ -7,6 +7,8 @@
 
 void uart_init(void);
 void uart_putc(char c);
+int  uart_readable(void);
+int  uart_getc(void); /* -1 if the RX FIFO is empty */
 void uart_puts(const char *s);
 void uart_puthex(unsigned long v);
 void uart_printf(const char *fmt, ...);

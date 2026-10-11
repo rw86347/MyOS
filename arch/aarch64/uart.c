@@ -15,8 +15,10 @@
 #define UART_FR   0x18u
 #define UART_CR   0x30u
 #define UART_FR_TXFF (1u << 5)
+#define UART_FR_RXFE (1u << 4)
 #define UART_CR_UARTEN (1u << 0)
 #define UART_CR_TXE    (1u << 8)
+#define UART_CR_RXE    (1u << 9)
 
 static inline void mmio_write32(uintptr_t addr, uint32_t val)
 {
@@ -30,7 +32,19 @@ static inline uint32_t mmio_read32(uintptr_t addr)
 
 void uart_init(void)
 {
-    mmio_write32(UART_BASE + UART_CR, UART_CR_UARTEN | UART_CR_TXE);
+    mmio_write32(UART_BASE + UART_CR, UART_CR_UARTEN | UART_CR_TXE | UART_CR_RXE);
+}
+
+int uart_readable(void)
+{
+    return !(mmio_read32(UART_BASE + UART_FR) & UART_FR_RXFE);
+}
+
+int uart_getc(void)
+{
+    if (!uart_readable())
+        return -1;
+    return (int)(mmio_read32(UART_BASE + UART_DR) & 0xff);
 }
 
 void uart_putc(char c)

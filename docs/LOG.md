@@ -3414,3 +3414,26 @@ kernel C. WORKLIST B52 points to it.
   (link @ 0x40400000), `elf64_load.c`, embedded `hello.elf`. Static binary built with Alpine
   `libc.a`; `_start` uses `write` syscall until EL0 data faults for musl crt are fixed (gaps.md).
   Test greps `musl hello from MyOS`. Next: EL0 data PTE, initramfs, BusyBox.
+- 2026-10-11: **ARM64 EL0 data + musl crt:** 4K L0→L1→L2 (kernel 2 MiB EL1-only, user AP bit 6
+  only — bits 6+7 is RO). PAN/SPAN cleared. SVC skips the `svc` insn and saves x0–x30 in
+  order (return value was clobbering LR). CPACR FPEN for musl SIMD. `make ARCH=arm64 test`
+  greps `EL0: data access ok` and `musl hello from MyOS`. Next: initramfs + `/init`, BusyBox.
+- 2026-10-11: **ARM64 initramfs + exec `/init`:** newc walker (`arch/aarch64/cpio.c`), host
+  `test-arm64-cpio`, `pack-arm64-initrd.py` packs musl `hello.elf` as `/init`. Boot finds
+  the archive after the EL0 data test and ELF-loads it (no VFS). `make ARCH=arm64 test`
+  greps `initramfs: /init` and `musl hello from MyOS`. Next: Alpine BusyBox as `/init`.
+- 2026-10-11: **ARM64 BusyBox echo:** Alpine `busybox.static` 1.36.1 (ET_EXEC @ 0x400000)
+  packed as `/init`. VA 0x400000 aliased onto RAM (GiB 0 is L2, not a 1 GiB device block).
+  First-wave syscalls (`mmap`/`writev`/`ioctl`/ids). Fixes: IRQ must save ELR/SPSR (do not
+  `daifclr` before `eret`); SVC ELR is already the next insn; argv strings must sit above
+  SP. `make ARCH=arm64 test` greps `busybox from MyOS`. Next: ash + fork/exec/pipes.
+- 2026-10-11: **ARM64 BusyBox cat:** tiny fd table over the newc archive (fds 0–2
+  console; ≥3 point at cpio bytes). `openat`/`read`/`close`/`lseek`/`fstat`/
+  `newfstatat`/`faccessat`/`sendfile`; file-backed `mmap` copies into the bump
+  arena. Packer adds `hello.txt`. `/init` argv is `cat /hello.txt`.
+  `make ARCH=arm64 test` greps `cat from initramfs`. Next: ash + fork/exec/wait/pipes.
+- 2026-10-11: **ARM64 bash on UTM virt:** process table (`clone`/`vfork`/`execve`/
+  `wait4`/pipes), per-process page tables (eager copy), shebang + PT_INTERP,
+  unique `st_ino` so musl does not skip libraries. `/init` runs ash then
+  `exec /bin/bash -i`. `make ARCH=arm64 test` greps `bash-5.2`.
+  `make ARCH=arm64 utm-arm64` builds `build/arm64/MyOS-ARM64.utm`.

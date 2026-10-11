@@ -25,6 +25,8 @@ static void stage(const char *name)
     uart_puts("\n");
 }
 
+static void launch_init(void);
+
 void kernel_main(unsigned long dtb_from_boot)
 {
     unsigned long dtb = dtb_from_boot ? dtb_from_boot : (unsigned long)myos_dtb_start;
@@ -96,14 +98,22 @@ void kernel_main(unsigned long dtb_from_boot)
     uart_puts("Hello world from MyOS!  (aarch64, QEMU virt)\n");
 
     stage("EL0");
-    el0_set_resume(&&after_el0_data);
+    el0_set_resume((void *)launch_init);
     el0_run_databtest();
     el0_enter_user();
-after_el0_data:
-    stage("Musl");
-    el0_run_musl_hello();
-    el0_enter_user();
 
+    for (;;)
+        __asm__ volatile("wfe");
+}
+
+static void launch_init(void)
+{
+    uart_puts("Step - Initramfs\n");
+    if (el0_run_initrd() < 0) {
+        for (;;)
+            __asm__ volatile("wfe");
+    }
+    el0_enter_user();
     for (;;)
         __asm__ volatile("wfe");
 }

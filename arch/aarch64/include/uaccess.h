@@ -6,9 +6,9 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define ARM64_USER_MIN  0x40200000ULL
-#define ARM64_USER_MAX  0x48000000ULL /* stack pages from PMM below this for bring-up */
+#include "memlayout.h"
 
+int arm64_user_range_ok(uintptr_t start, size_t n);
 int copy_from_user(void *dst, const void *user_src, size_t n);
 int copy_to_user(void *user_dst, const void *src, size_t n);
 

@@ -185,3 +185,10 @@ That probe crossed program against hostname — `ping`, `wget` and `nslookup`
 against `example.com` and `google.com`, three rounds — and came back 18 of 18,
 with every query answered in the capture. See `docs/gaps.md` for the full list
 of what was ruled out.
+
+## Native ARM64 (QEMU virt, HVF)
+
+`make ARCH=arm64 utm-arm64` writes `build/arm64/MyOS-ARM64.utm` — aarch64,
+QEMU virt, host CPU, kernel.elf, serial Terminal. Double-click the bundle
+and type at the `bash-5.2#` prompt. This is the ARM64 bring-up kernel, not
+the x86 portable tree; there is no virtio-net yet.

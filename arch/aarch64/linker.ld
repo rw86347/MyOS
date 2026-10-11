@@ -46,20 +46,19 @@ SECTIONS
         __bss_end = .;
     }
 
+    /* Kernel stack in the EL1-only 2 MiB (below ARM64_USER_MIN). */
+    . = ALIGN(16);
+    . += 65536;
+    __stack_top = .;
     __kernel_end = .;
 
-    /* EL0 bring-up: code + rodata at a fixed user VA (see uaccess.h). */
-    .user 0x40200000 : {
+    /* EL0 bring-up stub (identity user RAM; see memlayout.h). */
+    .user 0x40800000 : {
         __user_start = .;
         *(.user.text)
         *(.user.rodata)
         __user_end = .;
     }
-
-    /* Kernel stack (fixed; not in .bss). */
-    . = ALIGN(16);
-    . = 0x40260000;
-    __stack_top = .;
 
     /DISCARD/ : {
         *(.comment)
