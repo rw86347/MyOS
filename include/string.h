@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * string.h — the C library string/memory functions the kernel needs.
  * There is no libc in the kernel, so we write our own. GCC may also emit

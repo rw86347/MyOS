@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * dhcp.c — a DHCP client (RFC 2131), enough to be given an address.
  *
@@ -297,7 +299,7 @@ static int exchange(const uint8_t mac[6], int type, int reply)
    the wrong width. */
 static void print_ip(const char *label, uint32_t ip)
 {
-    kprintf("%s%u.%u.%u.%u", label, (unsigned)(ip >> 24), (unsigned)(ip >> 16) & 0xFF,
+    klog("%s%u.%u.%u.%u", label, (unsigned)(ip >> 24), (unsigned)(ip >> 16) & 0xFF,
             (unsigned)(ip >> 8) & 0xFF, (unsigned)ip & 0xFF);
 }
 
@@ -345,7 +347,7 @@ int dhcp_lease(struct net_device *dev, struct dhcp_lease *out)
        the same four addresses, so without this line a boot log cannot tell
        a working DHCP client from one that never got a reply. */
     print_ip("dhcp: lease from ", offer_server);
-    kprintf("\n");
+    klog("\n");
     out->addr = offer_addr;
     /* A server need not send a netmask or a gateway, and one that sends a
        netmask of zero would put every address off-subnet. Fall back to the
@@ -366,7 +368,7 @@ int dhcp_configure(void)
     if (rc < 0) {
         if (eth) {
             print_ip("dhcp: no answer, using ", IPV4_ADDR_STATIC);
-            kprintf("\n");
+            klog("\n");
         }
         use_static();
         return rc;

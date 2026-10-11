@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * fstest.c — the writable file system (step 8i)
  *

@@ -1,3 +1,5 @@
+; SPDX-License-Identifier: BSD-2-Clause
+; Copyright (c) 2026 Rodger Wilson
 ; =============================================================================
 ; usermode.asm — drop from the kernel (ring 0) into a user program (ring 3)
 ; =============================================================================

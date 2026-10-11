@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * fbmem.c — /dev/fb0, the framebuffer device (step 11b)
  *

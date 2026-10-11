@@ -738,3 +738,15 @@ quiet sockets keep their single page.
 The bigger win is X: after each partial write, Xorg moves its whole unsent
 rest to the front. A 19 MB reply took about 4,700 such moves at 4 KiB per
 write, and takes about 75 at 256 KiB.
+
+## FAT32 reads: one chain walk per file, runs of clusters per command (2026-10-10)
+
+read() of a FAT file went 512 bytes at a time, and each piece walked the
+cluster chain from the file's first cluster. That is O(n²) in the file's
+length. Now the walk resumes where the last read of the file stopped, and
+adjacent clusters are read in one command of up to 64 KiB.
+
+| copying INITRD.CPIO (238 MB) off the stick's EFI partition (512-byte clusters; x86_64, QEMU, USB stick) | time |
+|---|---|
+| before | about 4 MB a minute (the copy was stopped after 15 minutes) |
+| after (whole installer EFI step: read, write FAT32 to NVMe) | 3 s |

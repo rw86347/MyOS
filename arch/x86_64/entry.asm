@@ -1,3 +1,5 @@
+; SPDX-License-Identifier: BSD-2-Clause
+; Copyright (c) 2026 Rodger Wilson
 ; entry.asm — first 64-bit kernel code
 ;
 ; The UEFI loader copied kernel.bin to physical 1 MiB and jumped here, in

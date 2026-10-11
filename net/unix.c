@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * unix.c — AF_UNIX sockets: connections between programs on this machine
  *

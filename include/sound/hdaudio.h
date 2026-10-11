@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * hdaudio.h — the HD Audio bus and its codecs, as Linux shapes them
  * (include/sound/hdaudio.h): a controller is a `hdac_bus`, each codec on

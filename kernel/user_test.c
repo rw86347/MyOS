@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * user_test.c — run the test programs (from /bin in the initramfs) and
  * check what happened.

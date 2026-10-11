@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-2-Clause
+# Copyright (c) 2026 Rodger Wilson
 """Turn assets/myos-logo.png into a 320x200 VGA mode-13h bitmap.
 
 Output is exactly 64000 bytes, one byte per pixel, row by row. Each byte is

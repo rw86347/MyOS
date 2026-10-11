@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 #ifndef DRM_GEM_VRAM_HELPER_H
 #define DRM_GEM_VRAM_HELPER_H
 

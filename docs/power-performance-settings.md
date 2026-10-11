@@ -1,5 +1,11 @@
 # Power & Performance — Settings requirements
 
+> **2026-10-10:** the mode and slot parts of this document are replaced by
+> `docs/KERNEL-CONFIG.md`: three modes (realtime, soft realtime, max power
+> savings), the kernel's settings in one 512-byte block on the disk, and
+> slots numbered 0–19 with the OS at 0 and 10. The display, sleep, lid and
+> battery parts below still stand.
+
 This document specifies what **Settings** must offer for choosing between **real-time
 guaranteed throughput** and **power savings**, what each mode controls, and what the
 **kernel**, **GPU/display stack**, and **Settings application** must implement to support

@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 #ifndef LINUX_CPUMASK_H
 #define LINUX_CPUMASK_H
 /* A set of CPUs. MyOS runs on one CPU (number 0), so a mask is one word

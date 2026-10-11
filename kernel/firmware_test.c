@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * firmware_test.c — request_firmware, checked at boot (make test builds).
  * The test initramfs carries /lib/firmware/myos-test.fw (user/rootfs).

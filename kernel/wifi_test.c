@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * wifi_test.c — the 802.11 core (W2b), checked at boot in `make test`
  * builds on the simulated radio (drivers/net/wireless/sim.c): it registers

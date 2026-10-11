@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * lock.c — POSIX record locks: fcntl(F_GETLK / F_SETLK / F_SETLKW), and
  * the open-file ones (F_OFD_GETLK / F_OFD_SETLK / F_OFD_SETLKW)

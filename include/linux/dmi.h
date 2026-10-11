@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 #ifndef LINUX_DMI_H
 #define LINUX_DMI_H
 /* The firmware's description of the machine (SMBIOS/DMI: vendor, model).

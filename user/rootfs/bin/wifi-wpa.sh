@@ -1,4 +1,6 @@
 #!/bin/sh
+# SPDX-License-Identifier: BSD-2-Clause
+# Copyright (c) 2026 Rodger Wilson
 # Alpine's wpa_supplicant, unchanged, against MyOS's nl80211 (docs/WIFI-PLAN.md
 # W3c), on the simulated radio of `make test` kernels: it joins the WPA2
 # network, runs the 4-way handshake with the simulated AP and installs the

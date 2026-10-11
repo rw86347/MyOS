@@ -1,4 +1,6 @@
 #!/bin/sh
+# SPDX-License-Identifier: BSD-2-Clause
+# Copyright (c) 2026 Rodger Wilson
 # Run user/diskbench.c on Linux (Debian 12's stock i686 kernel, 6.1) in the
 # same QEMU setup as MyOS's disk benchmark (tools/diskbench.sh), on one of
 # the disk types: ide, ahci, nvme, virtio, usb. $2: the ext2 test image.

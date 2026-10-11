@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * ahci.c — SATA disks through an AHCI controller (ICH6 and later, QEMU's q35)
  *
@@ -308,7 +310,7 @@ static void add_port(int n)
     pmm_free(idframe);
     blockdev_sd_name(dev.name);
     blockdev_register(&dev);
-    kprintf("ahci: %s: port %d, %lu MiB\n", dev.name, n, sectors / 2048);
+    klog("ahci: %s: port %d, %lu MiB\n", dev.name, n, sectors / 2048);
 }
 
 void ahci_init(void)

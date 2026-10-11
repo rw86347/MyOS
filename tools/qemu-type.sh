@@ -1,4 +1,6 @@
 #!/bin/sh
+# SPDX-License-Identifier: BSD-2-Clause
+# Copyright (c) 2026 Rodger Wilson
 # qemu-type.sh — turn text into QEMU monitor "sendkey" commands, one per
 # character, so a test can "type" at the keyboard of a headless MyOS.
 #

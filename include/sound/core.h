@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * core.h — the sound core, as a driver sees it: Linux's ALSA driver API in
  * a small form. A driver makes a card (snd_card_new), gives it one PCM

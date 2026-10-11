@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * syscall.c — the Linux system calls, and the table that finds them
  *
@@ -85,6 +87,24 @@ int32_t rw_at(uint32_t fd, uintptr_t buf, uintptr_t len, int writing, int64_t at
     }
     if (!user_range_ok(buf, len))
         return -EFAULT;
+    /*
+     * A disk (/dev/sda...) does the whole request, as on Linux: mke2fs
+     * writes 2 MB of inode table at once and takes a short write for an
+     * error ("Attempt to write block ... resulted in short write": the
+     * installer's format failed, 2026-10-09). So no RW_MAX, and no
+     * fault-in first: its copies go through a bounce buffer between disk
+     * reads and writes, which sleep anyway. Two compares on the way to an
+     * ordinary read or write. (Not every open file has an inode: inotify's
+     * and epoll's don't.)
+     */
+    if (f->inode && S_ISBLK(f->inode->mode)) {
+        if (len > 0x7FFFF000)
+            len = 0x7FFFF000;           /* Linux's MAX_RW_COUNT */
+        file_get(f);
+        int32_t rc = blkfile_rw(f, buf, (uint32_t)len, writing, at);
+        file_put(f);
+        return rc;
+    }
     if (len > RW_MAX)
         len = RW_MAX;
     /* `!writing` because the flag is the kernel's direction: a read() is the
@@ -103,11 +123,6 @@ int32_t rw_at(uint32_t fd, uintptr_t buf, uintptr_t len, int writing, int64_t at
      * at f->pos, so they get a copy of the open file that starts at `at`,
      * and the copy's position is thrown away.
      */
-    if (at >= 0 && S_ISBLK(f->inode->mode)) {     /* a disk: positions past 4 GiB */
-        int32_t rc = blkfile_rw(f, buf, len, writing, at);
-        file_put(f);
-        return rc;
-    }
     struct file copy;
     struct file *use = f;
     if (at >= 0) {

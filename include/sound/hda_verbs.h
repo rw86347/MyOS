@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * hda_verbs.h — the commands ("verbs") an HD Audio codec understands, and
  * the parameters it reports. From Intel's High Definition Audio

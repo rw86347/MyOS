@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * pit.c — 8253/8254 Programmable Interval Timer: the 1 ms system tick
  *
@@ -74,7 +76,7 @@ void timer_check(void)
     if (tick_within(50000000ull))
         return;
     if (hpet_legacy_start(TIMER_HZ) == 0 && tick_within(50000000ull))
-        kprintf("timer: the PIT does not tick; the HPET gives the 1 ms tick\n");
+        klog("timer: the PIT does not tick; the HPET gives the 1 ms tick\n");
     else
         kprintf("timer: NO TICK: the PIT does not count and there is no HPET."
                 " Sleeps and time slots will not work.\n");

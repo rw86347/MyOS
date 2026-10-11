@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: BSD-2-Clause
+# Copyright (c) 2026 Rodger Wilson
 # =============================================================================
 # MyOS Makefile
 #
@@ -563,7 +565,7 @@ $(BUILD)/efi/efi_main.o: arch/x86_64/boot/efi/efi_main.c arch/i386/boot/efi/efi.
 	@mkdir -p $(dir $@)
 	END=0x$$($(NM) $(BUILD)/kernel.elf | awk '$$3 == "__kernel_end_phys" { print $$1 }'); \
 	LOAD=$$(( (END + 4095) / 4096 * 4096 )); \
-	$(CLANG_EFI) -DKERNEL_LOAD=0x100000 -DKERNEL_END=$$END -DINITRD_LOAD=$$LOAD \
+	$(CLANG_EFI) $(if $(filter 1,$(TRACE)),-DLOADER_BARS) -DKERNEL_LOAD=0x100000 -DKERNEL_END=$$END -DINITRD_LOAD=$$LOAD \
 	  -Iinclude -Iarch/i386/boot/efi -Iarch/x86_64/include -c $< -o $@
 
 $(UEFI_IMG): $(BUILD)/BOOTX64.EFI $(BUILD)/kernel.bin $(INITRD) \
@@ -579,7 +581,7 @@ $(BUILD)/efi/efi_main.o: arch/i386/boot/efi/efi_main.c $(BUILD)/efi/efi_jump.inc
 	@mkdir -p $(dir $@)
 	END=0x$$($(NM) $(BUILD)/kernel.elf | awk '$$3 == "__kernel_end" { print $$1 }'); \
 	LOAD=$$(( (END - 0xC0000000 + 4095) / 4096 * 4096 )); \
-	$(CLANG_EFI) -DINITRD_LOAD=$$LOAD -I$(BUILD)/efi -Iarch/i386/boot/efi \
+	$(CLANG_EFI) $(if $(filter 1,$(TRACE)),-DLOADER_BARS) -DINITRD_LOAD=$$LOAD -I$(BUILD)/efi -Iarch/i386/boot/efi \
 	  -c $< -o $@
 
 $(UEFI_IMG): $(BUILD)/BOOTX64.EFI $(BUILD)/kernel.bin $(INITRD) \
@@ -723,10 +725,10 @@ test-uefi-shell: $(UEFI_TEST_IMG) $(USB)
 	  grep -q "^4.5" $$L || { echo "FAIL: floating point"; ok=0; }; \
 	  grep -q "^after ctrl-c" $$L || { echo "FAIL: Ctrl-C"; ok=0; }; \
 	  if [ "$(ARCH)" = x86_64 ]; then \
-	    grep -q "^nvme: nvme0n1: .*MSI-X irq 16" $$L || { echo "FAIL: NVMe on MSI-X"; ok=0; }; \
-	    grep -q "^fat32: nvme0n1.* mounted" $$L || { echo "FAIL: read through MSI-X"; ok=0; }; \
+	    grep -q "^ *nvme: nvme0n1: .*MSI-X irq 16" $$L || { echo "FAIL: NVMe on MSI-X"; ok=0; }; \
+	    grep -q "^ *fat32: nvme0n1.* mounted" $$L || { echo "FAIL: read through MSI-X"; ok=0; }; \
 	  else \
-	    grep -q "^nvme: cannot map .*above 4 GiB" $$L || { echo "FAIL: NVMe above 4 GiB not reported"; ok=0; }; \
+	    grep -q "^ *nvme: cannot map .*above 4 GiB" $$L || { echo "FAIL: NVMe above 4 GiB not reported"; ok=0; }; \
 	  fi; \
 	  [ $$ok = 1 ] && echo "UEFI SHELL TEST OK ($(ARCH))" || exit 1
 
@@ -747,9 +749,9 @@ test-sound: $(UEFI_TEST_IMG)
 	    -device ich9-intel-hda -device hda-micro,audiodev=snd0 \
 	    -serial file:$(BUILD)/sound.log -monitor stdio >/dev/null || true
 	@perl -pe 's/\e\[[0-9;?]*[A-Za-z]//g; s/\r//g' $(BUILD)/sound.log > $(BUILD)/sound.txt
-	@grep -E "^(hda|sound):|^sndtest|^ok |^FAIL|^c.* (control|pcm)C" $(BUILD)/sound.txt; echo
+	@grep -E "^ *(hda|sound):|^sndtest|^ok |^FAIL|^c.* (control|pcm)C" $(BUILD)/sound.txt; echo
 	@L=$(BUILD)/sound.txt; ok=1; \
-	  grep -q "^sound: card 0: " $$L || { echo "FAIL: no sound card"; ok=0; }; \
+	  grep -q "^ *sound: card 0: " $$L || { echo "FAIL: no sound card"; ok=0; }; \
 	  grep -q "^sndtest: all ok" $$L || { echo "FAIL: sndtest"; ok=0; }; \
 	  python3 tools/check-tone.py $(SOUND_WAV) 440 0.8 || ok=0; \
 	  [ $$ok = 1 ] && echo "SOUND TEST OK ($(ARCH))" || exit 1
@@ -764,7 +766,7 @@ ifeq ($(ARCH),x86_64)
   LIVE_LOGIN_INITRD := build/live/login-initrd-x86_64.cpio
   LIVE_LOCK         := live/packages.x86_64.lock
   LIVE_HD           := $(BUILD)/myos-live-root.img
-  LIVE_MB           := 3072
+  LIVE_MB           := 4096
   MUSL_LDSO         := /lib/ld-musl-x86_64.so.1
   LIVE_MARCH        := -march=x86-64
   ALPINE_TRIPLET    := x86_64-alpine-linux-musl
@@ -794,7 +796,7 @@ $(LIVE_UEFI): $(BUILD)/BOOTX64.EFI $(BUILD)/kernel.bin $(LIVE_LOGIN_INITRD) $(LI
               arch/i386/boot/efi/vga-font.bin tools/mkuefi.py
 	ESP=$$(( $$(wc -c < $(LIVE_LOGIN_INITRD)) / 1048576 + 32 )); \
 	  [ $$ESP -lt 128 ] && ESP=128; \
-	  python3 tools/mkuefi.py --out $@ --esp-mb $$ESP $(MKUEFI_ROOT) \
+	  python3 tools/mkuefi.py --out $@ --esp-mb $$ESP $(MKUEFI_ROOT) --config-mb 1 \
 	    --file EFI/BOOT/BOOTX64.EFI=$(BUILD)/BOOTX64.EFI \
 	    --file EFI/MYOS/KERNEL.BIN=$(BUILD)/kernel.bin \
 	    --file EFI/MYOS/INITRD.CPIO=$(LIVE_LOGIN_INITRD) \
@@ -840,9 +842,9 @@ test-usb: $(LIVE_UEFI)
 	    -serial file:$(BUILD)/usb-serial.log -monitor stdio >/dev/null || true
 	@L=$(BUILD)/usb-serial.log; ok=1; \
 	  grep -a "xhci\|usb\|sd[a-z]\|mounted at /\|login screen" $$L; \
-	  grep -q "^xhci: .*MSI-X" $$L || { echo "FAIL: xHCI with MSI-X"; ok=0; }; \
-	  grep -q "^usb-storage: sda: " $$L || { echo "FAIL: the stick as sda"; ok=0; }; \
-	  grep -q "^ext2: sda2 mounted at /:" $$L || { echo "FAIL: myos-root from the stick"; ok=0; }; \
+	  grep -q "^ *xhci: .*MSI-X" $$L || { echo "FAIL: xHCI with MSI-X"; ok=0; }; \
+	  grep -q "^ *usb-storage: sda: " $$L || { echo "FAIL: the stick as sda"; ok=0; }; \
+	  grep -q "^ *ext2: sda2 mounted at /:" $$L || { echo "FAIL: myos-root from the stick"; ok=0; }; \
 	  grep -q "the login screen is up" $$L || { echo "FAIL: the login screen"; ok=0; }; \
 	  [ $$ok = 1 ] && echo "USB TEST OK ($(ARCH)): the live system runs from a USB stick" || exit 1
 
@@ -1014,11 +1016,23 @@ LIVE_LINK = $(CC) -nostdlib -Wl,-z,noexecstack -Wl,-dynamic-linker,$(MUSL_LDSO) 
 	  $(LIVE_SYSROOT)/usr/lib/crt1.o $(LIVE_SYSROOT)/usr/lib/crti.o \
 	  $(1) -L$(LIVE_SYSROOT)/usr/lib -L$(LIVE_SYSROOT)/lib \
 	  $(2) -lc -lgcc $(LIVE_SYSROOT)/usr/lib/crtn.o -o $@
+# Settings › Kernel (docs/KERNEL-CONFIG.md): kconfig.c is shared with the
+# helper that saves it; its table of power savings is made from
+# tools/kconfig/powerfeatures.py, so the two can't drift apart.
+KCONFIG_FEATURES := $(BUILD)/live/kconfig_features.h
+$(KCONFIG_FEATURES): tools/kconfig/powerfeatures.py
+	@mkdir -p $(dir $@)
+	python3 $< --c > $@
+$(BUILD)/live/kconfig.o: live/myos-settings/kconfig.c live/myos-settings/kconfig.h $(KCONFIG_FEATURES) \
+                         | $(LIVE_SYSROOT)/.done
+	@mkdir -p $(dir $@)
+	$(CC) $(LOGIN_CFLAGS) -I$(BUILD)/live -Wno-format-truncation -c $< -o $@
 $(SETTINGS_BIN): live/myos-settings/myos-settings.c live/myos-settings/scale.h \
-                 live/myos-settings/wallpaper.h | $(LIVE_SYSROOT)/.done
+                 live/myos-settings/wallpaper.h live/myos-settings/kconfig.h $(BUILD)/live/kconfig.o \
+                 | $(LIVE_SYSROOT)/.done
 	@mkdir -p $(dir $@) $(BUILD)/live
 	$(CC) $(LOGIN_CFLAGS) $(GTK_CFLAGS) -Wno-deprecated-declarations -Wno-format-truncation -c $< -o $(BUILD)/live/myos-settings.o
-	$(call LIVE_LINK,$(BUILD)/live/myos-settings.o,-lgtk-3 -lgdk-3 -lgdk_pixbuf-2.0 -lgio-2.0 \
+	$(call LIVE_LINK,$(BUILD)/live/myos-settings.o $(BUILD)/live/kconfig.o,-lgtk-3 -lgdk-3 -lgdk_pixbuf-2.0 -lgio-2.0 \
 	  -lgobject-2.0 -lglib-2.0 -lcairo -lpango-1.0 -lpangocairo-1.0 -lX11 -lm)
 # The Wi-Fi tray icon (live/myos-wifi): GTK3, wpa_supplicant's control
 # socket. Started by IceWM's startup script.
@@ -1145,6 +1159,16 @@ $(ADDUSER_BIN): live/myos-settings/myos-adduser.c | $(LIVE_SYSROOT)/.done
 	$(call LIVE_LINK,$(BUILD)/live/myos-adduser.o,-lpam)
 	chmod 4755 $@
 
+# Settings › Kernel's Save: checks an administrator's password and the
+# config, and writes the myos-config partition. Setuid root, as myos-adduser.
+KCONFIG_BIN := $(LIVE_EXTRA)/usr/libexec/myos-kconfig
+$(KCONFIG_BIN): live/myos-settings/myos-kconfig.c live/myos-settings/kconfig.h $(BUILD)/live/kconfig.o \
+                | $(LIVE_SYSROOT)/.done
+	@mkdir -p $(dir $@) $(BUILD)/live
+	$(CC) $(LOGIN_CFLAGS) -c $< -o $(BUILD)/live/myos-kconfig.o
+	$(call LIVE_LINK,$(BUILD)/live/myos-kconfig.o $(BUILD)/live/kconfig.o,-lpam)
+	chmod 4755 $@
+
 # The installer (live/myos-install): GTK + --text writes a plan; the
 # setuid helper is the only process that may write a disk.
 INSTALL_BIN := $(LIVE_EXTRA)/usr/bin/myos-install
@@ -1163,12 +1187,18 @@ $(HELPER_BIN): $(BUILD)/live/install/plan.o $(BUILD)/live/install/disks.o \
 	$(call LIVE_LINK,$(BUILD)/live/install/plan.o $(BUILD)/live/install/disks.o \
 	  $(BUILD)/live/install/myos-install-helper.o,)
 	chmod 4755 $@
+# The FAT32 writer the helper makes the new EFI partition with (MyOS's own
+# FAT driver only reads; the live disk has no mkfs.vfat).
+MKESP_BIN := $(LIVE_EXTRA)/usr/libexec/myos-mkesp
+$(MKESP_BIN): live/myos-install/myos-mkesp
+	@mkdir -p $(dir $@)
+	install -m 755 $< $@
 $(INSTALL_BIN): $(BUILD)/live/install/plan.o $(BUILD)/live/install/disks.o \
                 $(BUILD)/live/install/myos-install.o live/overlay/usr/share/applications/myos-install.desktop
 	@mkdir -p $(dir $@) $(LIVE_EXTRA)/usr/share/applications
 	$(call LIVE_LINK,$(BUILD)/live/install/plan.o $(BUILD)/live/install/disks.o \
-	  $(BUILD)/live/install/myos-install.o,-lgtk-3 -lgdk-3 -lgobject-2.0 -lglib-2.0 -lgio-2.0 \
-	  -lcairo -lX11 -lm)
+	  $(BUILD)/live/install/myos-install.o,-lgtk-3 -lgdk-3 -lgdk_pixbuf-2.0 -lgobject-2.0 \
+	  -lglib-2.0 -lgio-2.0 -lpango-1.0 -lpangocairo-1.0 -lcairo -lX11 -lm)
 	install -m 644 live/overlay/usr/share/applications/myos-install.desktop \
 	  $(LIVE_EXTRA)/usr/share/applications/
 
@@ -1265,14 +1295,14 @@ $(LIVE_THEME): live/theme/make-live-theme.py assets/themes/golden-hour/make-them
 	@touch $@
 
 live-theme: $(LIVE_THEME)
-live-extra: $(FW_STAMP) $(LIVE_THEME) $(LOGIN_BIN) $(MENU_BIN) $(SETTINGS_BIN) $(XSETTINGS_BIN) $(ADDUSER_BIN) $(INSTALL_BIN) $(HELPER_BIN) $(FILES_BIN) $(PREVIEW_BIN) $(WIFI_BIN) $(DESKTOP_BIN) $(WP_BIN) $(RM_BIN) $(TRASH_BIN) $(VOLUME_BIN) $(FORCEQUIT_BIN) $(CHOOSE_BIN) $(PLAYER_BIN)
+live-extra: $(FW_STAMP) $(LIVE_THEME) $(LOGIN_BIN) $(MENU_BIN) $(SETTINGS_BIN) $(XSETTINGS_BIN) $(ADDUSER_BIN) $(KCONFIG_BIN) $(INSTALL_BIN) $(HELPER_BIN) $(MKESP_BIN) $(FILES_BIN) $(PREVIEW_BIN) $(WIFI_BIN) $(DESKTOP_BIN) $(WP_BIN) $(RM_BIN) $(TRASH_BIN) $(VOLUME_BIN) $(FORCEQUIT_BIN) $(CHOOSE_BIN) $(PLAYER_BIN)
 
 # The live disk: like `make hd`, but myos-root holds the live userland
 # (tools/mklivehd.sh: owners, setuid bits and case-only names kept).
 # Every overlay file is a prerequisite. Names may have spaces ("My Files.desktop"
 # in the Programs menu): find's output is escaped so make keeps each one whole.
 OVERLAY_DEPS := $(shell find live/overlay live/overlay.local -type f 2>/dev/null | sed 's/ /\\ /g')
-$(LIVE_TAR): $(FW_STAMP) $(LIVE_THEME) $(LOGIN_BIN) $(MENU_BIN) $(SETTINGS_BIN) $(XSETTINGS_BIN) $(ADDUSER_BIN) $(INSTALL_BIN) $(HELPER_BIN) $(FILES_BIN) $(PREVIEW_BIN) $(WIFI_BIN) $(DESKTOP_BIN) $(WP_BIN) $(RM_BIN) $(TRASH_BIN) $(VOLUME_BIN) $(FORCEQUIT_BIN) $(CHOOSE_BIN) $(PLAYER_BIN) $(LIVE_LOCK) $(OVERLAY_DEPS)
+$(LIVE_TAR): $(FW_STAMP) $(LIVE_THEME) $(LOGIN_BIN) $(MENU_BIN) $(SETTINGS_BIN) $(XSETTINGS_BIN) $(ADDUSER_BIN) $(KCONFIG_BIN) $(INSTALL_BIN) $(HELPER_BIN) $(MKESP_BIN) $(FILES_BIN) $(PREVIEW_BIN) $(WIFI_BIN) $(DESKTOP_BIN) $(WP_BIN) $(RM_BIN) $(TRASH_BIN) $(VOLUME_BIN) $(FORCEQUIT_BIN) $(CHOOSE_BIN) $(PLAYER_BIN) $(LIVE_LOCK) $(OVERLAY_DEPS)
 	python3 tools/fetch-live.py --arch $(ALPINE_ARCH)
 ifeq ($(ARCH),x86_64)
 $(LIVE_HD): $(LIVE_TAR) tools/mklivehd.sh
@@ -1408,7 +1438,7 @@ check-selftests: $(IMG) $(USB)
 	@rm -f $(BUILD)/serial.log
 	@# Type and click once the self-tests have finished (up to 90 s), not
 	@# after a fixed time: the suite grows, and a fixed clock cut it short.
-	@(i=0; while [ $$i -lt 900 ] && ! grep -q "^Self-tests:" $(BUILD)/serial.log 2>/dev/null; do \
+	@(i=0; while [ $$i -lt 900 ] && ! grep -q "^ *Self-tests:" $(BUILD)/serial.log 2>/dev/null; do \
 	    sleep 0.1; i=$$((i + 1)); done; sleep 1; \
 	  for k in h i ret; do echo "sendkey $$k"; sleep 0.2; done; \
 	  echo "mouse_move 10 5"; sleep 0.3; echo "mouse_button 1"; sleep 0.3; \

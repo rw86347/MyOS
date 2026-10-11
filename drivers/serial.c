@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * serial.c — COM1 serial port (16550 UART), interrupt-driven both ways
  *

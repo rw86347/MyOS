@@ -1,3 +1,5 @@
+; SPDX-License-Identifier: BSD-2-Clause
+; Copyright (c) 2026 Rodger Wilson
 ; =============================================================================
 ; true.asm — the smallest possible program: exit(0) at once
 ; =============================================================================

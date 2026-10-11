@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-2-Clause
+# Copyright (c) 2026 Rodger Wilson
 """
 mkseeds.py — starting points for the packet fuzzers (tools/fuzz/seeds/).
 

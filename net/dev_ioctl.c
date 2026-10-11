@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * dev_ioctl.c — the network interface ioctls (Linux: net/core/dev_ioctl.c)
  *

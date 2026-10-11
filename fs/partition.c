@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * partition.c — read the MBR partition table and register each partition
  * as its own block device (hdb -> hdb1, hdb2, ...), like Linux does.
@@ -113,7 +115,7 @@ static int add_part(struct blockdev *disk, int n, uint32_t lba, uint32_t sectors
         old->sectors = sectors;
         old->priv = (void *)(uintptr_t)type;
         strlcpy(old->label, label ? label : "", sizeof old->label);
-        kprintf("part: %s: start %lu, %lu sectors (%lu MiB), type %02x %s\n",
+        klog("part: %s: start %lu, %lu sectors (%lu MiB), type %02x %s\n",
                 old->name, (unsigned long)lba, (unsigned long)sectors,
                 (unsigned long)(sectors / 2048), type, type_name(type));
         return 1;
@@ -129,7 +131,7 @@ static int add_part(struct blockdev *disk, int n, uint32_t lba, uint32_t sectors
         strlcpy(part.label, label, sizeof part.label);
     if (!part_name(part.name, sizeof part.name, disk->name, n) || !blockdev_register(&part))
         return 0;
-    kprintf("part: %s: start %lu, %lu sectors (%lu MiB), type %02x %s\n",
+    klog("part: %s: start %lu, %lu sectors (%lu MiB), type %02x %s\n",
             part.name, (unsigned long)lba, (unsigned long)sectors,
             (unsigned long)(sectors / 2048), type, type_name(type));
     return 1;

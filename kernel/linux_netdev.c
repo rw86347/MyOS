@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * linux_netdev.c — Linux's net_device API: allocating a device with room
  * for its driver's private data, registering it (listed, still down —

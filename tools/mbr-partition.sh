@@ -1,4 +1,6 @@
 #!/bin/sh
+# SPDX-License-Identifier: BSD-2-Clause
+# Copyright (c) 2026 Rodger Wilson
 # mbr-partition.sh — write the partition table into a disk image's MBR.
 #
 #   tools/mbr-partition.sh IMAGE

@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-2-Clause
+# Copyright (c) 2026 Rodger Wilson
 # Echo server for user/netbench.c: QEMU's user network maps the guest's
 # 10.0.2.2:7777 (UDP) and 10.0.2.2:7778 (TCP) to 127.0.0.1 here.
 import socket

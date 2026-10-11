@@ -3092,3 +3092,294 @@ The old `removable` guess remains only if `/proc/mounts` can't be read.
 
 Checked in QEMU: in the GUI, clicking the live disk's row leaves the
 selection on the empty disk. In text mode, choosing it re-asks.
+
+## 2026-10-09 — The MSI's SSD shows up; the installer names it right
+
+On the MSI with the bridge-following kernel: GPU 01:00.0, Kingston NVMe
+02:00.0 (2646:500c), Realtek 03:00.0. nvme0n1 is 488 GB with MSI-X, and
+its partitions are EFI, "recovery", a large Linux one and swap: Pop!_OS.
+The installer listed it, but only as `/dev/nvme0n1`, "Windows likely".
+Next to "USB DISK 3.2" (the stick) it didn't look like the main disk.
+
+- NVMe: the driver now asks the controller for its model (Identify
+  Controller, CNS 1, bytes 24–63), so `/sys/block/nvme0n1/device/model`,
+  the boot log and the installer show the drive's name.
+- The installer says "Windows likely" only when a partition carries
+  Windows' own names ("Basic data partition", "Microsoft reserved");
+  otherwise an EFI partition plus a large one is "another system is
+  installed". Either way the EFI partition is kept (has_system).
+
+QEMU: "QEMU NVMe Ctrl (NVMe)" in the installer's list. i386 `make test`
+215/215.
+
+## 2026-10-09 — "MSI" is a computer name
+
+The installer refused "MSI": plan_good_hostname took only lowercase
+letters, while its message said "letters". Host names are case-insensitive
+(RFC 1123) and Linux keeps them as typed, so ASCII letters of either case,
+digits and - are accepted now; still not starting or ending with -, and
+nothing else (spaces, _, non-ASCII). Checked on the Mac: MSI, Rodgers-MSI
+ok; -MSI, MSI-, "MS I", MSI_1, empty refused.
+
+## 2026-10-09 — Installer: drive pictures, a big check, the partition manager
+
+- **Chinese fonts are always installed; the question is gone** (text and
+  GUI). `font-noto-cjk` is on both live disks and installs copy the system.
+  The "and pinyin" in the summary went too: no input method is on the disk.
+- **The disk picker:**
+  - Each disk has a picture (live/overlay/usr/share/myos/icons/installer:
+    a drive, or a thumb drive for a removable disk), its name in bold,
+    size and state, and a big green check on the chosen one.
+  - The suggestion is the first internal disk not in use, never a USB stick
+    when there is anything else.
+- **The Partitions page follows docs/installer/partition-manager-mockup.jpg:**
+  - The disk's picture and name.
+  - Before and After bars. After is tall named blocks: EFI slate, Windows
+    blue, unallocated hatched, myos-root orange, myos-data green, and no
+    block narrower than a readable minimum.
+  - A table (Partition, Type, Size, Mount, Action) with the selected row
+    teal.
+  - Tools: Resize (the system's size, in a popover), Delete and Add
+    partition (the separate myos-data), and Format (off: new partitions are
+    always formatted).
+  - The note "Nothing is written until you click Install".
+  - The layout follows the helper's own rules.
+- **Shared with the other pages:** circled steps in the sidebar with the
+  current one on a teal pill, a teal Next, and the page in the window title.
+- **Fixes on the way:**
+  - Partitions are listed in disk order (`readdir` order put the MSI's p2
+    first).
+  - Windows' "Basic data partition" shows as "Windows (C:)".
+  - The installer now links gdk-pixbuf and pango.
+
+Checked in QEMU with a 64 GB GPT test disk (EFI 260 MiB, Windows 24 GiB,
+free space): EFI kept, Windows kept, myos-root 32 GB, myos-data 11 GB.
+
+## 2026-10-09 — The installer's format failed: disk writes were short
+
+On the MSI the install stopped at formatting. In QEMU, `mke2fs` on a disk
+file failed at once: "Could not write 509 blocks in inode table ... short
+write". It writes 2 MB at a time. A disk file took 64 KiB per call, and
+every read or write was cut to RW_MAX (256 KiB). Linux never writes a
+disk short, and e2fsprogs counts a short write as an error.
+
+Now a disk file does the whole request (up to Linux's MAX_RW_COUNT), 64
+KiB through the bounce buffer at a time. rw_at sends block devices
+straight there: no RW_MAX, no fault-in first, because their copies sit
+between disk transfers that sleep anyway. On the read/write path that is
+one compare of the inode's mode.
+
+QEMU: `mke2fs -F` of a 24 GB partition completes in 2.2 s (192 groups).
+
+Also: Resize on the Partitions page has "Use all (N GB)", which gives
+myos-root all of MyOS's space with no separate myos-data. The size field
+can't ask for more than the disk has.
+
+## 2026-10-10 — The installer installs: erase a disk, boot it, log in
+
+On the MSI the install had spun forever. The helper's steps were mostly
+log lines, and some real steps were wrong. Erase-with-EFI-kept wrote a
+table with no EFI partition at all. Partitions were found by guessing
+their numbers, and the EFI partition was to be made with `mkfs.vfat`,
+which the live disk doesn't have. Now `myos-install-helper --apply` does
+the whole job:
+
+1. **partition**: sfdisk writes a new GPT ("EFI System" 512 MiB,
+   myos-root, myos-data). Free-space installs append the same three
+   (`--append`), only on a disk with no EFI partition yet (MyOS can't
+   write FAT, so it can't add itself to Windows' EFI partition; the
+   window says so). BLKRRPART must succeed, and the new partitions are
+   found by GPT name among the ones that weren't there before.
+2. **filesystems**: mke2fs with the features our ext2 reads, and fewer
+   inodes than mke2fs's default (they are all zeroed).
+3. **boot**: `myos-mkesp` (new, Python, in /usr/libexec) writes FAT32
+   straight onto the new EFI partition. It holds a copy of the stick's
+   own EFI partition, mounted read-only. The firmware starts
+   EFI/BOOT/BOOTX64.EFI by itself, so no boot entry is needed.
+4. **copy**: myos-root at /mnt/myos-root, myos-data at its /data, then
+   `rsync -ax` of the running system. Left out: the kernel's file
+   systems, temporary files, /mnt and /home.
+5. **configure**: the account is written into passwd, group and shadow
+   (sha512-crypt, uid 1000, the administrator's groups). Root is
+   locked, and every live account goes (`myos` has no password). /home
+   is a link to /data/home. Removed: the stick's ssh host key (every
+   install would share it), the build Mac's key, ssh login itself (off
+   by default), the installer, and the Wi-Fi passwords unless asked.
+   Then the computer name, language, keyboard and time zone.
+6. **finish**: sync (it flushes the drives' own caches too).
+
+The helper is setuid root, so it was also a way in. It ran sfdisk,
+rsync and python with the caller's environment, so LD_PRELOAD would have
+run their code as root. Any user could erase any disk. The plan and the
+log in /tmp could be links to root's files. Now the environment is
+cleared, only root or wheel may run it, and the plan must be the
+caller's own: it is checked, then read from the same open file. The log
+is made fresh with O_EXCL. The window writes the plan 0600 from the
+start, with O_EXCL. The language and keyboard names are checked too,
+because they go into a shell script every login runs.
+
+**The FAT driver read a file in O(n²).** Each 512-byte piece of a
+read() walked the cluster chain from the file's start. The stick's EFI
+partition has 512-byte clusters, so copying its 240 MB INITRD.CPIO ran
+at about 4 MB a minute. fat32_read now continues from where the last
+read of the same file stopped, and reads runs of adjacent clusters in
+one disk command (up to 64 KiB). read() goes through a 64 KiB buffer. The
+FAT-sector cache was also shared unsafely between threads; it is now
+read and changed only with interrupts off. QEMU: the whole EFI step
+takes 3 s (docs/performance.md).
+
+**The kernel picks the right root.** With the stick still plugged in,
+both disks hold a "myos-root". The one on the kind of disk we started
+from wins (USB when BOOT_FROM_USB, otherwise not USB). myos-data is
+taken only from the root's own disk, so a live stick never mounts an
+installed system's files.
+
+The window: it stopped spinning when the helper finishes (a closed
+pipe's watch returned TRUE forever). Erase always makes a new EFI
+partition. "Free space" explains why it can't be used: the disk has an
+EFI partition, or not enough room (it counted 0 bytes free as enough).
+The work list follows the helper's order. A disk mounted by an earlier
+try says "restart the computer"; it no longer says "MyOS is running from
+it".
+
+Checked in QEMU, live image as a USB stick plus a 64 GB NVMe:
+`--apply` in 91 s (partition 1 s, file systems 1 s, EFI 3 s, copy 85 s
+for 3.4 GB). Booted from the NVMe alone: myos-root at /, myos-data at
+/data, login as the new account with its password, home on myos-data,
+no live user, no ssh keys, `doas` asks for the password. Booted from the
+stick with that NVMe attached: the stick's root, NVMe left alone.
+
+## 2026-10-10 — Kernel configuration: the design, three mockups, a reference
+
+The new **Settings › Kernel** screen (docs/KERNEL-CONFIG.md):
+- A slider picks one of three modes. **Realtime** has exact slots and no
+  power management. **Soft realtime** has preferred slots, and idles only
+  in states that wake within a latency budget. **Max power savings** has
+  no slots, and switches for every saving this processor and these
+  devices have.
+- In the two real-time modes, each of the 20 slots has a name field.
+  Slots 0 and 10 are always the OS, so it runs exactly every 10 ms; the
+  kernel's 1-based slots 1 and 10 are moving to this numbering.
+- Save checks everything, then encodes one 512-byte block in the target
+  processor's byte order and writes it to a `myos-config` partition (two
+  copies, generation and CRC-32, not encrypted). The kernel finds the
+  block through the partition table and reads it in `storage_init()`.
+
+Three mockups were drawn (docs/kernel-config/mockups.html, PNGs from
+headless Chrome): A timeline and list, B clock dial, C engineer's table
+with the live block. **Rodger chose B**: the slots as a wheel, the power
+savings as a grid of cards. A and C were deleted; the trimmed page draws B
+exactly as before (the re-rendered PNGs differ by 0 pixels), and a
+Realtime picture of B was added. Documentation that runs:
+`tools/kconfig/kconfig.py` (layout, checks, little/big-endian encode and
+decode, the A/B rule, the C struct) and `tools/kconfig/powerfeatures.py`
+(every saving, per processor family). The generated struct compiles to
+the documented offsets with both cross compilers.
+
+## 2026-10-10 — Settings › Kernel, for real, on the x86_64 live disk
+
+- **The page** (`live/myos-settings/myos-settings.c`, mockup B):
+  - the three-stop slider;
+  - the 20 ms wheel with a name field beside each slot;
+  - a task list: program, arguments, the user it runs as, start at boot,
+    restart if it stops. A new name gets `/bin/<name>`;
+  - the latency budget;
+  - in power savings, a grid of cards for this computer, each with its
+    settings inside once switched on;
+  - live checks in the footer;
+  - **Save…**, with an administrator's password.
+- **`kconfig.c`** is shared by the page and the helper: the text form,
+  the checks, the two parts' bytes, the A/B partition write. The host
+  test gives the same bytes as `kconfig.py`, little- and big-endian; the
+  power-saving table is generated from `powerfeatures.py --c` by the
+  build.
+- **`myos-kconfig`** (setuid root, `/usr/libexec`): `read`, and `save`.
+  Save checks the password with PAM, as `myos-adduser` does, and checks
+  the config again, the programs' files too. It then writes the copy not
+  in use (task list, flush, boot block, flush) and reads it back.
+- **`tools/mkuefi.py --config-mb 1`** adds the `myos-config` partition,
+  with its own type GUID, 9390AFB2-C545-487E-AF50-3648E56B736C. The
+  first try showed the kernel reads only the MBR of these hybrid-MBR
+  images, so the partition is also MBR entry 3 (type 0xDA). The helper
+  then finds it through the GPT and its first sector.
+
+Checked in QEMU (q35 AHCI, as UTM):
+- read gave "nothing saved yet";
+- Save went to copy A (generation 1), and again to copy B (generation 2);
+- read gave the config back;
+- a wrong password and a task with no program were both refused.
+
+The partition QEMU wrote decodes with `kconfig.py` on the Mac to the same
+config. A screenshot of the page went into docs/kernel-config/. The UTM
+machine `~/Desktop/MyOS 64-bit.utm` got the new boot disk (its install
+disk kept).
+
+The kernel in that image is the 07:20 build. At 13:30 another session
+was editing kernel files (`kprintf`, `xhci`, `partition.c`, `main.c` and
+more), and `xhci.c` didn't compile then. The image was assembled from the
+new userland and the last good kernel, without touching their work.
+
+New: **docs/TIME-SLOTS.md**:
+- how a program is bound to its slots (`myos-taskd`, then the check at
+  `execve`: by file, user, and one process per task);
+- how the OS slots run the kernel and the desktop. OS threads go first
+  everywhere and run at once on wake-up, and a fence stops a runaway
+  among them. A runaway program can't freeze the GUI: a click reaches X
+  within microseconds, or at most 9 ms with realtime tasks;
+- how to write a program for a slot.
+
+## 2026-10-10 — Settings › Kernel on the MSI: power savings by CPUID
+
+On the MSI (i7-11800H) most power-saving cards were greyed out. Settings
+knew processors only by name (Pentium 4, Pentium M, Ryzen), so an Intel
+Core was "not known". Three more were greyed because a program can't see
+them ("MyOS can't tell yet").
+
+Now:
+- **The processor's own bits** (CPUID, read by Settings; MyOS's
+  `/proc/cpuinfo` lists no `est`, `acpi` or `tm`):
+  - SpeedStep or CPPC means it can change speed;
+  - AMD CPB or Intel Turbo means boost;
+  - MWAIT means deeper idle;
+  - ACPI + TM means clock modulation;
+  - the hypervisor bit means a virtual machine: the page says the host
+    manages the processor's power.
+- **What only the kernel can confirm** (deep idle, C1E, PCIe ASPM, USB,
+  SATA link power, disk spin-down) is switchable, marked "checked when
+  MyOS starts".
+- **USB sticks** (removable) no longer count as hard disks or SATA links.
+- `myos-kconfig detect` prints what Settings sees, as the caller (no
+  root).
+
+On the MSI, over ssh: 10 of 17 savings are switchable. The rest are
+right to be off:
+- two need SMP;
+- there is no spinning disk and no SATA disk;
+- MyOS has no sound driver for this machine yet;
+- there is no Ethernet driver yet;
+- there is no graphics driver with power management.
+
+The new stick image keeps the kernel the first one had (the 13:36 build).
+
+## 2026-10-10 — The touchpad plan
+
+docs/TOUCHPAD-PLAN.md: two-finger scrolling and palm rejection for the
+MSI's I2C HID touchpad, which MyOS can't see at all yet. The kernel will
+deliver every finger, with palms marked, through this chain:
+1. the ACPI tables, to find the pad (no AML yet: a per-machine table
+   from the MSI's decompiled DSDT);
+2. the LPSS DesignWare I2C controller;
+3. HID over I2C, a general HID parser, and precision-touchpad mode;
+4. polling every 8 ms, then a GPIO interrupt;
+5. Linux's multitouch protocol on `/dev/input/event2`.
+
+libinput (with `libudev-zero`, since MyOS has no udev) then gives the Mac
+feel: smooth natural scrolling, tapping, and palm rejection in four
+layers. Those are the pad's own confidence bit, ignoring the pad while
+typing, edge zones, and size. Seven steps, about 2,000–3,000 lines of
+kernel C. WORKLIST B52 points to it.
+
+- 2026-10-11: Roadmap: step **14** is now ARM64 (QEMU `virt`, then Raspberry Pi bare metal);
+  new step **15** is **Apple Silicon bare metal** (MacBook Air M1+ as MyOS-only, boot chain,
+  Apple NVMe/input/display, aarch64 live userland). `CLAUDE.md` lists three CPU families.
+  UTM/x86 on a Mac stays dev workflow, not step 15.

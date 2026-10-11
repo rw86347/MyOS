@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * util.c — 802.11 helpers the core and drivers share (Linux has them in
  * net/wireless/util.c): header lengths, channel numbers <-> frequencies,

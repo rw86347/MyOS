@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-2-Clause
+# Copyright (c) 2026 Rodger Wilson
 """coff2efi.py — link one or more clang COFF objects into a PE32+ EFI app.
 
 Apple clang can compile x86_64 Windows objects, but this tree has no lld.

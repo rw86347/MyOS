@@ -1,4 +1,6 @@
 #!/bin/sh
+# SPDX-License-Identifier: BSD-2-Clause
+# Copyright (c) 2026 Rodger Wilson
 # The self-tests (make test's kernel) with the ext2 test disk on each of the
 # other disk drivers: AHCI (SATA), NVMe, virtio-blk, a USB stick (xHCI).
 # `make test` covers IDE. They run in parallel, each on its own copies of

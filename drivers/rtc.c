@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * rtc.c — the battery-backed clock (CMOS RTC): what time is it?
  *

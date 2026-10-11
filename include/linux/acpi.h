@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 #ifndef LINUX_ACPI_H
 #define LINUX_ACPI_H
 /* No ACPI yet (CONFIG_ACPI off): the driver's ACPI tables (SAR, PPAG...)

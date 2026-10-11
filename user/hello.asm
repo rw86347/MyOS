@@ -1,3 +1,5 @@
+; SPDX-License-Identifier: BSD-2-Clause
+; Copyright (c) 2026 Rodger Wilson
 ; =============================================================================
 ; hello.asm — the first user-mode program (ring 3)
 ; =============================================================================

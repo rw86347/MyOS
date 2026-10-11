@@ -1,3 +1,5 @@
+; SPDX-License-Identifier: BSD-2-Clause
+; Copyright (c) 2026 Rodger Wilson
 ; =============================================================================
 ; entry.asm — first kernel code: turn on paging, move to the higher half
 ; =============================================================================

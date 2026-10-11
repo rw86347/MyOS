@@ -1,4 +1,6 @@
 #!/bin/sh
+# SPDX-License-Identifier: BSD-2-Clause
+# Copyright (c) 2026 Rodger Wilson
 # Alpine's iw, unchanged, against MyOS's nl80211 (docs/WIFI-PLAN.md W2c,
 # W3a), on the simulated radio of `make test` kernels: wlan0 up, the
 # interface list, a scan with both simulated networks, then joining the

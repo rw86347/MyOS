@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * hda_codec.c — the generic HD Audio codec driver: speakers, headphones,
  * line out and microphones on any codec that follows the HD Audio spec.
@@ -516,17 +518,17 @@ struct hda_gen *hda_gen_probe(struct hdac_device *codec)
     check_jacks(g, 0);
     codec_name(g);
 
-    kprintf("hda: %s: %d output%s (", g->chip, g->nouts, g->nouts == 1 ? "" : "s");
+    klog("hda: %s: %d output%s (", g->chip, g->nouts, g->nouts == 1 ? "" : "s");
     for (int i = 0; i < g->nouts; i++)
-        kprintf("%s%s pin 0x%02x <- DAC 0x%02x", i ? ", " : "",
+        klog("%s%s pin 0x%02x <- DAC 0x%02x", i ? ", " : "",
                 g->outs[i].kind == OUT_HP ? "headphone" : g->outs[i].kind == OUT_SPEAKER
                 ? "speaker" : "line out", g->outs[i].pin,
                 g->outs[i].path.nid[g->outs[i].path.n - 1]);
-    kprintf("), %d input%s", g->nins, g->nins == 1 ? "" : "s");
+    klog("), %d input%s", g->nins, g->nins == 1 ? "" : "s");
     for (int i = 0; i < g->nins; i++)
-        kprintf("%s%s mic pin 0x%02x", i ? ", " : " (", g->ins[i].internal ? "built-in" : "jack",
+        klog("%s%s mic pin 0x%02x", i ? ", " : " (", g->ins[i].internal ? "built-in" : "jack",
                 g->ins[i].pin);
-    kprintf("%s%s\n", g->nins ? " -> ADC" : "", g->nins ? ")" : "");
+    klog("%s%s\n", g->nins ? " -> ADC" : "", g->nins ? ")" : "");
     return g;
 }
 

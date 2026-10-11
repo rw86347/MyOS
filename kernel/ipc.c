@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * ipc.c — what System V IPC's three kinds share (see ipc.h): permissions,
  * and the ways in. Linux i386 has one system call, ipc() (117), that leads

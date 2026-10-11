@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * linux_sg.c — scatter lists (include/linux/scatterlist.h): counting the
  * entries, copying a buffer into them, and mapping them for a device.

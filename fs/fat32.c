@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * fat32.c — FAT32 file system driver (read-only for now)
  *
@@ -34,8 +36,14 @@
  *   DOS ignores). Each holds 13 UTF-16 characters, stored last-part-first.
  */
 #include <fat32.h>
+#include <interrupts.h>
 #include <kprintf.h>
 #include <string.h>
+
+/* Sectors in one disk command when a file's clusters lie one after another
+   on the disk (the usual case: files are written in one piece). 64 KiB,
+   like a disk file's chunk (fs/dev.c). */
+#define RUN_SECTORS   128
 
 #define FAT_EOC_MIN   0x0FFFFFF8u  /* end-of-chain marker (any value >= this) */
 #define FAT_BAD       0x0FFFFFF7u  /* cluster marked unusable */
@@ -62,18 +70,63 @@ static uint32_t cluster_to_sector(struct fat32_fs *fs, uint32_t c)
 
 /* Look up cluster c in the FAT: returns the next cluster in the chain, a
    value >= FAT_EOC_MIN at the end, or 0 on error. Caches one FAT sector,
-   because walking a chain usually reads neighbouring entries. */
+   because walking a chain usually reads neighbouring entries.
+   Two threads may walk chains at once (the kernel preempts), and the read
+   sleeps: the sector is read into a buffer of our own, and the cache is
+   only looked at or changed with interrupts off, so nobody ever sees a
+   sector number with another sector's bytes. */
 static uint32_t next_cluster(struct fat32_fs *fs, uint32_t c)
 {
     uint32_t byte_offset = c * 4;
     uint32_t sector = fs->reserved_sectors + byte_offset / SECTOR_SIZE;
+    uint32_t off = byte_offset % SECTOR_SIZE, next;
+    uint8_t buf[SECTOR_SIZE];
 
-    if (sector != fs->fat_cache_sector) {
-        if (blockdev_read(fs->dev, sector, 1, fs->fat_cache) < 0)
-            return 0;
-        fs->fat_cache_sector = sector;
+    unsigned long f = irq_save();
+    int hit = sector == fs->fat_cache_sector;
+    next = hit ? rd32(fs->fat_cache + off) : 0;
+    irq_restore(f);
+    if (hit)
+        return next & FAT_MASK;
+    if (blockdev_read(fs->dev, sector, 1, buf) < 0)
+        return 0;
+    f = irq_save();
+    memcpy(fs->fat_cache, buf, SECTOR_SIZE);
+    fs->fat_cache_sector = sector;
+    irq_restore(f);
+    return rd32(buf + off) & FAT_MASK;
+}
+
+/* The cluster with index `index` in the chain that starts at `first`.
+   The walk starts where the last read of the same file ended, if that is
+   not past `index`: a file read front to back walks its chain once in all.
+   (It walked from the start for every read, and read() came in 512-byte
+   pieces: copying a 240 MB file off a stick took about an hour.) The FAT
+   only reads, so a remembered place in a chain stays true. */
+static uint32_t seek_cluster(struct fat32_fs *fs, uint32_t first, uint32_t index)
+{
+    uint32_t c = first, at = 0;
+    unsigned long f = irq_save();
+    if (fs->pos_first == first && fs->pos_index <= index) {
+        c = fs->pos_cluster;
+        at = fs->pos_index;
     }
-    return rd32(fs->fat_cache + byte_offset % SECTOR_SIZE) & FAT_MASK;
+    irq_restore(f);
+    for (; at < index; at++) {
+        c = next_cluster(fs, c);
+        if (!valid_cluster(fs, c))
+            return 0;
+    }
+    return c;
+}
+
+static void remember_cluster(struct fat32_fs *fs, uint32_t first, uint32_t index, uint32_t c)
+{
+    unsigned long f = irq_save();
+    fs->pos_first = first;
+    fs->pos_index = index;
+    fs->pos_cluster = c;
+    irq_restore(f);
 }
 
 int fat32_mount(struct fat32_fs *fs, struct blockdev *dev)
@@ -328,7 +381,7 @@ int fat32_read(struct fat32_fs *fs, const struct fat32_dirent *file,
 {
     uint8_t sector[SECTOR_SIZE];
     uint8_t *out = buf;
-    uint32_t cluster_bytes = fs->sectors_per_cluster * SECTOR_SIZE;
+    uint32_t spc = fs->sectors_per_cluster, cluster_bytes = spc * SECTOR_SIZE;
 
     if (file->attr & FAT_ATTR_DIRECTORY)
         return -1;
@@ -337,36 +390,54 @@ int fat32_read(struct fat32_fs *fs, const struct fat32_dirent *file,
     if (len > file->size - offset)
         len = file->size - offset;  /* don't read past end of file */
 
-    /* Skip whole clusters until we reach the one containing `offset`. */
-    uint32_t c = file->cluster;
-    for (uint32_t skip = offset / cluster_bytes; skip; skip--) {
-        c = next_cluster(fs, c);
-        if (!valid_cluster(fs, c))
-            return -1;              /* chain shorter than the file size says */
-    }
-
+    uint32_t index = offset / cluster_bytes;    /* which cluster of the file */
+    uint32_t c = seek_cluster(fs, file->cluster, index);
     uint32_t done = 0;
     uint32_t pos = offset % cluster_bytes;      /* position inside cluster c */
     while (done < len) {
         if (!valid_cluster(fs, c))
             return -1;
-
-        /* Read the sector that holds `pos`, copy the part we need. */
-        uint32_t sec = pos / SECTOR_SIZE;
-        if (blockdev_read(fs->dev, cluster_to_sector(fs, c) + sec, 1, sector) < 0)
-            return -1;
+        uint32_t lba = cluster_to_sector(fs, c) + pos / SECTOR_SIZE;
         uint32_t in_sector = pos % SECTOR_SIZE;
-        uint32_t n = SECTOR_SIZE - in_sector;
-        if (n > len - done)
-            n = len - done;
-        memcpy(out + done, sector + in_sector, n);
-        done += n;
-        pos += n;
-
+        if (in_sector || len - done < SECTOR_SIZE) {
+            /* Part of one sector: read it whole, copy the part we need. */
+            if (blockdev_read(fs->dev, lba, 1, sector) < 0)
+                return -1;
+            uint32_t n = SECTOR_SIZE - in_sector;
+            if (n > len - done)
+                n = len - done;
+            memcpy(out + done, sector + in_sector, n);
+            done += n;
+            pos += n;
+        } else {
+            /* Whole sectors, straight into buf: the rest of this cluster
+               and of the clusters right after it on the disk, in one
+               command of up to RUN_SECTORS. */
+            uint32_t want = (len - done) / SECTOR_SIZE, n = spc - pos / SECTOR_SIZE, last = c;
+            if (want > RUN_SECTORS)
+                want = RUN_SECTORS;
+            while (n < want && next_cluster(fs, last) == last + 1 && valid_cluster(fs, last + 1)) {
+                last++;
+                n += spc;
+            }
+            if (n > want)
+                n = want;
+            if (blockdev_read(fs->dev, lba, n, out + done) < 0)
+                return -1;
+            done += n * SECTOR_SIZE;
+            pos += n * SECTOR_SIZE;
+            while (pos >= cluster_bytes && c < last) {  /* into the clusters read */
+                c++;
+                index++;
+                pos -= cluster_bytes;
+            }
+        }
         if (pos == cluster_bytes && done < len) {   /* move to next cluster */
             c = next_cluster(fs, c);
+            index++;
             pos = 0;
         }
     }
+    remember_cluster(fs, file->cluster, index, c);
     return (int)done;
 }

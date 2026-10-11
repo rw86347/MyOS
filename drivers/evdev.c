@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * evdev.c — /dev/input/event0 (keyboard) and event1 (mouse)
  *

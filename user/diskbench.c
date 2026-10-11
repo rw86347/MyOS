@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * diskbench.c — CPU work per disk operation, the same binary on MyOS and Linux
  *

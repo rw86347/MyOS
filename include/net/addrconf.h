@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 #ifndef NET_ADDRCONF_H
 #define NET_ADDRCONF_H
 /* IPv6 address configuration: none here (no IPv6 stack), so a driver's

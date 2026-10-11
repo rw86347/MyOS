@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * shim_test.c — the Linux driver API's core (W1a), checked at boot in
  * `make test` builds: printing, parsing, lists, bits, memory, and the

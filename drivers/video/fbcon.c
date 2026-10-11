@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * fbcon.c — the console on a graphics framebuffer (step 11b)
  *
@@ -217,14 +219,18 @@ static void measure(void)
     pitch = info->fix.line_length / 4;
 }
 
-/* Right after a mode set: the screen is black (see drm_simple_kms_helper.h),
-   so only the cells with something in them are drawn. */
+/* Black first, then only the cells with something in them are drawn. A
+   mode set leaves the screen black (see drm_simple_kms_helper.h), but the
+   UEFI framebuffer (simplefb) has no mode set: it still holds the loader's
+   text, which the blank cells would leave showing. One fill costs about
+   one glyph's work per cell; drawing every blank cell would cost them all. */
 static void take_over(void)
 {
     measure();
     ytop = 0;
     cur_row = -1;
     pan_to(0);
+    fill(0, 0, info->var.xres, info->var.yres, 0);
     fresh = 1;
     vt_set_backend(&fbcon_ops, cols, rows);     /* draws the grid */
     fresh = 0;
@@ -243,7 +249,7 @@ void fbcon_attach(struct fb_info *fb)
     swap_rb = (bi->fb_magic == BOOTINFO_FB_MAGIC && bi->fb_format == 1);
     info = fb;
     take_over();
-    kprintf("fbcon: %dx%d\n", cols, rows);
+    klog("fbcon: %dx%d\n", cols, rows);
 }
 
 void fbcon_mode_changed(struct fb_info *fb)

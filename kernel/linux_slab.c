@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * linux_slab.c — kmalloc(size, gfp) and friends for Linux drivers, on the
  * kernel heap (mm/kheap.c). Kept apart from include/linux/slab.h: the

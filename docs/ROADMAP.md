@@ -1,6 +1,9 @@
 # MyOS Roadmap
 
-Target first: 32-bit x86 (i686) in QEMU. Real hardware and ARM come later.
+Target first: 32-bit x86 (i686) in QEMU, then real x86 PCs and x86_64 (MSI, GPD Pocket 4).
+**Apple Silicon Macs (bare metal, no macOS)** are a planned third CPU family after the
+ARM64 port has a QEMU `virt` bring-up; see step **15**. Running MyOS on an M1 Mac in
+**QEMU/UTM** (emulated x86) is not a port — it is the normal dev workflow today.
 Mark a step `[x]` only when its "Done when" check works.
 
 ## Phase 1 — Boot and basic kernel
@@ -252,9 +255,48 @@ Mark a step `[x]` only when its "Done when" check works.
   wpa_supplicant joins a simulated WPA2 network through our stack, and
   iwlwifi links into the x86_64 kernel; the tray icon is written (its
   screenshot test is left); next is W7, the real card on the MSI.
-- [ ] **14. ARM port** — one board (original Raspberry Pi), device tree, ARM boot path.
+- [ ] **14. ARM64 port** — CPU-specific code only in `arch/` (same rule as i386 and x86_64).
+  Linux **aarch64** syscall ABI and ELF64 user programs. Boot with a **device tree** in
+  QEMU's `virt` machine first; no Apple hardware in this step.
+  Done when: `make ARCH=arm64 run` (or equivalent) prints hello on the serial console and a
+  static musl aarch64 binary runs one `write` syscall.
+  - [ ] 14a: exceptions, EL1, GIC, timers, MMU (4 KiB pages or 4-level as needed), context
+    switch, `kmalloc`, and a minimal UART driver for early print.
+  - [ ] 14b: Linux syscall table for aarch64, `fork`/`execve`, paging and signals on ARM64.
+  - [ ] 14c: **Raspberry Pi (original board)** as the first **bare-metal ARM** target — simpler
+    firmware and published docs than Apple. Device tree for that board, SD boot, USB keyboard
+    if needed. Done when: the Pi boots MyOS from an SD card to a shell on serial or HDMI.
+- [ ] **15. Apple Silicon bare metal** — MyOS as the **only** OS on the machine (MacBook Air
+  M1 and later Apple laptops/desktops with Apple Silicon). This is **not** a macOS app or a
+  VM: the Mac must boot MyOS from its own partition or external disk without running Darwin.
+  Depends on **14** (shared `arch/aarch64/` kernel) and most of the x86_64 bring-up (UEFI
+  habits, live userland on `aarch64` Alpine, Linux drivers through the shim where we use them).
+  Apple blocks arbitrary kernels the way a PC BIOS does not — plan on a **small boot chain**
+  (study [Asahi Linux](https://asahilinux.org/) / m1n1: hand-off into our kernel with a DTB
+  and reserved memory map). CPU-specific Apple blocks stay in `arch/aarch64/` and
+  `arch/aarch64/apple/` (or similar), not in portable code.
+  Done when: a **MacBook Air (M1)** boots MyOS from disk to the same kind of login session
+  the x86_64 live stick reaches today (framebuffer or serial, keyboard, root disk, power off).
+  - [ ] 15a: document the target machines and boot path (`docs/hardware-apple-silicon.md`:
+    models, secure boot / recovery constraints, partition layout next to macOS if dual-boot
+    is ever wanted — **single-boot MyOS-only is the first goal**).
+  - [ ] 15b: boot — load the kernel + DTB on at least one M1-class machine; serial or
+    framebuffer text; memory map and CPU features parsed from the DTB.
+  - [ ] 15c: storage — Apple NVMe (or the path Asahi uses) so `myos-root` on the internal
+    SSD is visible; USB boot from a stick remains the installer path until internal disk works.
+  - [ ] 15d: input and display — built-in keyboard/trackpad and the laptop panel (framebuffer
+    or a simple KMS path); enough for `myos-login` or agetty.
+  - [ ] 15e: **`live/packages.aarch64.txt`** (or merge into arch-specific world files): Alpine
+    aarch64 userland, same desktop story as x86_64 where packages exist; rebuild
+    `make ARCH=arm64 live-uefi` (or an Apple-specific boot image) on the Mac host.
+  - [ ] 15f: networking and Wi‑Fi on Apple hardware (last within this step — same priority as
+    step 13 on x86: hard, mostly Linux driver + firmware through the shim).
+  Expect this step to take **much longer** than a PC or Pi port; treat each sub-bullet as its
+  own visible milestone in `docs/LOG.md`.
 
 ## Notes
 - Drivers: most will move to user space, built against a Linux-kernel-API shim (see `docs/DESIGN.md`).
 - WiFi alone can be more code than everything else combined — plan for it last.
+- **Apple Silicon bare metal** reuses the ARM64 kernel but adds Apple-only boot and hardware;
+  it is scheduled **after** step 14's QEMU and Pi checks so `arch/` stays one tree per ISA.
 - If speed matters more than learning: Linux kernel + BusyBox ("Linux From Scratch") reaches the same goals far faster.

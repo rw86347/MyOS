@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * kprintf.c — a small printf for the kernel.
  *
@@ -35,20 +37,43 @@ void console_write(const char *s, size_t n)
     irq_restore(flags);
 }
 
+/*
+ * The boot's layout. While the kernel starts, the screen shows a title and
+ * one line per stage, "Step 07 - Threads" (boot_step), and nothing else
+ * unless something goes wrong. The detail (memory map, PCI devices, disks)
+ * is printed with klog: serial and the log only, indented four spaces under
+ * its step, so the serial port reads as an outline. A kprintf while booting
+ * is a warning or an error: indented the same way, and on the screen too.
+ * When the first program starts (boot_end), lines go out as they come.
+ */
+static int booting = 1;                 /* until boot_end() */
+static int line_start = 1;              /* the next character begins a line */
+static int step_no;                     /* the last "Step NN" printed */
+
 /* Where output goes: kprintf -> screen + serial, klog -> serial only. */
 struct out {
     void (*flush)(const char *s, size_t n);
+    int indent;                         /* 4 spaces before each line (booting) */
     size_t n;
     char buf[120];
 };
 
-static void out(struct out *o, char c)
+static void put(struct out *o, char c)
 {
     o->buf[o->n++] = c;
     if (o->n == sizeof o->buf) {
         o->flush(o->buf, o->n);
         o->n = 0;
     }
+}
+
+static void out(struct out *o, char c)
+{
+    if (o->indent && line_start && c != '\n')
+        for (int k = 0; k < 4; k++)
+            put(o, ' ');
+    line_start = c == '\n';
+    put(o, c);
 }
 
 /* Print `s` padded to `width` (pad on the left unless left_align). */
@@ -217,11 +242,19 @@ static void to_serial(const char *s, size_t n)
     serial_write_n(s, n);
 }
 
+static void to_screen(const char *s, size_t n)
+{
+    log_append(s, n);
+    uint32_t flags = irq_save();
+    vt_write(s, n);
+    irq_restore(flags);
+}
+
 void kprintf(const char *fmt, ...)
 {
     va_list ap;
     va_start(ap, fmt);
-    struct out o = { to_console, 0, {0} };
+    struct out o = { to_console, booting, 0, {0} };
     vformat(&o, fmt, ap);
     va_end(ap);
 }
@@ -231,12 +264,44 @@ void klog(const char *fmt, ...)
     va_list ap;
     va_start(ap, fmt);
 #ifdef TRACE_EXEC
-    struct out o = { to_console, 0, {0} };  /* make TRACE=1: on the screen too */
+    struct out o = { to_console, booting, 0, {0} };   /* make TRACE=1: on the screen too */
 #else
-    struct out o = { to_serial, 0, {0} };
+    struct out o = { to_serial, booting, 0, {0} };
 #endif
     vformat(&o, fmt, ap);
     va_end(ap);
+}
+
+/* One whole line, never indented: the boot's own. A line someone left
+   open (a kprintf without '\n') is ended first. */
+static void boot_line(void (*flush)(const char *, size_t), const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    struct out o = { flush, 0, 0, {0} };
+    if (!line_start)
+        put(&o, '\n');
+    vformat(&o, fmt, ap);
+    va_end(ap);
+}
+
+void boot_title(int on_serial)
+{
+    void (*flush)(const char *, size_t) = on_serial ? to_console : to_screen;
+    vt_set_color(VT_LIGHT_GREEN, VT_BLACK);
+    boot_line(flush, "MyOS, written by Rodger Wilson...\n");
+    vt_set_color(VT_LIGHT_GREY, VT_BLACK);
+    boot_line(flush, "Step %02u - %s\n", (unsigned)++step_no, "Boot loader");
+}
+
+void boot_step(const char *name)
+{
+    boot_line(to_console, "Step %02u - %s\n", (unsigned)++step_no, name);
+}
+
+void boot_end(void)
+{
+    booting = 0;
 }
 
 /* Copy log bytes [from, to) (counts, at most LOG_SIZE apart) out: snapshot

@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * linux_sync.c — Linux's mutexes and completions on MyOS's wait queues.
  * Interrupts are off around each check-then-sleep, so a wake-up (from

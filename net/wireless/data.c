@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * data.c — Ethernet frames over Wi-Fi (Linux: mac80211's tx.c and rx.c,
  * the data parts). The network stack sends and receives Ethernet frames;

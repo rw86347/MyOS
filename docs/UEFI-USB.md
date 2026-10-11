@@ -40,8 +40,12 @@ it has the memory map (ConOut can hang ExitBootServices):
 - **Gold** — left UEFI, jumping to the kernel.
 - **Red** — ExitBootServices failed.
 - **Dark screen, gold bar, "Hello world from MyOS!" / "long mode  x86_64"**
-  — the 64-bit kernel painted the GOP. That is success for this image.
-- Kernel text, then the Golden Hour login — that is the 32-bit live image.
+  — the hello binary (`arch/x86_64/early.c`) painted the GOP. That is
+  success for that image.
+- **"MyOS, written by Rodger Wilson..." and then "Step 01 - Boot loader",
+  "Step 02 - CPU" and so on, one line per stage** — the real kernel (either
+  CPU). The details of each step are on the serial port and in `dmesg`;
+  the last step, "Starting programs", is followed by the login.
 
 A 32-bit pointer cannot hold the GOP at `0x400000000`. The kernel
 reaches it with PSE-36 (extra physical bits in the page directory).

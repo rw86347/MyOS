@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * packet.c — AF_PACKET: sockets that send and receive link-layer frames
  * (Linux's packet(7)). wpa_supplicant carries its EAPOL key handshake over

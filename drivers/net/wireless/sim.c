@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * sim.c — a simulated Wi-Fi radio and the air around it, so the 802.11
  * core can be tested in QEMU, which has no Wi-Fi card (docs/WIFI-PLAN.md).

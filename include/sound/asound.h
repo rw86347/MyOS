@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * asound.h — the ALSA interface programs see: /dev/snd/controlC0 and
  * /dev/snd/pcmC0D0p (playback) / pcmC0D0c (capture), Linux's ioctl numbers

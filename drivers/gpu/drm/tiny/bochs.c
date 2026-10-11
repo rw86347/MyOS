@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * bochs.c — the Bochs / QEMU standard VGA card (PCI 1234:1111), step 11b
  *

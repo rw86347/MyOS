@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-2-Clause
+# Copyright (c) 2026 Rodger Wilson
 """check-screen.py — is the console really on the screen? (make test)
 
 QEMU's monitor command `screendump FILE` saves what the virtual screen

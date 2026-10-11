@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * drm_fbdev.c — fbdev emulation: a DRM display as /dev/fb0 (step 11b)
  *
@@ -192,7 +194,7 @@ void drm_fbdev_generic_setup(struct drm_device *dev, unsigned int preferred_bpp)
     }
 
     struct pci_dev *pdev = dev->pdev;
-    kprintf("drm: %s %04x:%04x, %lu MiB, %s\n", dev->driver->name,
+    klog("drm: %s %04x:%04x, %lu MiB, %s\n", dev->driver->name,
             pdev ? pdev->vendor : 0, pdev ? pdev->device : 0,
             dev->vram_size >> 20, m->name);
     register_framebuffer(info);

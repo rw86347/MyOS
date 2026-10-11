@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * bootinfo.h — what the 64-bit UEFI loader leaves at 0x1000
  *

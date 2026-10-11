@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * sysenter.c — set up fast system calls (see sysentry.asm for how they work)
  */

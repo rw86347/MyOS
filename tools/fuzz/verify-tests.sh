@@ -1,4 +1,6 @@
 #!/bin/sh
+# SPDX-License-Identifier: BSD-2-Clause
+# Copyright (c) 2026 Rodger Wilson
 # Check that each adversarial test actually fails against the bug it is meant
 # to catch. A test that passes either way is measuring nothing, and writing
 # these caught exactly that twice (see docs/security.md).

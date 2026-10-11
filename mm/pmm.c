@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * pmm.c — physical memory manager: hands out 4 KiB pages ("frames") of RAM
  *

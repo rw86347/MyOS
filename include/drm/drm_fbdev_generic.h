@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 #ifndef DRM_FBDEV_GENERIC_H
 #define DRM_FBDEV_GENERIC_H
 

@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /* memlayout.h for the host fuzz build.
  *
  * The kernel maps physical address 0 at 0xC0000000, so P2V just adds

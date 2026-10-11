@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * uaccess_test.c — the armed sleep inside copy_to_user / copy_from_user.
  * Only compiled into `make test` builds. See include/uaccess_test.h.

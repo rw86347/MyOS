@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * linux_pci.c — Linux's PCI driver API on MyOS's PCI scan (pci.c).
  *

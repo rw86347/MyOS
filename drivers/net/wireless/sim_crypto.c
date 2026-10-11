@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * sim_crypto.c — the cryptography a WPA2-Personal access point needs, for
  * the simulated one (sim.c), in `make test` kernels only:

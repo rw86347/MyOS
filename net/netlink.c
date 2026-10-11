@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * netlink.c — AF_NETLINK: how programs talk to the kernel's network code
  *

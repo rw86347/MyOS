@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * ext2.c — the second extended file system, Linux's classic disk format
  *
@@ -1510,7 +1512,7 @@ int ext2_mount(struct blockdev *dev, const char *path)
     }
     copy_attrs(fs->m.root, rdi);
     brelse(rb);
-    kprintf("ext2: %s mounted at %s: %lu MiB, %lu-byte blocks, %lu%% free%s\n",
+    klog("ext2: %s mounted at %s: %lu MiB, %lu-byte blocks, %lu%% free%s\n",
             dev->name, path, (uint32_t)((uint64_t)fs->blocks * fs->bsize >> 20), fs->bsize,
             (uint32_t)((uint64_t)fs->sb->free_blocks_count * 100 / fs->blocks),
             fs->readonly ? " (read-only: unknown features)" : "");

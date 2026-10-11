@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * sndtest.c — the sound card from a program's side, with raw ALSA ioctls
  * (the ones alsa-lib makes), for either CPU. In `make test-sound` QEMU has

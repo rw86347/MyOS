@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 #ifndef LINUX_RFKILL_H
 #define LINUX_RFKILL_H
 /* Why a radio is switched off by hardware (the laptop's Wi-Fi switch,

@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * pthreadtest — POSIX threads through musl's own pthread library, which is
  * what GLib (and so GTK, AbiWord...) is built on. Exercises clone with

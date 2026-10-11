@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * usb_storage.c — USB sticks and USB disks: the mass storage class,
  * "bulk-only transport" (BOT). docs/USB-PLAN.md.
@@ -398,7 +400,7 @@ int usb_storage_probe(struct usb_device *d, const uint8_t *cfg, int len)
         kprintf("usb-storage: no room for another disk\n");
         goto drop;
     }
-    kprintf("usb-storage: %s: %s %s %s, %lu MiB\n", bd.name, vendor, product, rev,
+    klog("usb-storage: %s: %s %s %s, %lu MiB\n", bd.name, vendor, product, rev,
             (unsigned long)(bd.sectors / 2048));
     return 0;
 drop:                                   /* ours, but of no use */

@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * core.c — sound cards and their mixer: /dev/snd/controlC<n>.
  *
@@ -97,7 +99,7 @@ int snd_card_register(struct snd_card *card)
         make_node(snd, name[1], base + 16);
     if (card->pcm && card->pcm->has[SNDRV_PCM_STREAM_CAPTURE])
         make_node(snd, name[2], base + 24);
-    kprintf("sound: card %d: %s, %d controls\n", card->number, card->longname,
+    klog("sound: card %d: %s, %d controls\n", card->number, card->longname,
             card->ncontrols);
     return 0;
 }

@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 #ifndef LINUX_NETDEV_FEATURES_H
 #define LINUX_NETDEV_FEATURES_H
 /* What a network device can do for the stack (checksums, segmentation,

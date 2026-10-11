@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * nvme.c — NVMe SSDs (PCIe flash; QEMU's -device nvme)
  *
@@ -424,6 +426,21 @@ void nvme_init(void)
     prp_list = P2V(prp_list_phys);
 
     struct sqe e;
+    memset(&e, 0, sizeof e);            /* identify the controller: its model name */
+    e.opcode = ADM_IDENTIFY;
+    e.prp1 = idf;
+    e.cdw10 = 1;                        /* CNS 1: the controller */
+    char model[41] = "";
+    if (admin_cmd(&e) == 0) {
+        const char *mn = (const char *)P2V(idf) + 24;     /* 40 bytes, ASCII, space-padded */
+        int n = 40;
+        while (n && (mn[n - 1] == ' ' || mn[n - 1] == 0))
+            n--;
+        for (int k = 0; k < n; k++)
+            model[k] = mn[k] >= 32 && mn[k] < 127 ? mn[k] : '?';
+        model[n] = 0;
+    }
+
     memset(&e, 0, sizeof e);            /* identify namespace 1 */
     e.opcode = ADM_IDENTIFY;
     e.nsid = 1;
@@ -469,8 +486,10 @@ void nvme_init(void)
         .flush   = nvme_flush,
         .rwv     = nvme_rwv,
     };
+    strlcpy(dev.model, model, sizeof dev.model);    /* /sys/block/nvme0n1/device/model */
     blockdev_register(&dev);
-    kprintf("nvme: nvme0n1: %lu MiB, %s irq %d\n", (unsigned long)(dev.sectors / 2048),
+    klog("nvme: nvme0n1: %s, %lu MiB, %s irq %d\n", model[0] ? model : "(no model)",
+            (unsigned long)(dev.sectors / 2048),
             msix ? "MSI-X" : pci->irq_type == PCI_IRQ_MSI ? "MSI" : "pin",
             pci_irq_vector(pci, 0));
     return;

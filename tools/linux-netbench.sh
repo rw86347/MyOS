@@ -1,4 +1,6 @@
 #!/bin/sh
+# SPDX-License-Identifier: BSD-2-Clause
+# Copyright (c) 2026 Rodger Wilson
 # Run user/netbench.c on Linux (Debian 12's stock i686 kernel) in the same
 # QEMU setup `make bench` uses, for docs/performance.md. Needs
 # tools/echo-server.py running on the host. Extra kernel arguments go in $1

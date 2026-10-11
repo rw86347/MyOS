@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * gdt.c — x86_64 GDT + 64-bit TSS (RSP0 for syscall/interrupt from ring 3)
  *

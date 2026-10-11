@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * simplefb.c — the firmware framebuffer UEFI left us (GOP)
  *
@@ -112,7 +114,7 @@ void simplefb_init(void)
             gop_va = va;
             memset(shadow, 0, bytes);           /* RAM; do not read the iGPU BAR */
             info.fix.smem_start = pa;
-            kprintf("simplefb: RAM shadow at %08lx (used when X mmaps /dev/fb0)\n",
+            klog("simplefb: RAM shadow at %08lx (used when X mmaps /dev/fb0)\n",
                     (unsigned long)pa);
         }
     } else {
@@ -127,11 +129,11 @@ void simplefb_init(void)
     info.screen_size = bytes;
     if (register_framebuffer(&info) == 0) {
 #ifdef ARCH_X86_64
-        kprintf("simplefb: %lux%lu at %016lx\n",
+        klog("simplefb: %lux%lu at %016lx\n",
                 (unsigned long)bi->fb_width, (unsigned long)bi->fb_height,
                 (unsigned long)bootinfo_fb_phys(bi));
 #else
-        kprintf("simplefb: %lux%lu at %08lx%08lx\n",
+        klog("simplefb: %lux%lu at %08lx%08lx\n",
                 (unsigned long)bi->fb_width, (unsigned long)bi->fb_height,
                 (unsigned long)bi->fb_phys_hi, (unsigned long)bi->fb_phys);
 #endif

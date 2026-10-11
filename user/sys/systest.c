@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * systest.c — the system calls added on 2026-10-05, checked from a program's
  * side, on either CPU (built for whichever ARCH is; the Makefile's

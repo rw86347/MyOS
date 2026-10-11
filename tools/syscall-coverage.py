@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-2-Clause
+# Copyright (c) 2026 Rodger Wilson
 """syscall-coverage.py — which Linux system calls MyOS has, by CPU.
 
 Compares the kernel's tables (kernel/syscall.c: [NR_x] and [NR64_x] entries,

@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * fpu.c — the floating-point unit (x87) and SSE registers
  *
@@ -63,7 +65,7 @@ void fpu_init(void)
     fpu_save(clean_state);
     fpu_restore(clean_state);           /* (FNSAVE also resets; undo that) */
 
-    kprintf("FPU: x87%s, saved with %s\n", cpu_has(CPU_SSE) ? " + SSE" : "",
+    klog("FPU: x87%s, saved with %s\n", cpu_has(CPU_SSE) ? " + SSE" : "",
             has_fxsr ? "FXSAVE" : "FNSAVE");
 }
 

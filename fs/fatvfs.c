@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * fatvfs.c — FAT32 as a file system in the tree (step 9e, read half)
  *
@@ -17,6 +19,7 @@
 #include <vfs.h>
 
 #define MSDOS_MAGIC 0x4d44
+#define FAT_CHUNK   (64 * 1024)     /* bytes per disk read in read() */
 
 struct fatmnt {
     struct mount m;
@@ -101,18 +104,30 @@ static int32_t fat_read(struct file *f, void *user_buf, uint32_t n)
     if (n > RW_MAX)
         n = RW_MAX;
 
-    uint8_t chunk[512];
+    /* Through a 64 KiB kernel buffer the disk reads straight into, one
+       copy to the program: big pieces, so a run of clusters is one disk
+       command (fat32_read), not 128. */
+    uint32_t size = n < FAT_CHUNK ? (n + 511) & ~511u : FAT_CHUNK;
+    uint8_t *chunk = kmalloc_contig(size);
+    if (!chunk)
+        return -ENOMEM;
     uint32_t done = 0;
+    int32_t err = 0;
     while (done < n) {
         uint32_t k = n - done;
-        if (k > sizeof chunk)
-            k = sizeof chunk;
+        if (k > size)
+            k = size;
         if (fat_read_kernel(i, f->pos + done, chunk, k) < 0)
-            return done ? (int32_t)done : -EIO;
-        if (copy_to_user((uint8_t *)user_buf + done, chunk, k) < 0)
-            return done ? (int32_t)done : -EFAULT;
+            err = -EIO;
+        else if (copy_to_user((uint8_t *)user_buf + done, chunk, k) < 0)
+            err = -EFAULT;
+        if (err)
+            break;
         done += k;
     }
+    kfree(chunk);
+    if (!done)
+        return err;
     f->pos += done;
     return (int32_t)done;
 }
@@ -227,7 +242,7 @@ int fat_vfs_mount(struct blockdev *dev, const char *path)
         kfree(fm);
         return err;
     }
-    kprintf("fat32: %s mounted at %s (read-only), label \"%s\"\n",
+    klog("fat32: %s mounted at %s (read-only), label \"%s\"\n",
             dev->name, path, fm->fat.label);
     return 0;
 }

@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * fatvfs_test.c — FAT32 through the VFS (make test, step 9e read)
  *

@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * linux_device.c — struct device for Linux drivers: names, and devres —
  * the resources a driver took with devm_* (memory, IRQs, mappings), freed

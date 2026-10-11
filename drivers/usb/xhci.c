@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * xhci.c — USB host controllers: xHCI, in every PC since about 2012 (the
  * MSI's Intel 8086:43ed, QEMU's -device qemu-xhci). docs/USB-PLAN.md.
@@ -770,7 +772,7 @@ static struct usb_device *attach(struct xhci *hc, int p)
     for (int o = 0; !cls && o + 9 <= len && cfg[o]; o += cfg[o])
         if (cfg[o + 1] == USB_DT_INTERFACE)
             cls = cfg[o + 5];
-    kprintf("usb %d-%d: %04x:%04x %s%s(USB %x.%x, %s), class %d\n", bus, p,
+    klog("usb %d-%d: %04x:%04x %s%s(USB %x.%x, %s), class %d\n", bus, p,
             d->desc.idVendor, d->desc.idProduct, d->name, *d->name ? " " : "",
             d->desc.bcdUSB >> 8, (d->desc.bcdUSB >> 4) & 0xF, speed_name(speed), cls);
     if (usb_storage_probe(d, cfg, len) < 0) {
@@ -895,7 +897,7 @@ static void power_on(struct pci_dev *pci)
     usb_sleep(10);                      /* D3 -> D0 takes 10 ms (PCI PM 1.2) */
     for (int i = 0; i < 6; i++)
         pci_write_config(pci, (uint8_t)(0x10 + i * 4), pci->bar[i]);
-    kprintf("xhci: %04x:%04x was powered down: woke it\n", pci->vendor, pci->device);
+    klog("xhci: %04x:%04x was powered down: woke it\n", pci->vendor, pci->device);
 }
 
 static int hc_start(struct pci_dev *pci)
@@ -1008,11 +1010,11 @@ static int hc_start(struct pci_dev *pci)
     for (int p = 1; p <= hc->ports; p++)
         if (hc->usb3[p] && !n3++)
             first3 = p;
-    kprintf("xhci: %04x:%04x, xHCI %x.%02x, %d ports", pci->vendor, pci->device,
+    klog("xhci: %04x:%04x, xHCI %x.%02x, %d ports", pci->vendor, pci->device,
             hc->version >> 8, hc->version & 0xFF, hc->ports);
     if (n3)
-        kprintf(" (USB 3: %d-%d)", first3, first3 + n3 - 1);
-    kprintf(", %d slots, %s irq %d\n", hc->slots,
+        klog(" (USB 3: %d-%d)", first3, first3 + n3 - 1);
+    klog(", %d slots, %s irq %d\n", hc->slots,
             pci->irq_type == PCI_IRQ_MSIX ? "MSI-X" : pci->irq_type == PCI_IRQ_MSI ? "MSI" : "pin",
             pci_irq_vector(pci, 0));
     return 0;

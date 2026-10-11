@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 #ifndef FAT32_H
 #define FAT32_H
 
@@ -27,6 +29,9 @@ struct fat32_fs {
 
     uint32_t fat_cache_sector;    /* which FAT sector is in fat_cache */
     uint8_t  fat_cache[SECTOR_SIZE];
+    /* Where the last read stopped: cluster number pos_cluster is the
+       pos_index-th of the chain that starts at pos_first (fat32_read). */
+    uint32_t pos_first, pos_index, pos_cluster;
 };
 
 /* A file or directory, as found in a directory listing. */

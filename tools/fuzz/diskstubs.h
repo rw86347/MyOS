@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /* diskstubs.h — the host side of the disk fuzz target. */
 #ifndef FUZZ_DISKSTUBS_H
 #define FUZZ_DISKSTUBS_H

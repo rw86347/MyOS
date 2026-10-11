@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 #ifndef LINUX_PTP_CLOCK_KERNEL_H
 #define LINUX_PTP_CLOCK_KERNEL_H
 /* No PTP clocks: registering one fails, which the driver accepts. */

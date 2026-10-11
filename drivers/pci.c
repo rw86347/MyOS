@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * pci.c — read the PCI configuration space (step 10)
  *
@@ -92,7 +94,7 @@ static void add(uint8_t bus, uint8_t slot, uint8_t func, uint32_t id)
     d->irq = (uint8_t)cfg_read(bus, slot, func, 0x3c);
     for (int i = 0; i < 6; i++)
         d->bar[i] = cfg_read(bus, slot, func, (uint8_t)(0x10 + i * 4));
-    kprintf("pci: %02x:%02x.%x %04x:%04x class %06lx irq %u\n",
+    klog("pci: %02x:%02x.%x %04x:%04x class %06lx irq %u\n",
             bus, slot, func, d->vendor, d->device, d->class_rev >> 8, d->irq);
 }
 
@@ -118,7 +120,7 @@ static void bridge(uint8_t bus, uint8_t slot, uint8_t func, int dev, int depth)
                 bus, slot, func);
         return;
     }
-    kprintf("pci: bridge %02x:%02x.%x -> bus %02x-%02x\n", bus, slot, func, secondary, subordinate);
+    klog("pci: bridge %02x:%02x.%x -> bus %02x-%02x\n", bus, slot, func, secondary, subordinate);
     if (self) {
         uint32_t cmd = pci_read_config(self, 0x04);
         pci_write_config(self, 0x04, (cmd & 0xFFFF) | PCI_COMMAND_IO | PCI_COMMAND_MEMORY |

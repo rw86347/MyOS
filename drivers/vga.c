@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * vga.c — the console on the VGA text screen (the vt.c backend for 80x25)
  *

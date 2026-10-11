@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * e1000.c — Intel 82540EM, the card QEMU emulates (step 10)
  *
@@ -394,7 +396,7 @@ int e1000_init(void)
     wr(E1000_IMS, IMS_RXT0 | IMS_LSC);
 
     int err = register_netdev(&nic.dev);
-    kprintf("e1000: %02x:%02x:%02x:%02x:%02x:%02x bar %08lx irq %u link %s\n",
+    klog("e1000: %02x:%02x:%02x:%02x:%02x:%02x bar %08lx irq %u link %s\n",
             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
             (unsigned long)bar, pci->irq,
             (rd(E1000_STATUS) & STATUS_LU) ? "up" : "down");

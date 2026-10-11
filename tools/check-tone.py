@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-2-Clause
+# Copyright (c) 2026 Rodger Wilson
 """check-tone.py WAV HZ SECONDS — is there a tone of HZ, at least SECONDS
 long, in WAV (16-bit PCM)? For make test-sound: QEMU writes what the sound
 card played into the file.

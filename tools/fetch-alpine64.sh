@@ -1,4 +1,6 @@
 #!/bin/sh
+# SPDX-License-Identifier: BSD-2-Clause
+# Copyright (c) 2026 Rodger Wilson
 # fetch-alpine64.sh — Alpine x86_64 busybox-static for the 64-bit initramfs.
 set -e
 MIRROR=${MIRROR:-https://dl-cdn.alpinelinux.org/alpine/v3.20/main/x86_64}

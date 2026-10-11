@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * io.h — x86 port I/O (same IN/OUT instructions in long mode as in protected mode)
  *

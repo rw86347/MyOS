@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 #ifndef LINUX_IP_H
 #define LINUX_IP_H
 /* The IPv4 header (RFC 791), little-endian bitfield order as on x86. */

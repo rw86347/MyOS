@@ -1,4 +1,6 @@
 #!/bin/sh
+# SPDX-License-Identifier: BSD-2-Clause
+# Copyright (c) 2026 Rodger Wilson
 # linux-audit.sh — run ON MyOS (or on Linux, to compare): which of the
 # files and tools Linux programs rely on are there, and which are not.
 #

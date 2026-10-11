@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * main.c — the kernel's C entry point
  *
@@ -144,6 +146,26 @@ static void mount_root(struct blockdev *d)
         kprintf("root: no /dev on %s\n", d->name);
 }
 
+static const struct blockdev *disk_of_part(const struct blockdev *d)
+{
+    return d->parent ? d->parent : d;
+}
+
+/* Two disks may both hold a "myos-root": the USB stick MyOS was installed
+   from, still plugged in, and the disk it was installed to. The one on the
+   kind of disk we started from wins (1), so the stick can't take over the
+   installed system's start, nor the installed system the stick's. Disk
+   order alone would pick whichever driver found its disk first. */
+static int root_rank(const struct blockdev *d)
+{
+    const struct blockdev *disk = disk_of_part(d);
+    int usb_start = 0;
+#ifdef BOOT_FROM_USB
+    usb_start = (((const struct bootinfo *)P2V(BOOTINFO_PHYS))->boot_flags & BOOT_FROM_USB) != 0;
+#endif
+    return (disk->removable != 0) == usb_start;
+}
+
 /* Disks: find them and their partitions, then our own file systems on
    them, by label — on a Linux partition (type 0x83) or a whole disk with
    no partition table:
@@ -153,8 +175,15 @@ static void mount_root(struct blockdev *d)
    disk). Anything else is left alone: an old PC may still hold someone's
    Linux disk, and we never write to that. */
 /* The disks from index `from` on: their partitions, then our labels.
-   Returns how far it got (the usb thread may add disks meanwhile). */
-static int scan_disks(int from, struct blockdev **rootdev, struct blockdev **datadev)
+   Returns how far it got (the usb thread may add disks meanwhile).
+   A "myos-data" belongs with its root: only one on the root's disk is
+   taken (storage_init), so a live stick never mounts an installed
+   system's files. */
+#define DATA_MAX 4
+static struct blockdev *data_seen[DATA_MAX];
+static int ndata_seen;
+
+static int scan_disks(int from, struct blockdev **rootdev)
 {
     for (int i = from; i < blockdev_count(); i++)      /* adds the partitions */
         if (!blockdev_get(i)->parent)
@@ -167,18 +196,26 @@ static int scan_disks(int from, struct blockdev **rootdev, struct blockdev **dat
             continue;
         if (ext2_label(d, label) < 0)
             continue;                   /* not ext2 */
-        if (!*rootdev && strcmp(label, "myos-root") == 0)
-            *rootdev = d;
-        else if (!*datadev && strcmp(label, "myos-data") == 0)
-            *datadev = d;
-        else
-            kprintf("ext2: %s (\"%s\") is not a MyOS disk: left alone\n", d->name, label);
+        if (strcmp(label, "myos-root") == 0) {
+            struct blockdev *other = d;
+            if (!*rootdev || root_rank(d) > root_rank(*rootdev)) {
+                other = *rootdev;
+                *rootdev = d;
+            }
+            if (other)
+                klog("ext2: %s is another \"myos-root\": left alone\n", other->name);
+        } else if (strcmp(label, "myos-data") == 0) {
+            if (ndata_seen < DATA_MAX)
+                data_seen[ndata_seen++] = d;
+        } else
+            klog("ext2: %s (\"%s\") is not a MyOS disk: left alone\n", d->name, label);
     }
     return i;
 }
 
 static void storage_init(void)
 {
+    boot_step("Disks and USB");
     usb_init();                         /* USB sticks: found by the usb thread, */
     ata_init();                         /* while these start */
     virtio_blk_init();
@@ -188,23 +225,30 @@ static void storage_init(void)
     bcache_init();                      /* blocks, cached */
     pcache_init();                      /* and files' pages */
 
+    boot_step("File systems");
     struct blockdev *rootdev = NULL, *datadev = NULL;
-    int seen = scan_disks(0, &rootdev, &datadev);
+    int seen = scan_disks(0, &rootdev);
 #ifdef BOOT_FROM_USB
     /* We came from a USB stick, so its myos-root should be here: a slow
        stick may show up late. Wait for it a while (Linux's "rootwait"). */
     const struct bootinfo *bi = P2V(BOOTINFO_PHYS);
-    if (!rootdev && (bi->boot_flags & BOOT_FROM_USB)) {
+    if ((!rootdev || !root_rank(rootdev)) && (bi->boot_flags & BOOT_FROM_USB)) {
         kprintf("storage: waiting for the USB stick we started from\n");
-        for (int t = 0; t < 100 && !rootdev; t++) {
+        for (int t = 0; t < 100 && (!rootdev || !root_rank(rootdev)); t++) {
             usb_sleep(100);
-            seen = scan_disks(seen, &rootdev, &datadev);
+            seen = scan_disks(seen, &rootdev);
         }
     }
 #endif
     (void)seen;
     if (!blockdev_count())
         kprintf("storage: no disks\n");
+    for (int k = 0; k < ndata_seen && !datadev; k++)
+        if (!rootdev || disk_of_part(data_seen[k]) == disk_of_part(rootdev))
+            datadev = data_seen[k];
+    for (int k = 0; k < ndata_seen; k++)
+        if (data_seen[k] != datadev)
+            klog("ext2: %s is a \"myos-data\" of another disk: left alone\n", data_seen[k]->name);
     if (rootdev)
         mount_root(rootdev);
     if (datadev)
@@ -221,6 +265,18 @@ static void storage_init(void)
     }
 }
 
+/* Did a UEFI loader start us? Then it has printed the title and Step 01 on
+   the firmware's console, which is the serial port too in QEMU. (The 32-bit
+   kernel's own BIOS loader prints nothing on serial.) */
+static int uefi_loader(void)
+{
+#ifdef ARCH_X86_64
+    return 1;                           /* the only way it starts */
+#else
+    return ((const struct bootinfo *)P2V(BOOTINFO_PHYS))->fb_magic == BOOTINFO_FB_MAGIC;
+#endif
+}
+
 void kernel_main(void)
 {
 #ifdef BENCH
@@ -229,56 +285,67 @@ void kernel_main(void)
     serial_init();
     vga_text_init();        /* the console on the BIOS's 80x25 text screen */
     vt_clear();
-    vt_set_color(VT_LIGHT_GREEN, VT_BLACK);
+    /* The screen gets one line per stage (include/kprintf.h); what each
+       stage finds goes to serial with klog, indented under it. */
+    boot_title(!uefi_loader());
 #ifdef ARCH_X86_64
-    kprintf("Hello world from MyOS!  (long mode x86_64, UEFI loader)\n");
+    klog("Hello world from MyOS!  (long mode x86_64, UEFI loader)\n");
 #else
-    kprintf("Hello world from MyOS!  (protected mode, own boot loader)\n");
+    klog("Hello world from MyOS!  (protected mode, %s)\n",
+         uefi_loader() ? "UEFI loader" : "own boot loader");
 #endif
-    vt_set_color(VT_LIGHT_GREY, VT_BLACK);
-    kprintf("serial: %s\n", serial_present() ? "COM1" : "no COM1 (messages on the screen only)");
+    klog("Open source for your enjoyment.\n");
+    klog("serial: %s\n", serial_present() ? "COM1" : "no COM1 (messages on the screen only)");
 
+    boot_step("CPU");
     cpu_init();             /* what can this CPU do? (stops if too old) */
-
-    /* CPU tables and interrupts. */
     gdt_init();             /* our own segment table + TSS */
     idt_init();             /* interrupt table + exception handlers + PIC remap */
     serial_irq_init();      /* serial output now queued, sent by IRQ 4 */
     fpu_init();             /* x87 + SSE on; saved per user thread */
 
-    /* Memory. */
+    boot_step("Memory");
     pmm_init();             /* which physical RAM is free (BIOS memory map) */
     vmm_init();             /* map all RAM with 4 MiB pages; unmap NULL */
     pmm_refs_init();        /* pages may now be shared (copy-on-write) */
     mm_init();              /* address spaces */
+    klog("Memory: %lu MiB usable, paging on, kernel at %p, heap at %p\n",
+         pmm_usable_count() / 256, (void *)_start, (void *)KHEAP_START);
     sysenter_init();        /* fast syscalls, if the CPU has sysenter */
+
+    boot_step("Timer and input");
     timer_init();           /* IRQ 0: 1 ms tick */
     keyboard_init();        /* IRQ 1 */
     mouse_init();           /* IRQ 12, if there is a PS/2 mouse */
     interrupts_enable();    /* sti: from now on, IRQs can arrive */
     timer_check();          /* a PIT that never ticks (new chipsets): the HPET */
 
-    kprintf("Memory: %lu MiB usable, paging on, kernel at %p, heap at %p\n",
-            pmm_usable_count() / 256, (void *)_start, (void *)KHEAP_START);
-
+    boot_step("Clock and randomness");
     time_init();            /* the date and time, from the CMOS clock */
     random_init();          /* measure boot entropy, key the CSPRNG: before
                                anything that needs an unguessable number */
+    boot_step("Boot files");
     initrd_init();          /* the initramfs stage 2 loaded */
+    boot_step("Threads");
     thread_init();          /* kernel_main becomes thread 0, "main" */
     shim_init();            /* Linux's timers and work queues, for drivers */
+    boot_step("PCI devices");
     pci_init();             /* which PCI devices are fitted: the IDE controller, the NIC */
+    boot_step("Graphics");
     drm_init();             /* a display card: the console moves to pixels, /dev/fb0 */
+    boot_step("Sound");
     hda_intel_init();       /* HD Audio: the sound card, /dev/snd (before the
                                root disk: its nodes go in the boot /dev) */
-    storage_init();         /* IDE disks and their partitions */
+    storage_init();         /* "Disks and USB", then "File systems" */
+    boot_step("Network");
     net_init();             /* loopback, then the e1000 and IPv4 if the card is there */
 #if defined(WIFI_SIM) && !defined(SELFTEST)
     {   /* make WIFISIM=1: the self-tests' simulated radio, for trying the
            Wi-Fi programs on a whole system (test builds only). */
         int sim_wifi_init(void);
+        boot_step("Wi-Fi simulator (debug mode)");
         if (sim_wifi_init() == 0)
-            kprintf("wifi: the simulated radio is up (MyOS-Test, MyOS-Open-5G)\n");
+            klog("wifi: the simulated radio is up (MyOS-Test, MyOS-Open-5G)\n");
     }
 #endif
 #ifdef MYOS_IWLWIFI
@@ -286,21 +353,29 @@ void kernel_main(void)
            intel/iwlwifi/myos.c). The firmware loads in the background from
            /lib/firmware (the root file system is mounted by now). */
         void iwlwifi_myos_init(void);
-        iwlwifi_myos_init();
 #ifdef MYOS_IWLDEBUG
-        kprintf("wifi: iwlwifi built in, with its debug lines (dmesg)\n");
+        boot_step("Wi-Fi (debug mode)");
+        iwlwifi_myos_init();
+        klog("wifi: iwlwifi built in, with its debug lines (dmesg)\n");
 #else
-        kprintf("wifi: iwlwifi built in (Intel Wi-Fi 6 AX201 and its family)\n");
+        boot_step("Wi-Fi");
+        iwlwifi_myos_init();
+        klog("wifi: iwlwifi built in (Intel Wi-Fi 6 AX201 and its family)\n");
 #endif
     }
 #endif
 
 #if defined(SELFTEST)
+    boot_step("Self-tests (debug mode)");
     run_selftests();        /* ends with the slot scheduler running */
+    boot_end();
     kprintf("Type here (F10/F11/F12 = test a CPU fault)> ");
 #elif defined(BENCH)
+    boot_step("Benchmarks (debug mode)");
     run_benchmarks(boot_start);     /* switches QEMU off when done */
 #else
+    boot_step("Starting programs");
+    boot_end();
     sched_start();          /* the 20 x 1 ms slot scheduler */
     run_init();             /* the first program, if the initramfs has one */
     kprintf("Type here> ");

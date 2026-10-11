@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * cpu.c — x86_64 twin of arch/i386/cpu.c (same CPUID leaves in long mode).
  *
@@ -54,7 +56,7 @@ void cpu_init(void)
     if (family == 6 && model < 3 && stepping < 3)
         cpu_features &= ~CPU_SEP;
 
-    kprintf("CPU: %s family %lu model %lu:%s%s%s%s%s%s%s%s\n", vendor, family, model,
+    klog("CPU: %s family %lu model %lu:%s%s%s%s%s%s%s%s\n", vendor, family, model,
             cpu_has(CPU_PSE) ? " pse" : "", cpu_has(CPU_PSE36) ? " pse36" : "",
             cpu_has(CPU_PGE) ? " pge" : "",
             cpu_has(CPU_SEP) ? " sysenter" : "", cpu_has(CPU_FXSR) ? " fxsr" : "",

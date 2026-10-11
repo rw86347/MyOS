@@ -1,4 +1,6 @@
 #!/bin/sh
+# SPDX-License-Identifier: BSD-2-Clause
+# Copyright (c) 2026 Rodger Wilson
 # check-asound.sh — prove include/sound/asound.h has Linux's ALSA layouts.
 #
 # For each CPU, compile two lists of numbers — sizes, field offsets and ioctl

@@ -1170,3 +1170,43 @@ own, `cld` on every entry and page-table checks are in (docs/LOG.md,
   `/proc/<pid>/task` for other processes.
 - **A deleted file that is still open reports `st_nlink` 1** (Linux: 0). SQLite only
   logs a warning about it.
+
+## The installer (2026-10-10)
+
+- **UEFI only, and only onto a disk without an EFI partition** (or by
+  erasing). Next to Windows it would have to add EFI/MYOS to Windows' FAT
+  partition, and MyOS's FAT driver only reads. Installing on a BIOS PC
+  isn't written either (the helper refuses both, before writing).
+- **No boot entry is written** (no efibootmgr / SetVariable). The firmware
+  finds EFI/BOOT/BOOTX64.EFI by itself on most PCs. On others, pick the
+  disk in the boot menu (F11 on the MSI).
+- **The installed EFI partition carries the live login initrd** (240 MB),
+  which an installed system doesn't need, and the firmware loads it at
+  every start. A small one, or none, would start faster.
+- **A failed try leaves the disk mounted** (umount is always EBUSY): the
+  window asks for a restart before the next try.
+- **ssh login is off on an installed system.** Turn it on with
+  `doas ln -s /etc/sv/sshd /var/service/` (a new host key is made then).
+- **The window's install flow was not clicked through in QEMU**, only
+  the helper with a written plan, then a boot of the result.
+
+## Kernel config (2026-10-10)
+
+- **The kernel doesn't read the config yet.** Settings › Kernel saves it
+  to `myos-config`, but the scheduler still runs `config/slots.conf`'s
+  table (docs/KERNEL-CONFIG.md §10, steps 2–7). The page says so.
+- **No `myos-taskd`, no binding at `execve`, no OS class yet.** Slots
+  still go to a thread with the right name (docs/TIME-SLOTS.md).
+- **Behind a hybrid MBR (no 0xEE entry) the kernel never reads the GPT**,
+  so GPT names are invisible there. The live/UTM images list
+  `myos-config` in the MBR too; the kernel's own reader will need the GPT.
+- **The installer doesn't make `myos-config` yet**, so an installed
+  system has nowhere to save; Settings says "no myos-config partition".
+- **Only the x86_64 image has it.** The i386 live disk (MBR, BIOS) needs
+  the config in its 0x7F boot area (docs/KERNEL-CONFIG.md §8).
+- **Some savings only the kernel can confirm.** Deep idle (ACPI _CST), C1E,
+  PCIe ASPM, USB autosuspend, SATA link power and disk spin-down are
+  switchable in Settings and marked "checked when MyOS starts": a program
+  can't see them, and the kernel will skip what isn't there.
+- **MyOS's /proc/cpuinfo leaves out flags** such as `est`, `acpi` and `tm`,
+  so Settings reads CPUID itself.

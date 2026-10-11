@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * pcm.c — sound streams: /dev/snd/pcmC<n>D0p (playback) and pcmC<n>D0c
  * (capture), with Linux's ALSA ioctls (asound.h).

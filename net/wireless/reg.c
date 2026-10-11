@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * reg.c — the rules of the country we are in (Linux: cfg80211's reg.c,
  * the part a driver uses).

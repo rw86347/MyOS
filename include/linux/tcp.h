@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 #ifndef LINUX_TCP_H
 #define LINUX_TCP_H
 /* The TCP header (RFC 9293), x86 bitfield order. */

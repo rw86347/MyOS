@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * scan.c — finding networks, and the list of the ones found (Linux:
  * mac80211's scan.c and cfg80211's scan.c).

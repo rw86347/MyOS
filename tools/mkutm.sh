@@ -1,4 +1,6 @@
 #!/bin/sh
+# SPDX-License-Identifier: BSD-2-Clause
+# Copyright (c) 2026 Rodger Wilson
 # mkutm.sh — wrap the boot disk image in a UTM virtual machine (macOS).
 #
 #   tools/mkutm.sh build/myos.img "dist/MyOS read-write.utm" [vm-uuid]

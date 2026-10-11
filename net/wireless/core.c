@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * core.c — radios and interfaces: what a Wi-Fi driver registers, and the
  * wlan0 network device that appears for it (Linux: mac80211's main.c and

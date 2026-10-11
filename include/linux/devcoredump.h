@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 #ifndef LINUX_DEVCOREDUMP_H
 #define LINUX_DEVCOREDUMP_H
 /* A firmware crash dump would go to user space through devcoredump; we

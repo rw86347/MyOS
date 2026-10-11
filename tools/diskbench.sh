@@ -1,4 +1,6 @@
 #!/bin/sh
+# SPDX-License-Identifier: BSD-2-Clause
+# Copyright (c) 2026 Rodger Wilson
 # Disk benchmark, MyOS vs Linux, on one disk type: ide, ahci, nvme, virtio,
 # usb (a USB stick on xHCI).
 # Both kernels run user/diskbench.c on a copy of the same ext2 image (two

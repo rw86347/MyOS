@@ -91,7 +91,7 @@ Files and storage
 Hardware
 - [ ] B50. USB keyboards and mice (HID)
 - [ ] B51. USB hubs
-- [ ] B52. The MSI's touchpad (I2C HID), two-finger scrolling
+- [ ] B52. The MSI's touchpad (I2C HID), two-finger scrolling (plan: docs/TOUCHPAD-PLAN.md)
 - [ ] B53. ACPI: power off and reboot on real PCs
 - [ ] B54. Local APIC timer and IOAPIC
 - B55. Sound: now part D below (`docs/SOUND-PLAN.md`)

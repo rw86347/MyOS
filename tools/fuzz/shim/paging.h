@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /* paging.h for the host fuzz build. The only thing the filesystem code wants
    from it is vmm_translate, which the block layer uses to turn a kernel
    virtual address into a physical one for DMA. The stub is the identity,

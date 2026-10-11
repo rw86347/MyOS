@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * hda_intel.c — HD Audio controllers ("Azalia"): the MSI's Tiger Lake-H
  * 8086:43c8, QEMU's ich9-intel-hda, and any other PCI class 0403 device.
@@ -654,7 +656,7 @@ static void azx_probe(struct pci_dev *pci)
     c->bus.codec_mask = rd16(c, AZX_REG_STATESTS) & 0x7fff;
     wr16(c, AZX_REG_STATESTS, (uint16_t)c->bus.codec_mask);    /* write 1 to clear */
     uint32_t cls = pci->class_rev >> 8;
-    kprintf("hda: %s %04x:%04x, class %06lx (%s), HD Audio %u.%u, %u out / %u in streams, "
+    klog("hda: %s %04x:%04x, class %06lx (%s), HD Audio %u.%u, %u out / %u in streams, "
             "codecs %02x\n", c->name, pci->vendor, pci->device, (unsigned long)cls,
             (cls & 0xff) == 0 ? "HD Audio" : "HD Audio with a DSP", rd8(c, AZX_REG_VMAJ),
             rd8(c, AZX_REG_VMIN), oss, iss, c->bus.codec_mask);

@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: BSD-2-Clause
+# Copyright (c) 2026 Rodger Wilson
 # =============================================================================
 # myos-ssh.sh — log in to a MyOS live stick over ssh, with this Mac's key
 #

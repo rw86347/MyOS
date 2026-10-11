@@ -1,0 +1,417 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: BSD-2-Clause -->
+<!-- Copyright (c) 2026 Rodger Wilson -->
+<!-- Settings > Kernel: mockup B, the one Rodger chose (2026-10-10), out of
+     three (docs/KERNEL-CONFIG.md): the 20 ms frame as a wheel, the power
+     savings as a grid of cards. Open in a browser; #b-0, #b-1, #b-2 put the
+     slider on realtime, soft realtime, max power savings. The power features
+     are tools/kconfig/powerfeatures.py --json. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kernel settings mockup</title>
+<style>
+:root {
+  --title1: #1f7180; --title2: #0f4f63;
+  --sand1: #fbe9c6; --sand2: #efd3a0;
+  --ink: #1d2430; --muted: #5b6573; --faint: #8a93a0;
+  --page: #fbfbf9; --card: #ffffff; --line: #dcdad4; --line2: #ecebe6;
+  --blue: #0a64d6; --blue2: #2f7fd8; --green: #23a047; --amber: #c77700; --red: #d70015;
+  --os: #1b6b78; --free: #efede7;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: #3b4a55; font: 13px/1.35 "Noto Sans", "DejaVu Sans", "Segoe UI", system-ui, sans-serif; color: var(--ink); }
+.review { color: #eef2f5; padding: 14px 24px 6px; max-width: 1080px; margin: 0 auto; }
+.review h1 { font-size: 17px; margin: 0 0 6px; }
+.review .tabs { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+.review button { font: inherit; border: 1px solid #6b7c88; background: #4b5d6a; color: #eef2f5; border-radius: 5px; padding: 4px 10px; cursor: pointer; }
+.review button.on { background: #eef2f5; color: #1d2430; }
+.review select { font: inherit; margin-left: 12px; }
+.review p { margin: 6px 0 0; color: #c8d2da; max-width: 1000px; }
+.stage { display: flex; justify-content: center; padding: 10px 0 30px; }
+.shot .review { display: none; }
+.shot .stage { padding: 18px 0; }
+
+.window { width: 1024px; height: 800px; border-radius: 9px; overflow: hidden; box-shadow: 0 10px 34px rgba(0,0,0,.45); display: flex; flex-direction: column; background: var(--page); }
+.titlebar { height: 30px; background: linear-gradient(var(--title1), var(--title2)); color: #fff; display: flex; align-items: center; padding: 0 10px; font-weight: bold; text-shadow: 0 1px 1px rgba(0,0,0,.4); }
+.titlebar .appicon { width: 16px; height: 16px; border-radius: 3px; background: linear-gradient(#e8eef3,#aab8c4); margin-right: 8px; border: 1px solid #fff8; }
+.titlebar .btns { margin-left: auto; display: flex; gap: 5px; }
+.titlebar .btns i { width: 17px; height: 17px; border-radius: 50%; display: block; border: 1px solid #fff9; background: radial-gradient(circle at 40% 35%, #b9f3ff, #3aa0b8); }
+.titlebar .btns i:last-child { background: radial-gradient(circle at 40% 35%, #ffd2a0, #e66b12); }
+.body { flex: 1; display: flex; min-height: 0; }
+.sidebar { width: 210px; background: linear-gradient(var(--sand1), var(--sand2)); border-right: 1px solid #d9c49a; padding: 8px 8px; font-size: 12px; }
+.sidebar .search { background: #fff; border: 1px solid #d6c7a8; border-radius: 4px; padding: 3px 7px; color: #999; margin-bottom: 8px; }
+.sidebar .me { display: flex; gap: 8px; align-items: center; padding: 2px 2px 8px; border-bottom: 1px solid #0001; margin-bottom: 4px; }
+.sidebar .me b { display: block; }
+.sidebar .me span { color: var(--muted); font-size: 11px; }
+.sidebar .me .pic { width: 30px; height: 30px; border-radius: 5px; background: linear-gradient(135deg, #7da9c9, #e8c98f); }
+.sidebar .item { display: flex; align-items: center; gap: 7px; padding: 3px 6px; border-radius: 4px; }
+.sidebar .item i { width: 14px; height: 14px; border-radius: 3px; display: inline-block; }
+.sidebar .item.sel { background: var(--blue); color: #fff; }
+.sidebar hr { border: 0; border-top: 1px solid #0001; margin: 5px 4px; }
+.content { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+.scroll { flex: 1; overflow: auto; padding: 14px 22px 14px; }
+.pagehead { display: flex; gap: 12px; align-items: center; margin-bottom: 12px; }
+.pagehead svg { flex: none; }
+.pagehead h2 { margin: 0; font-size: 21px; font-weight: 600; }
+.pagehead .sub { color: var(--muted); }
+.pagehead .chip { margin-left: auto; font-size: 11px; padding: 3px 9px; border-radius: 10px; background: #e7f4ea; color: #1b6f33; border: 1px solid #bfe2c8; white-space: nowrap; }
+.pagehead .chip.pending { background: #fff4df; color: #8a5a00; border-color: #f1d49a; }
+.group { background: var(--card); border: 1px solid var(--line); border-radius: 7px; margin-bottom: 12px; }
+.group > .gh { font-weight: 600; padding: 8px 12px 6px; display: flex; align-items: baseline; gap: 8px; }
+.group > .gh span { font-weight: normal; color: var(--muted); font-size: 12px; }
+.row { display: flex; align-items: center; gap: 10px; padding: 7px 12px; border-top: 1px solid var(--line2); }
+.row .lab { flex: 1; min-width: 0; }
+.row .lab small { display: block; color: var(--muted); font-size: 11.5px; }
+.row.off { color: var(--faint); }
+.row.off small { color: #a0a7b0; }
+.why { font-size: 11px; color: var(--amber); }
+.footer { height: 48px; border-top: 1px solid var(--line); display: flex; align-items: center; gap: 10px; padding: 0 22px; background: #f4f3ef; }
+.footer .status { flex: 1; font-size: 12px; }
+.footer .status b.ok { color: var(--green); } .footer .status b.warn { color: var(--amber); } .footer .status b.err { color: var(--red); }
+.btn { font: inherit; padding: 5px 16px; border-radius: 5px; border: 1px solid #b8b5ad; background: linear-gradient(#fff, #ebe9e3); color: var(--ink); cursor: pointer; }
+.btn.primary { background: linear-gradient(#3f8ee6, #0a64d6); color: #fff; border-color: #0a56b8; font-weight: 600; }
+.btn:disabled { opacity: .45; cursor: default; }
+input[type=text], input[type=number], input[type=password], select { font: inherit; border: 1px solid #c9c6be; border-radius: 4px; padding: 3px 6px; background: #fff; color: var(--ink); }
+input[type=text].bad { border-color: var(--red); background: #fff3f3; }
+input[type=text]:disabled { background: #eef4f5; color: var(--os); border-color: #bcd5d9; font-weight: 600; }
+.switch { width: 38px; height: 22px; border-radius: 11px; background: #cfccc4; position: relative; flex: none; cursor: pointer; border: 0; }
+.switch::after { content: ""; position: absolute; top: 2px; left: 2px; width: 18px; height: 18px; border-radius: 50%; background: #fff; box-shadow: 0 1px 2px #0005; transition: left .12s; }
+.switch.on { background: var(--green); } .switch.on::after { left: 18px; }
+.switch:disabled { opacity: .45; cursor: default; }
+.note { color: var(--muted); font-size: 12px; }
+.legend { display: flex; flex-wrap: wrap; gap: 6px 14px; padding: 4px 12px 10px; font-size: 12px; }
+.legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; }
+.hatch { background: repeating-linear-gradient(45deg, var(--os) 0 4px, #2b8796 4px 8px) !important; color: #fff; }
+
+/* ---- the mode slider ---- */
+.sliderB { padding: 14px 18px 10px; }
+.sliderB .track { position: relative; height: 54px; }
+.sliderB .rail { position: absolute; left: 30px; right: 30px; top: 22px; height: 10px; border-radius: 5px; background: linear-gradient(90deg, #2f6fd6, #6d5fe0 50%, #2fae5a); box-shadow: inset 0 1px 2px #0004; }
+.sliderB .stop { position: absolute; top: 0; width: 60px; margin-left: -30px; text-align: center; cursor: pointer; }
+.sliderB .stop .dot { width: 54px; height: 54px; margin: 0 auto; border-radius: 50%; background: #fff; border: 2px solid #d4d2cb; display: flex; align-items: center; justify-content: center; box-shadow: 0 1px 3px #0002; }
+.sliderB .stop.sel .dot { border-color: var(--blue); box-shadow: 0 0 0 4px #0a64d633, 0 2px 6px #0003; }
+.sliderB .names { display: flex; justify-content: space-between; margin-top: 6px; font-size: 12px; }
+.sliderB .names div { width: 160px; text-align: center; color: var(--muted); }
+.sliderB .names div:first-child { text-align: left; } .sliderB .names div:last-child { text-align: right; }
+.sliderB .names div.sel { color: var(--ink); font-weight: 600; }
+
+/* ---- the slot name fields ---- */
+.slotrow { display: flex; align-items: center; gap: 8px; padding: 3px 0; }
+.slotrow .n { width: 22px; text-align: right; font-weight: 600; color: var(--muted); }
+.slotrow .t { width: 64px; font-size: 11px; color: var(--faint); }
+.slotrow .sw { width: 10px; height: 18px; border-radius: 2px; background: var(--free); flex: none; }
+.slotrow input { flex: 1; min-width: 0; }
+
+/* ---- B: dial ---- */
+.dialwrap { display: grid; grid-template-columns: 1fr 300px 1fr; align-items: center; gap: 8px; padding: 2px 12px 0; }
+.dialcol .slotrow { gap: 6px; padding: 2px 0; }
+.dialcol input { padding: 2px 6px; }
+.dialcol.left .slotrow { flex-direction: row-reverse; }
+.dialcol.left .slotrow .n { text-align: left; }
+.dialcol .slotrow .t { display: none; }
+.task { border-top: 1px solid var(--line2); padding: 7px 12px 8px; }
+.task .tl { display: flex; align-items: baseline; gap: 8px; margin-bottom: 5px; }
+.task .tl i { width: 11px; height: 11px; border-radius: 2px; display: inline-block; align-self: center; }
+.task .tl .state { margin-left: auto; font-size: 11.5px; color: var(--muted); }
+.task .tf { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 14px; font-size: 12px; color: var(--muted); padding-left: 19px; margin-top: 3px; }
+.task .tf label { display: flex; align-items: center; gap: 5px; }
+.task .tf input[type=text] { color: var(--ink); font-family: "DejaVu Sans Mono", Menlo, monospace; font-size: 11.5px; }
+.btn.small { padding: 2px 9px; font-size: 12px; }
+.group .footnote { color: var(--muted); font-size: 11px; padding: 6px 12px 9px; border-top: 1px solid var(--line2); }
+.cards { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; padding: 4px 12px 12px; }
+.card { border: 1px solid var(--line); border-radius: 8px; padding: 10px; background: #fff; display: flex; flex-direction: column; gap: 5px; min-height: 112px; }
+.card.on { border-color: #9ad3ab; background: #f6fcf7; }
+.card.off { background: #f6f5f2; color: var(--faint); }
+.card .top { display: flex; align-items: flex-start; gap: 8px; }
+.card .top b { flex: 1; font-size: 12.5px; }
+.card small { color: var(--muted); font-size: 11.5px; }
+.card.off small { color: #a0a7b0; }
+.card .meta { margin-top: auto; display: flex; flex-wrap: wrap; gap: 2px 8px; font-size: 11px; color: var(--muted); align-items: center; }
+.card .meta span { white-space: nowrap; }
+.dots i { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: #d9d6ce; margin-right: 2px; }
+.dots i.f { background: var(--green); }
+
+.modal { position: fixed; inset: 0; background: #0006; display: none; align-items: center; justify-content: center; }
+.modal.show { display: flex; }
+.modal .box { width: 420px; background: var(--page); border-radius: 9px; box-shadow: 0 10px 30px #0007; overflow: hidden; }
+.modal .box .titlebar { border-radius: 0; }
+.modal .in { padding: 14px 16px; }
+.modal .in p { margin: 0 0 10px; }
+.modal .btns { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }
+.toast { position: fixed; bottom: 30px; left: 50%; transform: translateX(-50%); background: #1d2430; color: #fff; padding: 8px 16px; border-radius: 6px; display: none; }
+</style>
+</head>
+<body>
+<div class="review">
+  <h1>Settings &rsaquo; Kernel &mdash; mockup B (chosen)</h1>
+  <div class="tabs" id="tabs"></div>
+  <p>The 20 ms frame as a wheel: the OS slots sit at 12 and 6 o'clock, so "every 10 ms" is visible at a glance, and each name field sits beside its wedge. Power savings is a grid of cards showing how much each saves and how slowly it wakes. The slider and the name fields work; the menu pretends to be another computer.</p>
+</div>
+<div class="stage"><div class="window" id="win"></div></div>
+<div class="modal" id="modal"><div class="box"><div class="titlebar">Save kernel settings</div><div class="in" id="modalIn"></div></div></div>
+<div class="toast" id="toast"></div>
+
+<script>
+/* The power-feature catalogue: python3 tools/kconfig/powerfeatures.py --json */
+const PF = /*@PF@*/{"families":{"pentium4":"Pentium 4 (old desktop)","pentium-m":"Pentium M (old laptop)","zen":"Ryzen, Zen 4/5 (GPD Pocket 4)"},"features":[{"bit":0,"key":"cpu_speed","label":"Change processor speed","group":"Processor","what":"Runs the processor slower (and at a lower voltage) when there is little to do.","support":{"pentium4":"some","pentium-m":"yes","zen":"yes"},"wake_us":10,"slows_cpu":true,"saves":3,"param":"cpu_min_pct, cpu_max_pct, epp"},{"bit":1,"key":"no_boost","label":"Turn off boost","group":"Processor","what":"Never runs above the rated speed: less heat, less power, steadier timing.","support":{"pentium4":"no","pentium-m":"no","zen":"yes"},"wake_us":0,"slows_cpu":true,"saves":2,"param":""},{"bit":2,"key":"deep_idle","label":"Deep idle states","group":"Processor","what":"When idle, stops more of the processor than a plain halt does (C2, C3, ...).","support":{"pentium4":"no","pentium-m":"yes","zen":"yes"},"wake_us":100,"slows_cpu":false,"saves":3,"param":"cstate_max"},{"bit":3,"key":"c1e","label":"Enhanced halt (C1E)","group":"Processor","what":"A halted processor also drops its voltage and clock.","support":{"pentium4":"some","pentium-m":"no","zen":"yes"},"wake_us":10,"slows_cpu":false,"saves":2,"param":""},{"bit":4,"key":"throttle","label":"Clock modulation","group":"Processor","what":"Skips clock cycles to cool down. Saves little energy: the voltage stays the same.","support":{"pentium4":"yes","pentium-m":"yes","zen":"no"},"wake_us":0,"slows_cpu":true,"saves":1,"param":""},{"bit":5,"key":"tickless","label":"Skip unneeded timer ticks","group":"Processor","what":"Wakes the processor only when a timer is due, not 1000 times a second.","support":{"pentium4":"yes","pentium-m":"yes","zen":"yes"},"wake_us":0,"slows_cpu":false,"saves":2,"param":""},{"bit":6,"key":"smt_off","label":"Turn off second threads","group":"Processor","what":"Hyper-Threading / SMT off: one thread per core, less power, steadier timing.","support":{"pentium4":"smp","pentium-m":"no","zen":"smp"},"wake_us":0,"slows_cpu":false,"saves":1,"param":""},{"bit":7,"key":"core_park","label":"Park idle cores","group":"Processor","what":"Puts whole cores to sleep while the others can do the work.","support":{"pentium4":"no","pentium-m":"no","zen":"smp"},"wake_us":400,"slows_cpu":false,"saves":2,"param":""},{"bit":8,"key":"disk_spindown","label":"Spin down hard disks","group":"Storage","what":"Stops a hard disk's motor after minutes without use. The next read waits seconds.","support":{"pentium4":"machine","pentium-m":"machine","zen":"machine"},"wake_us":0,"slows_cpu":false,"saves":3,"param":"spindown_min"},{"bit":9,"key":"sata_lpm","label":"SATA link power management","group":"Storage","what":"Lets the SATA cable's link sleep between commands.","support":{"pentium4":"machine","pentium-m":"machine","zen":"machine"},"wake_us":0,"slows_cpu":false,"saves":1,"param":""},{"bit":10,"key":"nvme_apst","label":"NVMe power states","group":"Storage","what":"The SSD drops into its own low-power states when idle (APST).","support":{"pentium4":"no","pentium-m":"no","zen":"machine"},"wake_us":0,"slows_cpu":false,"saves":2,"param":""},{"bit":11,"key":"pcie_aspm","label":"PCIe link power management","group":"Devices","what":"PCI Express links sleep when no data moves (ASPM L0s / L1).","support":{"pentium4":"machine","pentium-m":"machine","zen":"machine"},"wake_us":0,"slows_cpu":false,"saves":2,"param":""},{"bit":12,"key":"usb_autosuspend","label":"Suspend idle USB devices","group":"Devices","what":"Idle USB devices sleep. Keyboard, mouse and touchscreen never do.","support":{"pentium4":"machine","pentium-m":"machine","zen":"machine"},"wake_us":0,"slows_cpu":false,"saves":2,"param":""},{"bit":13,"key":"wifi_ps","label":"Wi-Fi power save","group":"Devices","what":"The Wi-Fi radio sleeps between beacons while connected.","support":{"pentium4":"machine","pentium-m":"machine","zen":"machine"},"wake_us":0,"slows_cpu":false,"saves":2,"param":""},{"bit":14,"key":"audio_pm","label":"Power down the sound chip","group":"Devices","what":"The sound chip powers down after a few seconds of silence.","support":{"pentium4":"machine","pentium-m":"machine","zen":"machine"},"wake_us":0,"slows_cpu":false,"saves":1,"param":""},{"bit":15,"key":"nic_idle","label":"Idle unplugged Ethernet","group":"Devices","what":"A wired network card with no cable plugged in powers down.","support":{"pentium4":"machine","pentium-m":"machine","zen":"machine"},"wake_us":0,"slows_cpu":false,"saves":1,"param":""},{"bit":16,"key":"gpu_pm","label":"Graphics power management","group":"Devices","what":"Lower graphics clocks and panel self-refresh while the picture doesn't change.","support":{"pentium4":"no","pentium-m":"no","zen":"machine"},"wake_us":0,"slows_cpu":false,"saves":2,"param":""}],"cstates":[{"n":1,"name":"C1 (halt)","wake_us":1,"families":["pentium4","pentium-m","zen"]},{"n":2,"name":"C2","wake_us":20,"families":["pentium-m","zen"]},{"n":3,"name":"C3","wake_us":100,"families":["pentium-m","zen"]},{"n":4,"name":"C4 (Deeper Sleep)","wake_us":200,"families":["pentium-m"]},{"n":6,"name":"C6 (core off)","wake_us":400,"families":["zen"]}]}/*@PF-END@*/;
+
+/* The computers to pretend to be. "machine" features depend on what is in
+   them: an old laptop has an IDE disk and no PCI Express, the Pocket 4 an
+   NVMe SSD and no wired Ethernet port. */
+const MACHINES = {
+  "pentium-m": { name: "ThinkPad-style laptop: Pentium M 1.7 GHz, ICH4-M, IDE disk", arch: "i386", disk: "hda",
+    have: { disk_spindown: true, usb_autosuspend: true, nic_idle: true },
+    why: { sata_lpm: "No SATA (IDE disk)", pcie_aspm: "No PCI Express (ICH4-M)", wifi_ps: "No driver yet for its Wi-Fi (Intel 2200BG)",
+           audio_pm: "AC'97 sound: nothing to switch" } },
+  "pentium4": { name: "Desktop: Pentium 4 530J 3.0 GHz HT, ICH5, IDE disk", arch: "i386", disk: "hda",
+    have: { disk_spindown: true, usb_autosuspend: true, nic_idle: true, c1e: true },
+    why: { cpu_speed: "This Pentium 4 has no SpeedStep (CPUID)", sata_lpm: "No AHCI (ICH5)", pcie_aspm: "No PCI Express (ICH5)",
+           wifi_ps: "No Wi-Fi", audio_pm: "AC'97 sound: nothing to switch" } },
+  "zen": { name: "GPD Pocket 4: Ryzen 7 8840U, NVMe SSD", arch: "x86_64", disk: "nvme0n1",
+    have: { nvme_apst: true, pcie_aspm: true, usb_autosuspend: true, wifi_ps: true, audio_pm: true },
+    why: { disk_spindown: "No hard disk (an SSD has no motor)", sata_lpm: "No SATA", nic_idle: "No wired Ethernet port",
+           gpu_pm: "Needs MyOS's own amdgpu driver (not yet)" } },
+};
+
+
+const MODES = ["Realtime", "Soft realtime", "Max power savings"];
+const MODE_DESC = [
+  "Named tasks get their slots exactly, every time: they start on the slot boundary and are stopped at its end. No power management: the processor runs at its full rated speed (no boost) and only halts when there is nothing to do; disks and devices never sleep.",
+  "Named tasks run first in their slots, but without a promise: one may start a little late or run a little over. The processor may rest in idle states that wake within the latency budget. Its speed stays fixed, and disks and devices stay on.",
+  "No time slots: every program takes its turn. The processor slows down and sleeps, and disks and devices power down when idle. Choose which savings this computer uses.",
+];
+const COLORS = ["#0a84ff", "#bf5af2", "#ff9f0a", "#30d158", "#ff375f", "#5e5ce6", "#64b9d6", "#ac8e68", "#e0b000"];
+
+/* ---- state ---- */
+const S = {
+  mode: 1, running: 1, dirty: false, cpu: "zen", bigEndian: false, saved: false, generation: 7,
+  slots: Array.from({ length: 20 }, (_, i) => (i === 0 || i === 10 ? "os" : "")),
+  budget: 100, on: new Set(["cpu_speed", "deep_idle", "tickless", "nvme_apst", "usb_autosuspend", "wifi_ps", "disk_spindown"]),
+  cpuMin: 30, cpuMax: 100, epp: 128, cstate: 3, spindown: 10,
+};
+[[2, "audio"], [12, "audio"], [4, "brakes"], [9, "brakes"], [14, "brakes"], [19, "brakes"], [6, "radio"], [16, "radio"]]
+  .forEach(([s, n]) => (S.slots[s] = n));
+/* The run part: what myos-taskd starts for each task after boot. */
+S.programs = {
+  audio: { program: "/usr/bin/myos-audiod", args: "--period 10ms", user: "nobody", boot: true, restart: true },
+  brakes: { program: "/bin/brakes", args: "--hz 200", user: "nobody", boot: true, restart: true },
+  radio: { program: "/usr/local/bin/radio", args: "", user: "rodger", boot: true, restart: true },
+};
+const USERS = ["nobody", "rodger", "root"];
+/* The programs this pretend computer has (Settings looks at the real files). */
+const FILES = { "/usr/bin/myos-audiod": "ok", "/bin/brakes": "ok", "/usr/local/bin/radio": "ok",
+                "/home/rodger/pump": "writable" };
+const prog = (t) => (S.programs[t] = S.programs[t] || { program: "/bin/" + t, args: "", user: "nobody", boot: true, restart: true });
+
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const tasks = () => { const t = []; S.slots.forEach((n) => { if (n && n !== "os" && !t.includes(n)) t.push(n); }); return t; };
+const colorOf = (n) => (n === "os" ? "var(--os)" : n ? COLORS[tasks().indexOf(n) % COLORS.length] : "var(--free)");
+const feat = (k) => PF.features.find((f) => f.key === k);
+
+/* Can this computer use feature f? {ok, why} */
+function avail(f) {
+  const m = MACHINES[S.cpu], s = f.support[S.cpu] || "no";
+  if (m.why[f.key]) return { ok: false, why: m.why[f.key] };
+  if (s === "no") return { ok: false, why: "Not on a " + PF.families[S.cpu].replace(/ \(.*/, "") };
+  if (s === "smp") return { ok: false, why: "Needs MyOS on more than one core" };
+  if (s === "machine" && !m.have[f.key]) return { ok: false, why: "Not in this computer" };
+  if (s === "some" && !m.have[f.key]) return { ok: false, why: "Not on this model (CPUID)" };
+  return { ok: true, why: "" };
+}
+const cstatesHere = () => PF.cstates.filter((c) => c.families.includes(S.cpu));
+function softCstate() { let best = PF.cstates[0]; cstatesHere().forEach((c) => { if (c.wake_us <= S.budget) best = c; }); return best; }
+
+function cadence(slots) {
+  if (slots.length === 1) return "every 20 ms";
+  const gaps = slots.map((s, i) => (slots[(i + 1) % slots.length] - s + 20) % 20 || 20);
+  return gaps.every((g) => g === gaps[0]) ? "every " + gaps[0] + " ms" : "uneven: " + gaps.join("/") + " ms";
+}
+
+/* The checks Save runs: the same rules as kconfig.py's check(). */
+function check() {
+  const err = [], warn = [], note = [];
+  S.slots.forEach((n, s) => {
+    if (s === 0 || s === 10) return;
+    if (!n) return;
+    if (["os", "idle", "main", "kernel"].includes(n)) err.push(`Slot ${s}: “${n}” is a name the kernel uses itself`);
+    else if (!/^[a-z][a-z0-9_-]{0,14}$/.test(n)) err.push(`Slot ${s}: “${n}” — start with a small letter; a–z, 0–9, - and _ only (15 at most)`);
+  });
+  const free = S.slots.filter((n) => !n).length;
+  if (S.mode < 2) {
+    tasks().forEach((t) => { const mine = S.slots.map((n, i) => (n === t ? i : -1)).filter((i) => i >= 0); note.push(`${t}: slot${mine.length > 1 ? "s" : ""} ${mine.join(", ")} — ${cadence(mine)}`); });
+    if (free < 2) warn.push(`Only ${free} free slot${free === 1 ? "" : "s"}: ordinary programs (the desktop too) get little time`);
+    if (S.mode === 1) note.push(`May idle down to ${softCstate().name} (wakes in about ${softCstate().wake_us} µs)`);
+  } else {
+    if (tasks().length) note.push("The tasks still start, as ordinary programs: no slots in this mode");
+    const on = [...S.on].filter((k) => avail(feat(k)).ok);
+    if (!on.length) warn.push("Every saving is off: soft realtime saves more than this");
+    if (!(10 <= S.cpuMin && S.cpuMin <= S.cpuMax && S.cpuMax <= 100)) err.push("Processor speed: 10% ≤ slowest ≤ fastest ≤ 100%");
+    if (S.on.has("disk_spindown") && avail(feat("disk_spindown")).ok && S.spindown < 10) warn.push("A disk stopped every few minutes wears out sooner (10 min or more)");
+    note.push(`${on.length} of ${PF.features.filter((f) => avail(f).ok).length} savings this computer has are on`);
+  }
+  tasks().forEach((t) => {
+    const p = prog(t);
+    if (!p.program.startsWith("/") || p.program.includes("/../")) err.push(`${t}: the program must be a full path, like /bin/${t}`);
+    else if (!FILES[p.program]) err.push(`${t}: ${p.program} isn't there`);
+    else if (FILES[p.program] === "writable") err.push(`${t}: ${p.program} can be changed by others: only root may write it`);
+    if (p.user === "root") warn.push(`${t} runs as root, with full control of the computer`);
+    if (!p.boot) warn.push(`${t} doesn't start at boot: its slots stay empty until something starts it`);
+  });
+  return { err, warn, note };
+}
+
+/* ---- pieces ---- */
+const ICON = {
+  kernel: '<svg width="44" height="44" viewBox="0 0 44 44"><rect x="9" y="9" width="26" height="26" rx="4" fill="#2b3f52"/><rect x="14" y="14" width="16" height="16" rx="2" fill="#4fb3c8"/><text x="22" y="25.5" font-size="8" text-anchor="middle" fill="#0e2c52" font-weight="bold" font-family="sans-serif">OS</text>' +
+    [12, 18, 24, 30].map((p) => `<rect x="${p - 1}" y="4" width="2" height="5" fill="#8a96a3"/><rect x="${p - 1}" y="35" width="2" height="5" fill="#8a96a3"/><rect x="4" y="${p - 1}" width="5" height="2" fill="#8a96a3"/><rect x="35" y="${p - 1}" width="5" height="2" fill="#8a96a3"/>`).join("") + "</svg>",
+  stopwatch: '<svg width="28" height="28" viewBox="0 0 28 28"><circle cx="14" cy="16" r="9" fill="none" stroke="#0a64d6" stroke-width="2.4"/><rect x="11" y="2.5" width="6" height="3" rx="1" fill="#0a64d6"/><path d="M14 16 L14 10" stroke="#0a64d6" stroke-width="2.4" stroke-linecap="round"/></svg>',
+  wave: '<svg width="28" height="28" viewBox="0 0 28 28"><path d="M3 15 Q7 6 11 15 T19 15 T27 13" fill="none" stroke="#6d5fe0" stroke-width="2.4" stroke-linecap="round"/><circle cx="11" cy="15" r="2" fill="#6d5fe0"/></svg>',
+  leaf: '<svg width="28" height="28" viewBox="0 0 28 28"><path d="M5 23 C5 10 13 5 24 4 C24 16 17 23 5 23 Z" fill="#2fae5a"/><path d="M6 22 L18 10" stroke="#fff" stroke-width="1.6" stroke-linecap="round"/></svg>',
+};
+const SIDE = [["Software Update", "#2fae5a"], null, ["Wi-Fi", "#3a8fd6"], ["Bluetooth", "#6b8fb8"], ["Network", "#3a6fd6"], ["Battery", "#45b04b"], null,
+  ["General", "#9aa6b2"], ["Kernel", "#2b3f52", 1], ["Accessibility", "#3fa0d8"], ["Appearance", "#e08a2e"], ["Displays", "#2a5fa8"], ["Wallpaper", "#56a35a"],
+  ["Sound", "#8a96a3"], ["Privacy & Security", "#48a0b8"], ["Users", "#3a7fb8"], null, ["Keyboard", "#8a96a3"], ["Mouse", "#8a96a3"]];
+
+function sidebar() {
+  return `<div class="sidebar"><div class="search">Search</div>
+    <div class="me"><div class="pic"></div><div><b>rodger</b><span>Administrator</span></div></div>
+    ${SIDE.map((x) => (x ? `<div class="item${x[2] ? " sel" : ""}"><i style="background:${x[1]}"></i>${x[0]}</div>` : "<hr>")).join("")}</div>`;
+}
+function pagehead() {
+  const chip = S.saved ? '<span class="chip pending">Saved — used after a restart</span>'
+    : S.dirty || S.mode !== S.running ? '<span class="chip pending">Changed — not saved yet</span>'
+    : `<span class="chip">Running now: ${MODES[S.running]}</span>`;
+  return `<div class="pagehead">${ICON.kernel}<div><h2>Kernel</h2><div class="sub">How the processor's time is shared, and how hard the computer saves power.</div></div>${chip}</div>`;
+}
+function footer() {
+  const c = check(), m = MACHINES[S.cpu];
+  let st;
+  if (c.err.length) st = `<b class="err">✕ ${c.err.length} problem${c.err.length > 1 ? "s" : ""}:</b> ${esc(c.err[0])}`;
+  else if (c.warn.length) st = `<b class="warn">! ${esc(c.warn[0])}</b> — you can still save`;
+  else st = `<b class="ok">✓ Ready to save.</b> Boot settings and task list go to <b>myos-config</b> on <b>${m.disk}</b>; used from the next start.`;
+  return `<div class="footer"><div class="status">${st}</div><button class="btn" onclick="revert()">Revert</button>
+    <button class="btn primary" ${c.err.length ? "disabled" : ""} onclick="askSave()">Save…</button></div>`;
+}
+function slotInput(s, extra = "", osText = "OS — always the system") {
+  const n = S.slots[s], os = s === 0 || s === 10;
+  const bad = n && !os && !/^[a-z][a-z0-9_-]{0,14}$/.test(n);
+  return `<input type="text" maxlength="15" ${os ? `disabled value="${osText}"` : `value="${esc(n)}" placeholder="free"`}
+    class="${bad ? "bad" : ""}" ${extra} oninput="setSlot(${s}, this.value)">`;
+}
+function powerNote() {
+  return `<div class="group"><div class="gh">Time slots are off in this mode</div><div class="row"><div class="lab">Every program takes its turn on the processor.
+    <small>Your tasks (${tasks().map(esc).join(", ") || "none"}) still start after boot, as ordinary programs, and get their slots back when you move the slider back.</small></div></div></div>`;
+}
+/* ---- the slider, the dial, the cards ---- */
+function budgetGroup() {
+  const c = softCstate();
+  return `<div class="group"><div class="gh">Latency budget <span>How late a task may start because the processor was resting</span></div>
+    <div class="row"><div class="lab">Wake within <b>${S.budget} µs</b><small>The processor may rest down to ${c.name} (wakes in about ${c.wake_us} µs). Nothing else saves power in this mode.</small></div>
+    <input type="range" min="1" max="500" value="${S.budget}" style="width:220px" onchange="S.budget=+this.value;render()"></div></div>`;
+}
+
+function slidersB() {
+  const icons = [ICON.stopwatch, ICON.wave, ICON.leaf];
+  return `<div class="group sliderB"><div class="track"><div class="rail"></div>
+    ${[0, 1, 2].map((i) => `<div class="stop ${i === S.mode ? "sel" : ""}" style="left:${[30, 50, 70][i] === 50 ? "50%" : i === 0 ? "30px" : "calc(100% - 30px)"}" onclick="setMode(${i})"><div class="dot">${icons[i]}</div></div>`).join("")}</div>
+    <div class="names">${MODES.map((m, i) => `<div class="${i === S.mode ? "sel" : ""}">${m}</div>`).join("")}</div>
+    <div class="note" style="margin-top:8px">${MODE_DESC[S.mode]}</div></div>`;
+}
+function dial() {
+  const cx = 160, cy = 160, R = 140, r = 86, seg = (Math.PI * 2) / 20;
+  const pt = (rad, a) => [cx + rad * Math.cos(a), cy + rad * Math.sin(a)];
+  let s = `<svg width="300" height="300" viewBox="0 0 320 320"><defs><pattern id="h" width="8" height="8" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><rect width="8" height="8" fill="#1b6b78"/><rect width="4" height="8" fill="#2b8796"/></pattern></defs>`;
+  S.slots.forEach((n, i) => {
+    const a0 = -Math.PI / 2 + i * seg + 0.012, a1 = a0 + seg - 0.024;
+    const [x0, y0] = pt(R, a0), [x1, y1] = pt(R, a1), [x2, y2] = pt(r, a1), [x3, y3] = pt(r, a0);
+    const fill = n === "os" ? "url(#h)" : n ? COLORS[tasks().indexOf(n) % COLORS.length] : "#efede7";
+    s += `<path d="M${x0},${y0} A${R},${R} 0 0 1 ${x1},${y1} L${x2},${y2} A${r},${r} 0 0 0 ${x3},${y3} Z" fill="${fill}" stroke="#fff" stroke-width="1"/>`;
+    const [tx, ty] = pt((R + r) / 2, a0 + seg / 2);
+    s += `<text x="${tx}" y="${ty + 4}" font-size="11" text-anchor="middle" fill="${n ? "#fff" : "#8a93a0"}" font-weight="600">${i}</text>`;
+  });
+  s += `<text x="${cx}" y="${cy - 8}" text-anchor="middle" font-size="22" font-weight="600" fill="#1d2430">20 ms</text>
+    <text x="${cx}" y="${cy + 12}" text-anchor="middle" font-size="11" fill="#5b6573">then it repeats</text>
+    <text x="${cx}" y="${cy + 30}" text-anchor="middle" font-size="10.5" fill="#1b6b78">OS at 0 and 10</text></svg>`;
+  return s;
+}
+function bodyB() {
+  let h = slidersB();
+  if (S.mode === 2) return h + powerNote() + cardsB();
+  const row = (s) => `<div class="slotrow"><span class="n">${s}</span><span class="sw ${s % 10 === 0 ? "hatch" : ""}" style="background:${colorOf(S.slots[s])}"></span>${slotInput(s)}</div>`;
+  h += `<div class="group"><div class="gh">Time slots <span>Each wedge is 1 ms. Name a slot to keep it for that task; the same name in several slots is one task.</span></div>
+    <div class="dialwrap"><div class="dialcol left">${[19, 18, 17, 16, 15, 14, 13, 12, 11, 10].map(row).join("")}</div>
+    <div>${dial()}</div><div class="dialcol">${[0, 1, 2, 3, 4, 5, 6, 7, 8, 9].map(row).join("")}</div></div>
+    </div>`;
+  h += tasksGroup();
+  if (S.mode === 1) h += budgetGroup();
+  return h;
+}
+/* The run part: one row per task, what starts after boot to fill its slots. */
+function tasksGroup() {
+  const list = tasks();
+  return `<div class="group" id="tasks"><div class="gh">Tasks <span>Started after boot, each running only in its own slots</span></div>
+    ${list.length ? list.map((t) => {
+      const p = prog(t), mine = S.slots.map((n, i) => (n === t ? i : -1)).filter((i) => i >= 0);
+      const bad = !FILES[p.program] || FILES[p.program] === "writable";
+      return `<div class="task"><div class="tl"><i style="background:${colorOf(t)}"></i><b>${esc(t)}</b>
+          <span class="note">${cadence(mine)} \u00b7 slot${mine.length > 1 ? "s" : ""} ${mine.join(", ")}</span>
+          <span class="state">Not running yet \u2014 starts at the next boot</span></div>
+        <div class="tf"><label>Program <input type="text" class="${bad ? "bad" : ""}" style="width:230px" value="${esc(p.program)}" oninput="prog('${t}').program=this.value;S.dirty=true;render()"></label>
+          <button class="btn small">Choose\u2026</button>
+          <label>Arguments <input type="text" style="width:120px" value="${esc(p.args)}" oninput="prog('${t}').args=this.value;S.dirty=true;render()"></label>
+          <label>Run as <select onchange="prog('${t}').user=this.value;S.dirty=true;render()">${USERS.map((u) => `<option ${u === p.user ? "selected" : ""}>${u}</option>`).join("")}</select></label></div>
+        <div class="tf"><label><input type="checkbox" ${p.boot ? "checked" : ""} onchange="prog('${t}').boot=this.checked;S.dirty=true;render()"> Start at boot</label>
+          <label><input type="checkbox" ${p.restart ? "checked" : ""} onchange="prog('${t}').restart=this.checked;S.dirty=true;render()"> Restart if it stops</label></div></div>`;
+    }).join("") : '<div class="row"><div class="lab note">Name a slot on the wheel to add a task.</div></div>'}
+    <div class="footnote">Only the program set here, started by the system, can use a task's slots. A program that merely calls itself \u201cbrakes\u201d gets nothing.</div></div>`;
+}
+function cardsB() {
+  return `<div class="group"><div class="gh">Savings on this computer <span>${esc(MACHINES[S.cpu].name)}</span></div><div class="cards">${PF.features.map((f) => {
+    const a = avail(f), on = a.ok && S.on.has(f.key);
+    const wake = f.key === "deep_idle" ? (cstatesHere().find((c) => c.n === S.cstate) || cstatesHere()[0]).wake_us : f.wake_us;
+    return `<div class="card ${a.ok ? (on ? "on" : "") : "off"}"><div class="top"><b>${f.label}</b><button class="switch ${on ? "on" : ""}" ${a.ok ? "" : "disabled"} onclick="toggle('${f.key}')"></button></div>
+      <small>${a.ok ? f.what : `<span class="why">${a.why}</span>`}</small>
+      <div class="meta"><span><span class="dots">${[1, 2, 3].map((k) => `<i class="${k <= f.saves ? "f" : ""}"></i>`).join("")}</span>saves</span>
+      ${wake ? `<span>· wakes ~${wake} µs</span>` : ""}${f.slows_cpu ? "<span>· slower code</span>" : ""}</div></div>`;
+  }).join("")}</div></div>`;
+}
+
+/* ---- the page ---- */
+function render() {
+  const keep = document.activeElement ? document.activeElement.getAttribute("oninput") : null;
+  const pos = keep ? document.activeElement.selectionStart : 0;
+  document.getElementById("win").innerHTML = `<div class="titlebar"><span class="appicon"></span>Settings<span class="btns"><i></i><i></i><i></i></span></div>
+    <div class="body">${sidebar()}<div class="content"><div class="scroll">${pagehead()}${bodyB()}</div>${footer()}</div></div>`;
+  if (keep) { const el = document.querySelector(`[oninput="${keep}"]`); if (el) { el.focus(); el.setSelectionRange(pos, pos); } }
+  document.getElementById("tabs").innerHTML =
+    `<select onchange="S.cpu=this.value;S.cstate=Math.min(S.cstate,Math.max(...cstatesHere().map(c=>c.n)));render()">${Object.entries(MACHINES).map(([k, m]) => `<option value="${k}" ${k === S.cpu ? "selected" : ""}>Pretend: ${m.name}</option>`).join("")}</select>`;
+}
+function go() { history.replaceState(null, "", `#b-${S.mode}`); render(); }
+function setMode(m) { S.mode = m; S.saved = false; go(); }
+function setSlot(s, v) { S.slots[s] = v.trim(); S.saved = false; S.dirty = true; render(); }
+function toggle(k) { S.on.has(k) ? S.on.delete(k) : S.on.add(k); S.saved = false; S.dirty = true; render(); }
+function revert() { location.reload(); }
+function askSave() {
+  const m = MACHINES[S.cpu];
+  document.getElementById("modalIn").innerHTML = `<p>Changing how the kernel shares the processor affects everyone on this computer.
+    Type an administrator's password to save.</p><p class="note">Writes 512 bytes to <b>myos-config</b> on <b>${m.disk}</b> (copy ${S.generation % 2 ? "B" : "A"},
+    generation ${S.generation + 1}). The kernel checks it again, and uses it from the next start.</p>
+    <input type="password" placeholder="Password for rodger" style="width:100%"><div class="btns"><button class="btn" onclick="closeModal()">Cancel</button>
+    <button class="btn primary" onclick="doSave()">Save</button></div>`;
+  document.getElementById("modal").classList.add("show");
+}
+function closeModal() { document.getElementById("modal").classList.remove("show"); }
+function doSave() { closeModal(); S.generation++; S.saved = true; S.dirty = false; render(); const t = document.getElementById("toast"); t.textContent = "Saved. Restart to use the new settings."; t.style.display = "block"; setTimeout(() => (t.style.display = "none"), 2500); }
+
+const m = /^#(?:b-)?([012])/.exec(location.hash);
+if (m) S.mode = +m[1];
+if (/shot/.test(location.search)) document.body.classList.add("shot");
+const cpu = /cpu=([a-z0-9-]+)/.exec(location.search); if (cpu && MACHINES[cpu[1]]) S.cpu = cpu[1];
+render();
+if (/demo=pump/.test(location.search)) { S.slots[7] = "pump"; S.dirty = true; render(); }   /* a new name: /bin/pump by default */
+if (/scroll=tasks/.test(location.search)) { const t = document.getElementById("tasks"); if (t) t.scrollIntoView(); }
+</script>
+</body>
+</html>

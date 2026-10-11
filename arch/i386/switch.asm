@@ -1,3 +1,5 @@
+; SPDX-License-Identifier: BSD-2-Clause
+; Copyright (c) 2026 Rodger Wilson
 ; =============================================================================
 ; switch.asm — switch the CPU from one kernel thread to another
 ; =============================================================================

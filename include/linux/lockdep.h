@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 #ifndef LINUX_LOCKDEP_H
 #define LINUX_LOCKDEP_H
 /* Linux's lock checker: nothing to check on one CPU here. */

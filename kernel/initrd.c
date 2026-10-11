@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * initrd.c — the initramfs ("initial RAM file system")
  *
@@ -28,12 +30,12 @@ void initrd_init(void)
 {
     const struct bootinfo *bi = P2V(BOOTINFO_PHYS);
     if (!bi->initrd_size) {
-        kprintf("initramfs: none\n");
+        klog("initramfs: none\n");
         return;
     }
     data = P2V(bi->initrd_phys);
     size = bi->initrd_size;
-    kprintf("initramfs: %lu KiB at physical %08lx\n", size / 1024, bi->initrd_phys);
+    klog("initramfs: %lu KiB at physical %08lx\n", size / 1024, bi->initrd_phys);
     initramfs_load(data, size);     /* its files become the file tree */
     dev_init();                     /* plus /dev/null, /dev/console, ... */
 }

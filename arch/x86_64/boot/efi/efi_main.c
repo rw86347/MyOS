@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * efi_main.c — 64-bit UEFI loader for the 64-bit kernel
  *
@@ -69,19 +71,6 @@ static void say(const char *s)
     g_st->con_out->output_string(g_st->con_out, buf);
 }
 
-static void say_hex(u64 n)
-{
-    char b[19];
-    int i;
-    b[0] = '0'; b[1] = 'x';
-    for (i = 0; i < 16; i++) {
-        int d = (int)((n >> ((15 - i) * 4)) & 0xF);
-        b[2 + i] = (char)(d < 10 ? '0' + d : 'a' + d - 10);
-    }
-    b[18] = 0;
-    say(b);
-}
-
 static void paint_bar(u32 color)
 {
     u32 y, x, rows;
@@ -94,6 +83,16 @@ static void paint_bar(u32 color)
             line[x] = color;
     }
 }
+
+/* Blue (about to leave UEFI) and gold (left it) show how far a boot that
+   hangs got, where the loader can no longer print. Debug builds only
+   (make TRACE=1): on a normal boot the kernel's text would start under an
+   orange strip. A red bar, a failure, is always painted. */
+#ifdef LOADER_BARS
+#define progress_bar(color) paint_bar(color)
+#else
+#define progress_bar(color) ((void)0)
+#endif
 
 void *memcpy(void *dst, const void *src, unsigned long n)
 {
@@ -146,12 +145,14 @@ static int file_size(struct efi_file *root, u16 *name, u64 *out)
    a slow USB stick is still being read. */
 #define READ_CHUNK (1ull << 20)
 
+static int dots;                    /* printed so far, on Step 01's line */
+
 static int load_file(struct efi_file *root, u16 *name, void *dest, u64 cap, u64 *out_size)
 {
     struct efi_file *f = 0;
     u64 sz, pos, done;
     if (root->open(root, &f, name, EFI_FILE_MODE_READ, 0) != EFI_SUCCESS || !f) {
-        say("open failed\r\n");
+        say("\r\n    open failed");
         return -1;
     }
     if (f->set_position(f, ~0ull) != EFI_SUCCESS
@@ -160,7 +161,7 @@ static int load_file(struct efi_file *root, u16 *name, void *dest, u64 cap, u64 
         return -1;
     }
     if (pos > cap) {
-        say("file too big\r\n");
+        say("\r\n    file too big");
         f->close(f);
         return -1;
     }
@@ -172,12 +173,12 @@ static int load_file(struct efi_file *root, u16 *name, void *dest, u64 cap, u64 
         u64 want = pos - done < READ_CHUNK ? pos - done : READ_CHUNK;
         sz = want;
         if (f->read(f, &sz, (u8 *)dest + done) != EFI_SUCCESS || sz != want) {
-            say("read failed\r\n");
+            say("\r\n    read failed");
             f->close(f);
             return -1;
         }
         if ((done + sz) % (8 * READ_CHUNK) == 0)
-            say(".");
+            say(dots++ ? "." : " .");  /* after "Step 01 - Boot loader" */
     }
     f->close(f);
     *out_size = pos;
@@ -273,13 +274,6 @@ static void take_gop(struct efi_boot_services *bs, struct bootinfo *bi)
     if (info->pixel_format == PixelRedGreenBlueReserved8BitPerColor
         || (info->pixel_format == PixelBitMask && info->red_mask == 0x000000FFu))
         pixfmt = 1;
-    say("gop ");
-    say_hex(g_w);
-    say("x");
-    say_hex(g_h);
-    say(" @ ");
-    say_hex(g_fb);
-    say("\r\n");
     bi->fb_magic = BOOTINFO_FB_MAGIC;
     bi->fb_phys = g_fb;
     bi->fb_pitch = g_pitch;
@@ -312,8 +306,9 @@ static int on_usb(struct efi_boot_services *bs, efi_handle dev)
    then go back to the firmware, which tries its next boot entry. */
 static efi_status give_up(const char *why)
 {
+    say("\r\n    ");
     say(why);
-    say("\r\nMyOS loader stopped; back to the firmware in 30 s.\r\n");
+    say("\r\n    MyOS loader stopped; back to the firmware in 30 s.\r\n");
     g_st->boot->stall(30 * 1000000ull);
     return EFI_NOT_FOUND;
 }
@@ -343,7 +338,10 @@ efi_status efi_main(efi_handle image, struct efi_system_table *st)
     efi_status stt;
 
     g_st = st;
-    say("MyOS UEFI loader (x86_64)\r\n");
+    /* The boot's first two lines (include/kprintf.h); the dots of the
+       files being read follow on the second. The kernel repeats both on
+       the screen only: the firmware's console is serial too. */
+    say("MyOS, written by Rodger Wilson...\r\nStep 01 - Boot loader");
     if (!st || !st->boot)
         return EFI_NOT_FOUND;
     bs = st->boot;
@@ -354,7 +352,6 @@ efi_status efi_main(efi_handle image, struct efi_system_table *st)
 
     low = BOOTINFO_PHYS;
     if (!alloc_at(bs, BOOTINFO_PHYS, 2)) {      /* bootinfo + 8x16 font */
-        say("0x1000 busy, allocating elsewhere\r\n");
         low = 0xFFFFF000ull;
         if (bs->allocate_pages(AllocateMaxAddress, EfiLoaderData, 2, &low)
             != EFI_SUCCESS)
@@ -363,7 +360,6 @@ efi_status efi_main(efi_handle image, struct efi_system_table *st)
     kpages = pages_for(KERNEL_END - KERNEL_LOAD);
     ksrc = KERNEL_LOAD;
     if (!alloc_at(bs, KERNEL_LOAD, kpages)) {
-        say("1 MiB busy, allocating elsewhere\r\n");
         ksrc = 0xFFFFF000ull;
         if (bs->allocate_pages(AllocateMaxAddress, EfiLoaderData, kpages, &ksrc)
             != EFI_SUCCESS)
@@ -379,13 +375,9 @@ efi_status efi_main(efi_handle image, struct efi_system_table *st)
 
     if (load_file(root, kname, (void *)ksrc, KERNEL_END - KERNEL_LOAD, &ksize) < 0)
         return give_up("kernel not loaded");
-    say("kernel ");
-    say_hex(ksize);
-    say("\r\n");
 
     extra = 0;
     if (file_size(root, iname, &isize) < 0 || !isize) {
-        say("no initrd (hello kernel)\r\n");
         isize = 0;
     } else if (isize > (512ull << 20)) {
         return give_up("initrd too big");
@@ -403,19 +395,13 @@ efi_status efi_main(efi_handle image, struct efi_system_table *st)
                 != EFI_SUCCESS || extra + isize > KERNEL_RAM_LIMIT)
                 return give_up("no room for the initrd below 2 GiB");
         }
-        say("initrd ");             /* before the read: a hang shows where */
-        say_hex(isize);
-        say(" @ ");
-        say_hex(extra);
-        say(" ");
         if (load_file(root, iname, (void *)extra, isize, &isize) < 0)
             return give_up("initrd not loaded");
-        say("\r\n");
     }
 
     if (load_file(root, fname, (void *)(low + (FONT_PHYS - BOOTINFO_PHYS)),
                   4096, &fsize) < 0 || fsize != 4096)
-        say("no font (fbcon will stay off)\r\n");
+        say("\r\n    no font (fbcon will stay off)");
 
     bi = (struct bootinfo *)low;
     memset(bi, 0, sizeof *bi);
@@ -424,11 +410,11 @@ efi_status efi_main(efi_handle image, struct efi_system_table *st)
     bi->font_phys = (fsize == 4096) ? FONT_PHYS : 0;
     if (on_usb(bs, li->device)) {
         bi->boot_flags |= BOOT_FROM_USB;
-        say("booted from USB\r\n");
     }
+    say("\r\n");                    /* the end of Step 01's line */
     take_gop(bs, bi);
 
-    paint_bar(0x002080C0u);         /* blue: about to leave UEFI */
+    progress_bar(0x002080C0u);      /* blue: about to leave UEFI */
 
     for (tries = 0; tries < 4; tries++) {
         map_size = 0;
@@ -445,7 +431,6 @@ efi_status efi_main(efi_handle image, struct efi_system_table *st)
             continue;
         }
         fill_e820(bi, map, map_size, desc_size);
-        ser("e820\r\n");
         stt = bs->exit_boot_services(image, map_key);
         if (stt == EFI_SUCCESS)
             break;
@@ -462,7 +447,7 @@ efi_status efi_main(efi_handle image, struct efi_system_table *st)
         memcpy((void *)BOOTINFO_PHYS, (void *)low, 2 * EFI_PAGE);
     if (ksrc != KERNEL_LOAD)
         memcpy((void *)KERNEL_LOAD, (void *)ksrc, (u64)kpages * EFI_PAGE);
-    paint_bar(0x00C06020u);         /* gold: jumping in long mode */
+    progress_bar(0x00C06020u);      /* gold: jumping in long mode */
     __asm__ volatile ("cli");
     ((void (*)(void))KERNEL_LOAD)();
     for (;;)

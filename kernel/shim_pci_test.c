@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * shim_pci_test.c — Linux's device, PCI, IRQ and DMA API (W1b), checked at
  * boot in `make test` builds with a driver written only against that API.

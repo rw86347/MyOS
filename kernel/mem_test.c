@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * mem_test.c — boot-time self-tests for the page allocator, paging and kmalloc.
  */

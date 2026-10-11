@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * boottest — the system calls a real init and getty make while the machine
  * starts and stops (runit, agetty): sethostname, mount/umount2 (tmpfs, proc),

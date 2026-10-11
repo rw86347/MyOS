@@ -1,4 +1,6 @@
 #!/bin/sh
+# SPDX-License-Identifier: BSD-2-Clause
+# Copyright (c) 2026 Rodger Wilson
 # fetch-alpine.sh — get the Alpine Linux packages MyOS's root file system
 # uses: unmodified 32-bit x86 Linux programs (MyOS speaks Linux's system
 # call language, so they run as they are).

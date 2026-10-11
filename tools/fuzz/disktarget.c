@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /* disktarget.c — run the kernel's real filesystem code against a crafted
  * disk image, under AddressSanitizer.
  *

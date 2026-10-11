@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 #ifndef LINUX_DEBUGFS_H
 #define LINUX_DEBUGFS_H
 /* No debugfs: creating an entry gives back an error pointer, which every

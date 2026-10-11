@@ -1,3 +1,5 @@
+; SPDX-License-Identifier: BSD-2-Clause
+; Copyright (c) 2026 Rodger Wilson
 ; usermode.asm — the first entry into ring 3 (user_enter)
 ;
 ; void user_enter(uint64_t entry, uint64_t user_sp)

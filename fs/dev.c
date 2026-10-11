@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * dev.c — device files: /dev/null, /dev/zero, /dev/console, /dev/tty
  *
@@ -197,7 +199,8 @@ static const struct file_ops full_ops = { .read = zero_read, .write = full_write
  * keeps its own 64-bit position (struct blkfile in f->priv); lseek and
  * pread/pwrite come here for it (syscall.c). Bytes go through a bounce
  * buffer in whole sectors — a partial sector is read, changed, written
- * back — at most BLK_CHUNK a call (callers loop, as for any file).
+ * back — BLK_CHUNK at a time, but a call does the whole request: disk
+ * tools (mke2fs) treat a short write as an error.
  *
  * The disk under a mounted file system can't be opened for writing
  * (EBUSY), and one open for writing can't be mounted: the file system's
@@ -310,8 +313,9 @@ static void blk_release(struct file *f)
     kfree(b);
 }
 
-/* read/write at `at`, or at (and moving) the open's own position if -1. */
-int32_t blkfile_rw(struct file *f, uintptr_t ubuf, uint32_t n, int writing, int64_t at)
+/* One piece of a disk read or write: at most BLK_CHUNK, through the bounce
+   buffer. At `at`, or at (and moving) the open's own position if -1. */
+static int32_t blk_chunk(struct file *f, uintptr_t ubuf, uint32_t n, int writing, int64_t at)
 {
     struct blkfile *b = f->priv;
     if (!b || !b->d->sectors)
@@ -352,6 +356,21 @@ int32_t blkfile_rw(struct file *f, uintptr_t ubuf, uint32_t n, int writing, int6
     if (r > 0 && at < 0)
         b->pos = pos + (uint32_t)r;
     return r;
+}
+
+/* The whole request, piece by piece: a disk's read or write is never short
+   unless it reaches the end or fails (Linux's rule, which disk tools count
+   on). */
+int32_t blkfile_rw(struct file *f, uintptr_t ubuf, uint32_t n, int writing, int64_t at)
+{
+    uint32_t done = 0;
+    while (done < n) {
+        int32_t r = blk_chunk(f, ubuf + done, n - done, writing, at >= 0 ? at + done : -1);
+        if (r <= 0)
+            return done ? (int32_t)done : r;
+        done += (uint32_t)r;
+    }
+    return (int32_t)done;
 }
 
 static int32_t blk_read(struct file *f, void *ubuf, uint32_t n)

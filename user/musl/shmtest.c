@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * shmtest — System V shared memory through musl (shmget, shmat, shmdt,
  * shmctl, all over ipc()), the way the X server's MIT-SHM and its clients

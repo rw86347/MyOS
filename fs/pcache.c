@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * pcache.c — the page cache: file data, one 4 KiB frame per (file, page)
  *
@@ -93,7 +95,7 @@ void pcache_init(void)
     if (dirty_max > DIRTY_CAP)
         dirty_max = DIRTY_CAP;
     pmm_set_reclaim(pcache_reclaim);
-    kprintf("pcache: %lu slots (%lu KiB table), up to all free RAM\n",
+    klog("pcache: %lu slots (%lu KiB table), up to all free RAM\n",
             nslots, nslots * (sizeof *table + sizeof *owner) / 1024);
 }
 

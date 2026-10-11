@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * drvapi.c — the rest of what a mac80211 driver may call (Linux's
  * include/net/mac80211.h), beyond receiving, sending and scanning (core.c,

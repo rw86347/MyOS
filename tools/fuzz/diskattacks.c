@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /* diskattacks.c — crafted disk images that must not break the kernel.
  *
  * The companion to tools/fuzz/attacks.c, which does this for the network

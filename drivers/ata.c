@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * ata.c — ATA (IDE) hard disk driver, PIO mode, interrupt driven
  *
@@ -638,7 +640,10 @@ static void dma_probe(struct ata_drive *d, const char *name, const uint16_t id[2
     ok = ok && dma_xfer(d, 0, 1, b, 0) == 0 && memcmp(a, b, sizeof a) == 0;
     irq_restore(flags);
     d->dma = (uint8_t)ok;
-    kprintf("ata: %s: %s\n", name, ok ? "bus-master DMA" : "DMA test failed, using PIO");
+    if (ok)
+        klog("ata: %s: bus-master DMA\n", name);
+    else
+        kprintf("ata: %s: DMA test failed, using PIO\n", name);    /* slower: say so */
 }
 
 void ata_init(void)
@@ -684,7 +689,7 @@ void ata_init(void)
             get_model(id, bd.model);
             set_multiple(d, id);
             if (blockdev_register(&bd))
-                kprintf("ata: %s: %lu sectors (%lu MiB) \"%s\", %lu sectors per IRQ\n",
+                klog("ata: %s: %lu sectors (%lu MiB) \"%s\", %lu sectors per IRQ\n",
                         bd.name, sectors, sectors / 2048, bd.model, (uint32_t)d->multi);
             if (!first)
                 first = d;

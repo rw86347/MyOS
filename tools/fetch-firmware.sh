@@ -1,4 +1,6 @@
 #!/bin/sh
+# SPDX-License-Identifier: BSD-2-Clause
+# Copyright (c) 2026 Rodger Wilson
 # fetch-firmware.sh — the firmware files MyOS's drivers load at run time,
 # from Linux's linux-firmware collection (kernel.org): the programs the
 # devices run themselves. Today: Intel's Wi-Fi (iwlwifi) for the AX201 in

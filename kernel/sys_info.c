@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * sys_info.c — "who am I, what time is it" system calls, and thread-local
  * storage: the things every program asks the kernel when it starts.

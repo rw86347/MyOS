@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-2-Clause
+# Copyright (c) 2026 Rodger Wilson
 """mkuefi.py — a GPT disk with one FAT32 EFI System Partition.
 
     tools/mkuefi.py --out build/myos-uefi.img --esp-mb 32 \
@@ -22,6 +24,9 @@ from pathlib import Path
 
 ESP_GUID = uuid.UUID("C12A7328-F81F-11D2-BA4B-00A0C93EC93B")
 LINUX_GUID = uuid.UUID("0FC63DAF-8483-4772-8E79-3D69D8477DE4")
+# MyOS's own type for the kernel config partition (docs/KERNEL-CONFIG.md):
+# made once with uuid4, 2026-10-10. Never change it.
+MYOS_CONFIG_GUID = uuid.UUID("9390AFB2-C545-487E-AF50-3648E56B736C")
 SECTOR = 512
 
 
@@ -53,6 +58,8 @@ def main() -> None:
                     help="sectors to copy (0 = rest of the file)")
     ap.add_argument("--root-from-mbr", action="store_true",
                     help="take the 0x83 partition from --root-file's MBR")
+    ap.add_argument("--config-mb", type=int, default=0,
+                    help="add an empty myos-config partition of this size (the kernel config)")
     args = ap.parse_args()
     files = []
     for item in args.file:
@@ -87,8 +94,12 @@ def main() -> None:
     else:
         root_sectors = 0
     root_start = start + esp_sectors
+    # After the root, 1 MiB aligned: the kernel config (blocks A and B, all
+    # zeros until Settings saves one: "nothing saved yet").
+    config_sectors = args.config_mb * 1024 * 1024 // SECTOR
+    config_start = (root_start + root_sectors + 2047) // 2048 * 2048
     # GPT backup at the end: 1 header + 32 entry sectors (128 entries)
-    disk_sectors = root_start + root_sectors + 33
+    disk_sectors = (config_start + config_sectors if config_sectors else root_start + root_sectors) + 33
     # round up so the image is a whole megabyte
     disk_sectors = (disk_sectors + 2047) // 2048 * 2048
 
@@ -134,6 +145,13 @@ def main() -> None:
             + struct.pack("<QQQ", root_start, root_start + root_sectors - 1, 0)
             + rname
         )
+    if config_sectors:
+        cname = "myos-config".encode("utf-16le").ljust(72, b"\0")
+        entries[256:384] = (
+            guid_bytes(MYOS_CONFIG_GUID) + guid_bytes(uuid.uuid4())
+            + struct.pack("<QQQ", config_start, config_start + config_sectors - 1, 0)
+            + cname
+        )
     entries_crc = crc32(entries)
 
     def header(current: int, backup: int, entries_lba: int) -> bytes:
@@ -160,6 +178,13 @@ def main() -> None:
                                    0x00, 0xFE, 0xFF, 0xFF,
                                    0x83, 0xFE, 0xFF, 0xFF,
                                    root_start, root_sectors)
+    if config_sectors:
+        # Also in the hybrid MBR: a kernel that reads only the MBR (no 0xEE
+        # entry, so no GPT) still publishes it, as sdX3. 0xDA: non-FS data.
+        mbr[478:494] = struct.pack("<BBBBBBBBII",
+                                   0x00, 0xFE, 0xFF, 0xFF,
+                                   0xDA, 0xFE, 0xFF, 0xFF,
+                                   config_start, config_sectors)
     mbr[510:512] = b"\x55\xAA"
 
     with out.open("wb") as f:
@@ -185,6 +210,7 @@ def main() -> None:
         f.write(header(disk_sectors - 1, 1, disk_sectors - 33))
 
     extra = f", root {root_sectors // 2048} MiB" if root_sectors else ""
+    extra += f", myos-config {args.config_mb} MiB" if config_sectors else ""
     print(f"wrote {out} ({disk_sectors * SECTOR} bytes, ESP {args.esp_mb} MiB{extra}, {len(files)} files)")
 
 

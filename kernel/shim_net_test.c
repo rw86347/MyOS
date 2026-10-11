@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * shim_net_test.c — Linux's packet and network-device API (W1c), checked
  * at boot in `make test` builds: sk_buffs (contiguous, frags, clones,

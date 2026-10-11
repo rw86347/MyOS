@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 #ifndef LINUX_AVERAGE_H
 #define LINUX_AVERAGE_H
 /* Exponentially weighted moving averages (Linux's DECLARE_EWMA), with the

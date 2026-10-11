@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 #ifndef ARCH_I386_PAGING_H
 #define ARCH_I386_PAGING_H
 

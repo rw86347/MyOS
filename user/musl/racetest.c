@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * racetest — attack-path tests for the one assumption this kernel was built
  * on and that turned out to be false: that a syscall is atomic because

@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * virtio_blk.c — the virtio block device (QEMU's and KVM's fast disk)
  *
@@ -227,6 +229,6 @@ void virtio_blk_init(void)
         .rwv     = vblk_rwv,
     };
     blockdev_register(&dev);
-    kprintf("virtio-blk: vda: %lu MiB, queue %u, irq %u\n",
+    klog("virtio-blk: vda: %lu MiB, queue %u, irq %u\n",
             dev.sectors / 2048, vq.qsize, pci->irq);
 }

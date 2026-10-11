@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-2-Clause
+# Copyright (c) 2026 Rodger Wilson
 # Is the file (dumped from the test disk by debugfs) exactly what
 # user/ext2test.c section 6 wrote? Exits 0 if so.
 import sys

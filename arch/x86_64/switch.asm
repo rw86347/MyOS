@@ -1,3 +1,5 @@
+; SPDX-License-Identifier: BSD-2-Clause
+; Copyright (c) 2026 Rodger Wilson
 ; switch.asm — x86_64 kernel thread switch (cdecl64: rdi, rsi)
 [bits 64]
 

@@ -1,3 +1,5 @@
+; SPDX-License-Identifier: BSD-2-Clause
+; Copyright (c) 2026 Rodger Wilson
 ; efi_jump.asm — copied to physical 0x3000, then jumped to with paging on.
 ; Drops from 64-bit long mode (what UEFI left us in) to 32-bit protected
 ; mode with no paging, the state our kernel's entry.asm expects.

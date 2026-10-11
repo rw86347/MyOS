@@ -1,3 +1,5 @@
+; SPDX-License-Identifier: BSD-2-Clause
+; Copyright (c) 2026 Rodger Wilson
 ; syscall_entry.asm — the `syscall` instruction lands here (MSR LSTAR)
 ;
 ; What `syscall` does: RCX = the user's RIP, R11 = the user's RFLAGS, CS and

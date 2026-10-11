@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * hda_core.c — the HD Audio bus: talking to codecs, and finding out what
  * they are. The controller driver (hda_intel.c) moves the words; this file
@@ -107,7 +109,7 @@ static void print_pins(struct hdac_device *c, const char *who)
         unsigned int loc = ((unsigned int)cfg >> AC_DEFCFG_LOCATION_SHIFT) & 0x3f;
         const char *place = conn == AC_JACK_PORT_FIXED || (loc >> 4) == 1 ? "built in"
                           : where[loc & 0xf][0] ? where[loc & 0xf] : "jack";
-        kprintf("hda: %s   pin 0x%02x: %s, %s%s (config %08x)\n", who, nid, jack_names[dev],
+        klog("hda: %s   pin 0x%02x: %s, %s%s (config %08x)\n", who, nid, jack_names[dev],
                 place, conn == AC_JACK_PORT_COMPLEX && (loc >> 4) != 1 && where[loc & 0xf][0]
                 ? " jack" : "", (unsigned int)cfg);
     }
@@ -149,7 +151,7 @@ void snd_hdac_bus_scan(struct hdac_bus *bus, const char *who)
             c->num_nodes = snd_hdac_get_sub_nodes(c, c->afg, &c->start_nid);
         }
         bus->codecs[addr] = c;
-        kprintf("hda: %s codec %u: %s%04x:%04x rev %06x, subsystem %04x:%04x, %s %d widgets\n",
+        klog("hda: %s codec %u: %s%04x:%04x rev %06x, subsystem %04x:%04x, %s %d widgets\n",
                 who, addr, vendor_name(c->vendor_id), (unsigned int)(c->vendor_id >> 16),
                 (unsigned int)(c->vendor_id & 0xffff), (unsigned int)(c->revision_id & 0xffffff),
                 (unsigned int)(c->subsystem_id >> 16), (unsigned int)(c->subsystem_id & 0xffff),

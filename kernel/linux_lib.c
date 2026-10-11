@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * linux_lib.c — the plain library part of the Linux driver API (the shim):
  * formatted printing (vsnprintf with Linux's %p extensions, printk),

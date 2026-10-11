@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * mlme.c — joining a network as a station (Linux: mac80211's mlme.c and
  * cfg80211's sme.c, in one).

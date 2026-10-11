@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * key.c — the keys wpa_supplicant installs after the 4-way handshake
  * (Linux: mac80211's key.c): the pairwise key (PTK's temporal key, for

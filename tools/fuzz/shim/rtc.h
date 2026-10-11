@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 #ifndef FUZZ_RTC_H
 #define FUZZ_RTC_H
 #include <stdint.h>

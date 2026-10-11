@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * pty.c — pseudo-terminals: /dev/ptmx and /dev/pts/N
  *

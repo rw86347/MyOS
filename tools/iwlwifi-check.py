@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: BSD-2-Clause
+# Copyright (c) 2026 Rodger Wilson
 """iwlwifi-check.py — compile Intel's Wi-Fi driver (the AX201's files,
 drivers/net/wireless/intel/iwlwifi) against MyOS's Linux-API headers,
 syntax only, and report which files compile and the first errors of those

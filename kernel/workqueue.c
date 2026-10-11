@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * workqueue.c — Linux's work queues: functions that run soon, in a thread,
  * where they may sleep. One kernel thread per workqueue runs its items in

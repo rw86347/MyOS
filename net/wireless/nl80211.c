@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * nl80211.c — Wi-Fi's netlink interface: the generic-netlink family
  * "nl80211" that `iw` and `wpa_supplicant` speak (Linux: net/wireless/

@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * inotify.c — tell programs when files change: inotify_init1,
  * inotify_add_watch, inotify_rm_watch, and the events read() returns

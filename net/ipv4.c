@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * ipv4.c — ARP, ICMP, and the IP header check (step 10)
  *
@@ -712,7 +714,7 @@ int ip_rate_ok(uint32_t peer)
    `unsigned long` on i686-elf, and %u would read the wrong width. */
 static void print_ip(const char *label, uint32_t ip)
 {
-    kprintf("%s%u.%u.%u.%u", label, (unsigned)(ip >> 24), (unsigned)(ip >> 16) & 0xFF,
+    klog("%s%u.%u.%u.%u", label, (unsigned)(ip >> 24), (unsigned)(ip >> 16) & 0xFF,
             (unsigned)(ip >> 8) & 0xFF, (unsigned)ip & 0xFF);
 }
 
@@ -740,10 +742,10 @@ void ipv4_init(void)
     for (uint32_t m = ipv4_mask; m & 0x80000000u; m <<= 1)
         bits++;
     print_ip("ipv4: eth0 is ", ipv4_addr);
-    kprintf("/%d", bits);
+    klog("/%d", bits);
     print_ip(" gateway ", ipv4_gw);
     print_ip(" dns ", ipv4_dns);
-    kprintf("\n");
+    klog("\n");
 }
 
 /* --- which device IPv4 runs on ------------------------------------------------- */
@@ -779,10 +781,10 @@ static void lease_thread(void *arg)
         dev->in4.gw = ipv4_gw = l.gw;
         dev->in4.dns = ipv4_dns = l.dns;
         print_ip("ipv4: ", ipv4_addr);
-        kprintf(" on %s", dev->name);
+        klog(" on %s", dev->name);
         print_ip(" gateway ", ipv4_gw);
         print_ip(" dns ", ipv4_dns);
-        kprintf("\n");
+        klog("\n");
     }
     thread_exit();
 }
@@ -792,7 +794,7 @@ void ipv4_link_up(struct net_device *dev)
     if (!dev || dev == eth)
         return;
     activate(dev);
-    kprintf("ipv4: now on %s\n", dev->name);
+    klog("ipv4: now on %s\n", dev->name);
     if (!dev->in4.addr)
         thread_create("ipconfig", lease_thread, dev);
 }
@@ -812,7 +814,7 @@ void ipv4_link_down(struct net_device *dev)
     }
     eth = NULL;                         /* (dev's settings are cleared, not saved) */
     activate(next);
-    kprintf("ipv4: %s gone, now on %s\n", dev->name, next ? next->name : "nothing");
+    klog("ipv4: %s gone, now on %s\n", dev->name, next ? next->name : "nothing");
 }
 
 int net_ping(uint32_t dst)

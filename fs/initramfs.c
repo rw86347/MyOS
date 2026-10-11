@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * initramfs.c — unpack the cpio archive into the VFS tree
  *
@@ -118,5 +120,5 @@ void initramfs_load(const uint8_t *a, uint32_t size)
         }
         off = align4(data_off + filesize);
     }
-    kprintf("initramfs: %lu files and directories\n", files);
+    klog("initramfs: %lu files and directories\n", files);
 }

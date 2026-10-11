@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * netdevice.c — the packet path a NIC driver talks to (step 10)
  *
@@ -93,7 +95,7 @@ int register_netdev(struct net_device *dev)
     if (dev->netdev_ops && dev->netdev_ops->ndo_open)
         dev->netdev_ops->ndo_open(dev);
     dev->flags |= IFF_UP;
-    kprintf("net: %s up\n", dev->name);
+    klog("net: %s up\n", dev->name);
     return 0;
 }
 

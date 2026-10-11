@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * random_test.c — boot-time self-tests for the CSPRNG (only in `make test`).
  *

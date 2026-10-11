@@ -1,4 +1,6 @@
 #!/bin/sh
+# SPDX-License-Identifier: BSD-2-Clause
+# Copyright (c) 2026 Rodger Wilson
 # Check that each racetest check actually fails against the bug it is meant to
 # catch. A test that passes either way is measuring nothing, which has happened
 # four times in this project now (see docs/security.md).

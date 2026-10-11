@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * shm.c — System V shared memory: shmget, shmat, shmdt, shmctl
  *

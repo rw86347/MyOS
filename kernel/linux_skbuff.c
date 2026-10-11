@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * linux_skbuff.c — the bigger sk_buff operations of Linux's API: clones
  * (a second descriptor on the same bytes), copies, moving a packet to a

@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * mouse.c — PS/2 mouse driver (IRQ 12)
  *
@@ -163,7 +165,7 @@ int mouse_init(void)
     outb(DATA, cfg);
 
     if (aux_send(0xF6) < 0) {           /* defaults; no answer: no mouse */
-        kprintf("mouse: no PS/2 mouse\n");
+        klog("mouse: no PS/2 mouse\n");
         return -1;
     }
     /* The IntelliMouse "knock": sample rates 200, 100, 80 in a row, and a
@@ -179,6 +181,6 @@ int mouse_init(void)
         return -1;
     }
     irq_install(12, mouse_irq);
-    kprintf("mouse: PS/2%s\n", packet_size == 4 ? ", with a wheel" : "");
+    klog("mouse: PS/2%s\n", packet_size == 4 ? ", with a wheel" : "");
     return 0;
 }

@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 #ifndef LINUX_CACHE_H
 #define LINUX_CACHE_H
 /* Cache-line alignment. 64 bytes on every CPU we run on (Pentium 4's L2

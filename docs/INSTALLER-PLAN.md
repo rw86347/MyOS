@@ -90,15 +90,18 @@ disk as a bar of its partitions, and three ways to use it:
   NTFS, so the box says how to make space from Windows itself.
 - **Erase this disk**: everything on it goes. The summary page names what will
   be lost.
-- **Something else**: the partition editor (`Edit partitions...` on the next
-  page), for people who know what they want.
+- **Something else**: the partition manager on the next page, for people who
+  know what they want.
 
-### 5. Partitions
+### 5. Disk & partitions
 
-![Partitions](installer/installWizard05.png)
+![Disk & partitions](installer/installWizard05.png)
 
-The disk before and after, and the partitions that will exist. The default
-layout:
+Before/after bars on the chosen disk (EFI, Windows, unallocated, then
+**myos-root** and **myos-data**), a five-column table (partition, type, size,
+mount, action), and a small toolbar (add, resize; delete/format greyed until
+they exist). An amber note repeats that nothing is written until **Install**
+on the summary page. Default layout:
 
 | machine | partitions |
 |---|---|

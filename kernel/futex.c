@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * futex.c — "fast user-space mutex": the one system call under every
  * pthread mutex, condition variable, semaphore and pthread_join (musl), and

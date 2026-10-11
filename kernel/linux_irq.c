@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * linux_irq.c — Linux's request_irq / request_threaded_irq on MyOS's IRQs.
  *

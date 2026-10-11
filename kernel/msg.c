@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * msg.c — System V message queues: msgget, msgsnd, msgrcv, msgctl
  *

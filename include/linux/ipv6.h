@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 #ifndef LINUX_IPV6_H
 #define LINUX_IPV6_H
 /* The IPv6 header (RFC 8200). We have no IPv6 stack; drivers only parse it. */

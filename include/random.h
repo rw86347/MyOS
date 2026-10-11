@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 #ifndef MYOS_RANDOM_H
 #define MYOS_RANDOM_H
 #include <stdint.h>

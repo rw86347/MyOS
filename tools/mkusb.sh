@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-License-Identifier: BSD-2-Clause
+# Copyright (c) 2026 Rodger Wilson
 # =============================================================================
 # mkusb.sh — build a FAT32 "USB stick" disk image with test files on it
 #

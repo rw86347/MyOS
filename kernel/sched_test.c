@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * sched_test.c — start the slot scheduler, and prove each task runs in
  * exactly the slots config/slots.conf gives it.

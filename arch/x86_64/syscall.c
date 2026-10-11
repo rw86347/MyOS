@@ -1,3 +1,5 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 Rodger Wilson */
 /*
  * syscall.c — set up the `syscall` instruction (musl's way into the kernel)
  *

@@ -4,13 +4,15 @@
 A hobby, from-scratch operating system kernel written by Rodger as a learning project:
 **a small, fast race horse of a kernel** — no bloat, built around **speed and predictability**.
 Goals, in priority order:
-1. Run on **two kinds of machine** with one kernel (CPU-specific code only in `arch/`):
+1. Run on **three CPU families** with one portable kernel (CPU-specific code only in `arch/`):
    - **Old PCs** (~20 years old): 32-bit x86, i686 — Pentium 4 / Pentium M, BIOS boot.
      **This is what we tune for: it must be fast on very old hardware.** First target.
-   - **New: GPD Pocket 4** (AMD Ryzen, x86-64, UEFI only — see `docs/hardwareRequirements.md`).
-     Needs a 64-bit `arch/x86_64` port and a UEFI loader; comes later. Don't let i386-only
-     shortcuts leak outside `arch/i386/`.
-   - ARM (original Raspberry Pi) after that.
+   - **New x86-64 PCs**: GPD Pocket 4 (see `docs/hardwareRequirements.md`), MSI Katana GF66,
+     and similar — UEFI, `arch/x86_64`. Don't let i386-only shortcuts leak outside `arch/i386/`.
+   - **ARM64**: QEMU `virt` and **Raspberry Pi** bare metal (roadmap step 14).
+   - **Apple Silicon Macs bare metal** (M1 MacBook Air and later — MyOS only, no macOS under it;
+     roadmap step 15). Same `arch/aarch64/` as Pi; Apple boot and devices in `arch/aarch64/apple/`.
+     Emulated x86 MyOS on an M1 Mac via UTM is dev-only, not this goal.
 2. Run unmodified GNU/Linux user-space programs by implementing the **Linux system call ABI**
    (i386: `int 0x80`, Linux syscall numbers, Linux struct layouts, ELF binaries).
 3. Networking, and eventually WiFi (last — by far the hardest part).
