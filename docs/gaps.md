@@ -3,6 +3,16 @@
 Shortcuts, limits and "later" notes in the current code, in one place. Remove an entry
 when it's fixed. File references point at the comment that mentions the gap.
 
+## ARM64 bring-up (QEMU virt, step 14)
+
+- **EL0 data access:** instruction fetch at EL0 works, but EL0 load/store to normal RAM
+  still permission-faults (ESR `0x9200000d` at the first `ldr` in `user_el0_databtest`).
+  Fixes landed: Linux-style `PTE_USER_RW` (AP[2:1]=`11`, bits 6+7); `.pagetables` + `.bss` in
+  the primary `PT_LOAD` (see `arch/aarch64/linker.ld`); fixed kernel stack at `__stack_top`
+  (`0x40260000`). Still needed: **TG0=4 KiB + TTBR0→L0→L1** — the TG0=64K + TTBR0→L1
+  shortcut lets EL0 execute but not data. A 4K L0 tree boots part-way but needs timer/IRQ
+  and post-MMU bring-up cleanup before it replaces the 64K path in `paging.c`.
+
 ## At a glance: where MyOS is not (yet) Linux (checked against the code 2026-10-07)
 
 The sections after this one have the detail. This list is what a Linux program is

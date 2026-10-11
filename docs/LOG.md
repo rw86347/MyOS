@@ -3383,3 +3383,34 @@ kernel C. WORKLIST B52 points to it.
   new step **15** is **Apple Silicon bare metal** (MacBook Air M1+ as MyOS-only, boot chain,
   Apple NVMe/input/display, aarch64 live userland). `CLAUDE.md` lists three CPU families.
   UTM/x86 on a Mac stays dev workflow, not step 15.
+- 2026-10-11: **ARM64 hello** (`ARCH=arm64`): `arch/aarch64/entry.S`, `early.c`, `linker.ld`;
+  `make ARCH=arm64 test` boots `qemu-system-aarch64 -M virt` and prints on PL011. Toolchain:
+  `brew install aarch64-elf-gcc`. Gotchas: AAPCS64 requires 16-byte-aligned SP before `bl`;
+  QEMU 11 PL011 needs CR UARTEN|TXE before TX; do not combine `-nographic` with a second
+  `-serial file:` (empty log). M1 bare metal still needs m1n1 hand-off (step 15).
+- 2026-10-11: **ARM64 step 14a (started):** PL011 `uart.c`, embedded `virt.dtb`, minimal `fdt.c`,
+  EL1 `vectors.S` + sync fault print, kernel @ 0x40100000. `make ARCH=arm64 test` checks FDT
+  magic and RAM line. Next: fix FDT /memory walk, PMM, MMU, then syscalls toward BusyBox.
+- 2026-10-11: **ARM64 step 14a (FDT + PMM):** Host `test-arm64-fdt` parses virt `/memory` reg;
+  `arm64_pmm_init` bitmap (2 GiB direct-map cap for RAM @ 0x40000000). Fixes: FDT 4-byte align
+  with `~(uintptr_t)3` (host mmap >4 GiB); unaligned-safe `be64`; `__kernel_end` in linker.ld.
+  `make ARCH=arm64 test` — FDT, RAM, PMM lines + hello. Next: EL1 MMU (map kernel, UART, RAM).
+- 2026-10-11: **ARM64 MMU (14a):** `paging.c` + `mmu.S` — TTBR0, TCR/MAIR, 1 GiB block identity
+  map (GiB0 MMIO, GiB1 RAM). `make ARCH=arm64 test` greps `MMU: on`. Gotcha: TG0 must be `01`
+  (4 KiB); L2-only tables failed — 1 GiB L1 blocks work. Next: GIC, timer, kheap, syscalls.
+- 2026-10-11: **ARM64 GIC + timer (14a):** GICv2 (virt DTB), CNTP_EL0 1 ms tick, `irq_el1` at
+  vector +0x280 (was `hang`). Test waits for 5 ticks, prints `Timer: 5 ms ticks`. Next: kheap,
+  EL0, syscalls toward BusyBox.
+- 2026-10-11: **ARM64 kheap + kprintf (14a):** `arm64_pmm_alloc/free`, slab `kmalloc` (identity
+  P2V), `kprintf`/`console_write` on UART. Test greps `kheap: kmalloc`. Next: EL0, syscalls, BusyBox.
+- 2026-10-11: **ARM64 EL0 + SVC (14a→14b):** user stub, sync_el0 @ 0x400, irq_el0, preserve
+  x0/x8 on entry; `EL0 svc: ping` test. Gotcha: timer IRQ @ 0x480 was `hang`; boot cannot run
+  after `eret` without EL1 resume. Next: real Linux syscalls + musl `write`.
+- 2026-10-11: **ARM64 Linux write (14b start):** `__NR_write` (64), `uaccess`, user image @
+  0x40200000 (`.user.text`/`.user.rodata`), RAM L1 PTE `AP` for EL0. Fixed sync_el0 to lay out
+  x0–x5 and x8 in `el0_regs` (ping only patched x0/x8). `make ARCH=arm64 test` greps
+  `user write: hi from EL0`. Next: musl static hello, ELF64 exec, initramfs + BusyBox.
+- 2026-10-11: **ARM64 musl hello (14b):** `fetch-alpine-arm64-musl.sh`, `user/arm64/musl-elf.ld`
+  (link @ 0x40400000), `elf64_load.c`, embedded `hello.elf`. Static binary built with Alpine
+  `libc.a`; `_start` uses `write` syscall until EL0 data faults for musl crt are fixed (gaps.md).
+  Test greps `musl hello from MyOS`. Next: EL0 data PTE, initramfs, BusyBox.

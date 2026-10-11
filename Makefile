@@ -26,6 +26,9 @@
 #   ARCH=i386       default: Pentium kernel + Alpine x86 userland
 #   ARCH=x86_64     64-bit kernel (long mode hello). make / make test-uefi
 #                   Userland fetch: python3 tools/fetch-live.py --arch x86_64
+#   ARCH=arm64      aarch64 hello on QEMU "virt" (roadmap 14; M1 bare metal is 15).
+#                   Needs: brew install aarch64-elf-gcc
+#                   make ARCH=arm64 run | make ARCH=arm64 test
 #   make run-uefi-text  boot that image in QEMU+OVMF, serial only
 #   make clean      delete build/
 #
@@ -46,18 +49,26 @@
 
 # One tree, two chips. ARCH picks the CPU dir, the toolchain, and Alpine.
 ARCH ?= i386
-ifeq ($(filter $(ARCH),i386 x86_64),)
-  $(error ARCH must be i386 or x86_64 (got $(ARCH)))
+ifeq ($(filter $(ARCH),i386 x86_64 arm64),)
+  $(error ARCH must be i386, x86_64, or arm64 (got $(ARCH)))
 endif
 ifeq ($(ARCH),i386)
   ALPINE_ARCH := x86
   UNAME_M     := i686
+else ifeq ($(ARCH),arm64)
+  ALPINE_ARCH := aarch64
+  UNAME_M     := aarch64
 else
   ALPINE_ARCH := x86_64
   UNAME_M     := x86_64
 endif
 
-ifeq ($(ARCH),x86_64)
+ifeq ($(ARCH),arm64)
+  CC      := aarch64-elf-gcc
+  OBJCOPY := aarch64-elf-objcopy
+  LD      := aarch64-elf-ld
+  NM      := aarch64-elf-nm
+else ifeq ($(ARCH),x86_64)
   CC      := x86_64-elf-gcc
   OBJCOPY := x86_64-elf-objcopy
   LD      := x86_64-elf-ld
@@ -90,6 +101,12 @@ ifeq ($(ARCH),x86_64)
     BUILD := build/x86_64/bench
   else
     BUILD := build/x86_64
+  endif
+else ifeq ($(ARCH),arm64)
+  ifeq ($(MODE),test)
+    BUILD := build/arm64/test
+  else
+    BUILD := build/arm64
   endif
 endif
 # make TRACE=1 <target>: the kernel prints every program started and every
@@ -258,6 +275,35 @@ ifeq ($(ARCH),x86_64)
   endif
 endif
 
+# arm64: hello kernel only (early.c + entry.S). QEMU virt first; Apple Silicon later.
+QEMU_ARM64 := qemu-system-aarch64
+ifeq ($(ARCH),arm64)
+  CFLAGS  := -std=c11 -ffreestanding -O2 -Wall -Wextra -g \
+             -mgeneral-regs-only -fno-tree-loop-distribute-patterns \
+             -fno-pic -fno-pie -DARCH_AARCH64 \
+             -Iarch/aarch64/include -Iinclude $(MODE_FLAGS)
+  LDFLAGS := -T arch/aarch64/linker.ld -nostdlib -static -ffreestanding -O2
+  LINKER_SCRIPT := arch/aarch64/linker.ld
+  C_SRCS  := arch/aarch64/boot.c arch/aarch64/uart.c arch/aarch64/fdt.c \
+             arch/aarch64/exceptions.c arch/aarch64/pmm.c arch/aarch64/paging.c \
+             arch/aarch64/gic.c arch/aarch64/timer.c arch/aarch64/kheap.c \
+             arch/aarch64/kprintf.c arch/aarch64/memcpy.c arch/aarch64/syscall.c \
+             arch/aarch64/uaccess.c arch/aarch64/elf64_load.c kernel/string.c
+  C_OBJS  := $(patsubst %.c,$(BUILD)/%.o,$(C_SRCS))
+  ALPINE_MUSL_ARM64 := build/ext/alpine-arm64-musl
+  ALPINE_MUSL_STAMP := $(ALPINE_MUSL_ARM64)/.fetched-musl
+  MUSL_ARM64_CFLAGS := -std=c11 -O2 -Wall -Wextra -nostdinc \
+                       -isystem $(ALPINE_MUSL_ARM64)/usr/include
+  MUSL_ARM64_LIB    := $(ALPINE_MUSL_ARM64)/usr/lib
+  OBJS    := $(BUILD)/arch/aarch64/entry.o $(BUILD)/arch/aarch64/vectors.o \
+             $(BUILD)/arch/aarch64/mmu.o $(BUILD)/arch/aarch64/user_stub.o \
+             $(BUILD)/arch/aarch64/user_write.o $(BUILD)/arch/aarch64/musl_hello.o \
+             $(BUILD)/arch/aarch64/dtb.o $(C_OBJS)
+  LIBS    := -lgcc
+  VIRT_DTB      := $(BUILD)/virt.dtb
+  VIRT_DTB_EMBED := $(BUILD)/virt-embed.dtb
+endif
+
 # Intel's Wi-Fi driver, iwlwifi (the MSI's AX201; docs/WIFI-PLAN.md W6):
 # Linux's own files, compiled against our Linux API headers as Linux
 # compiles them (GNU C, its config switches, compiler_types.h first), and
@@ -334,9 +380,11 @@ QEMU_FLAGS = -m 64M -cpu pentium3 \
 # fight over the port.
 HAIRPIN_PORT := 47007
 
-.PHONY: run-uefi test-uefi-shell diskattacks verify-disktests verify-tests attacks all dist utm utm-hd hd live-root live-extra live-theme live-hd utm-live run-live run-hd test-hd run run-full run-text debug test check-selftests test-shell bench run-bench usb clean fuzz fuzz-build fuzz-replay diskfuzz diskfuzz-replay verify-racetests uefi run-uefi-text test-uefi live-uefi test-live-uefi test-usb live-login-initrd test-uefi-login
+.PHONY: run-uefi test-uefi-shell diskattacks verify-disktests verify-tests attacks all dist utm utm-hd hd live-root live-extra live-theme live-hd utm-live run-live run-hd test-hd run run-full run-text debug test check-selftests test-shell bench run-bench usb clean fuzz fuzz-build fuzz-replay diskfuzz diskfuzz-replay verify-racetests uefi run-uefi-text test-uefi live-uefi test-live-uefi test-usb live-login-initrd test-uefi-login test-arm64 test-arm64-fdt
 
-ifeq ($(ARCH),x86_64)
+ifeq ($(ARCH),arm64)
+all: $(BUILD)/kernel.elf $(BUILD)/virt.dtb
+else ifeq ($(ARCH),x86_64)
 all: uefi
 else
 all: $(IMG) $(USB)
@@ -386,6 +434,10 @@ $(BUILD)/%.o: %.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
 
+$(BUILD)/%.o: %.S
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -c $< -o $@
+
 $(BUILD)/%.o: %.asm
 	@mkdir -p $(dir $@)
 	$(NASM) -f $(NASM_FMT) $< -o $@
@@ -401,6 +453,26 @@ $(BUILD)/gen/slots_conf.c: config/slots.conf tools/slots2c.awk
 
 $(BUILD)/gen/slots_conf.o: $(BUILD)/gen/slots_conf.c include/sched.h include/thread.h
 	$(CC) $(CFLAGS) -c $< -o $@
+
+ifeq ($(ARCH),arm64)
+$(ALPINE_MUSL_STAMP):
+	chmod +x tools/fetch-alpine-arm64-musl.sh
+	tools/fetch-alpine-arm64-musl.sh $(ALPINE_MUSL_ARM64)
+
+$(BUILD)/user/musl/hello.elf: user/musl/hello.c user/arm64/musl-elf.ld | $(ALPINE_MUSL_STAMP)
+	@mkdir -p $(dir $@)
+	$(CC) $(MUSL_ARM64_CFLAGS) -c user/musl/hello.c -o $(BUILD)/user/musl/hello.o
+	$(CC) -nostdlib -static -fno-pic -fno-pie -Wl,-z,noexecstack \
+	  -T user/arm64/musl-elf.ld \
+	  $(MUSL_ARM64_LIB)/crt1.o $(MUSL_ARM64_LIB)/crti.o $(BUILD)/user/musl/hello.o \
+	  -Wl,--start-group $(MUSL_ARM64_LIB)/libc.a -lgcc -Wl,--end-group \
+	  $(MUSL_ARM64_LIB)/crtn.o -o $@
+
+$(BUILD)/arch/aarch64/musl_hello.o: arch/aarch64/musl_hello.S $(BUILD)/user/musl/hello.elf
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -DMUSL_HELLO_ELF=\"$(abspath $(BUILD)/user/musl/hello.elf)\" \
+	  -c $< -o $@
+endif
 
 $(BUILD)/kernel.elf: $(OBJS) $(LINKER_SCRIPT)
 	$(CC) $(LDFLAGS) $(OBJS) -o $@ $(LIBS)
@@ -637,6 +709,64 @@ else
 	  || { echo "FAIL: 64-bit kernel did not say long mode"; exit 1; }
 	@echo "UEFI OK: OVMF started the 64-bit kernel"
 endif
+
+# QEMU "virt" ARM64 hello (roadmap step 14; Apple Silicon bare metal is step 15).
+# Do not mix -nographic with -serial file: — both claim uart0; the log stays empty.
+# DTB is embedded in the kernel (arch/aarch64/dtb.S); ELF -kernel has no DTB in RAM.
+QEMU_ARM64_BASE = -machine virt -cpu max -m 256M
+
+$(BUILD)/virt.dtb:
+	@mkdir -p $(BUILD)
+	$(QEMU_ARM64) -machine virt,dumpdtb=$@ -display none 2>/dev/null
+
+# dumpdtb sets totalsize to 1 MiB; embed 128 KiB and patch the header to match.
+$(BUILD)/virt-embed.dtb: $(BUILD)/virt.dtb
+	@dd if=$< of=$@ bs=1 count=131072 2>/dev/null
+	@python3 -c 'import sys,struct; d=bytearray(open(sys.argv[1],"rb").read()); \
+	  d[4:8]=struct.pack(">I",131072); open(sys.argv[1],"wb").write(d)' $@
+
+$(BUILD)/arch/aarch64/dtb.o: arch/aarch64/dtb.S $(BUILD)/virt-embed.dtb
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -DMYOS_DTB_PATH=\"$(abspath $(VIRT_DTB_EMBED))\" \
+	  -c $< -o $@
+
+run-arm64: $(BUILD)/kernel.elf
+	$(QEMU_ARM64) $(QEMU_ARM64_BASE) -nographic \
+	  -kernel $(BUILD)/kernel.elf -serial mon:stdio
+
+# Host-side unit test (FDT /memory on virt-embed.dtb).
+test-arm64-fdt: $(VIRT_DTB_EMBED)
+	@mkdir -p $(BUILD)
+	gcc -Wall -Wextra -Iarch/aarch64/include -o $(BUILD)/test-arm64-fdt \
+	  tools/test-arm64-fdt.c arch/aarch64/fdt.c
+	$(BUILD)/test-arm64-fdt $(abspath $(VIRT_DTB_EMBED))
+
+test-arm64: test-arm64-fdt $(BUILD)/kernel.elf
+	@rm -f $(BUILD)/arm64-serial.log
+	@(sleep 5; echo quit) \
+	  | $(QEMU_ARM64) $(QEMU_ARM64_BASE) -display none \
+	    -kernel $(BUILD)/kernel.elf \
+	    -serial file:$(BUILD)/arm64-serial.log -monitor stdio >/dev/null || true
+	@cat $(BUILD)/arm64-serial.log; echo
+	@grep -q "Hello world from MyOS" $(BUILD)/arm64-serial.log \
+	  || { echo "FAIL: ARM64 hello did not run on virt"; exit 1; }
+	@grep -q "FDT: magic ok" $(BUILD)/arm64-serial.log \
+	  || { echo "FAIL: device tree not parsed"; exit 1; }
+	@grep -q "RAM: 0x40000000" $(BUILD)/arm64-serial.log \
+	  || { echo "FAIL: RAM line missing"; exit 1; }
+	@grep -q "PMM:" $(BUILD)/arm64-serial.log \
+	  || { echo "FAIL: PMM line missing"; exit 1; }
+	@grep -q "MMU: on" $(BUILD)/arm64-serial.log \
+	  || { echo "FAIL: MMU line missing"; exit 1; }
+	@grep -q "Timer:" $(BUILD)/arm64-serial.log \
+	  || { echo "FAIL: timer line missing"; exit 1; }
+	@grep -q "kheap: kmalloc" $(BUILD)/arm64-serial.log \
+	  || { echo "FAIL: kheap line missing"; exit 1; }
+	@grep -q "EL0: data access ok" $(BUILD)/arm64-serial.log \
+	  || { echo "FAIL: EL0 data access"; exit 1; }
+	@grep -q "musl hello from MyOS" $(BUILD)/arm64-serial.log \
+	  || { echo "FAIL: musl static hello missing"; exit 1; }
+	@echo "ARM64 OK: FDT + PMM + MMU + timer + kheap + musl hello on QEMU virt"
 
 # user/sys/systest.c: the system call layer checked from a program's side,
 # with raw syscalls (no C library), for whichever CPU ARCH is. It goes only
@@ -1408,8 +1538,14 @@ endef
 # 1920x1200; zoom-to-fit scales that (or the text screen before it) to the window.
 DISPLAY_OPTS := -display cocoa,zoom-to-fit=on
 
+ifeq ($(ARCH),arm64)
+run: $(BUILD)/kernel.elf
+	$(QEMU_ARM64) $(QEMU_ARM64_BASE) -nographic \
+	  -kernel $(BUILD)/kernel.elf -serial mon:stdio
+else
 run: $(IMG) $(USB) $(DATA)
 	$(QEMU) $(QEMU_FLAGS) $(DISPLAY_OPTS) -serial stdio
+endif
 
 run-full: $(IMG) $(USB) $(DATA)
 	$(QEMU) $(QEMU_FLAGS) $(DISPLAY_OPTS),full-screen=on -serial stdio
@@ -1427,6 +1563,8 @@ debug: $(IMG) $(USB) $(DATA)
 # The kernel's serial output is the test result; each grep checks one thing.
 ifeq ($(ARCH),x86_64)
 test: test-uefi
+else ifeq ($(ARCH),arm64)
+test: test-arm64
 else
 test:
 	@$(MAKE) --no-print-directory MODE=test check-selftests

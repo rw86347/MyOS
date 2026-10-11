@@ -262,6 +262,9 @@ Mark a step `[x]` only when its "Done when" check works.
   static musl aarch64 binary runs one `write` syscall.
   - [ ] 14a: exceptions, EL1, GIC, timers, MMU (4 KiB pages or 4-level as needed), context
     switch, `kmalloc`, and a minimal UART driver for early print.
+    Started (2026-10-11): `arch/aarch64/` hello on QEMU virt (`make ARCH=arm64 test`);
+    PL011 @ 0x09000000, FDT/PMM/MMU identity map (`MMU: on` in serial log). Next: GIC, timer,
+    kheap, then 14b syscalls.
   - [ ] 14b: Linux syscall table for aarch64, `fork`/`execve`, paging and signals on ARM64.
   - [ ] 14c: **Raspberry Pi (original board)** as the first **bare-metal ARM** target — simpler
     firmware and published docs than Apple. Device tree for that board, SD boot, USB keyboard
