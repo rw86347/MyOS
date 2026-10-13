@@ -9,6 +9,7 @@
  */
 #include <cycles.h>
 #include <disk_demo.h>
+#include <kconfig_test.h>
 #include <keyboard.h>
 #include <kprintf.h>
 #include <mem_test.h>
@@ -71,6 +72,7 @@ void run_selftests(void)
     shim_net_selftest();    /* ...and sk_buffs, net_devices, NAPI */
     wifi_selftest();        /* the 802.11 core, on the simulated radio */
     user_selftest();        /* ring 3 programs, syscalls, ELF, FPU */
+    kconfig_selftest();     /* the kernel config: good and damaged copies */
     sched_selftest();       /* starts the 20 x 1 ms slot scheduler */
     selftest_summary();
 }

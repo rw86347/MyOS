@@ -808,7 +808,7 @@ static int32_t take(struct nlsock *s, int nonblock, int peek, struct nlbuf **out
         if (nonblock)
             return -EAGAIN;
         if (signal_pending())
-            return -EINTR;
+            return -ERESTARTSYS;
         wq_sleep(&s->wq);
     }
     struct nlbuf *b = s->head;

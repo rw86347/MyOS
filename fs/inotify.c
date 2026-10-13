@@ -201,6 +201,32 @@ void fsnotify_deleted(struct inode *i)
     irq_restore(flags);
 }
 
+uint32_t fsnotify_watches_on(const struct inode *i)
+{
+    uint32_t n = 0;
+    if (i->flags & I_WATCHED)
+        for (struct watch *w = watches; w; w = w->next)
+            n += w->inode == i;
+    return n;
+}
+
+#define IN_UNMOUNT 0x00002000
+void fsnotify_unmount(const struct mount *m)
+{
+    uint32_t flags = irq_save();
+    struct watch *w = watches;
+    while (w) {
+        struct watch *next = w->next;
+        if (w->inode->mnt == m) {
+            queue_event(w->in, w->wd, IN_UNMOUNT, 0, NULL, 0);
+            queue_event(w->in, w->wd, IN_IGNORED, 0, NULL, 0);
+            remove_watch(w);
+        }
+        w = next;
+    }
+    irq_restore(flags);
+}
+
 uint32_t fsnotify_cookie(void)
 {
     static uint32_t cookie;
@@ -216,7 +242,7 @@ static int32_t in_read(struct file *f, void *user_buf, uint32_t n)
         if (f->flags & O_NONBLOCK)
             return -EAGAIN;
         if (signal_pending())
-            return -EINTR;
+            return -ERESTARTSYS;
         wq_sleep(&in->wait);
     }
     if (n < in->head->size)
@@ -323,6 +349,8 @@ SYSCALL_DEF(sys_inotify_add_watch)
     err = get_path(path, a2);
     if (!err)
         err = mask & IN_DONT_FOLLOW ? vfs_lookup_nofollow(path, &i) : vfs_lookup(path, &i);
+    if (!err)
+        err = vfs_permission(i, MAY_READ);  /* Linux: you watch what you may read */
     if (err)
         return err;
     if ((mask & IN_ONLYDIR) && !S_ISDIR(i->mode))

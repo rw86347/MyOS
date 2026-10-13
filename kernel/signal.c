@@ -30,12 +30,82 @@
 #include <uaccess.h>
 #include <user.h>
 
-/* Signals whose default action is to do nothing. */
+/* Signals whose default action is to do nothing (SIGCONT's real work —
+   continuing — happens when it is sent, whatever its action). */
 static int default_ignored(int sig)
 {
-    return sig == SIGCHLD || sig == SIGCONT || sig == SIGURG || sig == SIGWINCH ||
-           sig == SIGTSTP || sig == SIGTTIN || sig == SIGTTOU || sig == SIGSTOP;
-    /* (Stop signals are ignored until job control can stop processes.) */
+    return sig == SIGCHLD || sig == SIGCONT || sig == SIGURG || sig == SIGWINCH;
+}
+
+/* The stop signals: their default action stops the whole process. */
+static int stop_sig(int sig)
+{
+    return sig == SIGSTOP || sig == SIGTSTP || sig == SIGTTIN || sig == SIGTTOU;
+}
+
+/* --- job control: stopping and continuing ------------------------------------ */
+
+/* The parent hears of a stop or a continue: SIGCHLD (unless it asked not
+   to, SA_NOCLDSTOP), and a wait4 with WUNTRACED / WCONTINUED wakes. */
+static void tell_parent(struct process *p)
+{
+    struct process *pp = p->parent;
+    if (!pp || pp->state != PROC_ALIVE)
+        return;
+    if (!(pp->sig_action[SIGCHLD - 1].flags & SA_NOCLDSTOP))
+        signal_send(pp, SIGCHLD);
+    wq_wake_all(&pp->child_wait);
+}
+
+static void resume(struct process *p, int continued)
+{
+    if (!p->stopped)
+        return;
+    p->stopped = 0;
+    p->stop_report = 0;
+    if (continued) {                    /* (SIGKILL just wakes it, to die) */
+        p->cont_report = 1;
+        tell_parent(p);
+    }
+    wq_wake_all(&p->stop_wait);
+}
+
+/* Sending a signal does part of job control at once, as on Linux: SIGCONT
+   continues a stopped process even if it ignores SIGCONT, and drops any
+   stop waiting to be taken; a stop drops a waiting SIGCONT. */
+static void job_control_send(struct process *p, int sig)
+{
+    uint64_t drop = 0;
+    if (sig == SIGCONT || sig == SIGKILL)
+        resume(p, sig == SIGCONT);
+    if (sig == SIGCONT)
+        drop = SIGBIT(SIGSTOP) | SIGBIT(SIGTSTP) | SIGBIT(SIGTTIN) | SIGBIT(SIGTTOU);
+    else if (stop_sig(sig))
+        drop = SIGBIT(SIGCONT);
+    if (drop) {
+        p->sig_pending &= ~drop;
+        for (struct thread *t = p->threads; t; t = t->proc_next)
+            t->sig_pending &= ~drop;
+    }
+}
+
+/* Taken with the default action: stop, until SIGCONT (or SIGKILL). The
+   other threads stop when they next head back to user mode. */
+static void do_stop(struct thread *t, struct process *p, int sig)
+{
+    p->stopped = 1;
+    p->stop_report = (uint8_t)sig;
+    p->cont_report = 0;
+    tell_parent(p);
+    for (struct thread *o = p->threads; o; o = o->proc_next)
+        if (o != t)
+            o->sig_check = 1;
+}
+
+static void sleep_while_stopped(struct thread *t, struct process *p)
+{
+    while (p->stopped && !((t->sig_pending | p->sig_pending) & SIGBIT(SIGKILL)))
+        wq_sleep(&p->stop_wait);
 }
 
 /* --- sending ---------------------------------------------------------------- */
@@ -51,6 +121,8 @@ int signal_send(struct process *p, int sig)
 {
     if (sig < 0 || sig > NSIG)
         return -EINVAL;
+    if (sig)
+        job_control_send(p, sig);
     if (sig == 0 || ignored(p, sig))
         return 0;                       /* sig 0: "does it exist?" */
 
@@ -76,6 +148,8 @@ int signal_send_thread(struct thread *t, int sig)
 {
     if (sig < 0 || sig > NSIG)
         return -EINVAL;
+    if (sig)
+        job_control_send(t->proc, sig);  /* stops are the whole process's */
     if (sig == 0 || ignored(t->proc, sig))
         return 0;
     uint32_t flags = irq_save();
@@ -85,6 +159,13 @@ int signal_send_thread(struct thread *t, int sig)
         thread_wake(t);
     irq_restore(flags);
     return 0;
+}
+
+int signal_ignored_or_blocked(int sig)
+{
+    struct thread *t = thread_current();
+    struct process *p = t->proc;
+    return !p || (t->sig_blocked & SIGBIT(sig)) || p->sig_action[sig - 1].handler == SIG_IGN;
 }
 
 int signal_pending(void)
@@ -137,12 +218,42 @@ static void take(struct thread *t, int sig, struct sig_origin *o)
         ptimer_siginfo(p, t, sig, own, o);
 }
 
+void signal_restart_note(uint32_t nr)
+{
+    struct thread *t = thread_current();
+    t->restart_nr = nr + 1;
+    t->sig_check = 1;                   /* signal_check decides, even if the
+                                           signal went to a sibling meanwhile */
+}
+
+/*
+ * A syscall cut short by a signal (-ERESTARTSYS), as Linux treats it:
+ *   - a handler runs that has SA_RESTART: the call runs again after it;
+ *   - a handler runs without: the call says EINTR;
+ *   - no handler runs (the signal was ignored, or blocked again): the call
+ *     runs again, and the program never notices.
+ * Calls that are never restarted (poll, nanosleep...) return -EINTR
+ * themselves, as on Linux.
+ */
+static void restart_or_eintr(struct thread *t, struct regs *r, const struct k_sigaction *a)
+{
+    uint32_t nr = t->restart_nr;
+    if (!nr)
+        return;
+    t->restart_nr = 0;
+    if (!a || (a->flags & SA_RESTART))
+        arch_syscall_restart(r, nr - 1);
+    else
+        arch_syscall_result(r, -EINTR);
+}
+
 void signal_check(struct regs *r)
 {
     struct thread *t = thread_current();
     struct process *p = t->proc;
     if (!p || !(r->cs & 3))
         return;
+    sleep_while_stopped(t, p);          /* a sibling stopped the process */
     for (;;) {
         uint64_t pending = t->sig_pending | p->sig_pending;
         t->sig_check = pending != 0;    /* blocked ones: look again later */
@@ -154,6 +265,7 @@ void signal_check(struct regs *r)
                 t->sig_blocked = t->sig_saved;
                 t->sig_restore = 0;
             }
+            restart_or_eintr(t, r, NULL);   /* no handler ran: again */
             return;
         }
         int sig = __builtin_ctzll(ready) + 1;   /* lowest number first */
@@ -162,12 +274,22 @@ void signal_check(struct regs *r)
 
         struct k_sigaction *a = &p->sig_action[sig - 1];
         if (sig == SIGKILL || a->handler == SIG_DFL) {
+            if (stop_sig(sig)) {
+                /* A group no shell can continue isn't stopped by the
+                   terminal's signals (SIGSTOP always stops). */
+                if (sig == SIGSTOP || !proc_pgrp_orphaned(p->pgid)) {
+                    do_stop(t, p, sig);
+                    sleep_while_stopped(t, p);
+                }
+                continue;
+            }
             if (sig != SIGKILL && default_ignored(sig))
                 continue;
             proc_exit(W_SIGNALED(sig));         /* the default: the end */
         }
         if (a->handler == SIG_IGN)
             continue;
+        restart_or_eintr(t, r, a);      /* before the frame saves the registers */
         if (setup_frame(sig, &o, a, r) < 0)
             proc_exit(W_SIGNALED(SIGSEGV));     /* no usable stack */
         return;                                 /* one handler at a time */
@@ -356,6 +478,25 @@ int32_t sys_rt_sigprocmask_impl(int how, uintptr_t set, uintptr_t oset, uint32_t
     return 0;
 }
 
+/* May the calling program signal p? Linux's rule (kill_ok_by_cred): root
+   may signal anyone; anyone else, a process whose real or saved user is
+   the caller's real or effective user — your own programs, including a
+   setuid one you started, but nobody else's. SIGCONT may also go to any
+   process in the caller's session, so a shell can continue a job that
+   changed user (su). Signals the kernel sends itself (Ctrl-C, SIGCHLD,
+   SIGPIPE) don't come through here. Signal 0 is checked too: "may I?" is
+   what `kill -0` asks. */
+int signal_allowed(const struct process *p, int sig)
+{
+    const struct process *me = proc_current();
+    const struct cred *c = &me->cred, *t = &p->cred;
+    if (c->euid == 0 || p == me)
+        return 1;
+    if (c->euid == t->uid || c->euid == t->suid || c->uid == t->uid || c->uid == t->suid)
+        return 1;
+    return sig == SIGCONT && p->sid == me->sid;
+}
+
 int32_t sys_kill_impl(int pid, int sig)
 {
     struct process *me = proc_current();
@@ -367,21 +508,30 @@ int32_t sys_kill_impl(int pid, int sig)
             struct thread *t = thread_by_tid(pid);
             p = t ? t->proc : NULL;
         }
-        return p ? signal_send(p, sig) : -ESRCH;
+        if (!p)
+            return -ESRCH;
+        return signal_allowed(p, sig) ? signal_send(p, sig) : -EPERM;
     }
     int pgid = pid == 0 ? me->pgid : -pid;
     if (pid == -1)
         pgid = 0;                       /* everyone (but init) */
-    int found = 0;
+    int found = 0, sent = 0;
     for (int i = 0; i < PROC_MAX; i++) {
         struct process *p = proc_at(i);
         if (p->state != PROC_ALIVE || (pgid && p->pgid != pgid) ||
             (pid == -1 && (p->pid == 1 || p == me)))
             continue;
-        signal_send(p, sig);
         found = 1;
+        if (signal_allowed(p, sig)) {
+            signal_send(p, sig);
+            sent = 1;
+        }
     }
-    return found ? 0 : -ESRCH;
+    /* Linux's answers: a group with nobody we may signal is EPERM; for
+       "everyone" (-1) it is ESRCH, as if those processes weren't there. */
+    if (sent)
+        return 0;
+    return found && pid != -1 ? -EPERM : -ESRCH;
 }
 
 void signal_send_group(int pgid, int sig)

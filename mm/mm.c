@@ -277,6 +277,11 @@ int mm_fault(user_addr_t va, uint32_t err)
     struct vma *v = find(current_mm, va);
     if (!v)
         return -1;                      /* nothing is allowed here: SIGSEGV */
+    /* PROT_NONE (a guard page, a reservation): no access at all, whether
+       its pages are there or not. mprotect leaves present pages in place
+       but takes their user bit away, so a touch lands here too. */
+    if (!(v->flags & VM_READ))
+        return -1;
 
     int write = err & 2;
     if (err & 1) {                      /* the page exists: a permission fault */
@@ -313,7 +318,9 @@ int mm_fault(user_addr_t va, uint32_t err)
        zero-filled, or for a mapped file, a copy of that part of the file
        (straight from the initramfs, or from its RAM pages). Pages never
        touched cost nothing. */
-    uint32_t frame = pmm_alloc();
+    /* A private page of this program: the high zone's when there is one
+       (pmm.h). Only the CPU touches it, never a device. */
+    phys_addr_t frame = pmm_alloc_user();
     if (!frame)
         return -1;                      /* out of memory: the program dies */
     user_addr_t page = PAGE_DOWN(va), n = 0;
@@ -377,6 +384,10 @@ user_addr_t mm_brk(user_addr_t new_brk)
 /* --- mmap ----------------------------------------------------------------- */
 
 #define PROT_WRITE    2
+/* Any of PROT_READ, PROT_WRITE, PROT_EXEC gives read access: an x86 page
+   can't be writable or executable without being readable (Linux's x86
+   rule too). Only PROT_NONE takes it away. */
+#define PROT_ANY      7
 #define MAP_SHARED    0x01
 #define MAP_FIXED     0x10
 #define MAP_ANONYMOUS 0x20
@@ -450,7 +461,7 @@ intptr_t mm_mmap(user_addr_t addr, user_addr_t len, uint32_t prot, uint32_t flag
     if (len > USER_ADDR_END)
         return -ENOMEM;                 /* (and PAGE_UP can't wrap) */
     len = PAGE_UP(len);
-    uint32_t vflags = VM_READ | (prot & PROT_WRITE ? VM_WRITE : 0) | shared;
+    uint32_t vflags = (prot & PROT_ANY ? VM_READ : 0) | (prot & PROT_WRITE ? VM_WRITE : 0) | shared;
     struct inode *anon = NULL;
     if ((flags & (MAP_SHARED | MAP_ANONYMOUS)) == (MAP_SHARED | MAP_ANONYMOUS)) {
         /* Shared anonymous memory (shared with children after fork): an
@@ -533,7 +544,7 @@ intptr_t mm_mmap_device(user_addr_t addr, user_addr_t len, uint32_t prot, uint32
     if (len == 0)
         return -EINVAL;
     struct vma n = { .start = 0, .end = len, .file = f->inode, .file_off = off,
-                     .flags = VM_READ | (prot & PROT_WRITE ? VM_WRITE : 0) |
+                     .flags = (prot & PROT_ANY ? VM_READ : 0) | (prot & PROT_WRITE ? VM_WRITE : 0) |
                               ((f->flags & O_ACCMODE) == O_RDWR ? VM_MAYWRITE : 0) };
     int err = f->ops->mmap(f, &n);
     if (err < 0)
@@ -686,7 +697,7 @@ intptr_t mm_mremap(user_addr_t old, user_addr_t old_len, user_addr_t new_len,
         uint32_t fl = vmm_get_flags(src);
         if (!(fl & PTE_PRESENT))
             continue;
-        uint32_t pa = vmm_unmap(src);
+        phys_addr_t pa = vmm_unmap(src);       /* may be a high page */
         if (!pa)
             continue;
         if (vmm_map(dest + off, pa, fl) < 0) {
@@ -740,19 +751,24 @@ int32_t mm_mprotect(user_addr_t addr, user_addr_t len, uint32_t prot)
     }
     if (split_at(mm, addr) < 0 || split_at(mm, end) < 0)
         return -ENOMEM;
-    uint32_t vflags = (prot & 1 ? VM_READ : 0) | (prot & PROT_WRITE ? VM_WRITE : 0) |
+    uint32_t vflags = (prot & PROT_ANY ? VM_READ : 0) | (prot & PROT_WRITE ? VM_WRITE : 0) |
                       (prot & 4 ? VM_EXEC : 0);
     for (int i = 0; i < mm->nareas; i++)
         if (mm->area[i].start >= addr && mm->area[i].end <= end)
             mm->area[i].flags = vflags | (mm->area[i].flags &
                                           (VM_PFNMAP | VM_WC | VM_RAM | VM_MAYWRITE | VM_SHARED));
-    /* Pages that exist get the new write permission (a copy-on-write page
-       stays read-only: its fault handler makes it writable). */
+    /* Pages that exist get the new permission (a copy-on-write page stays
+       read-only: its fault handler makes it writable). PROT_NONE keeps a
+       page present, its data and owners intact for fork and exit, which
+       go by the present bit; only the user bit goes, so the program's
+       next touch faults. (The kernel itself could still read it: no SMAP.) */
     for (user_addr_t a = addr; a < end; a += PAGE_SIZE) {
         uint32_t f = vmm_get_flags(a);
         if (!(f & PTE_PRESENT))
             continue;
-        f &= ~PTE_WRITABLE;
+        f &= ~(PTE_WRITABLE | PTE_USER);
+        if (vflags & VM_READ)
+            f |= PTE_USER;
         if ((vflags & VM_WRITE) && !(f & PTE_COW))
             f |= PTE_WRITABLE;
         vmm_protect(a, f);

@@ -53,6 +53,10 @@ vsyscall_code:
     push ebp
     mov ebp, esp
     sysenter
+    ; Never reached in order: sysexit returns to .ret. A syscall that a
+    ; signal cut short and that runs again (SA_RESTART) comes back two
+    ; bytes early, here, and repeats through int 0x80 (as Linux's vDSO).
+    int 0x80
 .ret:
     pop ebp
     pop edx

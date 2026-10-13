@@ -94,6 +94,17 @@ static void save_context(struct sigcontext *sc, const struct regs *r, uint64_t m
     sc->cr2 = 0;
 }
 
+void arch_syscall_restart(struct regs *r, uint32_t nr)
+{
+    r->eax = nr;
+    r->eip -= 2;                        /* int 0x80 is CD 80 */
+}
+
+void arch_syscall_result(struct regs *r, long value)
+{
+    r->eax = (uint32_t)value;
+}
+
 int arch_signal_frame(int sig, const struct sig_origin *o, const struct k_sigaction *a,
                       uint64_t mask, struct regs *r)
 {

@@ -60,7 +60,12 @@ def main() -> None:
                     help="take the 0x83 partition from --root-file's MBR")
     ap.add_argument("--config-mb", type=int, default=0,
                     help="add an empty myos-config partition of this size (the kernel config)")
+    ap.add_argument("--config-file", type=Path,
+                    help="what the myos-config partition holds (`kconfig.py partition`); "
+                         "implies --config-mb 1")
     args = ap.parse_args()
+    if args.config_file and not args.config_mb:
+        args.config_mb = 1
     files = []
     for item in args.file:
         if "=" not in item:
@@ -205,6 +210,12 @@ def main() -> None:
                         sys.exit("root image ended early")
                     f.write(chunk)
                     left -= len(chunk)
+        if args.config_file:
+            data = args.config_file.read_bytes()
+            if len(data) > config_sectors * SECTOR:
+                sys.exit("--config-file is bigger than the myos-config partition")
+            f.seek(config_start * SECTOR)
+            f.write(data)
         f.seek((disk_sectors - 33) * SECTOR)
         f.write(entries)
         f.write(header(disk_sectors - 1, 1, disk_sectors - 33))

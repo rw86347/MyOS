@@ -183,7 +183,7 @@ static int wait_rx(struct sock *s, int nonblock)
         if (nonblock)
             return -EAGAIN;
         if (signal_pending())
-            return -EINTR;
+            return -ERESTARTSYS;
         net_sleep(50);
     }
 }

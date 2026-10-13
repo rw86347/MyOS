@@ -294,8 +294,11 @@ void interrupt_dispatch(struct regs *r)
         /* Linux i386 convention: number in EAX, arguments in EBX, ECX, EDX,
            ESI, EDI, EBP; the result goes back in EAX. */
         thread_current()->uregs = r;    /* fork/execve need the registers */
-        r->eax = syscall_dispatch(r->eax, r->ebx, r->ecx, r->edx,
+        uint32_t nr = r->eax;
+        r->eax = syscall_dispatch(nr, r->ebx, r->ecx, r->edx,
                                   r->esi, r->edi, r->ebp);
+        if (r->eax == (uint32_t)-ERESTARTSYS)
+            signal_restart_note(nr);
         sched_preempt_check();      /* the slot may have ended meanwhile */
         SIGNAL_CHECK(r);            /* back to user mode: deliver signals */
         return;

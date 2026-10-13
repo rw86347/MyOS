@@ -10,6 +10,10 @@
 #define EPERM     1     /* not allowed */
 #define ESRCH     3     /* no such process */
 #define EINTR     4     /* interrupted by a signal */
+/* Kernel-internal, never seen by a program: a sleeping call a signal cut
+   short that may run again (signal.c: with SA_RESTART, or when no handler
+   runs; else it becomes EINTR). Linux's number. */
+#define ERESTARTSYS 512
 #define EIO       5     /* the disk said no (read/write error) */
 #define ENXIO     6     /* no such device (a node with no driver) */
 #define ENOEXEC   8     /* not an executable we can run */

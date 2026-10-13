@@ -789,6 +789,8 @@ SYSCALL(sys_chdir)
         return err;
     if (!S_ISDIR(i->mode))
         return -ENOTDIR;
+    if (vfs_permission(i, MAY_EXEC))
+        return -EACCES;                 /* you may not go into it */
     proc_set_cwd(proc_current(), i);
     return 0;
 }
@@ -811,6 +813,8 @@ SYSCALL(sys_chroot)
         return err;
     if (!S_ISDIR(i->mode))
         return -ENOTDIR;
+    if (vfs_permission(i, MAY_EXEC))
+        return -EACCES;
     vfs_get(i);
     if (p->root)
         vfs_put(p->root);
@@ -825,6 +829,8 @@ SYSCALL(sys_fchdir)
         return -EBADF;
     if (!S_ISDIR(f->inode->mode))
         return -ENOTDIR;
+    if (vfs_permission(f->inode, MAY_EXEC))
+        return -EACCES;
     proc_set_cwd(proc_current(), f->inode);
     return 0;
 }
@@ -964,31 +970,46 @@ SYSCALL(sys_readlinkat)
     return err ? err : do_readlink(dir, a2, a3, a4);
 }
 
-/* int access(const char *path, int mode) / faccessat(dirfd, path, mode, flags).
-   We're all root: everything exists-and-allowed, except executing a file
-   with no x bit. */
-#define X_OK 1
+/* int access(const char *path, int mode) / faccessat(dirfd, path, mode) /
+   faccessat2(dirfd, path, mode, flags). mode: F_OK (0, "does it exist?")
+   or any of R_OK 4, W_OK 2, X_OK 1 — the same bits as MAY_READ & co. The
+   check is made as the REAL user and group (a setuid program asking for
+   its caller), the whole path included, unless AT_EACCESS says effective. */
+#define AT_EACCESS          0x200
+#define AT_SYMLINK_NOFOLLOW 0x100
 
-static int32_t do_access(struct inode *dir, uintptr_t user_path, uint32_t mode)
+static int32_t do_access(struct inode *dir, uintptr_t user_path, uint32_t mode, uint32_t flags)
 {
     char path[PATH_MAX];
     struct inode *i;
+    if (mode & ~7u)
+        return -EINVAL;
+    if (flags & ~(AT_EACCESS | AT_SYMLINK_NOFOLLOW))
+        return -EINVAL;
     int err = get_path(path, user_path);
-    if (!err)
-        err = vfs_lookup_at(dir, path, 1, &i);
     if (err)
         return err;
-    if ((mode & X_OK) && !S_ISDIR(i->mode) && !(i->mode & 0111))
-        return -EACCES;
-    return 0;
+    struct thread *t = thread_current();
+    t->perm_real = !(flags & AT_EACCESS);
+    err = vfs_lookup_at(dir, path, !(flags & AT_SYMLINK_NOFOLLOW), &i);
+    if (!err && mode)
+        err = vfs_permission(i, (int)mode);
+    t->perm_real = 0;
+    return err;
 }
 
-SYSCALL(sys_access) { return do_access(NULL, a1, a2); }
+SYSCALL(sys_access) { return do_access(NULL, a1, a2, 0); }
 SYSCALL(sys_faccessat)
 {
     struct inode *dir;
     int err = dir_of(a1, &dir);
-    return err ? err : do_access(dir, a2, a3);
+    return err ? err : do_access(dir, a2, a3, 0);
+}
+SYSCALL(sys_faccessat2)
+{
+    struct inode *dir;
+    int err = dir_of(a1, &dir);
+    return err ? err : do_access(dir, a2, a3, a4);
 }
 
 /* int madvise(void *addr, size_t len, int advice) (mm.c). */
@@ -1060,6 +1081,10 @@ SYSCALL(sys_fsync)
 #define CMD_CAD_OFF     0u
 SYSCALL(sys_reboot)
 {
+    /* Root only (Linux: CAP_SYS_BOOT), checked before the magic numbers as
+       Linux does. The desktop's Turn off goes through doas. */
+    if (proc_current()->cred.euid != 0)
+        return -EPERM;
     if (a1 != REBOOT_MAGIC1 ||
         (a2 != 672274793 && a2 != 85072278 && a2 != 369367448 && a2 != 537993216))
         return -EINVAL;
@@ -1268,7 +1293,9 @@ SYSCALL(sys_rt_sigtimedwait64) { return sys_rt_sigtimedwait_impl(a1, a2, a3, a4,
 SYSCALL(sys_tkill)
 {
     struct thread *t = thread_by_tid(a1);
-    return t ? signal_send_thread(t, a2) : -ESRCH;
+    if (!t)
+        return -ESRCH;
+    return signal_allowed(t->proc, a2) ? signal_send_thread(t, a2) : -EPERM;
 }
 
 SYSCALL(sys_tgkill)
@@ -1276,7 +1303,7 @@ SYSCALL(sys_tgkill)
     struct thread *t = thread_by_tid(a2);
     if (!t || t->proc->pid != (int)a1)
         return -ESRCH;
-    return signal_send_thread(t, a3);
+    return signal_allowed(t->proc, a3) ? signal_send_thread(t, a3) : -EPERM;
 }
 
 /* rt_sigqueueinfo(tgid, sig, info) / rt_tgsigqueueinfo(tgid, tid, sig, info):
@@ -1312,7 +1339,7 @@ SYSCALL(sys_rt_tgsigqueueinfo)
     struct thread *t = thread_by_tid(a2);
     if (!t || t->proc->pid != (int)a1)
         return -ESRCH;
-    return signal_send_thread(t, a3);
+    return signal_allowed(t->proc, a3) ? signal_send_thread(t, a3) : -EPERM;
 }
 
 /* gettid(): this thread's id (= getpid() in a process's first thread). */
@@ -1831,7 +1858,7 @@ static const syscall_fn syscall_table[] U = {     /* (x86_64: unused, dropped) *
     [NR_faccessat]  = sys_faccessat,
     [NR_dup3]       = sys_dup3,
     [NR_pipe2]      = sys_pipe2,
-    [NR_faccessat2] = sys_faccessat,
+    [NR_faccessat2] = sys_faccessat2,
     [NR_lseek]      = sys_lseek,
     [NR_getpid]     = sys_getpid,
     [NR_brk]        = sys_brk,
@@ -2151,7 +2178,7 @@ static const syscall_fn syscall_table64[] = {
     [NR64_memfd_create] = sys_memfd_create,
     [NR64_membarrier]   = sys_membarrier,
     [NR64_statx]        = sys_statx,
-    [NR64_faccessat2]   = sys_faccessat,
+    [NR64_faccessat2]   = sys_faccessat2,
 };
 #define TABLE syscall_table64
 #else

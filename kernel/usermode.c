@@ -211,7 +211,9 @@ int program_load(const char *path, const char *const argv[],
         return err;
     if (S_ISDIR(ino->mode))
         return -EISDIR;
-    if (!S_ISREG(ino->mode) || (ino->ops && !ino->fs) || !(ino->mode & 0111))
+    /* A regular file the caller may run (fs/perm.c: its owner/group/other
+       x bit; root, any x bit). Reading it isn't needed: we map it. */
+    if (!S_ISREG(ino->mode) || (ino->ops && !ino->fs) || vfs_permission(ino, MAY_EXEC))
         return -EACCES;
 
     /* A script? Then run "interpreter [arg] script args..." instead. */
@@ -233,7 +235,8 @@ int program_load(const char *path, const char *const argv[],
         s->argv[n] = NULL;
         struct inode *interp = NULL;
         err = vfs_lookup(s->interp, &interp);
-        if (!err && (!S_ISREG(interp->mode) || (interp->ops && !interp->fs)))
+        if (!err && (!S_ISREG(interp->mode) || (interp->ops && !interp->fs) ||
+                     vfs_permission(interp, MAY_EXEC)))
             err = -EACCES;
         if (!err)                       /* (one level: no #! interpreters) */
             err = load_elf(interp, s->argv, envp, entry, sp, cred);
@@ -278,7 +281,7 @@ static int load_elf(struct inode *ino, const char *const argv[],
         err = vfs_lookup(info.interp, &ld);
         if (err)
             return err == -ENOENT ? -ENOENT : err;
-        if (!S_ISREG(ld->mode) || (ld->ops && !ld->fs))
+        if (!S_ISREG(ld->mode) || (ld->ops && !ld->fs) || vfs_permission(ld, MAY_EXEC))
             return -EACCES;
         struct elf_info linfo;
         err = elf_map(ld, ELF_BASE_ANY, &linfo, interp, sizeof interp);

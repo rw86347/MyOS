@@ -34,7 +34,13 @@ enum { S_read = 0, S_write = 1, S_open = 2, S_close = 3, S_lseek = 8, S_mmap = 9
        S_getsockname = 51, S_connect = 42, S_listen = 50, S_accept4 = 288, S_poll = 7,
        S_setuid = 105, S_sigaltstack = 131, S_socketpair = 53, S_sendmsg = 46,
        S_recvmsg = 47, S_getsockopt = 55, S_gettid = 186, S_rt_sigqueueinfo = 129,
-       S_rt_tgsigqueueinfo = 297, S_epoll_create1 = 291, S_epoll_ctl = 233 };
+       S_rt_tgsigqueueinfo = 297, S_epoll_create1 = 291, S_epoll_ctl = 233,
+       S_reboot = 169, S_sethostname = 170, S_tgkill = 234,
+       S_ppoll = 271, S_mprotect = 10,
+       S_access = 21, S_chmod = 90, S_chown = 92, S_truncate = 76, S_rename = 82,
+       S_setresuid = 117, S_utimensat = 280, S_faccessat2 = 439,
+       S_setgroups = 116, S_setgid = 106,
+       S_mount = 165, S_umount2 = 166, S_nanosleep = 35 };
 enum { F_GETLK = 5, F_SETLK = 6 };
 #else
 #define X64 0
@@ -57,7 +63,13 @@ enum { S_read = 3, S_write = 4, S_open = 5, S_close = 6, S_lseek = 19, S_mmap = 
        S_listen = 363, S_accept4 = 364, S_poll = 168, S_setuid = 213 /* setuid32 */,
        S_sigaltstack = 186, S_socketpair = 360, S_sendmsg = 370, S_recvmsg = 372,
        S_getsockopt = 365, S_gettid = 224, S_rt_sigqueueinfo = 178,
-       S_rt_tgsigqueueinfo = 335, S_epoll_create1 = 329, S_epoll_ctl = 255 };
+       S_rt_tgsigqueueinfo = 335, S_epoll_create1 = 329, S_epoll_ctl = 255,
+       S_reboot = 88, S_sethostname = 74, S_tgkill = 270,
+       S_ppoll = 309 /* timespec32 */, S_mprotect = 125,
+       S_access = 33, S_chmod = 15, S_chown = 212 /* chown32 */, S_truncate = 92,
+       S_rename = 38, S_setresuid = 208 /* setresuid32 */, S_utimensat = 320,
+       S_faccessat2 = 439, S_setgroups = 206 /* setgroups32 */,
+       S_setgid = 214 /* setgid32 */, S_mount = 21, S_umount2 = 52, S_nanosleep = 162 };
 enum { F_GETLK = 12, F_SETLK = 13 };    /* the flock64 ones (musl) */
 #endif
 
@@ -166,6 +178,8 @@ static int wait_child(long pid)
 #define IPC_RMID 0
 #define IPC_STAT 2
 #define IPC_64 0x100
+#define EPERM 1
+#define ESRCH 3
 #define EAGAIN 11
 #define EINTR 4
 #define EACCES 13
@@ -1045,6 +1059,314 @@ static void t_tcp_listen(void)
     check(wait_child(pid) == 0, "tcp: a user may not bind port 22", 0);
 }
 
+/* --- who may signal whom; reboot and the host name are root's ------------ */
+
+#define SIGKILL 9
+#define SIGTERM 15
+static void t_perm(void)
+{
+    long root = SC0(S_fork);
+    if (root == 0)                      /* root's process, waiting to be signalled */
+        for (;;)
+            SC0(S_pause);
+    long pid = SC0(S_fork);
+    if (pid == 0) {
+        SC1(S_setuid, 1000);            /* real, effective and saved: 1000 */
+        int ok = SC2(S_kill, root, 0) == -EPERM &&          /* "may I?": no */
+                 SC2(S_kill, root, SIGTERM) == -EPERM &&
+                 SC3(S_tgkill, root, root, SIGTERM) == -EPERM &&
+                 SC2(S_kill, -1, 0) == -ESRCH &&            /* nobody we may signal */
+                 SC2(S_kill, SC0(S_getpid), 0) == 0 &&      /* ourselves: yes */
+                 /* Ctrl-Alt-Del off: harmless even if the check were missing */
+                 SC4(S_reboot, 0xfee1dead, 672274793, 0, 0) == -EPERM &&
+                 SC2(S_sethostname, "x", 1) == -EPERM;
+        child_exit(ok ? 0 : 1);
+    }
+    check(wait_child(pid) == 0, "a user may not signal root's process, reboot, or name the host", 0);
+    check(SC2(S_kill, root, SIGKILL) == 0, "root may signal anyone", 0);
+    wait_child(root);
+}
+
+/* --- file permissions: Linux's rules, as user 1000 ------------------------- */
+
+#define EEXIST 17
+#define AT_FDCWD (-100)
+#define AT_EACCESS 0x200
+#define R_OK 4
+#define W_OK 2
+#define X_OK 1
+
+static void mkfile(const char *path, int mode, int uid)
+{
+    long fd = SC3(S_open, path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    SC3(S_write, fd, "data", 4);
+    SC1(S_close, fd);
+    SC2(S_chmod, path, mode);
+    SC3(S_chown, path, uid, uid);
+}
+
+/* Become user 1000 the way login does: no supplementary groups left
+   from root (they would still count), group 1000, then the user. */
+static void become_user(void)
+{
+    SC2(S_setgroups, 0, 0);
+    SC1(S_setgid, 1000);
+    SC1(S_setuid, 1000);
+}
+
+/* One rule per bit of `ok`, so a failure says which (check's detail). */
+static long as_user(void)
+{
+    long bad = 0, bit = 1, fd;
+#define RULE(cond) do { if (!(cond)) bad |= bit; bit <<= 1; } while (0)
+    RULE(SC3(S_open, "/tmp/pt/secret", O_RDONLY, 0) == -EACCES);   /* 0600 root */
+    RULE((fd = SC3(S_open, "/tmp/pt/pub", O_RDONLY, 0)) >= 0);     /* 0644 root */
+    SC1(S_close, fd);
+    RULE(SC3(S_open, "/tmp/pt/pub", O_WRONLY, 0) == -EACCES);
+    RULE(SC3(S_open, "/tmp/pt/pub", O_RDONLY | O_TRUNC, 0) == -EACCES);
+    RULE(SC3(S_open, "/tmp/pt/closed/x", O_RDONLY, 0) == -EACCES); /* dir 0700 root */
+    RULE(SC2(S_access, "/tmp/pt/closed/x", 0) == -EACCES);        /* even "exists?" */
+    RULE(SC1(S_chdir, "/tmp/pt/closed") == -EACCES);
+    RULE(SC2(S_mkdir, "/tmp/pt/new", 0755) == -EACCES);           /* dir 0755 root */
+    RULE(SC2(S_mkdir, "/tmp/pt/pub", 0755) == -EEXIST);           /* EEXIST first */
+    RULE(SC1(S_unlink, "/tmp/pt/pub") == -EACCES);
+    RULE(SC2(S_rename, "/tmp/pt/pub", "/tmp/pt-moved") == -EACCES);
+    RULE(SC1(S_unlink, "/tmp/pt-sticky") == -EPERM);              /* root's, in /tmp */
+    RULE((fd = SC3(S_open, "/tmp/pt-mine", O_WRONLY | O_CREAT, 0444)) >= 0);
+    SC1(S_close, fd);                                             /* made: opened anyway */
+    RULE(SC3(S_open, "/tmp/pt-mine", O_WRONLY, 0) == -EACCES);    /* now 0444 says no */
+    RULE(SC2(S_chmod, "/tmp/pt-mine", 0644) == 0);                /* own file: may */
+    RULE(SC3(S_chown, "/tmp/pt-mine", 0, -1) == -EPERM);          /* give it away: no */
+    RULE(SC3(S_chown, "/tmp/pt-mine", -1, 0) == -EPERM);          /* not in group 0 */
+    RULE(SC3(S_chown, "/tmp/pt-mine", 1000, 1000) == 0);          /* no change: fine */
+    RULE(SC1(S_unlink, "/tmp/pt-mine") == 0);                     /* own, in /tmp */
+    RULE(SC2(S_chmod, "/tmp/pt/pub", 0666) == -EPERM);
+    RULE(SC2(S_truncate, "/tmp/pt/pub", 0) == -EACCES);
+    RULE(SC4(S_utimensat, AT_FDCWD, "/tmp/pt/pub", 0, 0) == -EACCES);  /* touch */
+    long when[4] = { 1, 0, 1, 0 };
+    RULE(SC4(S_utimensat, AT_FDCWD, "/tmp/pt/open", when, 0) == -EPERM); /* 0666: write */
+    RULE(SC4(S_utimensat, AT_FDCWD, "/tmp/pt/open", 0, 0) == 0);  /* but "now" is fine */
+    RULE(SC3(S_open, "/tmp/pt/nogroup", O_RDONLY, 0) == -EACCES); /* 0044, ours: owner */
+    RULE(SC2(S_access, "/tmp/pt/pub", R_OK) == 0);                /*   bits decide */
+    RULE(SC2(S_access, "/tmp/pt/pub", W_OK) == -EACCES);
+    RULE(SC2(S_access, "/tmp/pt/pub", X_OK) == -EACCES);
+#undef RULE
+    return bad;
+}
+
+static void t_fileperm(void)
+{
+    SC2(S_mkdir, "/tmp/pt", 0755);
+    SC2(S_mkdir, "/tmp/pt/closed", 0700);
+    mkfile("/tmp/pt/closed/x", 0644, 0);
+    mkfile("/tmp/pt/secret", 0600, 0);
+    mkfile("/tmp/pt/pub", 0644, 0);
+    mkfile("/tmp/pt/open", 0666, 0);
+    mkfile("/tmp/pt/nogroup", 0044, 1000);
+    mkfile("/tmp/pt-sticky", 0666, 0);
+    long pid = SC0(S_fork);
+    if (pid == 0) {
+        become_user();
+        child_exit((int)as_user() ? 1 : 0);
+    }
+    int st = wait_child(pid);
+    long detail = 0;
+    if (st) {                           /* run it again here to say which */
+        pid = SC0(S_fork);
+        if (pid == 0) {
+            become_user();
+            long bad = as_user();
+            long n = 0;
+            while (!(bad & 1)) { bad >>= 1; n++; }
+            child_exit((int)n + 1);
+        }
+        detail = (wait_child(pid) >> 8) & 0xFF;
+    }
+    check(st == 0, "file permissions as user 1000 (detail: first failed rule + 1)", detail);
+
+    /* access() answers for the REAL user: a setuid-root program (real 1000,
+       effective 0) may open the secret, but access() says its caller may not;
+       AT_EACCESS asks for the effective user instead. */
+    pid = SC0(S_fork);
+    if (pid == 0) {
+        SC3(S_setresuid, 1000, 0, 0);
+        long fd = SC3(S_open, "/tmp/pt/secret", O_RDONLY, 0);
+        int ok = fd >= 0 && SC2(S_access, "/tmp/pt/secret", R_OK) == -EACCES &&
+                 SC4(S_faccessat2, AT_FDCWD, "/tmp/pt/secret", R_OK, AT_EACCESS) == 0;
+        child_exit(ok ? 0 : 1);
+    }
+    check(wait_child(pid) == 0, "access() checks the real user, AT_EACCESS the effective", 0);
+    long rx = SC2(S_access, "/tmp/pt/pub", X_OK);               /* root, no x bit at all */
+    check(rx == -EACCES, "even root can't run a file with no x bit", rx);
+
+    const char *gone[] = { "/tmp/pt/closed/x", "/tmp/pt/secret", "/tmp/pt/pub", "/tmp/pt/open",
+                           "/tmp/pt/nogroup", "/tmp/pt-sticky", "/tmp/pt-mine", 0 };
+    for (int k = 0; gone[k]; k++)
+        SC1(S_unlink, gone[k]);
+    SC1(S_rmdir, "/tmp/pt/closed");
+    SC1(S_rmdir, "/tmp/pt");
+}
+
+/* --- job control: stop, continue, and wait4 tells the parent ------------- */
+
+#define SIGSTOP    19
+#define SIGCONT    18
+#define WUNTRACED  2
+#define WCONTINUED 8
+static void t_jobctl(void)
+{
+    long pid = SC0(S_fork);
+    if (pid == 0)
+        for (;;)
+            SC0(S_pause);
+    int st = 0, st2 = 0, st3 = 0;
+    SC2(S_kill, pid, SIGSTOP);
+    long w1 = SC4(S_wait4, pid, &st, WUNTRACED, 0);         /* "stopped by SIGSTOP" */
+    SC2(S_kill, pid, SIGCONT);
+    long w2 = SC4(S_wait4, pid, &st2, WCONTINUED, 0);       /* "continued": 0xFFFF */
+    SC2(S_kill, pid, SIGSTOP);
+    SC4(S_wait4, pid, &st, WUNTRACED, 0);
+    SC2(S_kill, pid, SIGKILL);                              /* dies though stopped */
+    long w3 = SC4(S_wait4, pid, &st3, 0, 0);
+    int ok = w1 == pid && (st & 0xFF) == 0x7F && ((st >> 8) & 0xFF) == SIGSTOP &&
+             w2 == pid && (st2 & 0xFFFF) == 0xFFFF && w3 == pid && (st3 & 0x7F) == SIGKILL;
+    check(ok, "job control: SIGSTOP stops, wait4 says so; SIGCONT continues; SIGKILL ends it",
+          !(w1 == pid) ? 1 : (st & 0xFF) != 0x7F ? 2 : w2 != pid ? 3 : (st2 & 0xFFFF) != 0xFFFF ? 4 : 5);
+}
+
+/* --- SA_RESTART: a read a signal cuts short runs again --------------------- */
+
+#define SA_RESTART 0x10000000
+/* Read one byte from an empty pipe; a SIGALRM comes at 20 ms, a child
+   writes the byte at 80 ms. Returns what read() said. */
+static long interrupted_read(unsigned long flags)
+{
+    int p[2] = { -1, -1 };
+    SC1(S_pipe, p);
+    sigaction_k(SIGALRM, (void *)on_alarm, flags);
+    long pid = SC0(S_fork);
+    if (pid == 0) {
+        long ts[2] = { 0, 80000000 };
+        SC2(S_nanosleep, ts, 0);
+        SC3(S_write, p[1], "r", 1);
+        child_exit(0);
+    }
+    got_sig = 0;
+    long it[4] = { 0, 0, 0, 20000 };    /* once, in 20 ms */
+    SC3(S_setitimer, 0, it, 0);
+    char c = 0;
+    long n = SC3(S_read, p[0], &c, 1);
+    wait_child(pid);
+    long rest = SC3(S_read, p[0], &c, 0);
+    (void)rest;
+    SC1(S_close, p[0]);
+    SC1(S_close, p[1]);
+    return n == 1 && c == 'r' && got_sig == SIGALRM ? 1 : n;
+}
+
+static void t_restart(void)
+{
+    long with = interrupted_read(SA_RESTART);
+    long without = interrupted_read(0);
+    check(with == 1 && without == -EINTR,
+          "SA_RESTART: an interrupted pipe read runs again; without it, EINTR",
+          with != 1 ? with : without);
+}
+
+/* --- umount: a disk file system comes off, and back --------------------- */
+
+#define EBUSY 16
+#define O_DIRECTORY 0200000
+static int starts(const char *s, const char *p) { while (*p) if (*s++ != *p++) return 0; return 1; }
+
+static void t_umount(void)
+{
+    /* A disk mount to try it on: /data (ext2, i386's tests) or /mnt (FAT). */
+    static char m[4096];
+    char src[64] = "", dir[64] = "", type[16] = "";
+    long fd = SC3(S_open, "/proc/mounts", O_RDONLY, 0);
+    long n = fd >= 0 ? SC3(S_read, fd, m, sizeof m - 1) : 0;
+    SC1(S_close, fd);
+    m[n > 0 ? n : 0] = 0;
+    for (char *l = m; *l && !dir[0]; ) {
+        char *f[3];
+        int k = 0;
+        char *q = l;
+        while (k < 3 && *q && *q != '\n') {
+            f[k++] = q;
+            while (*q && *q != ' ' && *q != '\n')
+                q++;
+            if (*q == ' ')
+                *q++ = 0;
+        }
+        while (*q && *q != '\n')
+            q++;
+        char *next = *q ? q + 1 : q;
+        *q = 0;
+        if (k == 3 && starts(f[0], "/dev/") && (same(f[1], "/data", 6) || same(f[1], "/mnt", 5))) {
+            for (int i = 0; f[0][i] && i < 63; i++) src[i] = f[0][i];
+            for (int i = 0; f[1][i] && i < 63; i++) dir[i] = f[1][i];
+            for (int i = 0; f[2][i] && i < 15; i++) type[i] = f[2][i];
+        }
+        l = next;
+    }
+    if (!dir[0]) {
+        /* No /proc (i386's kernel tests run before /init mounts it): try
+           /data as ext2, and find its disk by mounting it back below. */
+        const char *dd = "/data", *et = "ext2";
+        for (int i = 0; dd[i]; i++) dir[i] = dd[i];
+        for (int i = 0; et[i]; i++) type[i] = et[i];
+    }
+    long d = SC3(S_open, dir, O_RDONLY | O_DIRECTORY, 0);
+    long busy_open = SC2(S_umount2, dir, 0);
+    if (busy_open == -EINVAL) {         /* not a mount after all: nothing to try */
+        SC1(S_close, d);
+        return;
+    }
+    SC1(S_close, d);
+    SC1(S_chdir, dir);
+    long busy_cwd = SC2(S_umount2, dir, 0);
+    SC1(S_chdir, "/");
+    long off = SC2(S_umount2, dir, 0);
+    long again = SC2(S_umount2, dir, 0);    /* the directory under it: not a mount */
+    long back = -1;
+    if (src[0]) {
+        back = SC5(S_mount, src, dir, type, 0, 0);
+    } else {                            /* which disk was it? the one that mounts */
+        static const char *const disks[] = { "/dev/hdc", "/dev/hdb", "/dev/hdd", "/dev/sdb",
+                                             "/dev/sdc", "/dev/sda", 0 };
+        for (int k = 0; disks[k] && back; k++)
+            back = SC5(S_mount, disks[k], dir, type, 0, 0);
+    }
+    check(busy_open == -EBUSY && busy_cwd == -EBUSY && off == 0 && again == -EINVAL && back == 0,
+          "umount: busy while open or a cwd, then off, then mounted again",
+          busy_open != -EBUSY ? 1 : busy_cwd != -EBUSY ? 2 : off ? 3 : again != -EINVAL ? 4 : back);
+}
+
+/* --- PROT_NONE: no access at all, yet the page keeps its data -------------- */
+
+#define SIGSEGV 11
+static void t_protnone(void)
+{
+    char *m = (char *)SC6(S_mmap, 0, 4096, 3, 0x22, -1, 0);   /* RW, MAP_PRIVATE|MAP_ANON */
+    m[0] = 'q';
+    long r = SC3(S_mprotect, m, 4096, 0);
+    long pid = SC0(S_fork);
+    if (pid == 0) {
+        volatile char c = m[0];         /* a read faults, not only a write */
+        (void)c;
+        child_exit(0);
+    }
+    int st = wait_child(pid);
+    pid = SC0(S_fork);                  /* a child forked meanwhile has the data */
+    if (pid == 0)
+        child_exit(SC3(S_mprotect, m, 4096, 1) == 0 && m[0] == 'q' ? 0 : 1);
+    int st2 = wait_child(pid);
+    check(r == 0 && (st & 0x7F) == SIGSEGV && st2 == 0,
+          "PROT_NONE: a read faults, the page keeps its data", st);
+    SC2(S_munmap, m, 4096);
+}
+
 /* --- Unix sockets: SOCK_SEQPACKET, passing a file, the sender's credentials --- */
 
 struct u_iov { const void *base; unsigned long len; };
@@ -1150,6 +1472,25 @@ static void t_unix_big(void)
     out("  (3 MB in "), outn(now_ms() - t0), out(" ms)\n");
 }
 
+/* ppoll's timeout, checked as Linux checks it: a negative time, or
+   nanoseconds past 999999999, is EINVAL (i386: the 32-bit timespec; it
+   used to overflow past ~24 days into "no limit"). A huge one is fine. */
+static void t_ppoll_time(void)
+{
+    int p[2] = { -1, -1 };
+    SC1(S_pipe, p);
+    SC3(S_write, p[1], "x", 1);         /* ready: a valid wait returns at once */
+    struct { int fd; short events, revents; } pf = { p[0], 1, 0 };
+    long neg[2] = { -1, 0 }, nsec[2] = { 0, 1000000000 }, huge[2] = { 0x7FFFFFFF, 999999999 };
+    long a = SC5(S_ppoll, &pf, 1, neg, 0, 8);
+    long b = SC5(S_ppoll, &pf, 1, nsec, 0, 8);
+    long c = SC5(S_ppoll, &pf, 1, huge, 0, 8);
+    check(a == -EINVAL && b == -EINVAL && c == 1, "ppoll: bad timeouts are EINVAL, a huge one waits",
+          a != -EINVAL ? a : b != -EINVAL ? b : c);
+    SC1(S_close, p[0]);
+    SC1(S_close, p[1]);
+}
+
 /* poll() on an epoll file: ready only while something inside is (GLib
    watches libmount's monitor so; "always ready" spun the Save As dialog). */
 static void t_epoll_poll(void)
@@ -1185,6 +1526,12 @@ void cmain(void)
     t_inotify();
     t_locks();
     t_misc();
+    t_perm();
+    t_protnone();
+    t_fileperm();
+    t_umount();
+    t_restart();
+    t_jobctl();
     t_netlink();
     t_packet();
     t_nl80211();
@@ -1192,6 +1539,7 @@ void cmain(void)
     t_unix_pass();
     t_unix_big();
     t_epoll_poll();
+    t_ppoll_time();
     /* Leave /tmp as we found it: its files are memory (`make test` counts
        every page after the programs have run). */
     SC1(S_unlink, "/tmp/sf_src");

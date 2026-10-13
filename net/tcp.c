@@ -367,7 +367,7 @@ static int nap(int nonblock, uint32_t deadline)
     if (nonblock)
         return -EAGAIN;
     if (signal_pending())
-        return -EINTR;
+        return -ERESTARTSYS;
     if (deadline && due(deadline, timer_ms()))
         return -ETIMEDOUT;
     net_sleep(50);
@@ -407,8 +407,9 @@ int tcp_connect(struct tcp_conn *c, uint32_t dst, uint16_t port, int nonblock)
         return -EINPROGRESS;
     while (c->state == ST_SYN_SENT) {
         int rc = nap(0, 0);
-        if (rc < 0)
-            return rc;              /* EINTR: the handshake goes on */
+        if (rc < 0)                 /* the handshake goes on; connect isn't run
+                                       again (it would find it under way): EINTR */
+            return rc == -ERESTARTSYS ? -EINTR : rc;
     }
     if (c->state == ST_CLOSED) {
         int e = c->err;

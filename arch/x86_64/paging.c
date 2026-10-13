@@ -180,6 +180,15 @@ void vmm_init(void)
         map_2mb(DIRECTMAP_BASE + pa, pa, PTE_WRITABLE);
     for (; pa < ram_end; pa += PAGE_SIZE)
         vmm_map(DIRECTMAP_BASE + pa, pa, PTE_WRITABLE);
+    /* The high zone: each RAM range above it, in whole 2 MiB pages (a
+       range's ragged ends are firmware data next to RAM, never device
+       registers: those sit far above the end of RAM). Only RAM is mapped,
+       not the holes, so nothing can speculatively read a device. */
+    phys_addr_t hs, he;
+    for (int i = 0; pmm_high_range(i, &hs, &he); i++)
+        for (pa = hs & ~(uint64_t)(HUGE_2MB - 1); pa < he; pa += HUGE_2MB)
+            if (pa >= ram_end)
+                map_2mb(DIRECTMAP_BASE + pa, pa, PTE_WRITABLE);     /* -1: mapped already */
 
     /* The kernel image (code, data, .bss): 2 MiB pages from physical 0. */
     uint64_t image_end = V2P(__kernel_end);
@@ -215,28 +224,28 @@ int vmm_map_big(uintptr_t va, uint64_t pa, uint32_t flags)
     return map_2mb(va, pa, flags);
 }
 
-uint32_t vmm_unmap(uintptr_t va)
+phys_addr_t vmm_unmap(uintptr_t va)
 {
     uint64_t *pte = get_pte(va, 0);
     if (!pte || !(*pte & PTE_PRESENT))
         return 0;
-    uint32_t pa = (uint32_t)PTE_ADDR(*pte);
+    phys_addr_t pa = PTE_ADDR(*pte);
     *pte = 0;
     invlpg(va);
     return pa;
 }
 
-uint32_t vmm_translate(uintptr_t va)
+phys_addr_t vmm_translate(uintptr_t va)
 {
     uint64_t *pde = get_pde(va, 0);
     if (!pde || !(*pde & PTE_PRESENT))
         return 0;
     if (*pde & PTE_PS)
-        return (uint32_t)(PTE_ADDR(*pde) + (va & (HUGE_2MB - 1)));
+        return PTE_ADDR(*pde) + (va & (HUGE_2MB - 1));
     uint64_t pte = table_at(PTE_ADDR(*pde))[PT_INDEX(va)];
     if (!(pte & PTE_PRESENT))
         return 0;
-    return (uint32_t)(PTE_ADDR(pte) | (va & 0xFFF));
+    return PTE_ADDR(pte) | (va & 0xFFF);
 }
 
 uint32_t vmm_get_flags(uintptr_t va)
@@ -276,7 +285,7 @@ void vmm_unmap_range(uintptr_t start, uintptr_t end)
             if (!(e & PTE_PRESENT))
                 continue;
             if (!(e & PTE_SHARED))
-                pmm_free((uint32_t)PTE_ADDR(e));
+                pmm_free(PTE_ADDR(e));      /* 64 bits: a program's page may be high */
             pt[i] = 0;
             invlpg(va);
         }
@@ -349,9 +358,9 @@ static void free_tree(phys_addr_t table, int level)
         if (level > 1)
             free_tree(PTE_ADDR(e), level - 1);
         else if (!(e & PTE_SHARED))
-            pmm_free((uint32_t)PTE_ADDR(e));
+            pmm_free(PTE_ADDR(e));
     }
-    pmm_free((uint32_t)table);
+    pmm_free(table);
 }
 
 void vmm_pd_destroy(uint32_t phys)
@@ -396,7 +405,7 @@ static int fork_tree(uint64_t *src, uint64_t *dst_entry, uint64_t src_entry, int
                 e = (e & ~(uint64_t)PTE_WRITABLE) | PTE_COW;
                 src[i] = e;
             }
-            pmm_ref((uint32_t)PTE_ADDR(e));             /* one more owner */
+            pmm_ref(PTE_ADDR(e));                       /* one more owner */
         }
         dst[i] = e;
     }
@@ -438,10 +447,11 @@ static void audit_walk(int pid, uint64_t *pml4, int count, uint32_t want)
                         continue;
                     uint64_t va = ((uint64_t)a << 39) | ((uint64_t)b << 30) |
                                   ((uint64_t)c << 21) | ((uint64_t)d << 12);
-                    uint32_t phys = (uint32_t)PTE_ADDR(e);
-                    int own = pmm_owners(phys);
+                    phys_addr_t full = PTE_ADDR(e);
+                    int own = pmm_owners(full);
                     if (own < 0)
-                        continue;           /* device memory */
+                        continue;           /* device memory, or the high zone */
+                    uint32_t phys = (uint32_t)full;   /* low: fits */
                     if (want) {             /* pass 2: who maps a bad frame */
                         if (phys == want)
                             kprintf("  audit:   pid %d va %lx flags %lx\n", pid,
@@ -526,11 +536,12 @@ int vmm_cow_fault(uintptr_t va)
     uint64_t *pte = get_pte(va, 0);
     if (!pte || !(*pte & PTE_PRESENT) || !(*pte & PTE_COW))
         return -1;
-    uint32_t old = (uint32_t)PTE_ADDR(*pte);
+    phys_addr_t old = PTE_ADDR(*pte);
     uint64_t flags = (PTE_FLAGS(*pte) & ~(uint64_t)PTE_COW) | PTE_WRITABLE;
     if (pmm_shared(old)) {
-        /* Others still use the page: make our own copy. */
-        uint32_t copy = pmm_alloc();
+        /* Others still use the page: make our own copy (a program's page:
+           the high zone's, if there is one). */
+        phys_addr_t copy = pmm_alloc_user();
         if (!copy)
             return -1;
         memcpy(P2V(copy), P2V(old), PAGE_SIZE);

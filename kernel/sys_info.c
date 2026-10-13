@@ -60,6 +60,8 @@ SYSCALL_DEF(sys_uname)
 SYSCALL_DEF(sys_sethostname)
 {
     char name[65];
+    if (proc_current()->cred.euid != 0)
+        return -EPERM;                  /* Linux: CAP_SYS_ADMIN, checked first */
     if (a2 > 64)
         return -EINVAL;
     if (copy_from_user(name, (const void *)a1, a2) < 0)

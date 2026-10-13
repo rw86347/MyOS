@@ -4,7 +4,7 @@
 """syscall-coverage.py — which Linux system calls MyOS has, by CPU.
 
 Compares the kernel's tables (kernel/syscall.c: [NR_x] and [NR64_x] entries,
-numbers from include/syscalls.h and include/syscall64.h) with Linux's own
+numbers from include/syscall.h and include/syscall64.h) with Linux's own
 lists, arch/x86/entry/syscalls/syscall_{32,64}.tbl, read from the Linux
 source tarball the Wi-Fi work already fetched (build/ext/linux-7.2.9.tar.xz).
 
@@ -46,7 +46,7 @@ def our_table(prefix, header):
 
 def report(arch):
     bits, prefix, header = (('64', 'NR64_', 'include/syscall64.h') if arch == 'x86_64'
-                            else ('32', 'NR_', 'include/syscalls.h'))
+                            else ('32', 'NR_', 'include/syscall.h'))
     linux, ours = linux_table(bits), our_table(prefix, header)
     missing = sorted(n for n in linux if n not in ours)
     ignored = sorted(n for n in linux if ours.get(n) == 'sys_nop')

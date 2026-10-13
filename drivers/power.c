@@ -7,14 +7,15 @@
  * pin; command 0xFE pulses it. That's how PCs have rebooted since the AT.
  * If nothing happens, a triple fault resets the CPU (cpu.c).
  *
- * Power off: on a real PC that is ACPI. The firmware's tables (the DSDT)
- * say which number to write to the power-management port for "soft off",
- * and reading those tables needs an AML interpreter we don't have. QEMU
- * (and so UTM) is simpler: its number is 0. We only do it there — writing
- * a guess to a real board's port could put it in some other sleep state —
- * and recognise QEMU by the subsystem vendor it gives every PCI device
- * (0x1AF4, Red Hat). Anywhere else, power off = halt with a message.
+ * Power off: on a real PC that is ACPI. The firmware's tables say which
+ * number to write to which power-management port for "soft off" (S5);
+ * acpi.c reads them at boot. If it found nothing, QEMU (and so UTM) still
+ * switches off: its number is 0, and we recognise it by the subsystem
+ * vendor it gives every PCI device (0x1AF4, Red Hat) — writing a guess to
+ * a real board's port could put it in some other sleep state. Anywhere
+ * else, power off = halt with a message.
  */
+#include <acpi.h>
 #include <cpu.h>
 #include <io.h>
 #include <kprintf.h>
@@ -75,10 +76,11 @@ static void qemu_soft_off(void)
 
 void power_off(void)
 {
-    kprintf("reboot: power down\n");
+    kprintf("reboot: power down%s\n", acpi_can_power_off() ? " (ACPI S5)" : "");
     serial_flush();
     __asm__ volatile ("cli");
-    qemu_soft_off();
+    acpi_power_off();               /* the firmware's own numbers */
+    qemu_soft_off();                /* (not found: QEMU's) */
     power_halt();                   /* still here: no way to switch off */
 }
 

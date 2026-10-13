@@ -33,6 +33,8 @@
 #include <interrupts.h>
 #include <kheap.h>
 #include <keyboard.h>
+#include <acpi.h>
+#include <kconfig.h>
 #include <kprintf.h>
 #include <memlayout.h>
 #include <mouse.h>
@@ -215,6 +217,7 @@ static int scan_disks(int from, struct blockdev **rootdev)
 
 static void storage_init(void)
 {
+    kconfig_init();                     /* the built-in config, until a disk's */
     boot_step("Disks and USB");
     usb_init();                         /* USB sticks: found by the usb thread, */
     ata_init();                         /* while these start */
@@ -249,6 +252,10 @@ static void storage_init(void)
     for (int k = 0; k < ndata_seen; k++)
         if (data_seen[k] != datadev)
             klog("ext2: %s is a \"myos-data\" of another disk: left alone\n", data_seen[k]->name);
+    /* The config Settings saved: on the root's disk, so a live stick never
+       runs an installed system's tasks (nor the reverse). With no root
+       disk, the first good one. Before sched_start(), which uses it. */
+    kconfig_from_disk(rootdev ? disk_of_part(rootdev) : NULL);
     if (rootdev)
         mount_root(rootdev);
     if (datadev)
@@ -331,6 +338,7 @@ void kernel_main(void)
     shim_init();            /* Linux's timers and work queues, for drivers */
     boot_step("PCI devices");
     pci_init();             /* which PCI devices are fitted: the IDE controller, the NIC */
+    acpi_init();            /* the firmware's power-off numbers (before any process) */
     boot_step("Graphics");
     drm_init();             /* a display card: the console moves to pixels, /dev/fb0 */
     boot_step("Sound");

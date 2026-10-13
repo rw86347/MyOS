@@ -244,7 +244,7 @@ int32_t lock_fcntl(struct file *f, uint32_t cmd, uintptr_t arg)
         wq_sleep(&lock_wait);
         me->lock_wait = NULL;
         if (signal_pending())
-            return -EINTR;
+            return -ERESTARTSYS;
     }
     if (!room_for(2))
         return -ENOLCK;

@@ -68,7 +68,7 @@ SYSCALL_DEF(sys_flock)
         if (a2 & LOCK_NB)
             return -EAGAIN;             /* EWOULDBLOCK */
         if (signal_pending())
-            return -EINTR;
+            return -ERESTARTSYS;
         wq_sleep(&flock_wait);
     }
     i->flock = want == LOCK_SH ? i->flock + 1 : -1;

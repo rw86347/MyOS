@@ -137,6 +137,7 @@ struct tty {
     struct wait_queue readers;
     struct wait_queue writers;      /* pty: a master waiting for room in `in` */
     int fg_pgrp;                    /* foreground process group */
+    int sid;                        /* the session it is the terminal of (0: none) */
     int hung;                       /* the other end is gone: reads see EOF */
     uint16_t rows, cols;
     tty_out_fn out;                 /* echo goes here */
@@ -342,13 +343,32 @@ uint32_t tty_poll(struct file *f)
     return (tty_readable(&console) ? 0x001 : 0) | 0x004;    /* POLLIN?, always POLLOUT */
 }
 
+/* A background job (its group isn't the foreground one) reading its own
+   terminal: SIGTTIN stops its group, and the shell's `fg` gives it the
+   terminal; the read then runs again (-ERESTARTSYS). One that can't be
+   stopped — it ignores or blocks SIGTTIN, or no shell could continue it —
+   gets EIO. Linux's rules (job_control in n_tty.c). */
+static int background_read(struct tty *t)
+{
+    struct process *me = proc_current();
+    if (!me || !t->sid || me->sid != t->sid || !t->fg_pgrp || me->pgid == t->fg_pgrp)
+        return 0;
+    if (signal_ignored_or_blocked(SIGTTIN) || proc_pgrp_orphaned(me->pgid))
+        return -EIO;
+    signal_send_group(me->pgid, SIGTTIN);
+    return -ERESTARTSYS;
+}
+
 int32_t tty_read_from(struct tty *t, struct file *f, void *user_buf, uint32_t n)
 {
+    int bg = background_read(t);
+    if (bg)
+        return bg;
     while (!tty_readable(t)) {
         if (f->flags & O_NONBLOCK)
             return -EAGAIN;
         if (signal_pending())
-            return -EINTR;
+            return -ERESTARTSYS;
 #ifdef BENCH
         bench_input_wait();
 #endif
@@ -479,6 +499,7 @@ int tty_onlcr(struct tty *t)
 
 int tty_get_fg(struct tty *t) { return t->fg_pgrp; }
 void tty_set_fg(struct tty *t, int pgid) { t->fg_pgrp = pgid; }
+void tty_set_session(struct tty *t, int sid) { t->sid = sid; }
 
 /*
  * May this process reconfigure the console?
@@ -534,7 +555,12 @@ static int32_t common_ioctl(struct tty *t, uint32_t cmd, uintptr_t arg)
         return 0;
     }
     case TIOCGPGRP: {
-        int pg = t->fg_pgrp ? t->fg_pgrp : proc_current()->pgid;
+        /* Only on your own controlling terminal (Linux: ENOTTY): a shell
+           finds out this way whether it can do job control. */
+        struct process *me = proc_current();
+        if (t->sid && me->sid != t->sid && proc_session_alive(t->sid))
+            return -ENOTTY;
+        int pg = t->fg_pgrp ? t->fg_pgrp : me->pgid;
         return copy_to_user((void *)arg, &pg, sizeof pg);
     }
     case TIOCSPGRP: {
@@ -548,9 +574,12 @@ static int32_t common_ioctl(struct tty *t, uint32_t cmd, uintptr_t arg)
            to be live and in the caller's session. */
         if (pg <= 0)
             return -EINVAL;
+        if (t->sid && proc_current()->sid != t->sid && proc_session_alive(t->sid))
+            return -ENOTTY;             /* another live session's terminal */
         if (!proc_pgid_in_session(pg, proc_current()->sid))
             return -EPERM;
         t->fg_pgrp = pg;
+        t->sid = proc_current()->sid;   /* (a terminal whose session ended: the caller's now) */
         return 0;
     }
     case FIONREAD: {
@@ -578,8 +607,25 @@ int32_t tty_ioctl(struct file *f, uint32_t cmd, uintptr_t arg)
     if (r != -ENOIOCTLCMD)
         return r;
     switch (cmd) {
-    case TIOCSCTTY:
+    case TIOCSCTTY: {
+        /* Become the controlling terminal of the caller's session — what
+           login does for the shell it starts (setsid, then TIOCSCTTY), and
+           agetty, and `setsid -c`. Its group gets the keyboard, and the
+           shell can do job control. A session leader only; taking it from
+           another session needs root and arg 1, as on Linux. */
+        struct process *me = proc_current();
+        if (me->sid != me->pid)
+            return -EPERM;
+        if (console.sid && console.sid != me->sid && proc_session_alive(console.sid) &&
+            !(arg == 1 && me->cred.euid == 0))
+            return -EPERM;
+        console.sid = me->sid;
+        console.fg_pgrp = me->pgid;
+        return 0;
+    }
     case TIOCNOTTY:
+        if (console.sid == proc_current()->sid)
+            console.sid = 0;
         return 0;
     /* A program that draws on the screen itself (an X server, a game on
        /dev/fb0) switches the console off with KD_GRAPHICS and back on with

@@ -103,10 +103,13 @@ static int  is_used(uint32_t f) { return bitmap[f / 32] & (1u << (f % 32)); }
 
 #ifdef PT_AUDIT
 /* The page-table audit (make PTAUDIT=1): owners of the frame at phys —
-   0 if it is free, -1 if it is not RAM we manage (device memory). */
-int pmm_owners(uint32_t phys)
+   0 if it is free, -1 if it is not RAM we manage (device memory). (Low
+   zone only: high frames count as "not ours" here.) */
+int pmm_owners(phys_addr_t phys)
 {
-    uint32_t f = phys / PAGE_SIZE;
+    if (phys >= DIRECTMAP_LIMIT)
+        return -1;
+    uint32_t f = (uint32_t)(phys / PAGE_SIZE);
     if (f >= nframes)
         return -1;
     if (!is_used(f))
@@ -192,6 +195,127 @@ static const char *e820_type_name(uint32_t type)
     }
 }
 
+/* --- the high zone (x86_64): RAM above DIRECTMAP_LIMIT ------------------------
+ *
+ * A second bitmap and set of share counts, for frames from HIGH_BASE up.
+ * pmm_init only notes where the high RAM is (it runs before paging maps
+ * it); vmm_init direct-maps those ranges, and pmm_refs_init (after it)
+ * makes the bitmap and counts, in low RAM, and frees the ranges. Same
+ * rules as the low zone: lowest first, a hint below which all is used.
+ */
+#ifdef HIGHMEM
+#define HIGH_BASE DIRECTMAP_LIMIT
+static struct { phys_addr_t start, end; } high_ranges[E820_MAX];
+static int nhigh_ranges;
+static uint32_t *high_map;              /* 1 bit per frame: 1 = used */
+static uint16_t *high_refs;             /* owners beyond the first */
+static uint32_t high_frames, high_free, high_usable, high_hint;
+
+/* The part of a usable range above the low zone, whole pages only. */
+static void note_high(uint64_t base, uint64_t end)
+{
+    if (end <= HIGH_BASE || nhigh_ranges == E820_MAX)
+        return;
+    if (base < HIGH_BASE)
+        base = HIGH_BASE;
+    base = (base + PAGE_SIZE - 1) & ~(uint64_t)(PAGE_SIZE - 1);
+    end &= ~(uint64_t)(PAGE_SIZE - 1);
+    if (base < end) {
+        high_ranges[nhigh_ranges].start = base;
+        high_ranges[nhigh_ranges++].end = end;
+    }
+}
+
+int pmm_high_range(int i, phys_addr_t *start, phys_addr_t *end)
+{
+    if (i < 0 || i >= nhigh_ranges)
+        return 0;
+    *start = high_ranges[i].start;
+    *end = high_ranges[i].end;
+    return 1;
+}
+
+static int high_used(uint32_t f) { return high_map[f / 32] & (1u << (f % 32)); }
+
+static void high_init(void)
+{
+    phys_addr_t top = HIGH_BASE;
+    for (int i = 0; i < nhigh_ranges; i++)
+        if (high_ranges[i].end > top)
+            top = high_ranges[i].end;
+    if (top == HIGH_BASE)
+        return;                         /* no RAM above the low zone */
+    uint64_t n = (top - HIGH_BASE) / PAGE_SIZE;
+    if (n > 0xFFFFFFE0u)
+        n = 0xFFFFFFE0u;                /* (16 TiB: more than a frame number holds) */
+    uint32_t map_pages = (uint32_t)((n / 8 + 4 + PAGE_SIZE - 1) / PAGE_SIZE);
+    uint32_t refs_pages_hi = (uint32_t)((n * sizeof(uint16_t) + PAGE_SIZE - 1) / PAGE_SIZE);
+    uint32_t mp = pmm_alloc_run(map_pages), rp = pmm_alloc_run(refs_pages_hi);
+    if (!mp || !rp) {
+        kprintf("pmm: no room to manage the %lu MiB above %lu MiB: not used\n",
+                (unsigned long)(n / 256), (unsigned long)(HIGH_BASE >> 20));
+        if (mp)
+            for (uint32_t k = 0; k < map_pages; k++)
+                pmm_free(mp + k * PAGE_SIZE);
+        if (rp)
+            for (uint32_t k = 0; k < refs_pages_hi; k++)
+                pmm_free(rp + k * PAGE_SIZE);
+        return;
+    }
+    high_map = P2V(mp);
+    high_refs = P2V(rp);
+    memset(high_map, 0xFF, (size_t)map_pages * PAGE_SIZE);     /* all used ... */
+    memset(high_refs, 0, (size_t)refs_pages_hi * PAGE_SIZE);
+    high_frames = (uint32_t)n;
+    for (int i = 0; i < nhigh_ranges; i++)                       /* ... but RAM */
+        for (phys_addr_t pa = high_ranges[i].start; pa < high_ranges[i].end; pa += PAGE_SIZE) {
+            uint32_t f = (uint32_t)((pa - HIGH_BASE) / PAGE_SIZE);
+            if (f < high_frames && high_used(f)) {
+                high_map[f / 32] &= ~(1u << (f % 32));
+                high_free++;
+            }
+        }
+    high_usable = high_free;
+    klog("pmm: %lu MiB above %lu MiB, for programs' memory\n",
+         (unsigned long)(high_usable / 256), (unsigned long)(HIGH_BASE >> 20));
+}
+
+/* The lowest free high frame, 32 at a time. */
+static phys_addr_t high_take(void)
+{
+    for (uint32_t w = high_hint / 32; w * 32 < high_frames; w++) {
+        if (high_map[w] == 0xFFFFFFFFu)
+            continue;
+        uint32_t f = w * 32 + __builtin_ctz(~high_map[w]);
+        if (f >= high_frames)
+            break;
+        high_map[f / 32] |= 1u << (f % 32);
+        high_free--;
+        high_hint = f + 1;
+        return HIGH_BASE + (phys_addr_t)f * PAGE_SIZE;
+    }
+    high_hint = high_frames;
+    return 0;
+}
+
+/* A high frame's number, or -1 (not high: the low zone's). */
+static int64_t high_frame(phys_addr_t phys)
+{
+    if (!high_map || phys < HIGH_BASE)
+        return -1;
+    return (int64_t)((phys - HIGH_BASE) / PAGE_SIZE);
+}
+#else
+static void note_high(uint64_t base, uint64_t end) { (void)base; (void)end; }
+static void high_init(void) { }
+static int64_t high_frame(phys_addr_t phys) { (void)phys; return -1; }
+int pmm_high_range(int i, phys_addr_t *start, phys_addr_t *end)
+{
+    (void)i, (void)start, (void)end;
+    return 0;
+}
+#endif
+
 void pmm_init(void)
 {
     const struct bootinfo *bi = P2V(BOOTINFO_PHYS);
@@ -210,6 +334,7 @@ void pmm_init(void)
 
         if (e->type == E820_USABLE && e->length) {     /* 2. usable -> free */
             mark_range(e->base, e->length, 1);
+            note_high(e->base, e->base + e->length);
             uint64_t end = e->base + e->length;
             if (end > DIRECTMAP_LIMIT)
                 end = DIRECTMAP_LIMIT;
@@ -256,16 +381,44 @@ void pmm_refs_init(void)
     }
     extra_refs = P2V(refs_phys);
     memset(extra_refs, 0, refs_pages * PAGE_SIZE);
+    high_init();                        /* vmm_init has mapped the high RAM */
 }
 
-void pmm_ref(uint32_t phys)
+void pmm_ref(phys_addr_t phys)
 {
+    int64_t h = high_frame(phys);
+#ifdef HIGHMEM
+    if (h >= 0) {
+        high_refs[h]++;
+        return;
+    }
+#endif
+    (void)h;
     extra_refs[phys / PAGE_SIZE]++;
 }
 
-int pmm_shared(uint32_t phys)
+int pmm_shared(phys_addr_t phys)
 {
+    int64_t h = high_frame(phys);
+#ifdef HIGHMEM
+    if (h >= 0)
+        return high_refs[h] != 0;
+#endif
+    (void)h;
     return extra_refs && extra_refs[phys / PAGE_SIZE] != 0;
+}
+
+/* A program's private page: high RAM first, where nothing else may go. */
+phys_addr_t pmm_alloc_user(void)
+{
+#ifdef HIGHMEM
+    if (high_free) {
+        phys_addr_t pa = high_take();
+        if (pa)
+            return pa;
+    }
+#endif
+    return pmm_alloc();
 }
 
 static uint32_t (*reclaim)(uint32_t want);
@@ -327,11 +480,33 @@ uint32_t pmm_alloc_run(uint32_t pages)
     return 0;
 }
 
-void pmm_free(uint32_t phys)
+void pmm_free(phys_addr_t phys)
 {
-    uint32_t f = phys / PAGE_SIZE;
+    int64_t h = high_frame(phys);
+#ifdef HIGHMEM
+    if (h >= 0) {
+        uint32_t hf = (uint32_t)h;
+        if (phys % PAGE_SIZE || h >= high_frames || !high_used(hf)) {
+            kprintf("pmm_free: bad or double free of %08lx%08lx\n",
+                    (unsigned long)(phys >> 32), (unsigned long)(uint32_t)phys);
+            return;
+        }
+        if (high_refs[hf]) {
+            high_refs[hf]--;
+            return;
+        }
+        high_map[hf / 32] &= ~(1u << (hf % 32));
+        high_free++;
+        if (hf < high_hint)
+            high_hint = hf;
+        return;
+    }
+#endif
+    (void)h;
+    uint32_t f = (uint32_t)(phys / PAGE_SIZE);
     if (phys % PAGE_SIZE || f >= nframes || !is_used(f)) {
-        kprintf("pmm_free: bad or double free of %08lx\n", phys);
+        kprintf("pmm_free: bad or double free of %08lx%08lx\n",
+                (unsigned long)(phys >> 32), (unsigned long)(uint32_t)phys);
         return;
     }
     if (extra_refs && extra_refs[f]) {
@@ -347,6 +522,11 @@ void pmm_free(uint32_t phys)
         search_from = f;    /* keep "lowest first" */
 }
 
+#ifdef HIGHMEM
+uint32_t pmm_free_count(void)    { return free_frames + high_free; }
+uint32_t pmm_usable_count(void)  { return total_usable + high_usable; }
+#else
 uint32_t pmm_free_count(void)    { return free_frames; }
 uint32_t pmm_usable_count(void)  { return total_usable; }
+#endif
 uint32_t pmm_end(void)           { return nframes * PAGE_SIZE; }

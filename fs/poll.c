@@ -96,6 +96,23 @@ SYSCALL_DEF(sys_poll)                   /* (fds, nfds, timeout_ms) */
     return poll_user(a1, a2, (int32_t)a3);
 }
 
+/* A timeout -> whole ms, rounded up. Linux's rule: negative seconds, or
+   nanoseconds outside 0..999999999, are EINVAL. The wait itself counts
+   in 32-bit ms, so a longer one is cut to 0x7FFFFFFF (~24.8 days). The
+   seconds are checked before multiplying: 64-bit seconds * 1000 can
+   overflow too, and an overflow could look negative, i.e. "no limit". */
+static int32_t ts_ms(int64_t sec, int64_t nsec, int *err)
+{
+    if (sec < 0 || nsec < 0 || nsec >= 1000000000) {
+        *err = -EINVAL;
+        return 0;
+    }
+    if (sec >= 0x7FFFFFFF / 1000)
+        return 0x7FFFFFFF;
+    /* nsec fits 32 bits now: a 32-bit division (no libgcc call on i386) */
+    return (int32_t)sec * 1000 + (int32_t)(((uint32_t)nsec + 999999) / 1000000);
+}
+
 /* timespec64 -> ms (-1 for NULL: no limit) */
 static int32_t ts64_ms(uintptr_t user_ts, int *err)
 {
@@ -106,8 +123,7 @@ static int32_t ts64_ms(uintptr_t user_ts, int *err)
         *err = -EFAULT;
         return 0;
     }
-    int64_t ms = ts[0] * 1000 + (ts[1] + 999999) / 1000000;
-    return ms > 0x7FFFFFFF ? 0x7FFFFFFF : (int32_t)ms;
+    return ts_ms(ts[0], ts[1], err);
 }
 
 /* timespec32 -> ms (-1 for NULL: no limit) */
@@ -120,7 +136,7 @@ static int32_t ts32_ms(uintptr_t user_ts, int *err)
         *err = -EFAULT;
         return 0;
     }
-    return ts[0] * 1000 + (ts[1] + 999999) / 1000000;
+    return ts_ms(ts[0], ts[1], err);
 }
 
 SYSCALL_DEF(sys_ppoll32)                /* (fds, nfds, timespec32 *, sigmask *, size) */

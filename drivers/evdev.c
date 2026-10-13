@@ -219,7 +219,7 @@ static int32_t ev_read(struct file *f, void *ubuf, uint32_t n)
         if (f->flags & O_NONBLOCK)
             return -EAGAIN;
         if (signal_pending())
-            return -EINTR;
+            return -ERESTARTSYS;
         wq_sleep(&d->wq);
     }
     /* Take events out with interrupts off, then copy: the copy can fault

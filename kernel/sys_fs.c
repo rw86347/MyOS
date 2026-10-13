@@ -72,6 +72,15 @@ static uint32_t umasked(uint32_t mode)
     return mode & 07777 & ~proc_current()->umask;
 }
 
+/* May the caller add `name` to dir (fs/perm.c)? An existing name is
+   EEXIST whatever your rights, as on Linux, so that comes first. */
+static int may_add(struct inode *dir, const char *name, uint32_t len)
+{
+    if (len && !vfs_is_dots(name, len) && vfs_child(dir, name, len))
+        return -EEXIST;
+    return vfs_may_create(dir);
+}
+
 /* --- new names ------------------------------------------------------------- */
 
 /* int mkdir(path, mode) / mkdirat(dirfd, path, mode) */
@@ -82,6 +91,8 @@ static int32_t do_mkdir(uint32_t dirfd, uintptr_t user_path, uint32_t mode)
     const char *name;
     uint32_t len;
     int err = parent_of(dirfd, user_path, path, &dir, &name, &len);
+    if (!err)
+        err = may_add(dir, name, len);
     return err ? err : vfs_create(dir, name, len, S_IFDIR | umasked(mode), 0, &i);
 }
 
@@ -105,6 +116,8 @@ static int32_t do_mknod(uint32_t dirfd, uintptr_t user_path, uint32_t mode, uint
     const char *name;
     uint32_t len;
     int err = parent_of(dirfd, user_path, path, &dir, &name, &len);
+    if (!err)
+        err = may_add(dir, name, len);
     if (!err)                           /* rdev: (major << 8) | minor */
         err = vfs_create(dir, name, len, type | umasked(mode),
                          type == S_IFCHR || type == S_IFBLK ? dev & 0xFFFF : 0, &i);
@@ -127,6 +140,8 @@ static int32_t do_symlink(uintptr_t user_target, uint32_t dirfd, uintptr_t user_
     int err = get_path(target, user_target);
     if (!err)
         err = parent_of(dirfd, user_path, path, &dir, &name, &len);
+    if (!err)
+        err = may_add(dir, name, len);
     return err ? err : vfs_symlink(dir, name, len, target, strlen(target));
 }
 
@@ -157,6 +172,9 @@ static int32_t do_remove(uint32_t dirfd, uintptr_t user_path, int rmdir)
     struct inode *i = vfs_child(dir, name, len);
     if (!i)
         return -ENOENT;
+    err = vfs_may_delete(dir, i);       /* write on dir; /tmp's sticky rule */
+    if (err)
+        return err;
     if (i->flags & I_MOUNTED)
         return -EBUSY;                  /* a mounted disk's root */
     if (rmdir) {
@@ -201,6 +219,18 @@ static int32_t do_rename(uint32_t olddirfd, uintptr_t oldpath, uint32_t newdirfd
     struct inode *i = vfs_child(odir, oname, olen);
     if (!i)
         return -ENOENT;
+    /* Linux's rules: taking the name away is a delete from odir; the new
+       name is a delete of whatever is there, or a create in ndir; and a
+       directory that changes parent rewrites its own "..", which needs
+       write permission on it. */
+    struct inode *there = vfs_child(ndir, nname, nlen);
+    err = vfs_may_delete(odir, i);
+    if (!err)
+        err = there ? vfs_may_delete(ndir, there) : vfs_may_create(ndir);
+    if (!err && S_ISDIR(i->mode) && ndir != odir)
+        err = vfs_permission(i, MAY_WRITE);
+    if (err)
+        return err;
     return vfs_rename(i, ndir, nname, nlen, flags & RENAME_NOREPLACE);
 }
 
@@ -210,8 +240,14 @@ SYSCALL_DEF(sys_renameat2) { return do_rename(a1, a2, a3, a4, a5); }
 
 /* --- attributes --------------------------------------------------------------- */
 
+/* Only the owner or root may change a mode (Linux: EPERM). Someone who
+   isn't in the file's group can't make it setgid to that group. */
 static int set_mode(struct inode *i, uint32_t mode)
 {
+    if (!vfs_owner_or_root(i))
+        return -EPERM;
+    if ((mode & S_ISGID) && !vfs_fs_root() && !vfs_in_group(i->gid))
+        mode &= ~S_ISGID;
     i->mode = (i->mode & S_IFMT) | (mode & 07777);
     i->ctime = time_now();
     return vfs_setattr(i);              /* on a disk: write it there too */
@@ -238,10 +274,25 @@ SYSCALL_DEF(sys_fchmod)
     return f ? set_mode(f->inode, a2) : -EBADF;
 }
 
-/* Owner and group; -1 leaves one unchanged. (We're all root, so this
-   only matters to programs that look, like `ls -l` and tar.) */
+/* Owner and group; -1 leaves one unchanged. Linux's rules (chown_ok,
+   chgrp_ok): only root gives a file to another user; its owner may move
+   it to one of their own groups. Every chown of a non-directory clears
+   setuid, and setgid if the group may run it — as on Linux, even root's:
+   a program must not keep running as someone it no longer belongs to. */
 static int set_owner(struct inode *i, uint32_t uid, uint32_t gid)
 {
+    if (!vfs_fs_root()) {
+        int owner = vfs_owner_or_root(i);
+        if (uid != 0xFFFFFFFFu && !(owner && uid == i->uid))
+            return -EPERM;
+        if (gid != 0xFFFFFFFFu && !(owner && (gid == i->gid || vfs_in_group(gid))))
+            return -EPERM;
+    }
+    if (!S_ISDIR(i->mode)) {
+        i->mode &= ~S_ISUID;
+        if (i->mode & S_IXGRP)
+            i->mode &= ~S_ISGID;
+    }
     if (uid != 0xFFFFFFFFu)
         i->uid = uid;
     if (gid != 0xFFFFFFFFu)
@@ -284,6 +335,18 @@ static int32_t set_times(uint32_t dirfd, uintptr_t user_path, uint32_t flags, in
         int err = target_of(dirfd, user_path, flags, &i);
         if (err)
             return err;
+    }
+    if (given && ns0 == UTIME_OMIT && ns1 == UTIME_OMIT)
+        return 0;                       /* nothing to set: no checks either */
+    /* "Now" (touch) needs ownership or write permission; any other time
+       needs ownership: a writer may not backdate someone else's file. */
+    if (!vfs_owner_or_root(i)) {
+        int now_only = !given || ((ns0 == UTIME_NOW || ns0 == UTIME_OMIT) &&
+                                  (ns1 == UTIME_NOW || ns1 == UTIME_OMIT));
+        if (!now_only)
+            return -EPERM;
+        if (vfs_permission(i, MAY_WRITE))
+            return -EACCES;
     }
     uint32_t now = time_now();
     if (!given || ns0 != UTIME_OMIT)
@@ -328,6 +391,8 @@ static int32_t path_truncate(uintptr_t user_path, int64_t size)
 {
     struct inode *i;
     int err = target_of(AT_FDCWD, user_path, 0, &i);
+    if (!err && !S_ISDIR(i->mode))
+        err = vfs_permission(i, MAY_WRITE);     /* (ftruncate: the fd's mode) */
     return err ? err : do_truncate(i, size);
 }
 
@@ -742,19 +807,25 @@ SYSCALL_DEF(sys_pivot_root)
     return err ? err : vfs_pivot_root(new_root, put_old);
 }
 
-/* umount2(target, flags). Taking a file system off the tree needs to know
-   that nothing in it is open or anyone's cwd; the VFS doesn't count that
-   yet, so every mount stays busy. */
+/* umount2(target, flags): a disk file system (ext2, vfat) comes off the
+   tree if nothing uses it (vfs_umount). Root only (Linux: CAP_SYS_ADMIN).
+   MNT_FORCE is a hint we don't need; MNT_DETACH ("lazily, once unused")
+   and MNT_EXPIRE aren't done: a busy mount stays, EBUSY. tmpfs, proc and
+   sysfs mounts stay too (EBUSY). */
 SYSCALL_DEF(sys_umount2)
 {
     char target[PATH_MAX];
     struct inode *i;
     if (a2 & ~0xFu)
         return -EINVAL;
+    if (proc_current()->cred.euid != 0)
+        return -EPERM;
     int err = get_path(target, a1);
     if (!err)
         err = vfs_lookup(target, &i);
     if (err)
         return err;
-    return is_mount_root(i) ? -EBUSY : -EINVAL;
+    if (!is_mount_root(i))
+        return -EINVAL;
+    return vfs_umount(i);
 }

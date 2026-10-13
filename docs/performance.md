@@ -750,3 +750,27 @@ adjacent clusters are read in one command of up to 64 KiB.
 |---|---|
 | before | about 4 MB a minute (the copy was stopped after 15 minutes) |
 | after (whole installer EFI step: read, write FAT32 to NVMe) | 3 s |
+
+## Permission checks on the path walk and open (2026-10-13)
+
+File permissions are checked now (`fs/perm.c`): search on every directory
+a path passes through, read/write on every open. Both are on the hottest
+file paths, so both have a test that needs no credentials when the answer
+is "everyone may":
+- **the walk**: a directory with all three x bits (0755, 1777 — nearly
+  all) is searchable by anyone: `(mode & 0111) == 0111`, two instructions;
+- **open**: `vfs_permission` is inline (`include/vfs.h`); when all three
+  sets allow the request (a 0644 file opened for reading), it answers at
+  once. Only the rest calls `vfs_permission_slow`, which reads the
+  process's credentials and, if needed, its groups.
+
+`make bench` (QEMU, `-icount`, i386):
+
+| | before | first try | after |
+|---|---|---|---|
+| open + close (2-part path) | 1621 | 1719 | 1659 cycles (+2.3%) |
+| stat (statx) | 1334 | 1342 | 1342 cycles (+0.6%) |
+
+The first try called into `perm.c` on every open (+98); the general inline
+test in the walk cost ~10 more per directory than the x-bits one (stat 1362),
+so the walk keeps its own.

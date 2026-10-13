@@ -1393,6 +1393,26 @@ static int32_t ext2_write(struct file *f, const void *user_buf, uint32_t n)
 static const struct file_ops ext2_file_ops = { .read = ext2_read, .write = ext2_write,
                                                .kbuf_ok = 1 };
 
+/* umount: the VFS has checked nothing uses it and written its pages.
+   Mark it cleanly unmounted (e2fsck then has nothing to check), write
+   that and every other dirty block, let go of the superblock, and forget
+   the device's cached blocks: a stick may be changed elsewhere before it
+   is mounted again. */
+static void ext2_unmount(struct mount *m)
+{
+    struct ext2 *fs = m->priv;
+    if (!fs->readonly) {
+        fs->sb->state |= VALID_FS;
+        fs->sb->wtime = time_now();
+        bdirty(fs->sb_buf);
+    }
+    brelse(fs->sb_buf);
+    fs->sb_buf = NULL;
+    fs->sb = NULL;
+    bcache_drop(fs->dev);               /* writes everything first (bsync) */
+    klog("ext2: %s unmounted%s\n", fs->dev->name, fs->readonly ? "" : " cleanly");
+}
+
 static const struct fs_ops ext2_ops = {
     .load_dir = ext2_load_dir,
     .create = ext2_create,
@@ -1405,6 +1425,7 @@ static const struct fs_ops ext2_ops = {
     .writepages  = ext2_writepages,
     .map_pages   = ext2_map_pages,
     .statfs = ext2_statfs,
+    .unmount = ext2_unmount,
 };
 
 /* --- mounting --------------------------------------------------------------------- */

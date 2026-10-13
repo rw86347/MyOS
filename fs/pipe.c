@@ -67,7 +67,7 @@ static int32_t pipe_read(struct file *f, void *user_buf, uint32_t n)
         if (f->flags & O_NONBLOCK)
             return -EAGAIN;
         if (signal_pending())
-            return -EINTR;
+            return -ERESTARTSYS;
         wq_sleep(&p->readq);
     }
     uint32_t avail = p->head - p->tail;
@@ -111,7 +111,7 @@ static int32_t pipe_write(struct file *f, const void *user_buf, uint32_t n)
             if (f->flags & O_NONBLOCK)
                 return done ? (int32_t)done : -EAGAIN;
             if (signal_pending())
-                return done ? (int32_t)done : -EINTR;
+                return done ? (int32_t)done : -ERESTARTSYS;
             wq_sleep(&p->writeq);           /* a reader will make room */
             continue;
         }
@@ -286,7 +286,7 @@ int fifo_open(struct inode *i, uint32_t flags, struct file **out)
     while (*open_now == 0 && *other == seen) {
         if (signal_pending()) {
             file_put(f);                /* undoes our end, frees the pipe if last */
-            return -EINTR;
+            return -ERESTARTSYS;
         }
         wq_sleep(acc == O_RDONLY ? &p->readq : &p->writeq);
     }

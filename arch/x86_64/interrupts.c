@@ -193,8 +193,9 @@ static void user_exception(struct regs *r, uint64_t cr2)
             if (at[k] < 0x1000 || at[k] >= USER_ADDR_END ||
                 copy_from_user(w, (const void *)(uintptr_t)(at[k] & ~7ull), sizeof w) < 0)
                 continue;
-            kprintf("  [%s] %lx: %lx %lx %lx %lx %lx %lx  (frame %x)\n", nm[k], at[k],
-                    w[0], w[1], w[2], w[3], w[4], w[5], vmm_translate(at[k] & ~0xFFFull));
+            kprintf("  [%s] %lx: %lx %lx %lx %lx %lx %lx  (frame %lx)\n", nm[k], at[k],
+                    w[0], w[1], w[2], w[3], w[4], w[5],
+                    (unsigned long)vmm_translate(at[k] & ~0xFFFull));
         }
         vmm_audit();
     }
@@ -270,6 +271,8 @@ void syscall_entry_c(struct regs *r)
     r->rax = nr <= 0xFFFFFFFF ? syscall_dispatch((uint32_t)nr, r->rdi, r->rsi, r->rdx,
                                                  r->r10, r->r8, r->r9)
                               : -ENOSYS;
+    if (r->rax == (uint64_t)-ERESTARTSYS)
+        signal_restart_note((uint32_t)nr);
     sched_preempt_check();              /* the slot may have ended meanwhile */
     SIGNAL_CHECK(r);                    /* back to user mode: deliver signals */
 }

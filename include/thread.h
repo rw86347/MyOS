@@ -85,6 +85,11 @@ struct thread {
     struct thread *rq_next, *rq_prev; /* the run queue: all READY threads */
     uint8_t owns_slot;                /* has slots in the slot table (sched.c) */
     uint8_t is_idle;                  /* the idle thread */
+    uint32_t restart_nr;              /* a syscall a signal cut short: its number + 1
+                                         (signal_check restarts it or says EINTR) */
+    uint8_t perm_real;                /* inside access(): permission checks use the
+                                         real user and group (fs/perm.c). Per
+                                         thread, so a sibling isn't affected. */
     /* CPU time used, in ms: the timer tick charges whoever it interrupts —
        to utime if it was in user mode, else to stime. Sampled like Linux's
        tick accounting: exact on average, not per call. (times, getrusage) */

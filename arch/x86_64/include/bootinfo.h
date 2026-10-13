@@ -47,6 +47,7 @@ struct bootinfo {
     uint64_t fb_phys;               /* full GOP address */
     uint32_t loader_magic;          /* BOOTINFO_MAGIC if loader filled GOP */
     uint32_t boot_flags;            /* BOOT_FROM_USB, ... */
+    uint64_t acpi_rsdp;             /* the firmware's ACPI tables (RSDP), 0 = not given */
 } __attribute__((packed));
 
 /* The loader came from a USB disk: the kernel waits for that disk to show

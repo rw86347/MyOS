@@ -8,25 +8,23 @@
 /*
  * The time-slot scheduler (see docs/DESIGN.md).
  *
- * Time repeats in a "major frame" of SCHED_SLOTS slots, 1 ms each.
- * Slots 1 and 10 run the system (the "main" thread). Other slots run the
- * named thread that config/slots.conf assigns to them, or the idle thread.
+ * Time repeats in a "major frame" of SCHED_SLOTS slots, 1 ms each,
+ * numbered 0-19. Slots 0 and 10 run the system (the "main" thread). Other
+ * slots run the named thread the kernel config gives them (kconfig.h:
+ * config/slots.conf built in, or the myos-config partition), or leftover
+ * work, or the idle thread.
  *
  * Until sched_start() the scheduler is in a simple round-robin mode, used
  * during boot and by the thread self-tests.
  */
 
 #define SCHED_SLOTS         20
-#define SCHED_SYSTEM_THREAD "main"      /* owns the system slots 1 and 10 */
-
-/* slot_config[s] = name of the thread that owns slot s, or NULL.
-   Generated at build time from config/slots.conf. */
-extern const char *const slot_config[SCHED_SLOTS + 1];
+#define SCHED_SYSTEM_THREAD "main"      /* owns the system slots 0 and 10 */
 
 /* Switch from round robin to the slot table. Creates the idle thread. */
 void sched_start(void);
 
-/* The slot running right now (1-20), or 0 before sched_start(). */
+/* The slot running right now (0-19), or -1 before sched_start(). */
 int sched_slot(void);
 
 /* Name of the owner of slot s per the config (system slots included),

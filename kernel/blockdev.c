@@ -6,6 +6,7 @@
  * Devices live in a small fixed-size array: a PC has only a few disks.
  */
 #include <blockdev.h>
+#include <types.h>
 #include <memlayout.h>
 #include <paging.h>
 #include <interrupts.h>
@@ -129,14 +130,17 @@ int blockdev_map(const void *buf, uint32_t bytes, struct bio_vec *v, int max)
     uintptr_t va = (uintptr_t)buf;
     int n = 0;
     while (bytes) {
-        uint32_t piece = PAGE_SIZE - (va & (PAGE_SIZE - 1)), pa;
+        uint32_t piece = PAGE_SIZE - (va & (PAGE_SIZE - 1));
+        phys_addr_t pa;
         if (piece > bytes)
             piece = bytes;
         if (va >= DIRECTMAP_BASE && va - DIRECTMAP_BASE < DIRECTMAP_LIMIT)
             pa = V2P(va);
         else if ((pa = vmm_translate(va & ~(PAGE_SIZE - 1))) != 0)
             pa |= va & (PAGE_SIZE - 1);
-        if (!pa)
+        /* Disk buffers are the kernel's (low zone, below 4 GiB): a device
+           address above that would be cut short, so it is refused instead. */
+        if (!pa || pa > 0xFFFFFFFFull - piece)
             return -1;
         if (n && v[n - 1].phys + v[n - 1].len == pa)
             v[n - 1].len += piece;

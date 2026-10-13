@@ -92,7 +92,7 @@ static const struct file_ops devtty_ops = {
 };
 
 static struct inode console_inode = {
-    .ino = 0, .mode = S_IFCHR | 0620, .nlink = 1, .rdev = DEV(5, 1),
+    .ino = 0, .mode = S_IFCHR | 0600, .nlink = 1, .rdev = DEV(5, 1),
     .name = "console", .name_len = 7, .ops = &console_ops,
 };
 
@@ -534,14 +534,38 @@ void dev_attach(struct inode *i)
     }
 }
 
+/* Who may open a node the kernel makes. Linux's devtmpfs makes nodes
+   0600 root and udev opens them up; with no udev here, the kernel gives
+   the final modes, Alpine's (mdev.conf, and its /etc/group numbers):
+   the keyboard, mouse and screen only to their groups (the X server is
+   root; the desktop's user is in them), the virtual terminals to tty,
+   the console to root alone. Everything else here (null, zero, random,
+   tty, ptmx) is everyone's. Sound sets its own (drivers/sound/core.c). */
+#define GID_TTY     5
+#define GID_INPUT   23
+#define GID_VIDEO   27
+
+static uint32_t node_mode(uint32_t rdev, uint32_t *gid)
+{
+    *gid = 0;
+    switch (rdev >> 8) {
+    case 4:  *gid = GID_TTY;   return 0620;     /* tty0..tty7 */
+    case 5:  return (rdev & 0xFF) == 1 ? 0600 : 0666;  /* console; tty, ptmx */
+    case 13: *gid = GID_INPUT; return 0660;     /* input/event* */
+    case 29: *gid = GID_VIDEO; return 0660;     /* fb0 */
+    default: return 0666;
+    }
+}
+
 static void make_node(struct inode *dev, const char *name, uint32_t rdev)
 {
-    uint32_t len = strlen(name);
+    uint32_t len = strlen(name), gid;
     if (vfs_child(dev, name, len))
         return;                             /* the initramfs has it already */
-    struct inode *i = vfs_add(dev, name, len, S_IFCHR | 0666);
+    struct inode *i = vfs_add(dev, name, len, S_IFCHR | node_mode(rdev, &gid));
     if (i) {
         i->rdev = rdev;
+        i->gid = gid;
         dev_attach(i);
     }
 }

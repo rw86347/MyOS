@@ -14,51 +14,44 @@ when it's fixed. File references point at the comment that mentions the gap.
 - **ARM64 user image:** Alpine busybox.static is ET_EXEC at 0x400000 (MMIO if
   identity-mapped). Paging aliases that VA onto RAM at `ARM64_USER_IMAGE_PA`.
 
-## At a glance: where MyOS is not (yet) Linux (checked against the code 2026-10-07)
+## At a glance: where MyOS is not (yet) Linux (checked against the code 2026-10-13)
 
 The sections after this one have the detail. This list is what a Linux program is
 most likely to trip over, each item checked in the source on the date above.
 
 - **System calls** (`tools/syscall-coverage.py` counts them from Linux's own tables):
-  on x86_64 Linux has 369; MyOS implements 218, accepts 3 and does nothing
-  (`madvise`, `readahead`, `set_robust_list`), and 148 return ENOSYS. Missing ones
-  real programs use: `sigaltstack`, `msync`, `mlock*`, `preadv`/`pwritev` (+`2`),
-  `waitid`, `ptrace`, `rt_sigqueueinfo`, `timerfd_*`, `signalfd*`, `sendmmsg`/
-  `recvmmsg`, `splice`/`tee`/`vmsplice`, `sync_file_range`, the `sched_*`
-  priority/affinity setters, POSIX message queues (`mq_*`), `clone3`,
-  `close_range`, `openat2`, `execveat`, `pidfd_*`, `rseq`, `io_uring`, AIO, the
-  new mount API (`fsopen`, util-linux `mount` asks for it), `get_mempolicy`/
-  `mbind`, `settimeofday`, `vhangup` (in the i386 table, not the x86_64 one).
-  i386 lacks 200 of Linux's 442, many of them on purpose (legacy calls,
-  `docs/DESIGN.md`).
-- **Memory**: the x86_64 kernel uses only the first 2 GiB of RAM (the MSI has
-  16 GiB); i386 uses 768 MiB. `PROT_NONE` isn't enforced (a `PROT_NONE` page is
-  still filled in and readable on a touch, so guard pages don't fault) and there is
-  no no-execute bit on either CPU. `madvise(MADV_DONTNEED)` doesn't drop pages, so
-  they don't read back as zeros as on Linux. `MAP_SHARED` file mappings are private
-  copies; `MAP_SHARED|MAP_ANONYMOUS` is private after `fork`. No address-space
-  randomisation. At most 1024 areas per process.
-- **Processes and signals**: no `sigaltstack`, no `SA_RESTART` (a signal makes a
-  sleeping call return EINTR), no job-control stops (SIGSTOP/SIGTSTP do nothing:
-  no Ctrl-Z), no ptrace or core dumps, signals are one bit each (not queued, no
-  `si_pid` for `kill`). A program's `int3` arrives as SIGSEGV, not SIGTRAP: every
-  x86_64 interrupt gate is kernel-only (`0x8E`, `arch/x86_64/interrupts.c`), so
-  `int3` from user mode raises #GP. Chromium's and WritePerfect's deliberate
-  crashes showed up that way. 64 threads, 64 processes and **64 open files per
-  process** in the whole system (Chromium wants hundreds); `select` looks only at
-  fds 0-31.
-- **Users and security**: users and setuid exist, but **nothing checks
-  permissions** (files, `kill`, `mount`, `reboot`, hostname): any user can write
-  `/etc/shadow`. No capabilities: `capset` that drops any is refused, so iputils
+  on x86_64 Linux has 369; MyOS implements 244, accepts 2 and does nothing
+  (`readahead`, `set_robust_list`), and 123 return ENOSYS. Missing ones real
+  programs use: `ptrace`, `timerfd_*`, `signalfd*`, `sendmmsg`/`recvmmsg`,
+  `splice`/`tee`/`vmsplice`, `sync_file_range`, POSIX message queues (`mq_*`),
+  `clone3`, `openat2`, `execveat`, `pidfd_*`, `rseq`, `io_uring`, AIO, the new
+  mount API (`fsopen`, util-linux `mount` asks for it), `get_mempolicy`/`mbind`,
+  `settimeofday`, `seccomp`, landlock. i386 implements 264 of Linux's 442; most
+  of the 176 it lacks are legacy calls left out on purpose (`docs/DESIGN.md`).
+- **Memory**: the x86_64 kernel uses all RAM, but only programs' private pages
+  live above 2 GiB: the kernel, its caches and RAM files fit in the first 2 GiB;
+  i386 uses 768 MiB. There is no no-execute bit on either CPU. A disk file can't be mapped `MAP_SHARED` for
+  writing (ENODEV; read-only it is a snapshot); RAM files and
+  `MAP_SHARED|MAP_ANONYMOUS` are really shared. No address-space randomisation.
+- **Processes and signals**: job control works (Ctrl-Z, `fg`, `bg`; SIGTTIN, not SIGTTOU), no
+  ptrace or core dumps, signals are one bit each (not queued, no `si_pid` for
+  `kill`). 512 threads and 256 processes in the whole system on x86_64 (256 and
+  128 on i386); 1024 open files per process.
+- **Users and security**: users, groups and setuid exist, and file permissions
+  are checked as Linux does (`fs/perm.c`, 2026-10-13); `kill` reaches only your
+  own processes; `reboot`, `sethostname`, `mount` and making device nodes are
+  root only. No ACLs, and the kernel's own files have fixed modes. No capabilities: `capset` that drops any is refused, so iputils
   `ping` (setuid root, drops to CAP_NET_RAW) fails with "cap_set_proc: Operation
   not permitted" (`busybox ping` works). No seccomp, namespaces or landlock.
   Empty live passwords accept anything.
 - **Files**: no hard links (`link` is EPERM), files at most 4 GiB, paths 255
   bytes, arguments + environment 64 KiB. ext2 only (ext4 refused, no journal),
-  FAT32 read-only. Mounts: only tmpfs/proc/sysfs, never undone. `/proc` has only
-  `self/exe`, `self/fd`, `cmdline` and `net`: no `/proc/<pid>`, `meminfo`,
-  `cpuinfo`, `mounts` (so `ps`, `top`, `pidof`, `free -m` show nothing). `/sys`
-  has only `class/graphics/fb0`.
+  FAT32 read-only. Mounts: tmpfs, proc, sysfs, and ext2/vfat from a block device
+  (root only); disk mounts can be undone (`umount`), RAM mounts can't. `/proc` has
+  `/proc/<pid>`, `cpuinfo`, `meminfo`, `mounts`, `uptime` and more, but some
+  per-process numbers are zeros (memory, faults) and `fd`/`exe`/`cwd` exist only
+  under `/proc/self`. `/sys` has `fb0`, the network, the disks and the CPU, no
+  input devices.
 - **TCP/IP** (`net/`; details under Networking and Drivers):
   - TCP has both ends (listen/accept since 2026-10-07, SYN cookies, at most 8
     waiting connections) but **at most 16 TCP connections in the whole system**
@@ -66,7 +59,7 @@ most likely to trip over, each item checked in the source on the date above.
   - No congestion control (a fixed 4 segments in flight, no slow start), no
     out-of-order queue (dropped, the peer resends), no SACK, no timestamps, no RTT
     estimate (retransmit 250 ms doubling to 4 s, 8 tries), no Nagle, TIME_WAIT 2 s.
-  - **No loopback**: anything to 127.0.0.1 fails with ENETUNREACH, TCP or UDP.
+  - **Loopback is UDP only**: TCP and ping to 127.0.0.1 fail with ENETUNREACH.
   - **`setsockopt` accepts every option and ignores it**: `SO_RCVTIMEO`/
     `SO_SNDTIMEO` (a read with a timeout waits for ever), `SO_KEEPALIVE`,
     `TCP_NODELAY`, `SO_REUSEADDR`, `SO_LINGER`... `getsockopt` knows four.
@@ -81,19 +74,22 @@ most likely to trip over, each item checked in the source on the date above.
   - UDP queues 8 datagrams per socket; raw sockets are ICMP only (echo requests
     to send), open to every user (no CAP_NET_RAW check).
   - No `sendmmsg`/`recvmmsg`, no packet filter (netfilter), one rate-limit bucket.
-- **Devices**: the serial port is written, never read (a login prompt on ttyS0
-  can't be typed into). One CPU (no SMP), the 8259 PIC (no IOAPIC), no ACPI
-  tables read (power off is real only in QEMU). USB: xHCI and mass storage only,
-  no hubs, no USB keyboards/mice; no touchpad (I2C HID); no sound; graphics is the
-  firmware framebuffer or QEMU's Bochs card, no DRM/KMS.
-- **Programs**: Chromium (x86_64) starts as of 2026-10-07 (the program loader and
-  `mmap` lengths were the first two blockers) and is not yet seen with a window.
-  32-bit Firefox dies at GUI start; AbiWord aborts in musl's malloc.
+- **Devices**: serial input reaches the console, but there is no `/dev/ttyS0`.
+  One CPU (no SMP), the 8259 PIC plus the local APIC for MSI only (no IOAPIC), no
+  ACPI tables read but the power-off numbers (drivers/acpi.c). USB: xHCI and mass storage
+  only, no hubs, no USB keyboards/mice; no touchpad (I2C HID,
+  `docs/TOUCHPAD-PLAN.md`); sound is HD Audio, one program at a time; graphics is
+  the firmware framebuffer or QEMU's Bochs card, no DRM/KMS.
+- **Programs**: Chromium (x86_64) is the Start menu's browser; it runs without
+  its sandbox and crashes in the browser process soon after loading a page
+  (2026-10-09 below). 32-bit Firefox dies at GUI start; AbiWord aborts in musl's
+  malloc.
 
 ## Boot
 - **Kernel must end below 4 MiB** (incl. `.bss`): `entry.asm` maps only one 4 MiB page
-  before `paging.c` maps the rest. The kernel is ~110 KiB, ~320 KiB with `.bss` (it ends
-  at ~1.3 MiB physical), so there's room; the linker script now fails the build if not.
+  before `paging.c` maps the rest. The kernel is ~490 KiB, ~1.3 MiB with `.bss` (it ends
+  at ~2.3 MiB physical, 2026-10-13: up from 1.3 MiB), so there's room, but less each
+  month; the linker script fails the build if not.
 - **Needs a Pentium Pro or later.** `cpu_init()` checks and prints a message, but
   `entry.asm` already turns on 4 MiB pages (PSE) before that — a CPU without PSE would
   crash before the message. (`arch/i386/entry.asm`, `arch/i386/cpu.c`)
@@ -109,8 +105,8 @@ most likely to trip over, each item checked in the source on the date above.
 - **E820 map holds at most 32 entries.** (`layout.inc`, `E820_MAX`)
 - **x86_64 live system** (`make ARCH=x86_64 live-uefi`): boots to the graphical
   login and desktop, from a USB stick too. First boot still logs `fsopen` (430,
-  util-linux `mount`), `sigaltstack` (131, grep) and `get_mempolicy` (239,
-  gdk-pixbuf-query-loaders) as not implemented; each program falls back.
+  util-linux `mount`) and `get_mempolicy` (239, gdk-pixbuf-query-loaders) as not
+  implemented; each program falls back.
 - **UEFI / GOP (i386):** GOP above 4 GiB on i386 is mapped with PSE-36
   for the kernel console (32-bit virtual address, 36-bit physical in
   the PDE). User `mmap` of `/dev/fb0` cannot name that address (32-bit
@@ -125,8 +121,9 @@ most likely to trip over, each item checked in the source on the date above.
 ## Live disk userland (`live/`, 2026-10-03)
 - **Boots to the graphical login** (`make live-hd`, `make utm-live`): `myos-login`
   starts X, checks the password with PAM and runs IceWM. agetty also runs on
-  `/dev/console`: there are no `/dev/tty1`/`ttyS0` nodes yet. Alpine's apk was never
-  run against the generated database (no Docker).
+  `/dev/console`: `/dev/tty1`-`tty7` are all that one console, and there is no
+  `/dev/ttyS0` node. Alpine's apk was never run against the generated database
+  (no Docker).
 - **The live user is made at build time** (`tools/fetch-live.py`, `add_live_user`):
   shadow's `useradd` and `passwd` lock `/etc/passwd` with a hard link, and the VFS has
   none (each name is its inode). Until `link()` exists they fail. Settings' **Add User…**
@@ -134,45 +131,54 @@ most likely to trip over, each item checked in the source on the date above.
   myos-adduser.c`) checks an administrator's password with PAM (`/etc/pam.d/myos-admin`)
   and writes passwd, group and shadow itself (flock, write, fsync, rename). Changing a
   password still has no tool.
-- **Empty passwords let any password in.** The live disk's `root` and `myos` have an
-  empty password, and base-auth's `nullok` makes pam_unix accept *anything* typed for
-  such an account, at the login screen and in `su` too. `myos-adduser` refuses a
-  typed password for an account whose password is empty; the login screen doesn't
-  yet. The installer must give both real passwords (or lock root's: `root:*:`).
+- **Empty passwords let any password in, in `su`.** The live disk's `root` and `myos`
+  have an empty password, and base-auth's `nullok` makes pam_unix accept *anything*
+  typed for such an account without asking. `myos-adduser` and the login screen
+  (since 2026-10-13) refuse a typed password for an account whose password is empty;
+  `su` doesn't. The installer gives both real passwords (and locks root's).
 - **Settings' Wi-Fi pane is still empty**, though Wi-Fi works (the MSI's AX201,
   from the tray icon): the pane reads `/proc/net/wireless`, which MyOS doesn't
   have, so it says "No Wi-Fi hardware found".
 - **Nothing reads the syslog socket.** `net/unix.c` has UNIX sockets now, but no
   syslog daemon runs, so login failures still go nowhere.
-- **64 fds per process** (`PROC_FILES`). bash still moves its terminal to fd 255 for
-  job control and gets `EBADF`, so the login shell has no Ctrl-Z / `fg`. `cloexec`
-  is a 64-bit mask; going past 63 needs a bitmap. `select()` still only sees fds
-  0–31 (Linux `fd_set` on i386 is 1024 bits; Firefox uses poll/epoll).
-- **No permission checks.** Processes have real users now (uid, groups, setuid exec),
-  but `open`, `unlink`, `kill`... don't check them: user `myos` can write `/etc/shadow`.
-  The scheduler also ignores nice values (`setpriority` stores them).
-- **/proc is `/proc/self/fd`, `/proc/self/exe`, `/proc/cmdline` and a `net`
-  entry** (`fs/procfs.c`). No `/proc/<pid>`,
-  `meminfo`, `mounts`; `self` is a directory, not a link to the pid. Listing
-  `/proc/self/fd` shows all 32 slots, open or not (opening or reading a closed one
-  is `ENOENT`). A pipe or socket fd can't be reopened through it (`ENXIO`), so
-  bash's `<(...)` can't use `/dev/fd`. A deleted file's link names just the file,
-  not its old directory.
-- **Named pipes: at most 64 open at once** (`FIFO_MAX`, `fs/pipe.c`), and a process
-  may have at most 1024 memory areas (`MM_AREAS_MAX`, `mm/mm.c`; Linux allows 65530).
-- **mount/umount2 are partial** (`kernel/sys_fs.c`). Only `tmpfs`, `proc` and `sysfs`
-  can be mounted (`mode=` is the one option read; `size=` is ignored: it shares the RAM
-  file system's pages). No devpts (`-ENODEV`); no block device files, so ext2/vfat
-  give `-ENOTBLK`; no bind or move mounts. A mount can't be undone: `umount2` says
-  `-EBUSY`, because the VFS doesn't count open files and cwds per mount. Remount
+- **Permissions are checked, the plain Unix way only** (`fs/perm.c`, since
+  2026-10-13): owner/group/other bits, the sticky bit, setgid directories, and
+  Linux's rules for open, create, delete, rename, chmod, chown, utimensat,
+  truncate, chdir, execve, access, inotify and Unix sockets. Not there: ACLs
+  (no extended attributes are kept at all), `noexec`/`nosuid` mounts
+  (accepted, not enforced), writing to a
+  setuid file doesn't clear its setuid bit (Linux does), and the kernel can
+  still read a present `PROT_NONE` page (no SMAP). Device nodes have Alpine's
+  modes and group numbers built in (`node_mode`, `fs/dev.c`): no udev to set
+  them. The scheduler also ignores nice values (`setpriority` stores them).
+- **/proc** (`fs/procfs.c`) has `/proc/<pid>`, `cpuinfo`, `meminfo`, `mounts`,
+  `stat`, `uptime` and the `net` files; what's missing per process is in the
+  2026-10-09 section. `self` is a directory, not a link to the pid. Listing
+  `/proc/self/fd` shows the 64 built-in slots, open or not (opening or reading a
+  closed one is `ENOENT`); fds 64-1023 work but aren't listed. A pipe or socket fd
+  can't be reopened through it (`ENXIO`), so bash's `<(...)` can't use `/dev/fd`.
+  A deleted file's link names just the file, not its old directory.
+- **Named pipes: at most 64 open at once** (`FIFO_MAX`, `fs/pipe.c`).
+- **mount/umount2 are partial** (`kernel/sys_fs.c`). Root may mount `tmpfs`, `proc`,
+  `sysfs`, and `ext2`/`vfat` from a block device (`mode=` is the one tmpfs option
+  read; `size=` is ignored: it shares the RAM file system's pages). No devpts
+  (`-ENODEV`); no bind or move mounts. `umount2` (root only) takes an ext2 or vfat
+  mount off when nothing uses it (`vfs_umount`), and EBUSY otherwise; tmpfs, proc
+  and sysfs mounts stay (EBUSY), and MNT_DETACH (lazy) isn't done. An unmounted
+  file system's in-memory inodes are kept, unreachable, not freed: a stick
+  mounted and unmounted again and again costs a little memory each time. Remount
   accepts nosuid/nodev/noexec without enforcing them and refuses read-only. tmpfs and
-  proc mounts don't show in `vfs_mount_count` (`df` misses them). Anyone may mount,
-  reboot and set the host name: those calls don't check for root yet.
-- **Power off is only real on QEMU** (`drivers/power.c`): it writes "soft off" to the
-  PIIX4/ICH9 power-management port when the PCI subsystem vendor is QEMU's (0x1AF4).
-  Real PCs need the sleep type from the ACPI tables (`_S5` in the DSDT); until we read
-  them, power off halts with "safe to turn off". Restart uses the keyboard controller,
-  then a triple fault. `reboot()` syncs first (Linux leaves that to the caller).
+  proc mounts don't show in `vfs_mount_count` (`df` misses them).
+- **Power off reads only what it needs from ACPI** (`drivers/acpi.c`, since
+  2026-10-13): the PM1a/PM1b ports from the FADT and `_S5`'s two sleep types, found
+  as bytes in the DSDT (no AML interpreter). A board whose `_S5` is computed, not a
+  constant package, a "hardware-reduced" one (no PM1 ports), or one that needs
+  `_PTS` run first still just halts with "safe to turn off". QEMU's own switch stays
+  as the fallback. Not yet tried on the MSI. No other sleep state (suspend). Restart
+  uses the keyboard controller, then a triple fault; ACPI's reset register isn't
+  read. `reboot()` syncs first (Linux leaves that to the caller).
+- **The i386 BIOS disk doesn't start on QEMU's q35 machine** (no serial output at
+  all, any RAM size; found 2026-10-13). The `pc` machine and UEFI are fine.
 - **vhangup doesn't revoke open files** (`drivers/tty.c`): it flushes input and sends
   SIGHUP/SIGCONT to the foreground group, but a process that kept the terminal open
   can still read the next user's typing. Linux makes those file descriptors fail.
@@ -220,17 +226,13 @@ most likely to trip over, each item checked in the source on the date above.
   table isn't read yet. With neither, the boot says "NO TICK" and sleeps never
   end. The planned tick is the local APIC timer in one-shot mode (CLAUDE.md),
   which also needs the APIC instead of the 8259 for device interrupts.
-- **Uses the old 8259 PIC and PIT**; real machines from ~2005 have the APIC. Switch to the
-  local APIC timer / IOAPIC later. (`arch/i386/pic.c`)
-- **No double-fault task gate.** A kernel stack overflow becomes a triple fault (reboot)
-  instead of a message. (`arch/i386/interrupts.c`)
+- **Uses the old 8259 PIC and PIT**; real machines from ~2005 have the APIC. The local
+  APIC is switched on only for MSI (`arch/x86_64/apic.c`). Switch to the local APIC
+  timer / IOAPIC later. (`arch/i386/pic.c`)
 
 ## Memory
 - **i386: RAM above 768 MiB is ignored** ("highmem"). Fine for old PCs with ≤ 768 MiB.
   (`mm/pmm.c`, `arch/i386/include/memlayout.h`)
-- **Kernel is one read/write/execute blob.** Code isn't write-protected and data isn't
-  no-execute. The Makefile comment says to split permissions once paging is on — paging
-  *is* on now, so this is due. (`Makefile`, `arch/i386/linker.ld`)
 - **Frame allocator is a linear bitmap scan.** Slow with lots of RAM; fine for now. (`mm/pmm.c`)
 - **Out of memory, the program that faults dies**, whichever it is: there is no OOM
   killer choosing the biggest one (Linux's), and no swap. With the x86_64 kernel's 2 GiB
@@ -243,25 +245,22 @@ most likely to trip over, each item checked in the source on the date above.
   page pool. (`mm/kheap.c`)
 - **Big blocks (> 1 KiB) are first-fit with a walk** over the big blocks. They're rare
   (thread stacks, buffers); small objects are O(1). (`mm/kheap.c`)
-- **Nothing above 0xFF000000 is used yet** (planned for temporary mappings etc.).
-  (`memlayout.h`)
-- **System V shared memory is what MIT-SHM needs, no more** (`kernel/shm.c`, 2026-10-04):
-  `shmget`, `shmat`, `shmdt`, and `shmctl`'s IPC_STAT, IPC_SET and IPC_RMID, through
-  `ipc()` (117), which is all musl calls. Not there: the direct calls (395-398), IPC_INFO,
-  SHM_INFO, SHM_STAT and `/proc/sysvipc/shm` (so `ipcs` lists nothing), SHM_LOCK (there's
-  no swap, so nothing to lock), the pre-`IPC_64` struct, and semaphores and message
-  queues (ENOSYS). At most 256 segments, and `shmget` with a key looks at all of them.
-  Their pages count against the RAM-file limit (half of RAM). A first touch past that
-  limit is SIGSEGV, where Linux gives SIGBUS. (Semaphores and message queues have
-  their own files now: `kernel/sem.c`, `kernel/msg.c`.)
-- **`MAP_SHARED | MAP_ANONYMOUS` is still private** after `fork`. The `VM_SHARED` areas
-  shared memory uses could carry it too, when a program needs it.
-- **The x86_64 kernel manages only the first 2 GiB of RAM** (`DIRECTMAP_LIMIT`,
-  `arch/x86_64/include/memlayout.h`; the page allocator's frames are 32-bit
-  numbers). The MSI has 16 GiB.
-- **`madvise` does nothing** (`sys_nop`): `MADV_DONTNEED` keeps the pages, where Linux
-  drops them and they read back as zeros. An allocator that relies on that sees old
-  data. (`MADV_FREE` and the hints are fine as no-ops.)
+- **System V IPC is what programs have asked for, no more** (`kernel/shm.c`, `sem.c`,
+  `msg.c`): shared memory (MIT-SHM), semaphores and message queues, through `ipc()` (117)
+  and the direct calls. Not there: IPC_INFO, SHM_INFO, SHM_STAT and `/proc/sysvipc`
+  (so `ipcs` lists nothing), SHM_LOCK (there's no swap, so nothing to lock), the
+  pre-`IPC_64` struct. At most 256 segments, and `shmget` with a key looks at all of
+  them. Their pages count against the RAM-file limit (half of RAM). A first touch past
+  that limit is SIGSEGV, where Linux gives SIGBUS.
+- **RAM above 2 GiB holds only programs' private pages** (x86_64, since
+  2026-10-13: `pmm_alloc_user`, `include/pmm.h`). The kernel's own memory, the page
+  cache, tmpfs and memfd files, shared memory and ELF segments stay in the first
+  2 GiB (the low zone, which every device can DMA into); on a 16 GiB machine
+  those can run out while 14 GiB are free. Next steps: page-cache and RAM-file
+  pages in the high zone for drivers that do 64-bit DMA. The high zone's share
+  counts take 2 bytes per high page, in low RAM (7 MiB for 14 GiB).
+  Not yet tried on the MSI. The UEFI loader keeps at most 96 memory-map entries
+  after merging; RAM described past that would be ignored.
 - **`mprotect` walks every page of its range** to update the ones present: fine for
   ordinary ranges, slow for a huge reservation (Chromium's allocator reserves 32 GiB
   of address space; a whole-range `mprotect` would be 8 million steps).
@@ -275,8 +274,9 @@ most likely to trip over, each item checked in the source on the date above.
   `sched_start()`). (`kernel/sched.c`)
 - **Dead threads are reaped lazily**: their slot and stack are only freed when
   `thread_create` needs the slot. (`kernel/thread.c`)
-- **Fixed tables: 64 threads, 64 processes, 64 fds per process.**
-  (`THREAD_MAX`, `PROC_MAX`, `PROC_FILES`; memory areas grow, up to `MM_AREAS_MAX`)
+- **Fixed tables: 512 threads and 256 processes on x86_64, 256 and 128 on i386**
+  (`THREAD_MAX`, `PROC_MAX`). A process's fd table starts at 64 and doubles up to 1024
+  (`PROC_FILES`); memory areas grow up to `MM_AREAS_MAX` (65536, Linux's limit).
 - **Threads (2026-10-03): what's missing.** `vfork` is plain fork (copy-on-write
   makes it cheap), and `clone(CLONE_VM)` *without* `CLONE_THREAD` gets a copy.
   - **Shared futexes are keyed by address space**, not by physical page, so a
@@ -291,41 +291,39 @@ most likely to trip over, each item checked in the source on the date above.
     status is lost (Linux fails the exec instead).
   - **No `CLONE_SETTLS` beyond the 3 GDT TLS slots**, the same limit as
     `set_thread_area`.
-- **No stack overflow detection.** A thread that uses more than 8 KiB silently overwrites
-  the heap. Fix: guard pages (an unmapped page below each stack).
-- **The slot table is compiled into the kernel.** Today `config/slots.conf` is turned into a
-  C array at build time (`tools/slots2c.awk`), so changing it means rebuilding. Goal: edit
-  `slots.conf` on the disk, reboot, and the kernel reads the file at boot and runs the new
-  table — no rebuild. Needs a file system the kernel can read early (FAT32 already reads; or
-  the initramfs, step 7) and a small parser in the kernel with the same checks as the awk
-  script (slots 1/10 reserved, one owner per slot), falling back to the built-in table if
-  the file is missing or wrong.
-- **Slot tasks are created by the self-test**, not from the config: the kernel only knows
-  names, and there are no programs to load yet. Later a name should map to a program
-  (an ELF file) that the kernel starts at boot.
+- **A slot goes to whichever thread has its owner's name** (`thread_find` in
+  `kernel/sched.c`); the owners come from the kernel config (`kernel/kconfig.c`).
+  Binding by program at `execve` is designed in `docs/TIME-SLOTS.md`; what is
+  missing is under Kernel config below.
 - **A slot owner can't run longer than 1 ms at a time, and overruns aren't reported.** It's
   simply preempted at the slot end. Real-time systems usually log or count overruns.
 - **The first slot after `sched_start()` is shorter than 1 ms** (the frame starts mid-tick).
 
 ## Processes, signals, terminal (step 8)
-- `select()` reads and writes only the first 32 bits of each `fd_set`
-  (`fs/poll.c`, `do_select` caps nfds at 32). A process can have 64 fds now
-  (`FD_MAX`), so a `select` on fd 32-63 never reports it ready. Not what POSIX
-  says either: bits 32-1023 of the caller's set are never cleared.
-- `ppoll`/`select` compute the timeout as a signed `tv_sec * 1000`, which
-  overflows on a large value and is then treated as "no timeout", turning a
-  short wait into an indefinite one. Interruptible, so it only affects the
-  caller.
-- **No job control stops**: SIGSTOP/SIGTSTP/SIGTTIN/SIGTTOU are ignored, so Ctrl-Z does
-  nothing and `fg`/`bg` can't work. No SIGTTOU/SIGTTIN for background terminal access.
-- **No syscall restart**: a signal makes a sleeping syscall return `-EINTR` even with
-  `SA_RESTART`. No `sigaltstack`, no core dumps, `pselect`/`ppoll` ignore their mask.
-- **One terminal**: the console (VGA + keyboard). Serial input isn't read (`drivers/
-  serial.c` enables only the transmit interrupt), so the live disk's agetty on ttyS0
-  prints a login prompt nobody can type into. `/dev/ttyN` are all the console.
-  VT100 subset only (no scroll regions, no line drawing).
+- **`ppoll`/`pselect6` cut a wait longer than ~24.8 days to that** (the wait counts
+  in 32-bit ms, `ts_ms` in `fs/poll.c`); it then ends early, as a timeout.
+- **Job control, without SIGTTOU** (since 2026-10-13: `kernel/signal.c`): stop signals
+  stop the process, SIGCONT continues it, `wait4`/`waitid` report both (WUNTRACED,
+  WCONTINUED), `ps` shows T, a terminal stop doesn't reach an orphaned group, and a
+  background job reading its terminal gets SIGTTIN (or EIO). Not yet: SIGTTOU for a
+  background job that writes with TOSTOP set or changes the terminal's settings;
+  threads asleep in a syscall stop only when it returns; ptrace stops. The console
+  is a controlling terminal like a pty now (TIOCSCTTY, TIOCNOTTY, TIOCGPGRP only for
+  its own session).
+- **Syscall restart follows Linux's lists, mostly** (since 2026-10-13: `-ERESTARTSYS`,
+  `signal_check`): reads and writes on pipes, terminals, sockets, eventfd, inotify
+  and input devices, `wait4`, `accept`, `recv`/`send`, `flock`/`F_SETLKW` and FIFO
+  opens run again after a handler with `SA_RESTART` (or when no handler runs);
+  `poll`, `select`, `epoll_wait`, `nanosleep`, System V IPC and `connect` say EINTR.
+  `futex` waits still say EINTR (Linux restarts them; musl loops anyway). No
+  `ERESTART_RESTARTBLOCK` (a restarted sleep with the time left). No core dumps,
+  `pselect`/`ppoll` ignore their mask.
+- **One terminal**: the console (VGA or framebuffer, keyboard, and the serial port's
+  input, which `drivers/serial.c` hands to the console like the keyboard's). There is
+  no separate `/dev/ttyS0`; `/dev/ttyN` are all the console. VT100 subset only (no
+  scroll regions, no line drawing).
 - **`poll`/`select`**: every waiter is woken on any terminal/pipe change (fine for a few
-  waiters); `select` handles fds 0-31 only.
+  waiters).
 - **Time**: millisecond resolution; the CMOS clock is assumed to be UTC; no
   `settimeofday`. `alarm` and `setitimer` do ITIMER_REAL only, in whole ms; arming one
   walks the sorted list of armed processes (at most PROC_MAX), the tick checks only its head.
@@ -341,8 +339,8 @@ most likely to trip over, each item checked in the source on the date above.
 - **Sockets**: AF_INET (TCP both ends, UDP, raw ICMP), AF_UNIX (stream and
   datagram), AF_NETLINK (read-only), AF_PACKET (receive). No AF_INET6. A UDP
   socket queues 8 datagrams and drops the rest. `setsockopt` accepts and ignores
-  every option (timeouts and keepalive included). Sending to 127.x fails
-  (ENETUNREACH): there is no loopback. The kernel does DHCP and a DNS A lookup
+  every option (timeouts and keepalive included). TCP and ping to 127.x fail
+  (ENETUNREACH): loopback is UDP only. The kernel does DHCP and a DNS A lookup
   itself (A records only). IP options and fragments are dropped. The receive queue holds 32
   packets; the neighbor table holds 8. `make test`'s DNS and HTTP lines need
   a path to example.com. QEMU ignores receives for one second after the
@@ -351,10 +349,11 @@ most likely to trip over, each item checked in the source on the date above.
 - **`uname` says "Linux"** (programs check it to know which syscalls exist); the release
   is "6.1.0-MyOS". `getrandom` is ChaCha20 (`kernel/random.c`); how much entropy seeds
   it is an estimate (see below).
-- **`mprotect(PROT_NONE)` doesn't hide pages**, on either CPU: present pages stay
-  readable (`mm_mprotect` only changes the write bit), and a `PROT_NONE` area is
-  still filled in on a read fault (`mm_fault` checks only writes). Guard pages and
-  reservations therefore never fault.
+- **The kernel can still read a `PROT_NONE` page that is present** (one that was
+  readable before an `mprotect`): such a page only loses its user bit, and with no
+  SMAP the kernel's own accesses pass, so `write(fd, prot_none_page, n)` sends its
+  data where Linux says EFAULT. A page never touched faults for the kernel too
+  (EFAULT), and every program access faults (`mm_fault`, 2026-10-13).
 - **No address-space randomisation**: static PIEs always load at 0x00400000.
 - **Disk-file mappings are private copies** (made per page on first touch), not the
   page cache's pages. Since 2026-10-09, `MAP_SHARED` of a disk file opened for writing
@@ -371,10 +370,7 @@ most likely to trip over, each item checked in the source on the date above.
 - **Execute permission isn't enforced**: i386 has no NX bit without PAE, and the
   x86_64 kernel doesn't set NX either.
 - **CPU exceptions become signals** (SIGSEGV/SIGFPE/SIGILL); a handler for them is called
-  but the faulting instruction runs again when it returns (like Linux). On x86_64 a
-  program's `int3` becomes SIGSEGV, not SIGTRAP: the IDT gates are all DPL 0, so `int3`
-  from user mode is a general-protection fault. Chromium's `IMMEDIATE_CRASH()` and
-  other deliberate traps are reported as "CPU exception 13".
+  but the faulting instruction runs again when it returns (like Linux).
 
 ## Disk / file systems
 - **One command at a time per disk** on every driver (IDE, AHCI, NVMe, virtio, USB):
@@ -413,14 +409,12 @@ most likely to trip over, each item checked in the source on the date above.
   at /mnt (`fs/fatvfs.c`). Creating or writing a file returns EROFS. `statfs` reports
   no free clusters yet. Long names are ASCII only; other characters become `?`
   (`fs/fat32.c`).
-- **Block devices live in a fixed-size array.** The comment says "no kmalloc yet" — we have
-  kmalloc now. (`kernel/blockdev.c`)
 - **Root on disk (9c)**: on an installed disk (`make hd`) the whole tree is on ext2. On
   a live disk only /data (if present) is; the rest is the initramfs in RAM, lost at
   power-off, at most half of RAM (`-ENOSPC`). After switching to a disk root the RAM tree
   (and the initramfs's 3 MiB) stays in memory unused; an installed disk still loads the
   full initramfs at boot. Files that mke2fs copied from the Mac belong to uid 501 (the
-  Mac user), not root. No `mount`/`umount` calls; mounts can't be undone. Only the first
+  Mac user), not root. Only the first
   `myos-root` counts. A program is mapped from its file and paged in on touch
   (the page cache, 9c-2); it is no longer copied whole at exec.
 - **The disk driver spins up to 2048 status reads** before sleeping on the interrupt (fast
@@ -428,10 +422,12 @@ most likely to trip over, each item checked in the source on the date above.
   to run; on real hardware that's up to ~2 ms of otherwise idle CPU per seek.
   (`drivers/ata.c`, `POLL_FIRST`)
 - **ext2** (`fs/ext2.c`): the first ext2 file system found (a type-0x83 partition or a
-  whole disk without a partition table) is mounted at /data; no `mount`/`umount` calls
-  yet. No journal: switching off mid-change can leave the disk
-  inconsistent (e2fsck repairs it); the superblock stays "not cleanly unmounted" since
-  nothing unmounts. Refused: ext4 extents, 64-bit, flex_bg; mounted read-only: disks with
+  whole disk without a partition table) is mounted at /data; root can mount others
+  (`mount -t ext2`) and unmount them. No journal: switching off
+  mid-change can leave the disk
+  inconsistent (e2fsck repairs it); a file system never unmounted (the root, /data
+  at power off: runit's stage 3 doesn't unmount yet) stays "not cleanly
+  unmounted". Refused: ext4 extents, 64-bit, flex_bg; mounted read-only: disks with
   checksums or other features we can't keep up to date. A directory we change loses its
   hash index (as with Linux's own ext2 driver). Hard links can't be made, and a file
   with two names (made by Linux) becomes two separate nodes here, whose sizes can drift
@@ -441,10 +437,6 @@ most likely to trip over, each item checked in the source on the date above.
   Times are 32-bit seconds.
 - **No hard links**: a file and its name are one struct, so `link()` returns `-EPERM`
   (what Linux says on FAT). Hard links in the cpio archive become separate files.
-- **No block device nodes** (`mknod` makes files, character devices and FIFOs only;
-  `kernel/sys_fs.c`).
-- **Permissions are stored, not checked**: everyone is root, so `chmod`/`chown` only change
-  what `ls -l` shows. The one check: `execve` needs an x bit.
 - **Directories: `lseek` only rewinds** (to 0); `seekdir` to a saved place isn't supported.
   Entries are listed newest first (`ls` sorts anyway).
 - **`atime` isn't updated by reads** (like mounting with `noatime`).
@@ -523,8 +515,7 @@ most likely to trip over, each item checked in the source on the date above.
   EOPNOTSUPP; SIOCSIFFLAGS can bring a link up or down). Multicast groups
   are remembered but no events are sent, so a program watching for a link
   to come up never hears it. No `ip route get`. Messages between programs
-  (a destination pid other than 0) are refused. No /proc/net/dev, so
-  `ifconfig` prints no counters.
+  (a destination pid other than 0) are refused.
 
 - **No DHCP lease renewal.** `net/dhcp.c` parses the lease time and ignores
   it: the address is kept until reboot. On a network whose server hands it to
@@ -583,7 +574,7 @@ most likely to trip over, each item checked in the source on the date above.
   semctl/msgctl IPC_INFO and *_STAT (what `ipcs` lists with) are -EINVAL. Legacy
   fallbacks (stat64, fstat64, utimes, futimesat, 32-bit clock_settime) stay out
   (docs/DESIGN.md): musl uses them only after -ENOSYS from the modern calls.
-- **inotify** has no IN_UNMOUNT (nothing unmounts), and its queue is 1024 events
+- **inotify**: an unmount ends the watches on it (IN_UNMOUNT, IN_IGNORED); its queue is 1024 events
   (then one IN_Q_OVERFLOW). An event goes to the watches on the file and on the
   one directory the VFS knows as its parent.
 
@@ -673,9 +664,8 @@ most likely to trip over, each item checked in the source on the date above.
   still a picture.
 - Unix datagram sockets (2026-10-06): at most 16 datagrams / 64 KiB wait
   for one socket and a datagram is at most 16 KiB (Linux allows ~200 KiB);
-  no autobind (an unbound sender is nameless, so it can't be answered); no
-  SO_PASSCRED / SCM_CREDENTIALS; shutdown() on a datagram socket says
-  ENOTCONN.
+  no autobind (an unbound sender is nameless, so it can't be answered);
+  shutdown() on a datagram socket says ENOTCONN.
 - iwlwifi on our core (W6, 2026-10-06), what differs from mac80211:
   - A firmware restart replays the connection to the driver as mac80211
     does (interface, channel, link settings, the AP's peer, keys), but not
@@ -714,13 +704,12 @@ most likely to trip over, each item checked in the source on the date above.
     times out is not aborted (CRCR.CA): the ring may then be stuck.
   - "Wait for the stick we started from" needs the loader's BOOT_FROM_USB
     flag: the x86_64 loader sets it, the i386 one doesn't.
-  - Not yet tested on real hardware (the MSI's Intel controller uses
-    64-byte contexts and scratchpad pages; QEMU's uses neither).
 
 ### Display (step 11b, 2026-10-03)
-- **Only QEMU/UTM's std VGA (Bochs, 1234:1111) gets graphics.** Real old PCs and every
-  other card stay on the 80x25 text screen until the VESA boot framebuffer
-  (`simpledrm` shape) is written. (`drivers/gpu/drm/tiny/bochs.c`)
+- **A BIOS boot has graphics only on QEMU/UTM's std VGA (Bochs, 1234:1111).** Real old
+  PCs and every other card stay on the 80x25 text screen until a VESA boot framebuffer
+  is written. (`drivers/gpu/drm/tiny/bochs.c`) A UEFI boot uses the firmware's
+  framebuffer (GOP, `drivers/video/simplefb.c`) at the mode the firmware chose.
 - **No EDID**: the mode list is the fixed VESA table up to 2560x1600, whatever the
   window or monitor is. QEMU can offer an EDID blob; we don't read it.
   (`drm_add_modes_noedid`, `drivers/gpu/drm/drm_core.c`)
@@ -745,13 +734,12 @@ most likely to trip over, each item checked in the source on the date above.
   no `VT_SETMODE`/`VT_PROCESS` switching yet.
 - **A mapped `/dev/fb0` is always shared**: `MAP_PRIVATE` gets the device pages too, not a
   private copy. Pages past the device's end give SIGSEGV (Linux: SIGBUS).
-- **The font comes from the BIOS** (`stage2.asm` copies it); a boot without our stage 2
-  has no font and fbcon doesn't start. CP437 glyphs only (no Unicode).
+- **The font comes from the BIOS** (`stage2.asm` copies it) or, under UEFI, a 4 KiB font
+  file the loader reads; without either, fbcon doesn't start. CP437 glyphs only (no
+  Unicode).
 - **`ioremap_wc` mappings are never undone**, and must be made before the first process
   starts (process page directories copy the kernel half once). (`arch/i386/pat.c`)
 
-- **Keyboard ignores extended keys** (arrows, Home/End, right Ctrl/Alt…). Scancodes are
-  parsed correctly, just not mapped. (`drivers/keyboard.c`)
 - **Keyboard drops keys when its ring buffer is full.** (`drivers/keyboard.c`)
 - **The serial output queue is 8 KiB.** Kernel messages that overflow it make `kprintf`
   wait for the port (rare); user `write()`s get a short count instead.
@@ -762,10 +750,10 @@ most likely to trip over, each item checked in the source on the date above.
 - **Keyboard: US layout, scancode set 1 only.**
 - **PS/2 mouse** (`drivers/mouse.c`): found and set up at boot by polling ~10 command/ACK
   round trips (instant in QEMU; on a real mouse maybe 10-30 ms of boot time — make it
-  interrupt-driven if a real machine shows it). Movements go into a 64-entry ring that
-  nothing reads yet: `/dev/input` for X comes next (step 11b). No USB mouse.
+  interrupt-driven if a real machine shows it). Movements go to X through
+  `/dev/input/event1` (`drivers/evdev.c`). No USB mouse.
 - **Laptop touchpad is I2C HID, not the PS/2 mouse** (MSI Katana GF66 11UE,
-  `docs/hardware-msi-katana-gf66.md`, 2026-10-06). The pad (Synaptics `06CB:7E7E`
+  `docs/hardware-msi-katana-gf66.md`, 2026-10-06; the plan: `docs/TOUCHPAD-PLAN.md`). The pad (Synaptics `06CB:7E7E`
   or ELAN `04F3:30AA` on `PNP0C50`) reports each finger. Two-finger scrolling
   like a Mac is possible on the hardware. It is not on the 8042 AUX port
   (`drivers/mouse.c` may see a ghost pointer). Split:
@@ -865,21 +853,18 @@ most likely to trip over, each item checked in the source on the date above.
   Local ports are random in 49152..65535 and the initial sequence number is a
   keyed hash of the four-tuple (RFC 6056, RFC 6528).
 - **Disk DMA** (9d): bus-master IDE (PIIX/ICH legacy mode); AHCI, NVMe and virtio-blk
-  are separate drivers (see Disk above). None tried on real hardware yet. We don't
+  are separate drivers (see Disk above). NVMe runs on the MSI (its Kingston SSD); the
+  others haven't been tried on real hardware yet. We don't
   pick a transfer mode ourselves (SET FEATURES, PIIX timing registers): DMA runs at
-  whatever mode the BIOS set up, checked by a test read at boot. Not yet tried on
-  real hardware. LBA28 only (128 GiB).
+  whatever mode the BIOS set up, checked by a test read at boot. LBA28 only (128 GiB).
 
 ## Found running Chromium (2026-10-08)
 
-- **MAP_SHARED of a disk file is private** (ext2): writes never reach the file
-  or other processes. RAM files (memfd, /dev/shm, tmpfs) are really shared.
+- **MAP_SHARED of a disk file** (ext2) is refused for writing and a snapshot read-only
+  (Processes above). RAM files (memfd, /dev/shm, tmpfs) are really shared.
 - **A RAM file once mapped shared keeps its pages when shrunk** (zeroed), until
   the file itself goes: a mapping may still point at them, and there is no
   reverse map to unmap it. Linux sends SIGBUS past the new end instead.
-- **`/proc/self/fd` lists fds 0-63 only** (a node each, made at boot); fds up to
-  1023 work, they just aren't listed. No `/proc/<pid>/task` for other processes,
-  no `/proc/uptime`, no `/proc/<pid>` directories (`ps` complains).
 - **No `ptrace`**: Chromium's crash reporter (crashpad) can't take a dump.
 - **Memory areas are a sorted array**: lookup is a binary search, but adding or
   splitting one moves the rest — with Chromium's thousands of areas that is a
@@ -902,7 +887,6 @@ most likely to trip over, each item checked in the source on the date above.
   a local TCP connection needs both ends of the state machine in one kernel. A
   socket bound to 127.0.0.1 is found by its port alone, so it also hears its
   port on the outside address.
-- **No IPv6** (socket(AF_INET6) is EAFNOSUPPORT); and still no DHCP renewal.
 
 ## Sound (2026-10-07, docs/SOUND-PLAN.md)
 
@@ -954,6 +938,11 @@ All of these are fixed; what is left is the testing gap and the capability one.
   most 200 ms; `kernel/uaccess_test.c`). `make verify-racetests` passes again: three of
   its mutations had stopped applying after the `pread`/`pwrite` and `file_copy_in`
   changes of 2026-10-05, so those fixes went unverified until today.
+- **racetest's two-waiters case can still lose under host load** (once in four runs on
+  2026-10-13, with two other QEMUs running): the sibling is let go (`sib_go = 1`)
+  just before the main thread calls `waitpid`, so a preemption in that gap lets the
+  sibling's `WNOHANG` reap the child first, and all four wait checks fail. The fix is
+  in the test: let the armed copy itself release the sibling.
 
 ## The graphical desktop (step 11b, 2026-10-04)
 
@@ -967,14 +956,13 @@ All of these are fixed; what is left is the testing gap and the capability one.
 - **`link()` is still missing**, so the X server cannot make its lock file and is
   started with `-nolock` (`live/myos-login/myos-login.c`). Two X servers on one
   display would not be noticed.
-- **The X server lets in any local program** (found 2026-10-09). myos-login starts it
-  with no `-auth` file, so X has no access control: any process on the machine, of any
-  user, can connect to `:0`, read the keyboard (passwords typed into a window
-  included), take screenshots and send input. A second account, a daemon, or someone
-  logged in over ssh gets the desktop of whoever sits at it. `tools/qemu-desktop.py`'s
-  `xdo` relies on this today, as the same user. The fix is Linux's: myos-login writes a
-  random cookie to a file only root reads, starts X with `-auth` on it, and gives the
-  session user `~/.Xauthority` (xauth); the test tool then sets `XAUTHORITY`.
+- **X's cookie is all-or-nothing** (since 2026-10-13: before, X let in every
+  local program of every user). myos-login makes a random cookie per server
+  (`/run/myos-login/X0.auth`, root's) and writes it to the user's
+  `~/.Xauthority`; without it X answers "Authorization required". Every
+  program of the session user has it, and can read keys and take
+  screenshots of the whole desktop, as on Linux's X11; separating programs
+  from each other needs Wayland (docs/performanceSuggestions.md, Part 2).
 - **16 pseudo-terminals** (`PTY_MAX`, `drivers/pty.c`), each with a one-page ring in
   each direction. `/dev/pts` is an ordinary RAM directory, not devpts: the nodes are
   made and removed by hand, and a `mount -t devpts` still fails.
@@ -982,15 +970,13 @@ All of these are fixed; what is left is the testing gap and the capability one.
   wait walks all of them and calls each file's `poll`. That is the cost X pays per
   event; Linux keeps a ready list. `EPOLLET` is accepted and treated as level
   triggered, and `epoll_pwait`'s signal mask is ignored.
-- **`/sys` holds one thing**: `class/graphics/fb0`, because the X server's fbdev
-  driver refuses a screen without it (`fs/sysfs.c`). Anything else that reads /sys —
-  udev, libinput, power management — finds nothing.
+- **`/sys` holds little** (`fs/sysfs.c`): `fb0` (the X server's fbdev driver refuses a
+  screen without it), the network devices, the disks, the CPU and the EFI firmware
+  flag. No input devices and no uevents, so libinput and udev find nothing to work with.
 - **Two-finger scroll needs kernel HID first**, then a userspace gesture
   reader. X only binds `xf86-input-evdev` to event0/event1. The laptop pad
-  and the split (kernel vs libinput) are under Drivers.
-- **Programs that look at other processes find nothing.** With no `/proc/<pid>`,
-  `pidof`, `pgrep`, `ps` and `top` come back empty, so service scripts that wait for
-  a program to appear spin for ever.
+  and the split (kernel vs libinput) are under Drivers; the plan is
+  `docs/TOUCHPAD-PLAN.md`.
 - **`FBIOPUTCMAP` fails** (`-EINVAL`), and the fbdev driver calls it even on a
   TrueColor screen: ten "(EE) FBIOPUTCMAP: Invalid argument" lines in `Xorg.0.log`
   that mean nothing. Gamma is not adjustable.
@@ -1038,12 +1024,13 @@ All of these are fixed; what is left is the testing gap and the capability one.
   (`/etc/icewm/keys`); Win+I needs the menu to open on key *release*.
 - **Settings is mostly read-only.** Displays changes the scale, Wallpaper the
   desktop picture (the theme landscape, plus the twenty scenes in
-  `/usr/share/myos/wallpapers`), and Mouse & Keyboard the pointer's size; Network, About,
-  Storage, Date & Time and Users & Groups only show. The network page shows the
-  address the system routes from (UDP connect + getsockname) and the DNS server:
-  there are no interface ioctls (`SIOCGIF*`) to ask for more. The processor name
-  comes from `cpuid` (no `/proc/cpuinfo`). Resolution can't be changed from it:
-  X's fbdev driver can't switch modes while running.
+  `/usr/share/myos/wallpapers`), Mouse & Keyboard the pointer's size, Users & Groups
+  can add a user, and Kernel saves the kernel config (which the kernel doesn't read
+  yet); Network, About, Storage and Date & Time only show. The network page shows
+  only the address the system routes from (UDP connect + getsockname) and the DNS
+  server; the `SIOCGIF*` ioctls exist now and could tell it more. The processor name
+  comes from `cpuid`: the code predates `/proc/cpuinfo`. Resolution can't be changed
+  from it: X's fbdev driver can't switch modes while running.
 - **The desktop lists `~/Desktop`** (`myos-desktop`; the folder is created if it
   is missing), in the same left-hand
   column as the Recycle can (`myos-trash`, which keeps the fifth place).
@@ -1051,7 +1038,8 @@ All of these are fixed; what is left is the testing gap and the capability one.
   wallpaper offers New Folder and Change Desktop Background…, which opens
   Settings > Wallpaper. The Start menu programs are not planted as icons;
   they stay on the Start menu (`live/myos-menu`):
-  Terminal, My Files, Web Browser (Firefox), WritePerfect, AbiWord, Preview,
+  Terminal, My Files, Web Browser (`myos-browser`: Chromium, or Firefox where there
+  is no Chromium), WritePerfect, AbiWord, Preview,
   Disks (My Files' disk view), Settings, Run..., Log off and Turn off.
 - **Firefox is on the disk but needs 1 GiB of RAM.** Alpine 3.20's 32-bit package
   (plus codecs, 255 MiB). `make utm-live` and `make run-live` give the machine
@@ -1062,9 +1050,9 @@ All of these are fixed; what is left is the testing gap and the capability one.
   render node). `/dev/shm` is a tmpfs for `shm_open`. `/proc/self/exe`,
   `fallocate` and `memfd_create` are there (Firefox uses them to find its
   files and size shared memory). The live VM CPU is `pentium3,+sse2`: Alpine
-  Firefox is built with SSE2, which a Pentium 4 / Pentium M has. Missing
-  `/proc` files (`cpuinfo`, `meminfo`, `/proc/<pid>/…` beyond `self/fd` and
-  `self/exe`) or other syscalls may still stop it. A GUI start dies in
+  Firefox is built with SSE2, which a Pentium 4 / Pentium M has. `/proc` has
+  `cpuinfo`, `meminfo` and `/proc/<pid>` now; what still stops it isn't known
+  (not retried since they came). A GUI start dies in
   `libxul.so` with a write to address 0 (no message, just "Segmentation
   fault"). `firefox --version` works. Look at `~/.xsession-errors` and the
   serial line `firefox: killed by CPU exception`.
@@ -1083,10 +1071,10 @@ All of these are fixed; what is left is the testing gap and the capability one.
   owner and mode in `._name.where` so Put Back can restore them. Empty Trash
   (right-click the can, or `rm --emptyTrash`) is the real delete; so is
   Delete Permanently (`rm --reallyDelete`, which runs GNU rm). No cut/move (copy, then delete), no properties window.
-  Without inotify it looks at the folder and its files every 2 s; in folders of
-  more than 1000 files only the folder's own time is watched, so a file written
-  over there needs F5. Disks finds other disks by `statfs` on the folders in `/`
-  (no `/proc/mounts`).
+  It watches the folder with inotify (since 2026-10-13: a change made elsewhere
+  shows within ~0.1 s, a file written over in place too); without inotify it
+  falls back to looking every 2 s. Disks lists the ext2/ext4/FAT mounts in
+  `/proc/mounts`; it doesn't notice a disk mounted while it's open (F5).
 - **Evince draws its own title bar** (GTK's header bar), not the Golden Hour one, and
   (it used to warn that it couldn't watch its settings file; inotify is in now).
 - **All Programs** is the row above Log off. It opens the Programs folders the way
@@ -1163,9 +1151,6 @@ own, `cld` on every entry and page-table checks are in (docs/LOG.md,
   Linux's majors 65–71; ours put minor > 255 into an 8-bit rdev.
   BLOCKDEV_MAX is 16, so this can't happen yet.
 - **No BLKDISCARD (TRIM).** mke2fs carries on without it.
-- **`umount` still always answers EBUSY.** The VFS doesn't count open
-  files per mount, so the installer can't unmount the new system to check
-  it.
 - **Some /proc/<pid> numbers are zeros.** RSS, page faults, context
   switches, I/O bytes, and `environ` (the kernel doesn't keep a copy of a
   program's environment). `ps` and `top` show 0 memory for each process.
@@ -1194,8 +1179,6 @@ own, `cld` on every entry and page-table checks are in (docs/LOG.md,
 - **The installed EFI partition carries the live login initrd** (240 MB),
   which an installed system doesn't need, and the firmware loads it at
   every start. A small one, or none, would start faster.
-- **A failed try leaves the disk mounted** (umount is always EBUSY): the
-  window asks for a restart before the next try.
 - **ssh login is off on an installed system.** Turn it on with
   `doas ln -s /etc/sv/sshd /var/service/` (a new host key is made then).
 - **The window's install flow was not clicked through in QEMU**, only
@@ -1203,18 +1186,22 @@ own, `cld` on every entry and page-table checks are in (docs/LOG.md,
 
 ## Kernel config (2026-10-10)
 
-- **The kernel doesn't read the config yet.** Settings › Kernel saves it
-  to `myos-config`, but the scheduler still runs `config/slots.conf`'s
-  table (docs/KERNEL-CONFIG.md §10, steps 2–7). The page says so.
+- **The kernel reads the config, but uses only its slot owners** (since
+  2026-10-13: docs/KERNEL-CONFIG.md §10 steps 1–3). The mode, the latency
+  budget and the power savings are read, checked and logged, and do nothing
+  yet (steps 6 and 9); a new config takes effect at the next start. With no
+  good copy the kernel runs its built-in one (`config/slots.conf`, realtime).
 - **No `myos-taskd`, no binding at `execve`, no OS class yet.** Slots
   still go to a thread with the right name (docs/TIME-SLOTS.md).
 - **Behind a hybrid MBR (no 0xEE entry) the kernel never reads the GPT**,
-  so GPT names are invisible there. The live/UTM images list
-  `myos-config` in the MBR too; the kernel's own reader will need the GPT.
-- **The installer doesn't make `myos-config` yet**, so an installed
-  system has nowhere to save; Settings says "no myos-config partition".
-- **Only the x86_64 image has it.** The i386 live disk (MBR, BIOS) needs
-  the config in its 0x7F boot area (docs/KERNEL-CONFIG.md §8).
+  so GPT names are invisible there. The live/UTM images list `myos-config`
+  in the MBR too, as type 0xDA, and the kernel takes an unnamed 0xDA
+  partition as a candidate (its contents must pass every check). The
+  installer makes `myos-config` (GPT, 1 MiB after myos-root, cleared).
+- **Only GPT and hybrid-MBR disks have it.** The i386 live disk (MBR,
+  BIOS) needs the config in its 0x7F boot area (docs/KERNEL-CONFIG.md §8),
+  which `tools/mbr-partition.sh` sizes with no room to spare: i386 always
+  runs its built-in config.
 - **Some savings only the kernel can confirm.** Deep idle (ACPI _CST), C1E,
   PCIe ASPM, USB autosuspend, SATA link power and disk spin-down are
   switchable in Settings and marked "checked when MyOS starts": a program

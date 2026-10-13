@@ -12,5 +12,9 @@ __pycache__/
 # This machine's own live-disk settings (the home Wi-Fi network): never committed.
 live/overlay.local/
 
+# Rodger's own screenshot of macOS Mission Control (shows his desktop): kept
+# locally for docs/performanceSuggestions.md §2.7, never committed.
+docs/window-server/macos-mission-control.webp
+
 # The live disk is its own repo (myos-live), checked out here.
 /live/

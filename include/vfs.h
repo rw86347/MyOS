@@ -49,6 +49,8 @@
 #define S_ISUID   04000             /* run as the file's owner */
 #define S_ISGID   02000             /* run as its group; on a directory: new
                                        entries take the directory's group */
+#define S_ISVTX   01000             /* sticky: on a directory (/tmp), only an
+                                       entry's owner may remove it */
 #define S_IXGRP   00010             /* group may execute */
 
 /* open() flags (Linux i386 values) */
@@ -151,6 +153,10 @@ struct fs_ops {
                      uint8_t *secs, struct blockdev **dev);
     int (*statfs)(struct mount *m, uint32_t *bsize, uint32_t *blocks, uint32_t *bfree,
                   uint32_t *files, uint32_t *ffree);
+    /* umount: nothing uses it any more and its pages are written; finish
+       (mark it cleanly unmounted, let go of held blocks, forget its cache).
+       May be NULL. */
+    void (*unmount)(struct mount *m);
 };
 
 struct mount {
@@ -261,9 +267,53 @@ static inline int file_copy_in(const struct file *f, void *dst, const void *src,
 /* --- the tree ---------------------------------------------------------- */
 struct inode *vfs_root(void);
 
+/* --- who may do what (fs/perm.c) ---------------------------------------- */
+/*
+ * Linux's rules, in the order Linux applies them. A file's mode has three
+ * sets of rwx bits: for its owner, its group, and everyone else. EXACTLY
+ * ONE set applies: the owner's if you are the owner, else the group's if
+ * you're in the group, else the others'. (So a 0055 file is closed to its
+ * owner, though everyone else may read it.) Root (fsuid 0) may read and
+ * write anything, and search any directory, but run only a file that has
+ * at least one x bit. The kernel's own threads count as root.
+ *
+ * "Search" a directory = MAY_EXEC on it: needed to go through it in a path.
+ */
+#define MAY_EXEC  1
+#define MAY_WRITE 2
+#define MAY_READ  4
+
+/* 0, or -EACCES. Checked with the file-access ids (fsuid, fsgid, groups),
+   or the real ones while the thread is inside access() (perm_real).
+   Inline because it's on every open and every directory of every path:
+   when all three sets allow it (a 0644 file for reading, a 0755
+   directory for searching), whoever asks may — root too — so the answer
+   needs no credentials at all. Only the rest goes to fs/perm.c. */
+int  vfs_permission_slow(const struct inode *i, int mask);
+static inline int vfs_permission(const struct inode *i, int mask)
+{
+    uint32_t m = i->mode, want = (uint32_t)mask;
+    if (((m >> 6) & (m >> 3) & m & want) == want)
+        return 0;
+    return vfs_permission_slow(i, mask);
+}
+/* A new name in dir: write and search on it. */
+int  vfs_may_create(const struct inode *dir);
+/* Remove or rename victim out of dir: write and search on dir, and in a
+   sticky directory (/tmp: mode 1777) only victim's owner, dir's owner or
+   root (-EPERM otherwise, as Linux says). */
+int  vfs_may_delete(const struct inode *dir, const struct inode *victim);
+/* The owner, or root: may chmod it, set its times to anything. */
+int  vfs_owner_or_root(const struct inode *i);
+/* Is the caller in group gid (its fsgid or a supplementary group)? */
+int  vfs_in_group(uint32_t gid);
+/* Root, for the file-access checks (fsuid 0, or a kernel thread). */
+int  vfs_fs_root(void);
+
 /* Find a path (in kernel memory), following symbolic links — also in the
    last component unless `nofollow`. Relative paths start at the current
-   directory. 0, -ENOENT, -ENOTDIR, -ELOOP or -ENAMETOOLONG. */
+   directory. 0, -ENOENT, -ENOTDIR, -ELOOP, -ENAMETOOLONG, or -EACCES (a
+   directory on the way you may not search). */
 int vfs_lookup(const char *path, struct inode **out);
 int vfs_lookup_nofollow(const char *path, struct inode **out);
 /* ...starting from directory `dir` (NULL: the current directory). */
@@ -360,6 +410,11 @@ int  vfs_mount_tree(const char *path, struct inode *tree);
 int  vfs_mount_ram(const char *path, uint32_t mode);
 int  vfs_pivot_root(const char *new_root, const char *put_old);
 int  vfs_mount_count(void);
+/* Take the disk file system whose root is r off the tree: -EBUSY if
+   anything still uses it (an open or mapped file, a current directory, a
+   program, a bound socket, a mount inside it), -EINVAL if r is not a disk
+   mount's root. RAM mounts (tmpfs, proc, sysfs) aren't handled: -EBUSY. */
+int  vfs_umount(struct inode *r);
 struct mount *vfs_mount_at(int index);
 /* Move i to new_dir under a new name, replacing what's there (rename()
    rules: a directory only over an empty directory, a file only over a
@@ -437,6 +492,10 @@ void     fsnotify_entry(struct inode *dir, struct inode *child, uint32_t mask,
                         uint32_t cookie, const char *name, uint32_t len)
                         __attribute__((cold));
 void     fsnotify_deleted(struct inode *i);
+/* Watches don't keep a file system mounted (Linux): how many an inode has,
+   and, at umount, IN_UNMOUNT + IN_IGNORED for those on m, and they end. */
+uint32_t fsnotify_watches_on(const struct inode *i);
+void     fsnotify_unmount(const struct mount *m);
 uint32_t fsnotify_cookie(void);         /* pairs IN_MOVED_FROM with IN_MOVED_TO */
 
 extern uint32_t inotify_watches;        /* watches in the system: usually 0 */

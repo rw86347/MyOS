@@ -718,8 +718,10 @@ void proc_thread_exit(int status)
     thread_leave(p);
 }
 
-#define WNOHANG  1
-#define WEXITED  4
+#define WNOHANG    1
+#define WUNTRACED  2                    /* = waitid's WSTOPPED */
+#define WEXITED    4
+#define WCONTINUED 8
 #define WNOWAIT  0x01000000             /* waitid: look, but leave the zombie */
 
 /* What a finished child left: wait4 and waitid report it differently. */
@@ -730,7 +732,9 @@ struct child_end {
 
 /* The waiting wait4 and waitid share: a child that has ended — pid > 0 that
    one, -1 any, 0 one in our process group, < -1 one in group -pid. Fills
-   *end and returns 1; 0 if none has ended yet and WNOHANG; or -errno. */
+   *end and returns 1 (ended), 2 (stopped: WUNTRACED) or 3 (continued:
+   WCONTINUED); 0 if none has yet and WNOHANG; or -errno. A stop or a
+   continue is told once (unless WNOWAIT), as on Linux. */
 static int wait_child(int pid, int options, struct child_end *end)
 {
     struct process *me = proc_current();
@@ -744,6 +748,19 @@ static int wait_child(int pid, int options, struct child_end *end)
                 pid < -1 && c->pgid != -pid)
                 continue;
             have_children = 1;
+            if (c->state == PROC_ALIVE && (options & WUNTRACED) && c->stop_report) {
+                *end = (struct child_end){ c->pid, 0x7F | c->stop_report << 8, c->cred.uid,
+                                           c->utime, c->stime };
+                if (!(options & WNOWAIT))
+                    c->stop_report = 0;
+                return 2;
+            }
+            if (c->state == PROC_ALIVE && (options & WCONTINUED) && c->cont_report) {
+                *end = (struct child_end){ c->pid, 0xFFFF, c->cred.uid, c->utime, c->stime };
+                if (!(options & WNOWAIT))
+                    c->cont_report = 0;
+                return 3;
+            }
             if (c->state != PROC_ZOMBIE || !(options & WEXITED))
                 continue;
             *end = (struct child_end){ c->pid, c->status, c->cred.uid,
@@ -767,7 +784,7 @@ static int wait_child(int pid, int options, struct child_end *end)
         if (options & WNOHANG)
             return 0;
         if (signal_pending())
-            return -EINTR;
+            return -ERESTARTSYS;
         wq_sleep(&me->child_wait);      /* a child's exit wakes us */
     }
 }
@@ -775,7 +792,7 @@ static int wait_child(int pid, int options, struct child_end *end)
 int proc_wait4(int pid, uintptr_t user_status, int options, uintptr_t user_rusage)
 {
     struct child_end end;
-    int found = wait_child(pid, (options & WNOHANG) | WEXITED, &end);
+    int found = wait_child(pid, (options & (WNOHANG | WUNTRACED | WCONTINUED)) | WEXITED, &end);
     if (found <= 0)
         return found;
     if (user_status && copy_to_user((void *)user_status, &end.status, 4) < 0)
@@ -791,8 +808,9 @@ int proc_wait4(int pid, uintptr_t user_status, int options, uintptr_t user_rusag
 int proc_waitid(int idtype, int id, uintptr_t user_info, int options, uintptr_t user_rusage)
 {
     enum { P_ALL, P_PID, P_PGID };
-    if (!(options & WEXITED) || idtype > P_PGID || (idtype == P_PID && id <= 0) || id < 0)
-        return -EINVAL;                 /* we never report stopped children */
+    if (!(options & (WEXITED | WUNTRACED | WCONTINUED)) || idtype > P_PGID ||
+        (idtype == P_PID && id <= 0) || id < 0)
+        return -EINVAL;
     int pid = idtype == P_ALL ? -1 : idtype == P_PID ? id : id ? -id : 0;
     struct child_end end = { 0 };
     int found = wait_child(pid, options, &end);
@@ -811,9 +829,16 @@ int proc_waitid(int idtype, int id, uintptr_t user_info, int options, uintptr_t 
         int sig = end.status & 0x7F;
         si.signo = SIGCHLD;
         si.code = !sig ? 1 : end.status & 0x80 ? 3 : 2;     /* CLD_EXITED, _DUMPED, _KILLED */
+        si.status = sig ? sig : (end.status >> 8) & 0xFF;
+        if (found == 2) {               /* CLD_STOPPED: by which signal */
+            si.code = 5;
+            si.status = (end.status >> 8) & 0xFF;
+        } else if (found == 3) {        /* CLD_CONTINUED */
+            si.code = 6;
+            si.status = SIGCONT;
+        }
         si.pid = end.pid;
         si.uid = end.uid;
-        si.status = sig ? sig : (end.status >> 8) & 0xFF;
     }
     if (user_info && copy_to_user((void *)user_info, &si, sizeof si) < 0)
         return -EFAULT;
@@ -835,6 +860,27 @@ int proc_setpgid(int pid, int pgid)
     if (p->sid != me->sid || p->pid == p->sid)
         return -EPERM;                  /* other session, or a session leader */
     p->pgid = pgid ? pgid : p->pid;
+    return 0;
+}
+
+int proc_pgrp_orphaned(int pgid)
+{
+    for (int i = 0; i < PROC_MAX; i++) {
+        struct process *c = &procs[i];
+        if (c->state != PROC_ALIVE || c->pgid != pgid)
+            continue;
+        struct process *pp = c->parent;
+        if (pp && pp->state == PROC_ALIVE && pp->pgid != pgid && pp->sid == c->sid)
+            return 0;                   /* a shell (or the like) can continue it */
+    }
+    return 1;
+}
+
+int proc_session_alive(int sid)
+{
+    for (int i = 0; i < PROC_MAX; i++)
+        if (procs[i].state == PROC_ALIVE && procs[i].sid == sid)
+            return 1;
     return 0;
 }
 

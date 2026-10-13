@@ -180,6 +180,11 @@ copy on every redraw, which an old PC can't always afford. So there are three le
 | `xrender` | `picom --backend xrender`, always on | the `[compositor]` packages (1.1 MiB); a full-screen repaint in 16 ms or less; 512 MiB of RAM |
 | `gl` | `picom --backend glx` | a GPU with a Mesa driver, through a render node (`/dev/dri/renderD128`); Mesa's drivers (`mesa-dri-gallium` and `llvm17-libs`, 188 MiB) |
 
+- **Update 2026-10-12: the goal is Mission Control exactly like macOS**, with live
+  Spaces along the top (`docs/performanceSuggestions.md` §2.7). The X program
+  below covers the current desktop. Live Spaces need every window's pixels, even on
+  other desktops, which IceWM doesn't keep. So the full version is a mode of MyOS's
+  own window server (Wayland), designed in from its first version.
 - **The overview works at every level.** It is our own small X program (Alpine has no
   Exposé clone). It reads IceWM's window list (`_NET_CLIENT_LIST`, `_NET_WM_DESKTOP`),
   lays the windows out, and raises the one clicked (`_NET_ACTIVE_WINDOW`). It starts

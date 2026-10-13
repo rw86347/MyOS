@@ -79,12 +79,24 @@ void signal_send_group(int pgid, int sig);
 /* The same for one thread (tgkill, a fault it caused). */
 int  signal_send_thread(struct thread *t, int sig);
 
+/* May the current program send sig to p (kill, tgkill)? 1 or 0. */
+int  signal_allowed(const struct process *p, int sig);
+
 /* Is a signal waiting for the current thread (one it doesn't block)?
    Sleeping syscalls check this and return -EINTR. */
 int  signal_pending(void);
 
+/* Does the current thread ignore or block sig? (A background job reading
+   its terminal: no stop then, but EIO, as on Linux.) */
+int  signal_ignored_or_blocked(int sig);
+
 /* On the way back to user mode: deliver one pending signal, if any. */
 void signal_check(struct regs *r);
+
+/* A syscall returned -ERESTARTSYS (a signal cut it short): note it, so the
+   next signal_check runs it again — if the handler asked for that
+   (SA_RESTART) or no handler runs — or makes it -EINTR. */
+void signal_restart_note(uint32_t nr);
 
 /* The fast path for the above: almost always nothing is pending, and then
    this costs one load and one compare — on every syscall and interrupt.
@@ -138,6 +150,13 @@ struct sig_origin {
    if the frame can't be written (the program then dies with SIGSEGV). */
 int  arch_signal_frame(int sig, const struct sig_origin *o, const struct k_sigaction *a,
                        uint64_t mask, struct regs *r);
+
+/* Make the program run syscall nr again when it resumes: the number back
+   in the result register, the program counter back over the 2-byte
+   syscall instruction (int 0x80, syscall; sysenter's page has an int 0x80
+   just before its return point for this). */
+void arch_syscall_restart(struct regs *r, uint32_t nr);
+void arch_syscall_result(struct regs *r, long value);
 
 /* The alternate signal stack (sigaltstack), for the frame code:
    sig_frame_top: where handler a's frame starts, given the stack pointer sp

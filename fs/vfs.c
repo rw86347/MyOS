@@ -17,6 +17,7 @@
 #include <proc.h>
 #include <string.h>
 #include <uaccess.h>
+#include <mm.h>
 #include <vfs.h>
 
 #define HASH_SIZE  512              /* buckets (power of two) */
@@ -616,6 +617,89 @@ int vfs_pivot_root(const char *new_path, const char *old_path)
     return 0;
 }
 
+/*
+ * umount. Nothing keeps a per-mount count on the hot paths (open, close);
+ * instead, umount looks, once, at everything that can use a file system:
+ *   - its inodes in the tree (what has been looked at): any reference, an
+ *     inotify watch's aside, means a user — an open or mapped file, a
+ *     current directory, a program, a bound socket; and a directory with
+ *     something mounted on it means a mount inside this one;
+ *   - every process's open files, mappings, cwd, root and program, which
+ *     also finds a file deleted while open (no longer in the tree).
+ * O(inodes loaded + processes' files and areas): umount is rare.
+ * The inodes themselves are kept (unreachable) rather than freed: freeing
+ * the tree needs every kernel user of an inode accounted for (docs/gaps.md).
+ */
+static int on_mount(const struct inode *i, const struct mount *m)
+{
+    return i && i->mnt == m;
+}
+
+static int mount_in_use(const struct mount *m)
+{
+    const struct inode *r = m->root;
+    /* The tree, depth first, without recursion: children, then siblings,
+       then back up through the parents. */
+    const struct inode *i = r;
+    for (;;) {
+        if (i->mode && (i->mounted || i->refs - fsnotify_watches_on(i) > (i == r ? 1u : 0u)))
+            return 1;
+        if (S_ISDIR(i->mode) && i->children) {
+            i = i->children;
+            continue;
+        }
+        while (i != r && !i->next_sibling)
+            i = i->parent;
+        if (i == r)
+            break;
+        i = i->next_sibling;
+    }
+    for (int k = 0; k < PROC_MAX; k++) {
+        struct process *p = proc_at(k);
+        if (p->state == PROC_FREE)
+            continue;
+        if (on_mount(p->cwd, m) || on_mount(p->root, m) || on_mount(p->exe, m))
+            return 1;
+        for (uint32_t fd = 0; p->files && fd < p->nfiles; fd++)
+            if (p->files[fd] && on_mount(p->files[fd]->inode, m))
+                return 1;
+        if (p->mm)
+            for (int a = 0; a < p->mm->nareas; a++)
+                if (on_mount(p->mm->area[a].file, m))
+                    return 1;
+    }
+    return 0;
+}
+
+int vfs_umount(struct inode *r)
+{
+    struct mount *m = r->mnt;
+    int at = -1;
+    for (int k = 0; k < nmounts; k++)
+        if (mounts[k] == m)
+            at = k;
+    if (r == root)
+        return -EBUSY;                  /* "/" stays */
+    if (at < 0 || r != m->root || !r->covers)
+        return r->covers ? -EBUSY : -EINVAL;    /* a RAM mount; or not a mount */
+    if (mount_in_use(m))
+        return -EBUSY;
+    pcache_sync();                      /* its files' pages, to the disk */
+    fsnotify_unmount(m);                /* watchers hear IN_UNMOUNT */
+    struct inode *old = r->covers;      /* the directory it sat on comes back */
+    old->mounted = NULL;
+    old->flags &= ~I_MOUNTED;
+    r->covers = NULL;
+    r->flags &= ~I_MOUNTED;
+    for (int k = at; k + 1 < nmounts; k++)
+        mounts[k] = mounts[k + 1];
+    nmounts--;
+    if (m->ops->unmount)
+        m->ops->unmount(m);             /* mark it clean, forget its blocks */
+    mounts_changed();
+    return 0;
+}
+
 int vfs_mount_tree(const char *path, struct inode *tree)
 {
     struct inode *old;
@@ -683,6 +767,13 @@ static int walk(struct inode *dir, const char *path, uint32_t len, int follow_la
 
         if (!S_ISDIR(cur->mode))
             return -ENOTDIR;
+        /* Search permission on each directory we go through (fs/perm.c).
+           Nearly every directory has all three x bits (0755, 1777), and
+           then whoever asks may: two instructions, no credentials read —
+           this is the hot path of every open and stat (the general inline
+           test in vfs_permission costs ~10 more per directory). */
+        if ((cur->mode & 0111) != 0111 && vfs_permission_slow(cur, MAY_EXEC))
+            return -EACCES;
         if (n > NAME_MAX)
             return -ENAMETOOLONG;
         if (n == 1 && name[0] == '.')
@@ -888,6 +979,7 @@ int vfs_open_at(struct inode *dir, const char *path, uint32_t flags, uint32_t mo
                 struct file **out)
 {
     struct inode *i;
+    int created = 0;
     int err = vfs_lookup_at(dir, path, !(flags & O_NOFOLLOW), &i);
     if (err == -ENOENT && (flags & O_CREAT)) {
         struct inode *parent;
@@ -895,9 +987,12 @@ int vfs_open_at(struct inode *dir, const char *path, uint32_t flags, uint32_t mo
         uint32_t len;
         err = vfs_lookup_parent(dir, path, &parent, &name, &len);
         if (!err)
+            err = vfs_may_create(parent);
+        if (!err)
             err = vfs_create(parent, name, len, S_IFREG | (mode & 07777), 0, &i);
         if (err)
             return err;
+        created = 1;
     } else if (err) {
         return err;
     } else if ((flags & (O_CREAT | O_EXCL)) == (O_CREAT | O_EXCL)) {
@@ -913,6 +1008,16 @@ int vfs_open_at(struct inode *dir, const char *path, uint32_t flags, uint32_t mo
     int writing = (flags & O_ACCMODE) != O_RDONLY;
     if (S_ISDIR(i->mode) && (writing || (flags & O_TRUNC)))
         return -EISDIR;
+    /* May we? Read for reading, write for writing or truncating. A file
+       this very call made is the caller's to open however it asked, even
+       if its mode says read-only (open("f", O_CREAT|O_WRONLY, 0444)). */
+    if (!created) {
+        int want = ((flags & O_ACCMODE) != O_WRONLY ? MAY_READ : 0) |
+                   (writing || (flags & O_TRUNC) ? MAY_WRITE : 0);
+        err = vfs_permission(i, want);
+        if (err)
+            return err;
+    }
     if (S_ISFIFO(i->mode))
         return fifo_open(i, flags, out);
     if (!i->ops && !S_ISREG(i->mode) && !S_ISDIR(i->mode))

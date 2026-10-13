@@ -3437,3 +3437,387 @@ kernel C. WORKLIST B52 points to it.
   unique `st_ino` so musl does not skip libraries. `/init` runs ash then
   `exec /bin/bash -i`. `make ARCH=arm64 test` greps `bash-5.2`.
   `make ARCH=arm64 utm-arm64` builds `build/arm64/MyOS-ARM64.utm`.
+- 2026-10-11: **Apple Silicon 15a:** `docs/hardware-apple-silicon.md` (M1 Air first,
+  m1n1/Asahi boot path, constraints). `arch/aarch64/apple/machine.c` reads root
+  `compatible`; serial banner `MyOS aarch64 (QEMU virt)` on virt.
+  `make ARCH=arm64 test-arm64-apple` checks virt + `m1-min.dtb` fixture. Next: 15b m1n1 hand-off.
+- 2026-10-11: **Apple 15b (DTB UART):** `fdt_mmio_by_compatible`, `uart_early.c` sets PL011
+  base from `apple,uart` reg. `m1-qemu-harness.dtb` boots in QEMU with Apple banner + bash.
+  `make ARCH=arm64 test-arm64-apple-boot`. Next: m1n1 on real M1 hardware DTB.
+- 2026-10-11: **Apple 15b m1n1 payload:** `tools/mk-m1n1-payload.sh`,
+  `arm64_boot_report()` (x0 vs embedded DTB). `make ARCH=arm64 test-arm64-m1n1-payload`.
+  Next: chain-load on real M1 with hardware DTB in x0.
+- 2026-10-11: **Apple 15b m1n1 x0 sim:** `kernel-m1n1-sim.elf` sets x0 to harness DTB in
+  `_start` (`M1N1_SIMULATE_X0`); `make ARCH=arm64 test-arm64-m1n1-x0-sim` greps
+  `Boot: … (x0)`. `docs/m1n1-chainload.md` for hardware steps. Next: real M1 + m1n1 client.
+- 2026-10-11: **Apple 15b s5l UART:** `m1-min.dtb` (J313 RAM @ 0x80000000, serial0 @
+  0x235200000); `apple/s5l_uart.c` + DTB pick in `uart_early.c`. Host:
+  `test-arm64-apple` + `test-arm64-uart-early`. Next: m1n1 chain-load on M1 Air hardware.
+- 2026-10-11: **Apple 15b MMU map:** `paging_init(dtb,…)` maps kernel GiB @ 0x40000000 when
+  DTB RAM is elsewhere, and device-maps console MMIO above 4 GiB (M1 S5L). Host:
+  `test-arm64-mmio-map`. Next: m1n1 on real M1; expect `MMU: early console MMIO @ 0x235200000`.
+
+## 2026-10-12 — Boot speed: measured, and a plan
+
+`tools/boottime.py` (new) boots an image in QEMU like UTM's machine and
+stamps each serial line, then logs in and times the desktop's programs.
+On the 64-bit live image, an everyday boot reaches the login screen at
+10.2 s:
+
+| Stage | Time |
+|---|---|
+| QEMU's firmware | 2.3 s |
+| our loader reading the 240 MB initramfs | 1.5 s (0.02 s with a 1 MB one) |
+| the kernel's DHCP wait | 1.0 s (the rest of the kernel ~50 ms) |
+| runit stage 1, about a dozen small programs | 1.3 s (one start ≈ 24 ms) |
+| X | 1.35 s, 0.65 s of it Mesa's software GL |
+| the login screen's picture | ~2 s |
+
+After logging in, icewm starts in 0.2 s, and the Start menu and desktop
+icons follow about 3 s later. A fresh image adds 14 s of first-boot
+scripts. The 32-bit loader still holds its picture 2 s at every boot.
+
+docs/performanceSuggestions.md is the plan, losing no capability:
+- **Loader:** the installer drops the live fallback initramfs; the
+  stick's loader loads it only when MyOS has no driver for its disk; the
+  loader writes its own boot entry; the 2 s hold goes.
+- **Kernel:** DHCP in the background; wait for USB only when the root is
+  on USB; mount /proc, /sys, /run and /dev/shm itself; a faster `exec`.
+- **Before the login screen:** the first boot runs at image build time;
+  a shorter stage 1; the login screen's picture cached; the login screen
+  first in line.
+- **After logging in:** the desktop's own programs, in visible order.
+- **Later:** read-ahead from a boot profile.
+
+Estimate: about 5 s instead of 10.2 s to the login screen in QEMU (24.8 s
+on a first boot today), more on real hardware. Each step comes with a
+before/after number.
+
+## 2026-10-12 — Performance suggestions: graphics and the window server
+
+docs/BOOT-SPEED.md became **docs/performanceSuggestions.md**, with a
+second part: how pixels reach the screen today, and how to make that much
+faster without losing programs. What the code shows:
+- **MIT-SHM is off** in `10-myos.conf`, for a reason that no longer
+  holds: the kernel has System V shared memory, `SO_PEERCRED`, and
+  `memfd` with seals. Every picture is copied through a socket twice.
+- **No GPU driver:** all drawing is on the CPU, OpenGL included.
+- **No `/dev/dri`** for programs.
+- **The whole-screen copy every 16 ms** happens only with the 32-bit
+  kernel and a firmware framebuffer above 4 GiB. The 64-bit kernel on the
+  MSI maps the screen directly.
+
+The phases:
+1. **Fewer copies in X11:** MIT-SHM on, with a test of what X needs from
+   `kernel/shm.c`; the compositor chosen by its measured cost; deferred
+   I/O for the 32-bit shadow.
+2. **`/dev/dri/card0`** (KMS: dumb buffers, page flips, `DIRTYFB`) for
+   Bochs and a simpledrm port.
+3. **A Mac-like window server:** Wayland with labwc, XWayland as the
+   XQuartz, and our desktop programs ported (taskbar, tray, desktop
+   icons). The X11 session stays until Wayland wins on every measurement.
+4. **GPU drivers** through the Linux shim: i915 for the MSI and old Intel
+   laptops, then amdgpu for the Pocket 4.
+
+With XWayland, xeyes and xfig keep working. Only tools that act on other
+programs' windows (xdotool, X screenshots) change.
+
+## 2026-10-12 — Mission Control, exactly like macOS
+
+Rodger's goal: move the pointer into the corner and every window zooms
+out, side by side, with the desktops (Spaces) live along the top. A
+picture of macOS's Mission Control is now in
+`docs/window-server/macos-mission-control.webp`. The design is
+docs/performanceSuggestions.md §2.7:
+- **In X11:** the overview of `docs/DESIGN.md` can lay out the current
+  desktop. **It can't show live Spaces:** IceWM unmaps the windows of
+  other workspaces, so they have no pixels.
+- **In MyOS's own window server (Wayland):** every window's buffer is
+  kept, on every Space, so Mission Control is a mode of the compositor,
+  built in from its first version (per-window transforms and a frame
+  clock from page flips).
+- **On the CPU:** about 2–4 ms a frame on the MSI, 8–16 ms on a
+  Pentium 4. It stays smooth with half/quarter-size copies made once,
+  live miniatures at a lower rate, and an automatic "Reduce motion".
+- **With GPU drivers:** free.
+
+DESIGN.md's overview decision now points there.
+
+## 2026-10-13 — gaps.md checked against the code; who may kill, reboot, name the host
+
+`docs/gaps.md` was read against today's source, entry by entry. Over 50
+entries changed: fixed things removed (`madvise`, `select` past fd 31,
+`int3`, block device nodes, the keyboard's extended keys...), half-true
+ones rewritten (/proc, /sys, mounts, the table limits, loopback), and
+duplicates merged. `tools/syscall-coverage.py` read the wrong header and
+counted 0 i386 calls: it says 244 (x86_64) and 264 (i386) now.
+
+`make test` was failing before any of this: the ARM64 bring-up added
+`user/musl/hello.c`, which the i386 test disk copied over the assembly
+`/bin/hello` that the tests expect to exit with 42. The Makefile leaves
+it out of `USER_BINS` now (the ARM64 rule names it directly).
+
+Then the first gap: any user could signal any process, reboot and set the
+host name.
+- **`kill`, `tkill`, `tgkill`, `rt_tgsigqueueinfo`** follow Linux's rule
+  (`signal_allowed`, `kernel/signal.c`): root may signal anyone; others,
+  a process whose real or saved user is their real or effective user;
+  SIGCONT also within the session. `kill(-1)` with nobody allowed is
+  ESRCH, a group is EPERM, as on Linux.
+- **`reboot` and `sethostname`** are root only, checked before their
+  arguments as Linux does. The desktop's Turn off already goes through
+  `doas`, and the login screen runs as root.
+- `user/sys/systest.c` checks all of it as user 1000, on both CPUs
+  (`make test`, `make ARCH=x86_64 test-uefi-shell`).
+
+## 2026-10-13 — PROT_NONE means no access; a typed password for an empty one
+
+- **`PROT_NONE` is enforced** (`mm/mm.c`). An area without access has no
+  `VM_READ` (any of read, write or exec gives it, as x86 Linux does), and
+  `mm_fault` refuses every touch of it, present page or not. `mprotect`
+  keeps a present page where it is but takes its user bit away: fork, exit
+  and unmap go by the present bit, so the page keeps its data and its
+  owners, and comes back intact when it is made readable again. Guard
+  pages now fault: musl's thread stacks have one (`pthread_create` maps
+  `PROT_NONE` and opens all but the guard). Checked by `user/systest.c`
+  (i386) and `user/sys/systest.c` (both CPUs), and on the x86_64 live
+  disk: the desktop and Chromium start, nothing is killed.
+- **`ppoll`/`pselect6` timeouts** go through one checked helper (`ts_ms`):
+  a negative time or bad nanoseconds is EINVAL as on Linux, and a huge
+  one is cut to ~24.8 days instead of overflowing into "wait for ever"
+  (the 32-bit one at ~24 days, the 64-bit one at ~292 million years).
+- **The login screen refuses a typed password for an account whose
+  password is empty** (`live/myos-login`): pam_unix with `nullok`
+  doesn't ask such an account, so any guess "worked". It reads
+  `/etc/shadow` again at each try. Tested on the live disk: `x` + Return
+  stays at the login screen, Return alone logs in.
+
+## 2026-10-13 — File permissions are checked
+
+Until today users and groups existed but nothing looked at a file's mode:
+any user could write `/etc/shadow`. Now Linux's rules apply (new file
+`fs/perm.c`; `include/vfs.h` explains them):
+- **one set of rwx bits applies**: the owner's if you own the file, else
+  the group's if you're in its group (fsgid or a supplementary group),
+  else everyone else's. Root may read, write and search anything, and run
+  anything with at least one x bit;
+- **path walk**: search (x) on every directory on the way (`walk`);
+- **open**: read and/or write; O_TRUNC needs write; a file the same call
+  created opens however it was asked;
+- **new names** (mkdir, mknod, symlink, O_CREAT, Unix socket bind): write
+  and search on the directory, EEXIST first as on Linux;
+- **removing and renaming**: the same, plus the sticky bit (`/tmp`: only
+  the file's owner, the directory's owner or root, else EPERM); a
+  directory moving to another parent needs write on itself (its "..");
+- **chmod**: owner or root (EPERM); setgid dropped if you're not in the
+  group. **chown**: only root gives a file away; its owner may change its
+  group to one of their own; every chown of a file clears setuid (and
+  setgid if the group may run it), as on Linux;
+- **utimensat**: "now" needs ownership or write, any other time ownership;
+  **truncate** needs write; **chdir/fchdir/chroot** need search;
+  **execve** needs x for the program, its `#!` interpreter and `ld.so`;
+  **inotify_add_watch** needs read; **connect/sendto** on a Unix socket
+  path needs write on the socket file;
+- **access()/faccessat()** answer for the REAL user, the whole path
+  included (a per-thread flag, `perm_real`: our credentials are the
+  process's, so swapping them would leak to sibling threads); faccessat2's
+  AT_EACCESS asks for the effective one.
+
+Device nodes the kernel makes got Alpine's modes and groups (`node_mode`,
+`fs/dev.c`): the keyboard and mouse 0660 input, the framebuffer 0660
+video, tty0–7 0620 tty, the console 0600 root; `/dev/pts/N` is group tty.
+`/proc/<pid>/oom_score_adj` is 0666 with an owner check in its write
+(its node can't follow each process's user).
+
+Two tests had relied on there being no checks: `boottest` made a user's
+file in root's 0700 tmpfs (now `/tmp`), and the x86_64 test image's `/tmp`
+was 1755 (`cp -R` on macOS applies the umask; now `cp -Rp`).
+`user/sys/systest.c` checks 30 rules as user 1000, plus access() with
+real 1000 / effective 0, on both CPUs. On the live disk, as `myos`:
+`/etc/shadow`, `/etc/passwd` and `/root` say Permission denied, the
+desktop comes up, `~/.xsession-errors` has no permission errors.
+Cost: open + close +38 cycles (+2.3%), stat +8 (docs/performance.md).
+
+## 2026-10-13 — The X server wants a cookie
+
+myos-login started X with no `-auth`, so any process on the machine, of
+any user, could connect to `:0`: read the keyboard (passwords typed into
+windows included), take screenshots, type into windows. Now, as Linux's
+display managers do:
+- a random 16-byte MIT-MAGIC-COOKIE-1 per X server (`getrandom`), in
+  `/run/myos-login/X0.auth` (directory 0700, root's) for the server
+  (`-auth`) and for the login screen's own connection;
+- the session child, after it has become the user, writes the same
+  cookie to `~/.Xauthority` (0600; to a new name with O_EXCL|O_NOFOLLOW,
+  then renamed into place) and sets `XAUTHORITY`. A home it can't write
+  gets `/tmp/.Xauthority-UID`;
+- the entry's family is FamilyWild, so renaming the host doesn't lock the
+  session out;
+- runit starts a fresh login screen, server and cookie after every
+  session, so what a past session left running is shut out.
+`tools/qemu-desktop.py` exports `XAUTHORITY` for its ssh commands.
+Checked on the live disk: without the cookie `xdotool` gets
+"Authorization required", with it it works; the login and desktop are
+unchanged. `tools/boottime.py` now waits for QEMU's serial port (it
+connected after a fixed 0.5 s, too early once).
+
+## 2026-10-13 — My Files: inotify and /proc/mounts
+
+My Files was written before MyOS had inotify and /proc/mounts, so it
+looked at the open folder every 2 s, and Disks tried `statfs` on every
+folder in `/`. Now:
+- **one inotify watch on the folder shown**, moved by `reload`. A burst of
+  events (an `rm -r`) becomes one reload, 100 ms after it starts; one
+  arriving while a name is being typed waits for it. If the folder itself
+  goes, the window moves to its nearest parent. No inotify (an old
+  kernel): the 2-second look, as before. The program now sleeps until
+  something changes, where it woke every 2 s.
+- **Disks reads /proc/mounts** (ext2, ext4 and vfat; `\040` in a path is
+  a space), with the old scan of `/` as the fallback.
+Checked on the live disk: My Files open on /tmp/ft, two files made and
+one removed from a shell, and the window showed it by itself.
+
+## 2026-10-13 — The kernel reads its config (KERNEL-CONFIG.md §10, steps 1–3)
+
+- **Slots 0–19, the OS at 0 and 10**: exactly 10 ms apart (they were 1
+  and 10: 9 ms, then 11). `sched_slot()` says -1 before the scheduler
+  starts.
+- **A built-in config** (`kconfig.py cdefault`): the build turns
+  `config/slots.conf` into the same boot block and task list a myos-config
+  partition holds, as two C arrays, and checks `include/kconfig.h`'s
+  structs against `kconfig.py header`. `tools/slots2c.awk` is gone.
+- **`kernel/kconfig.c`** checks a config as `kconfig.py decode` does
+  (magic, version, byte order, arch, CRC, the OS's slots, owners that name
+  real tasks, names and program paths a program can have, matching
+  generations), picks the newer good copy of A and B (generations compare
+  as serial numbers, so they may wrap), and gives the scheduler its slot
+  owners. It reads the `myos-config` partition on the root's disk (a GPT
+  name, or behind a hybrid MBR an unnamed type 0xDA entry), in
+  storage_init, before the scheduler starts. One line says what it used:
+  `kconfig: sda3 copy A, generation 3: soft realtime: audio 2 12; brakes 4 9 14 19`.
+- **13 self-tests** (`kernel/kconfig_test.c`): a bad CRC, the other byte
+  order, another arch, a task list from another save, a task in the OS's
+  slot, a missing task, a `..` in a program path, wrapped generations.
+- **On disks**: `make ARCH=x86_64 test-uefi-shell` gives its disk
+  `tools/kconfig/test.conf` (`mkuefi.py --config-file`) and checks the
+  kernel uses it; the live disk, with its empty partition, keeps the
+  built-in config, and with a config written into a copy of it uses that.
+- **The installer makes `myos-config`** (1 MiB, MyOS's type GUID, after
+  myos-root) and clears it. Installed in QEMU onto an NVMe and booted:
+  `nvme0n1p3`, found, empty, built-in config kept.
+- Settings › Kernel says when a save takes effect (the next start) and what
+  comes later. Not yet: the modes in the scheduler, binding by program,
+  myos-taskd, the power savings, and the BIOS disks' copy (i386).
+
+## 2026-10-13 — x86_64 uses the RAM above 2 GiB (for programs)
+
+The x86_64 kernel managed only the first 2 GiB: the page allocator handed
+out 32-bit addresses, and every device driver relies on that for DMA. The
+MSI has 16 GiB. Now the allocator has two zones (`include/pmm.h`), as
+Linux began with ZONE_DMA32:
+- **low** (below 2 GiB, as before): `pmm_alloc()`, 32-bit, for the kernel,
+  its caches and every DMA buffer — nothing there changed;
+- **high** (the rest): `pmm_alloc_user()`, 64-bit, only for programs'
+  private pages (anonymous memory, stacks, copy-on-write copies), which only
+  the CPU touches. It falls back to low RAM when the high zone is full.
+`pmm_init` notes the high RAM, `vmm_init` direct-maps it (2 MiB pages, RAM
+ranges only, never the holes), and `pmm_refs_init` gives it its own bitmap
+and share counts in low RAM. Every place a program's page passes through
+— unmap, translate, unmap_range, free_tree, fork_tree, the copy-on-write
+fault, mremap — now carries 64 bits (each had a `(uint32_t)` cast). The
+disk DMA helpers refuse an address above 4 GiB instead of cutting it.
+Checked: `make test`, `make ARCH=x86_64 test-uefi-shell` with 4 GiB (2 of
+them above 4 GiB in QEMU's map) and with `QEMU_UEFI_MEM=8G` ("pmm: 6144 MiB
+above 2048 MiB"), and the live desktop with Chromium: /proc/meminfo says
+4 GiB (it said 2), nothing killed. Not yet on the MSI.
+
+## 2026-10-13 — Power off on real PCs (ACPI S5)
+
+"Turn off" switched the machine off only in QEMU: a real board's
+power-off number lives in its ACPI tables, and MyOS didn't read them.
+`drivers/acpi.c` reads, once at boot, just what power off needs:
+- the RSDP: the UEFI loader now takes it from the firmware's
+  configuration table (ACPI 2.0's GUID, else 1.0's) into `bootinfo`; on
+  a BIOS PC the kernel searches the EBDA and 0xE0000–0xFFFFF;
+- the XSDT or RSDT, the FADT (the PM1a/PM1b control ports, SMI_CMD and
+  ACPI_ENABLE), and the DSDT, each checked by signature and checksum;
+  read through the direct map when it covers them, else `ioremap`;
+- `_S5`: a constant package on nearly every board, so its two sleep types
+  are read from the AML bytes (NameOp "_S5_" PackageOp ...) without an
+  interpreter.
+Power off then writes the type, then type + SLP_EN, to PM1a (and PM1b),
+after switching the firmware to ACPI mode if it wasn't. QEMU's own switch
+stays as the fallback. Checked: `poweroff` makes QEMU exit by itself, the
+log saying "(ACPI S5)", on x86_64 (UEFI, q35), i386 (BIOS, pc) and i386
+with 1 GiB (tables above the 768 MiB direct map: the ioremap path). Found
+along the way: the i386 BIOS disk doesn't start on q35 at all (gaps.md).
+
+## 2026-10-13 — umount
+
+`umount2` answered EBUSY to everything: the VFS didn't know whether a file
+system was in use. Now, for disk file systems (ext2, vfat), `vfs_umount`
+looks once at everything that can use one (nothing is counted on the hot
+paths): its inodes in the tree — any reference beyond an inotify watch's,
+or a mount on one of its directories — and every process's open files,
+mappings, cwd, root and program (which also finds a file deleted while
+open). In use: EBUSY, as before. Not: its pages are written, watchers get
+IN_UNMOUNT, the directory under it comes back, and the file system's own
+`unmount` finishes — ext2 marks itself cleanly unmounted and lets go of
+its superblock; both forget the partition's cached blocks. Root only.
+The inodes are kept, unreachable, rather than freed (a later step).
+RAM mounts (tmpfs, proc, sysfs) still say EBUSY.
+- `user/sys/systest.c`: EBUSY while the mount is open and while it is the
+  cwd, then off, then mounted again — FAT on x86_64, ext2 /data on i386,
+  where ext2test and fstest then run on the remounted disk.
+- The installer unmounts what it mounted at the end ("ext2: nvme0n1p2
+  unmounted cleanly"): `debugfs` on the result says "Filesystem state:
+  clean" for myos-root and myos-data (always "not clean" before). After a
+  failed step it unmounts too, so a second try needs no restart.
+
+## 2026-10-13 — SA_RESTART
+
+A signal made every sleeping call return EINTR, even when the handler was
+installed with SA_RESTART (as musl's `signal()` does). Now, as Linux:
+- the waits that Linux restarts return `-ERESTARTSYS` (kernel-internal,
+  512): pipe, tty/pty, Unix/UDP/TCP/packet/netlink socket reads and
+  writes, `accept`, `wait4`, eventfd, inotify and evdev reads, `flock`
+  and `F_SETLKW`, FIFO opens. Those Linux never restarts keep EINTR
+  (`poll`, `select`, `epoll_wait`, `nanosleep`, System V IPC, `connect`).
+- the syscall paths note it (`signal_restart_note`); `signal_check`
+  then restarts the call — the number back in EAX/RAX, the program
+  counter back over the 2-byte `int 0x80` / `syscall` — if the handler
+  has SA_RESTART or no handler runs, and makes it EINTR otherwise. It is
+  done before the signal frame saves the registers, so the call runs
+  again after `sigreturn`.
+- i386's sysenter returns into the vsyscall page: an `int 0x80` now sits
+  just before its return point (as in Linux's vDSO), and a restart lands
+  on it, with argument 6 put back in EBP. A changed return address
+  already makes the exit take the full `iret`, so ECX and EDX come back.
+Checked on all three ways in: `int 0x80` (rawsystest, i386), sysenter
+(musl's boottest, i386) and `syscall` (x86_64): an interrupted pipe read
+runs on and gets the byte written later; without SA_RESTART, EINTR.
+
+## 2026-10-13 — Job control: Ctrl-Z, fg, bg
+
+The stop signals were ignored, so Ctrl-Z did nothing. Now (kernel/signal.c,
+kernel/proc.c, drivers/tty.c), as Linux:
+- a stop signal with its default action (SIGSTOP always) stops the whole
+  process: its threads sleep until SIGCONT; the parent gets SIGCHLD
+  (unless SA_NOCLDSTOP). SIGCONT continues a stopped process whatever its
+  action is, and drops any stop still waiting; a stop drops a waiting
+  SIGCONT; SIGKILL wakes a stopped process to die;
+- `wait4` WUNTRACED and WCONTINUED, `waitid` WSTOPPED and WCONTINUED
+  (CLD_STOPPED, CLD_CONTINUED), each told once; `/proc/<pid>/stat` says T;
+- a group no shell can continue (orphaned) isn't stopped by the terminal;
+- a background job reading its terminal gets SIGTTIN (EIO if it ignores
+  or blocks it, or is orphaned).
+Bash on the console still had no job control: login takes the terminal
+for the new session with TIOCSCTTY, which the console ignored, so bash
+found another session's group in the foreground ("no job control in
+background"). The console now does what a pty does: TIOCSCTTY makes it
+the session's terminal, TIOCNOTTY lets go, TIOCGPGRP/TIOCSPGRP answer only
+the session that owns it (a session that has ended frees it).
+Checked: `user/sys/systest.c` (stop, wait4, continue, kill) on both CPUs,
+and on the live disk's console: `sleep 100`, Ctrl-Z → "[1]+ Stopped",
+`ps` T, `bg` → Running, `kill`; `cat &` → "Stopped (tty input)", then
+`kill -9` → "Killed".

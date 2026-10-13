@@ -28,6 +28,7 @@ static int checks;
 #define SYS_rmdir 40
 #define SYS_uname 122
 #define SYS_mprotect 125
+#define PROT_NONE 0
 #define SYS__newselect 142
 #define SYS_nanosleep 162
 #define SYS_poll 168
@@ -118,6 +119,38 @@ int main(int argc, char **argv)
     CHECK(syscall3(SYS_mprotect, (long)m, 4096, PROT_READ | PROT_WRITE) == 0);
     m[0] = 'c';
     CHECK(m[0] == 'c');
+
+    /* 7b. PROT_NONE: not even a read. The page keeps its data, in this
+       process and in a child forked meanwhile, for when it's readable again. */
+    CHECK(syscall3(SYS_mprotect, (long)m, 4096, PROT_NONE) == 0);
+    pid = fork();
+    if (pid == 0) {
+        volatile char c = m[0];
+        (void)c;
+        _exit(0);
+    }
+    CHECK(wait4(pid, &status, 0, 0) == pid && WIFSIGNALED(status) && WTERMSIG(status) == SIGSEGV);
+    pid = fork();
+    if (pid == 0)
+        _exit(syscall3(SYS_mprotect, (long)m, 4096, PROT_READ) == 0 && m[0] == 'c' ? 0 : 1);
+    CHECK(wait4(pid, &status, 0, 0) == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    CHECK(syscall3(SYS_mprotect, (long)m, 4096, PROT_READ) == 0 && m[0] == 'c');
+    /* A fresh PROT_NONE mapping (a guard page): its first touch faults,
+       and the kernel won't write into it for us either. */
+    char *g = mmap(0, 4096, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    pid = fork();
+    if (pid == 0) {
+        volatile char c = g[0];
+        (void)c;
+        _exit(0);
+    }
+    CHECK(wait4(pid, &status, 0, 0) == pid && WIFSIGNALED(status) && WTERMSIG(status) == SIGSEGV);
+    int zp[2];
+    CHECK(pipe(zp) == 0 && write(zp[1], "z", 1) == 1);
+    CHECK(read(zp[0], g, 1) == -EFAULT);
+    close(zp[0]);
+    close(zp[1]);
+    munmap(g, 4096);
 
     /* 8. openat relative to an open directory. */
     int dfd = open("/test", 0200000);           /* O_DIRECTORY */

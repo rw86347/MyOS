@@ -10,6 +10,7 @@
  *
  * Linux reports this type as MSDOS_SUPER_MAGIC (0x4d44).
  */
+#include <bcache.h>
 #include <errno.h>
 #include <fat32.h>
 #include <kheap.h>
@@ -210,6 +211,14 @@ static int fat_statfs(struct mount *m, uint32_t *bsize, uint32_t *blocks, uint32
     return 0;
 }
 
+/* umount: read-only, so nothing to write; forget the stick's blocks. */
+static void fat_unmount(struct mount *m)
+{
+    struct fatmnt *fm = m->priv;
+    bcache_drop(fm->fat.dev);
+    klog("fat32: %s unmounted\n", fm->fat.dev->name);
+}
+
 static const struct fs_ops fat_fsops = {
     .load_dir = fat_load_dir,
     .create = fat_create,
@@ -219,6 +228,7 @@ static const struct fs_ops fat_fsops = {
     .truncate = fat_truncate,
     .read_kernel = fat_read_kernel,
     .statfs = fat_statfs,
+    .unmount = fat_unmount,
 };
 
 int fat_vfs_mount(struct blockdev *dev, const char *path)

@@ -495,6 +495,8 @@ static char state_of(struct process *p)
 {
     if (p->state == PROC_ZOMBIE)
         return 'Z';
+    if (p->stopped)
+        return 'T';                     /* job control: stopped */
     for (struct thread *t = p->threads; t; t = t->proc_next)
         if (t->state == THREAD_READY)
             return 'R';
@@ -554,7 +556,8 @@ static void pid_status(struct gen *g, struct process *p)
     put(g, "\nUmask:\t0"), put_u(g, p->umask >> 6 & 7), put_u(g, p->umask >> 3 & 7), put_u(g, p->umask & 7);
     char st[2] = { state_of(p), 0 };
     put(g, "\nState:\t"), put(g, st);
-    put(g, st[0] == 'R' ? " (running)" : st[0] == 'Z' ? " (zombie)" : " (sleeping)");
+    put(g, st[0] == 'R' ? " (running)" : st[0] == 'Z' ? " (zombie)" :
+           st[0] == 'T' ? " (stopped)" : " (sleeping)");
     put(g, "\nTgid:\t"), put_u(g, (uint32_t)p->pid);
     put(g, "\nNgid:\t0\nPid:\t"), put_u(g, (uint32_t)p->pid);
     put(g, "\nPPid:\t"), put_u(g, (uint32_t)(p->parent ? p->parent->pid : 0));
@@ -745,7 +748,17 @@ static uint32_t gen_change_count(struct file *f)
 static int32_t gen_write(struct file *f, const void *ubuf, uint32_t n)
 {
     (void)ubuf;
-    return f->inode->fs_ino % PID_STEP == P_OOM ? (int32_t)n : -EINVAL;
+    uint32_t pid = f->inode->fs_ino / PID_STEP;
+    if (f->inode->fs_ino % PID_STEP != P_OOM)
+        return -EINVAL;
+    /* Its mode is 0666 (the node's owner can't follow each process's
+       user), so the owner rule is here: your own processes, or root's. */
+    struct process *p = pid ? proc_find((int)pid) : proc_current(), *me = proc_current();
+    if (!p)
+        return -ESRCH;
+    if (me && p != me && me->cred.euid != 0 && me->cred.euid != p->cred.uid)
+        return -EACCES;
+    return (int32_t)n;              /* taken, and ignored: there's no OOM killer */
 }
 
 static const struct file_ops gen_ops = {
@@ -809,7 +822,8 @@ static void pid_files_in(struct inode *dir, uint32_t pid)
     for (uint32_t k = 0; k < sizeof pid_files / sizeof pid_files[0]; k++) {
         struct inode *i = gen_file(dir, pid_files[k].name, pid * PID_STEP + pid_files[k].kind);
         if (i && pid_files[k].kind == P_OOM)
-            i->mode = S_IFREG | 0644;   /* the one a program writes */
+            i->mode = S_IFREG | 0666;   /* the one a program writes (gen_write
+                                           checks whose process it is) */
     }
 }
 

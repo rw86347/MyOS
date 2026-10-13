@@ -133,7 +133,7 @@ static int32_t master_read(struct file *f, void *user_buf, uint32_t n)
         if (f->flags & O_NONBLOCK)
             return -EAGAIN;
         if (signal_pending())
-            return -EINTR;
+            return -ERESTARTSYS;
         wq_sleep(&p->mread);
     }
     /* Taken out of the ring before the copy (which may sleep while a slave
@@ -177,7 +177,7 @@ static int32_t master_write(struct file *f, const void *user_buf, uint32_t n)
             if (f->flags & O_NONBLOCK)
                 err = -EAGAIN;
             else if (signal_pending())
-                err = -EINTR;
+                err = -ERESTARTSYS;
             if (err)
                 break;
             tty_wait_space(p->tty);
@@ -283,7 +283,7 @@ static int32_t slave_write(struct file *f, const void *user_buf, uint32_t n)
             if (f->flags & O_NONBLOCK)
                 err = -EAGAIN;
             else if (signal_pending())
-                err = -EINTR;
+                err = -ERESTARTSYS;
             if (err)
                 break;
             wq_sleep(&p->outroom);
@@ -329,6 +329,7 @@ static int make_ctty(struct pty *p)
         return -EPERM;              /* another session's terminal */
     p->sid = me->sid;
     tty_set_fg(p->tty, me->pgid);
+    tty_set_session(p->tty, me->sid);
     return 0;
 }
 
@@ -339,8 +340,10 @@ static int32_t slave_ioctl(struct file *f, uint32_t cmd, uintptr_t arg)
     case TIOCSCTTY:
         return p->sid == proc_current()->sid ? 0 : make_ctty(p);
     case TIOCNOTTY:
-        if (p->sid == proc_current()->sid)
+        if (p->sid == proc_current()->sid) {
             p->sid = 0;
+            tty_set_session(p->tty, 0);
+        }
         return 0;
     case TIOCGSID:
         if (!p->sid)
@@ -408,7 +411,8 @@ static int master_open(struct file *f)
     }
     p->node->rdev = (PTY_SLAVE_MAJOR << 8) | (uint32_t)n;
     p->node->ops = &slave_ops;
-    p->node->uid = proc_current()->cred.euid;   /* grantpt(): the opener's */
+    p->node->uid = proc_current()->cred.euid;   /* grantpt(): the opener's, */
+    p->node->gid = 5;                           /* group tty, mode 0620 (Linux) */
     p->index = n;
     p->refs = 1;
     p->master_open = 1;

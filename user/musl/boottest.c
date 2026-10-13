@@ -15,6 +15,7 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
+#include <sys/time.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/auxv.h>
@@ -542,10 +543,12 @@ static void users(void)
         uid_t r, e, sv;
         bad |= (getresuid(&r, &e, &sv) != 0 || sv != 1000) << 7;
         struct stat st;
-        int fd = open("/boottest-run/mine", O_CREAT | O_WRONLY, 0644);
+        /* In /tmp (1777): /boottest-run is root's (mode 0700), and a user
+           may not make files there now that permissions are checked. */
+        int fd = open("/tmp/boottest-mine", O_CREAT | O_WRONLY, 0644);
         bad |= (fd < 0 || fstat(fd, &st) != 0 || st.st_uid != 1000 || st.st_gid != 100) << 8;
         close(fd);
-        unlink("/boottest-run/mine");
+        unlink("/tmp/boottest-mine");
         if (bad)
             _exit(bad & 0x7F ? bad & 0x7F : 0x80 | (bad >> 7));
         execl("/bin/boottest", "boottest", "--ids", (char *)NULL);
@@ -560,6 +563,39 @@ static void users(void)
     check(code == 0 || code == 0x7D || code == 0xFE,
           "setgroups/setgid/setuid, saved id, files owned by the user");
     check(code == 0, "exec of a setuid-root file: euid 0, AT_SECURE");
+}
+
+/* SA_RESTART through musl's own syscalls (sysenter on i386: the restart
+   comes back through the int 0x80 in the vsyscall page). A read from an
+   empty pipe, interrupted at 20 ms, must go on and get the byte a child
+   writes at 80 ms. */
+static volatile int alrm_seen;
+static void on_alrm(int sig) { (void)sig; alrm_seen = 1; }
+
+static void sa_restart(void)
+{
+    int p[2];
+    if (pipe(p))
+        return;
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = on_alrm;
+    sa.sa_flags = SA_RESTART;
+    sigaction(SIGALRM, &sa, 0);
+    pid_t pid = fork();
+    if (pid == 0) {
+        usleep(80000);
+        write(p[1], "s", 1);
+        _exit(0);
+    }
+    struct itimerval it = { { 0, 0 }, { 0, 20000 } };
+    setitimer(ITIMER_REAL, &it, 0);
+    char c = 0;
+    ssize_t n = read(p[0], &c, 1);
+    waitpid(pid, 0, 0);
+    close(p[0]);
+    close(p[1]);
+    check(n == 1 && c == 's' && alrm_seen, "SA_RESTART: an interrupted read runs again");
 }
 
 /* The strings on the start-up stack, in Linux's order: argv[0] first, the
@@ -592,6 +628,7 @@ int main(int argc, char **argv)
     file_mmap();
     many_areas();
     users();
+    sa_restart();
     if (failures)
         return 1;
     printf("boottest: all ok\n");

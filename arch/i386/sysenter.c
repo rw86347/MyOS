@@ -66,7 +66,14 @@ void sysenter_dispatch(struct regs *r)
     uint32_t a6 = 0;
     get_user32(&a6, r->user_esp);
     thread_current()->uregs = r;        /* fork/execve need the registers */
-    r->eax = syscall_dispatch(r->eax, r->ebx, r->ecx, r->edx, r->esi, r->edi, a6);
+    uint32_t nr = r->eax;
+    r->eax = syscall_dispatch(nr, r->ebx, r->ecx, r->edx, r->esi, r->edi, a6);
+    if (r->eax == (uint32_t)-ERESTARTSYS) {
+        /* Run it again through the int 0x80 before the vsyscall page's
+           return point, which takes argument 6 from EBP: put it there. */
+        r->ebp = a6;
+        signal_restart_note(nr);
+    }
     sched_preempt_check();
     SIGNAL_CHECK(r);                    /* back to user mode: deliver signals */
 }

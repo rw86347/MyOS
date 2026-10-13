@@ -10,8 +10,9 @@
  *   0x0000000000000000 - 0x00007FFFFFFFEFFF  user space (128 TiB), per process.
  *                        A fixed-address program (busybox: 0x400000) can be
  *                        loaded where it was linked. (include/user.h)
- *   0xFFFF800000000000 - +DIRECTMAP_LIMIT    "direct map": all physical RAM at
- *                        +DIRECTMAP_BASE, 2 MiB pages. P2V/V2P. (PML4 entry 256)
+ *   0xFFFF800000000000 - +(end of RAM)       "direct map": all physical RAM at
+ *                        +DIRECTMAP_BASE, 2 MiB pages. P2V/V2P. (PML4 entry 256:
+ *                        512 GiB of it)
  *   0xFFFFFFFF80000000 - ...                 the kernel image, linked here
  *                        (-2 GiB: `-mcmodel=kernel` lets code address it with
  *                        32-bit sign-extended constants, so no 64-bit
@@ -38,9 +39,12 @@
 #define KERNEL_VBASE     0xFFFFFFFF80000000ull  /* the image: physical 0 is here too */
 #define KERNEL_SPACE_START DIRECTMAP_BASE       /* everything above is the kernel's */
 
-/* Direct-mapped physical RAM (pmm's limit, too: frames are 32-bit numbers).
-   The UEFI loader puts the initrd below it: KERNEL_RAM_LIMIT there. */
-#define DIRECTMAP_LIMIT  0x80000000ull          /* 2 GiB for now */
+/* The low zone (pmm.h): the kernel's own RAM, below 2 GiB, as 32-bit
+   frame addresses that every device can reach. The UEFI loader puts the
+   initrd below it (KERNEL_RAM_LIMIT). RAM above it is the high zone, for
+   programs' pages only (HIGHMEM); the direct map covers both. */
+#define DIRECTMAP_LIMIT  0x80000000ull
+#define HIGHMEM          1
 
 #define KSTACK_START     0xFFFFFFFFBE000000ull  /* thread.c: guard page + stack per slot */
 #define KSTACK_END       0xFFFFFFFFC0000000ull

@@ -284,6 +284,35 @@ static void take_gop(struct efi_boot_services *bs, struct bootinfo *bi)
     bi->loader_magic = BOOTINFO_MAGIC;
 }
 
+static int same_guid(const efi_guid *a, const efi_guid *b)
+{
+    const u8 *x = (const u8 *)a, *y = (const u8 *)b;
+    for (unsigned i = 0; i < sizeof *a; i++)
+        if (x[i] != y[i])
+            return 0;
+    return 1;
+}
+
+/* Where the firmware keeps its ACPI tables: the RSDP, in the system
+   table's configuration table, under ACPI 2.0's GUID (or 1.0's on old
+   firmware). The kernel reads the power-off numbers from them (acpi.c). */
+static u64 find_rsdp(struct efi_system_table *st)
+{
+    static const efi_guid acpi20 = { 0x8868e871, 0xe4f1, 0x11d3,
+                                     { 0xbc, 0x22, 0x00, 0x80, 0xc7, 0x3c, 0x88, 0x81 } };
+    static const efi_guid acpi10 = { 0xeb9d2d30, 0x2d88, 0x11d3,
+                                     { 0x9a, 0x16, 0x00, 0x90, 0x27, 0x3f, 0xc1, 0x4d } };
+    struct { efi_guid guid; void *table; } *ct = st->config_table;
+    u64 v1 = 0;
+    for (u64 i = 0; ct && i < st->ntables; i++) {
+        if (same_guid(&ct[i].guid, &acpi20))
+            return (u64)ct[i].table;
+        if (same_guid(&ct[i].guid, &acpi10))
+            v1 = (u64)ct[i].table;
+    }
+    return v1;
+}
+
 /* Is the disk we were loaded from on USB? (Its device path has a USB node.) */
 static int on_usb(struct efi_boot_services *bs, efi_handle dev)
 {
@@ -411,6 +440,7 @@ efi_status efi_main(efi_handle image, struct efi_system_table *st)
     if (on_usb(bs, li->device)) {
         bi->boot_flags |= BOOT_FROM_USB;
     }
+    bi->acpi_rsdp = find_rsdp(st);
     say("\r\n");                    /* the end of Step 01's line */
     take_gop(bs, bi);
 

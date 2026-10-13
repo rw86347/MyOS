@@ -89,6 +89,17 @@ void arch_siginfo(void *si, int sig, const struct sig_origin *o)
     fill_info(si, sig, o);
 }
 
+void arch_syscall_restart(struct regs *r, uint32_t nr)
+{
+    r->rax = nr;
+    r->rip -= 2;                        /* syscall is 0F 05 */
+}
+
+void arch_syscall_result(struct regs *r, long value)
+{
+    r->rax = (uint64_t)value;
+}
+
 int arch_signal_frame(int sig, const struct sig_origin *o, const struct k_sigaction *a,
                       uint64_t mask, struct regs *r)
 {

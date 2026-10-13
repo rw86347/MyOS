@@ -13,6 +13,9 @@ built-in default, and the tests use it to check the kernel's reader.
                                                            a myos-config partition image
     python3 tools/kconfig/kconfig.py decode IMAGE          what a partition holds
     python3 tools/kconfig/kconfig.py header                the C structs for the kernel
+    python3 tools/kconfig/kconfig.py cdefault SLOTS --arch A -o FILE.c
+                                                           the kernel's built-in default
+                                                           (from config/slots.conf), as C
     python3 tools/kconfig/kconfig.py layout                the field tables
 
 CONF is the text form (docs/kernel-config/example.conf).
@@ -823,6 +826,50 @@ def demo():
     _show_checks([m for m in check(bad)[0]], [], [])
 
 
+def parse_slots_conf(text, where="config/slots.conf"):
+    """config/slots.conf ("brakes 4 9 14 19" per line) -> KConfig: the
+    kernel's built-in default. Realtime, as the scheduler runs today (the
+    modes come with docs/KERNEL-CONFIG.md step 6); each task's program is
+    /bin/NAME, not started at boot (nothing starts tasks yet: step 5).
+    Mistakes stop the build, as slots2c.awk's did."""
+    cfg = KConfig(mode=MODES["realtime"], rt_flags=RT_LEFTOVER)
+    errors = []
+    for n, raw in enumerate(text.splitlines(), 1):
+        words = raw.split("#", 1)[0].split()
+        if not words:
+            continue
+        name, slots = words[0], words[1:]
+        if not slots:
+            errors.append(f"{where}:{n}: '{name}' has no slots")
+        for s in slots:
+            if not s.isdigit() or int(s) >= NSLOTS:
+                errors.append(f"{where}:{n}: '{s}' is not a slot number (0-{NSLOTS - 1})")
+            elif int(s) in OS_SLOTS:
+                errors.append(f"{where}:{n}: slot {s} belongs to the OS")
+            elif cfg.slots[int(s)]:
+                errors.append(f"{where}:{n}: slot {s} given to both {cfg.slots[int(s)]} and {name}")
+            else:
+                cfg.slots[int(s)] = name
+        cfg.programs[name] = Task(program="/bin/" + name, start_at_boot=False, restart=False)
+    return cfg, errors
+
+
+def c_default(cfg, source):
+    """Both parts as two C arrays, for the kernel to link in."""
+    boot, tasks = encode(cfg, 1), encode_tasks(cfg, 1)
+    out = [f"/* Generated from {source} by tools/kconfig/kconfig.py cdefault: do not edit.",
+           "   The kernel's built-in config (docs/KERNEL-CONFIG.md §10 step 2), in the",
+           "   same bytes a myos-config partition holds; kernel/kconfig.c checks it",
+           "   at boot as it checks one read from the disk. */",
+           "#include <stdint.h>", ""]
+    for name, data in (("kconfig_default_boot", boot), ("kconfig_default_tasks", tasks)):
+        out.append(f"const uint8_t {name}[{len(data)}] __attribute__((aligned(8))) = {{")
+        for i in range(0, len(data), 16):
+            out.append("    " + " ".join(f"0x{b:02x}," for b in data[i:i + 16]))
+        out.append("};")
+    return "\n".join(out) + "\n"
+
+
 def main(argv):
     if not argv or argv[0] in ("-h", "--help"):
         print(__doc__)
@@ -855,6 +902,22 @@ def main(argv):
                 f.truncate(1 << 20)         # the whole 1 MiB partition
             print(f"wrote {out}: copy A, {cfg.arch}, {cfg.order()}-endian")
         return 1 if errors else 0
+    elif cmd == "cdefault" and args:
+        cfg, errors = parse_slots_conf(open(args[0]).read(), args[0])
+        cfg.arch = opt.get("--arch", "i386")
+        if not errors:
+            errors = check(cfg)[0]
+        for e in errors:
+            print(e, file=sys.stderr)
+        if errors:
+            return 1
+        text = c_default(cfg, args[0])
+        if "-o" in opt:
+            with open(opt["-o"], "w") as f:
+                f.write(text)
+        else:
+            sys.stdout.write(text)
+        return 0
     elif cmd == "decode" and args:
         image = open(args[0], "rb").read()
         why = []

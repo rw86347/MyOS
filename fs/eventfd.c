@@ -44,7 +44,7 @@ static int32_t efd_read(struct file *f, void *user_buf, uint32_t n)
         }
         if (signal_pending()) {
             file_put(f);
-            return -EINTR;
+            return -ERESTARTSYS;
         }
         wq_sleep(&e->wait);
     }
@@ -86,7 +86,7 @@ static int32_t efd_write(struct file *f, const void *user_buf, uint32_t n)
         }
         if (signal_pending()) {
             file_put(f);
-            return -EINTR;
+            return -ERESTARTSYS;
         }
         wq_sleep(&e->wait);
     }

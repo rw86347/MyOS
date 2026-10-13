@@ -10,8 +10,12 @@
  *   slots        after sched_start(): every 1 ms tick moves to the next slot
  *                of the 20-slot frame and runs that slot's owner:
  *
- *       slot:   1    2    3    4    5    6   ...  10  ...  14  ...  19   20
- *       runs:  main idle idle brk  idle radio... main ... brk  ... brk  idle
+ *       slot:   0    1    2    3    4    5    6   ...  10  ...  14  ...  19
+ *       runs:  main idle idle idle brk  idle radio... main ... brk  ... brk
+ *
+ * Slots 0 and 10 are the OS's, exactly 10 ms apart; the owners of the
+ * others come from the kernel config (kernel/kconfig.c: built in from
+ * config/slots.conf, or what Settings › Kernel saved).
  *
  * The owner keeps the CPU for its whole slot; its timing is exactly what
  * the table says, whatever else is running.
@@ -23,6 +27,7 @@
  * no best-effort thread is ready does the idle thread run (hlt).
  */
 #include <interrupts.h>
+#include <kconfig.h>
 #include <kprintf.h>
 #include <pmm.h>
 #include <sched.h>
@@ -32,7 +37,7 @@
 
 static int slots_on;                /* 0 = round robin, 1 = slot table */
 static int preempt_on;              /* round robin: switch on every tick? */
-static volatile int slot;           /* slot running now, 1-20 (0 = not started) */
+static volatile int slot = -1;      /* slot running now, 0-19 (-1 = not started) */
 static volatile int need_resched;   /* set by the timer, handled at IRQ exit */
 static struct thread *idle;
 
@@ -40,7 +45,7 @@ static struct thread *idle;
    owners up by name is too slow for every tick, so we keep this table and
    rebuild it only when threads come or go (thread_generation changes).
    Every tick is then one array lookup. */
-static struct thread *slot_thread[SCHED_SLOTS + 1];
+static struct thread *slot_thread[SCHED_SLOTS];
 static uint32_t slot_table_gen = ~0u;
 static struct thread *be_last;      /* best effort: the last pick */
 
@@ -48,7 +53,7 @@ static void rebuild_slot_table(void)
 {
     for (int i = 0; i < THREAD_MAX; i++)
         thread_at(i)->owns_slot = 0;
-    for (int s = 1; s <= SCHED_SLOTS; s++) {
+    for (int s = 0; s < SCHED_SLOTS; s++) {
         const char *name = sched_slot_owner(s);
         slot_thread[s] = name ? thread_find(name) : NULL;
         if (slot_thread[s])
@@ -96,7 +101,7 @@ void sched_start(void)
     idle->is_idle = 1;
 
     uint32_t flags = irq_save();
-    slot = 1;                       /* the frame starts now, in slot 1, which
+    slot = 0;                       /* the frame starts now, in slot 0, which
                                        belongs to main — the thread running */
     slots_on = 1;
     irq_restore(flags);
@@ -109,9 +114,7 @@ int sched_slot(void)
 
 const char *sched_slot_owner(int s)
 {
-    if (s == 1 || s == 10)
-        return SCHED_SYSTEM_THREAD;
-    return slot_config[s];
+    return kconfig_slot_owner(s);   /* "main" for 0 and 10 */
 }
 
 void sched_set_preempt(int on)
@@ -139,7 +142,7 @@ struct thread *sched_pick(int yielding)
 void sched_tick(void)
 {
     if (slots_on) {
-        slot = slot % SCHED_SLOTS + 1;      /* 1, 2, ..., 20, 1, 2, ... */
+        slot = slot == SCHED_SLOTS - 1 ? 0 : slot + 1;  /* 0, 1, ..., 19, 0, ... */
         need_resched = 1;
     } else if (preempt_on) {
         need_resched = 1;

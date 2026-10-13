@@ -1,7 +1,9 @@
 # Time slots: who runs when
 
-Status: **design**. Today's kernel has the 20-slot frame (`kernel/sched.c`)
-and gives a slot to whichever thread has the right name. This document is
+Status: **design**. Today's kernel has the 20-slot frame (`kernel/sched.c`),
+takes the slot owners from the kernel config (built in, or the
+`myos-config` partition: `kernel/kconfig.c`), and gives a slot to whichever
+thread has the owner's name. This document is
 how it is meant to work:
 - **Part 1:** how a program is bound to its slots;
 - **Part 2:** how the kernel and the desktop share the two OS slots, so a
@@ -249,8 +251,8 @@ int main(void)
 
 | Today (`kernel/sched.c`) | Planned |
 |---|---|
-| Slots 1–20, system slots 1 and 10 (9 ms then 11 ms apart) | Slots 0–19, OS at 0 and 10 (exactly 10 ms apart) |
+| ~~Slots 1–20, system slots 1 and 10~~ Slots 0–19, OS at 0 and 10 (since 2026-10-13) | done |
 | A slot goes to whichever thread has the name | Bound by `myos-taskd` and checked at `execve` |
 | The system slots run only `main` | They run the whole OS class: the kernel's threads and the desktop |
 | Ordinary programs and the X server share time equally | OS threads first, everywhere; the fence stops a runaway among them |
-| One table, built in (`config/slots.conf`) | The config on the disk; the built-in table is only the default |
+| ~~One table, built in~~ The config on the disk (`myos-config`), the built-in one (`config/slots.conf`) as the default (since 2026-10-13) | done; the modes come with step 6 |

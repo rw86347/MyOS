@@ -284,8 +284,10 @@ static uint32_t phys_of(uintptr_t va)
 {
     if (va >= DIRECTMAP_BASE && va - DIRECTMAP_BASE < DIRECTMAP_LIMIT)
         return V2P(va);
-    uint32_t pa = vmm_translate(va & ~(PAGE_SIZE - 1));
-    return pa ? pa | (va & (PAGE_SIZE - 1)) : 0;
+    phys_addr_t pa = vmm_translate(va & ~(PAGE_SIZE - 1));
+    if (pa > 0xFFFFF000ull)
+        return 0;                       /* above 4 GiB: the PRD can't hold it */
+    return pa ? (uint32_t)pa | (va & (PAGE_SIZE - 1)) : 0;
 }
 
 /* Describe buf (bytes long) to the controller. Ranges that happen to be

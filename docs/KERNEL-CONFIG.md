@@ -84,11 +84,9 @@ possible jitter, is open question 5.
 - Names: 1–15 characters, a small letter first, then `a–z 0–9 - _`. `os`,
   `idle`, `main` and `kernel` are taken.
 
-> **Kernel change:** today's scheduler numbers the slots 1–20 and gives
-> the system 1 and 10. Those are 9 ms then 11 ms apart. The new numbering
-> (0–19, system at 0 and 10) spaces them exactly 10 ms apart.
-> `config/slots.conf`, `tools/slots2c.awk` and `kernel/sched.c` move with
-> it (§10, step 1).
+> **Kernel change (done 2026-10-13):** the scheduler numbered the slots
+> 1–20 and gave the system 1 and 10, 9 ms then 11 ms apart. Now they are
+> 0–19, the system at 0 and 10, exactly 10 ms apart (§10, step 1).
 
 ## 4. After boot: starting the tasks
 
@@ -505,19 +503,27 @@ B's cards yet. They could open inside a card when it is switched on
 
 ## 10. Steps (each ends with something to see in QEMU)
 
-1. **Slots 0–19, OS at 0 and 10.** Renumber `sched.c`, `slots.conf` and
-   `slots2c.awk`. `make test` shows `brakes` running in 4, 9, 14, 19.
-2. **The built-in default.** The build turns `config/slots.conf` into
-   both parts with `kconfig.py` and links them in. The kernel decodes
+1. **Slots 0–19, OS at 0 and 10.** *Done 2026-10-13.* `sched.c` and
+   `slots.conf` renumbered (`slots2c.awk` is gone: step 2 replaces it).
+   `make test` shows main in 0 and 10, `brakes` in 4, 9, 14, 19.
+2. **The built-in default.** *Done 2026-10-13* (`kconfig.py cdefault`,
+   `kernel/kconfig.c`, `kernel/kconfig_test.c`; its mode is realtime, what
+   the scheduler does until step 6 — §11 question 2 is still open). The
+   build turns `config/slots.conf` into both parts with `kconfig.py` and
+   links them in. The kernel decodes
    and checks them at boot and prints the mode and tasks. Self-tests
    feed it damaged parts and check it falls back correctly:
    - a bad CRC;
    - the wrong byte order;
    - the wrong arch;
    - a task list whose generation doesn't match its boot block.
-3. **Reading from disk.** The installer and `mkuefi.py` add
-   `myos-config`. The kernel finds it, picks A or B, and logs which. In
-   QEMU, write a partition with `kconfig.py partition` and see it used.
+3. **Reading from disk.** *Done 2026-10-13 for GPT and hybrid-MBR disks*
+   (the installer, `mkuefi.py --config-file`): the kernel looks on the
+   root's disk (no root: the first good one), picks A or B, and logs
+   which. `make ARCH=x86_64 test-uefi-shell` boots with
+   `tools/kconfig/test.conf` in it and checks the kernel used it. Not
+   yet: the BIOS disks' copy in the 0x7F boot area (§8), and the slot
+   owners are all the kernel applies (the modes: step 6).
 4. **Binding by program, not by name.** The root-only "make my child
    task T" call, the check at `execve` (inode, user, one process per
    task), and `EPERM` otherwise. `make test` shows a renamed thread

@@ -400,7 +400,7 @@ static int32_t usock_write(struct usock *s, const uint8_t *ubuf, uint32_t n,
             if (nonblock)
                 return done ? (int32_t)done : -EAGAIN;
             if (signal_pending())
-                return done ? (int32_t)done : -EINTR;
+                return done ? (int32_t)done : -ERESTARTSYS;
             uget(p);                /* its queue must outlive our sleep on it */
             wq_sleep(&p->wq);       /* its reader will make room */
             uput(p);
@@ -461,7 +461,7 @@ static int32_t usock_read(struct usock *s, uint8_t *ubuf, uint32_t n, int nonblo
         if (nonblock)
             return -EAGAIN;
         if (signal_pending())
-            return -EINTR;
+            return -ERESTARTSYS;
         wq_sleep(&s->wq);
     }
     uint32_t avail = s->head - s->tail;
@@ -536,7 +536,7 @@ static int32_t dgram_send(struct usock *s, struct usock *to, const struct user_i
         else if (nonblock)
             err = -EAGAIN;
         else if (signal_pending())
-            err = -EINTR;
+            err = -ERESTARTSYS;
         if (err) {
             kfree(d);
             return err;
@@ -575,7 +575,7 @@ static int32_t dgram_recv(struct usock *s, const struct user_iovec *iov, uint32_
         if (nonblock)
             return -EAGAIN;
         if (signal_pending())
-            return -EINTR;
+            return -ERESTARTSYS;
         wq_sleep(&s->wq);
     }
     struct udgram *d = s->dq;       /* out of the queue first: the copy may sleep */
@@ -824,6 +824,12 @@ static struct usock *find_bound(const uint8_t *name, uint32_t len, int *err)
         *err = vfs_lookup(path, &node);
         if (*err)
             return NULL;
+        /* Talking to a socket by its path needs write permission on it,
+           as on Linux (unix_find_bsd): that's how a daemon picks who may
+           connect (X's 0777, wpa_supplicant's group). */
+        *err = vfs_permission(node, MAY_WRITE);
+        if (*err)
+            return NULL;
         if ((node->mode & S_IFMT) != S_IFSOCK) {
             *err = -ECONNREFUSED;
             return NULL;
@@ -884,6 +890,8 @@ SYSCALL_DEF(unix_bind)
         const char *last;
         uint32_t llen;
         err = vfs_lookup_parent(NULL, path, &dir, &last, &llen);
+        if (!err)                   /* a taken name first, then our rights */
+            err = vfs_child(dir, last, llen) ? -EEXIST : vfs_may_create(dir);
         if (!err)
             err = vfs_create(dir, last, llen,
                              S_IFSOCK | (0777 & ~proc_current()->umask), 0, &node);
@@ -991,7 +999,7 @@ SYSCALL_DEF(unix_accept4)
         if (f->flags & O_NONBLOCK)
             return -EAGAIN;
         if (signal_pending())
-            return -EINTR;
+            return -ERESTARTSYS;
         wq_sleep(&s->wq);
         if (s->state != U_LISTEN)
             return -EINVAL;

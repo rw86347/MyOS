@@ -81,6 +81,12 @@ struct process {
        its own group, so Ctrl-C reaches exactly that job. */
     int pgid, sid;
 
+    /* Job control (signal.c): stopped by SIGSTOP / SIGTSTP / SIGTTIN /
+       SIGTTOU until SIGCONT, its threads asleep on stop_wait. What wait4
+       hasn't told the parent yet: a stop (its signal), a continue. */
+    uint8_t stopped, stop_report, cont_report;
+    struct wait_queue stop_wait;
+
     struct cred cred;                   /* its users and groups (cred.h) */
     int nice;                           /* -20 (most favoured) .. 19; the
                                            scheduler doesn't use it yet */
@@ -139,6 +145,12 @@ int  proc_waitid(int idtype, int id, uintptr_t user_info, int options, uintptr_t
 int  rusage_to_user(uintptr_t user, uint32_t user_ms, uint32_t sys_ms);
 int  proc_setpgid(int pid, int pgid);
 int  proc_setsid(void);
+/* No member of the group has a parent in another group of its session:
+   no shell is there to continue it, so terminal stops don't apply (POSIX). */
+int  proc_pgrp_orphaned(int pgid);
+/* Does any live process belong to session sid? (A terminal whose session
+   has ended is free again, as Linux frees it when the leader exits.) */
+int  proc_session_alive(int sid);
 int  proc_pgid_in_session(int pgid, int sid);   /* for TIOCSPGRP */
 void proc_set_cwd(struct process *p, struct inode *dir);    /* chdir */
 

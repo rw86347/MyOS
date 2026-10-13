@@ -204,7 +204,7 @@ static int32_t take(struct psock *s, int nonblock, int peek, struct pframe **out
         if (nonblock)
             return -EAGAIN;
         if (signal_pending())
-            return -EINTR;
+            return -ERESTARTSYS;
         wq_sleep(&s->wq);
     }
     struct pframe *b = s->head;

@@ -2,7 +2,7 @@
 /* Copyright (c) 2026 Rodger Wilson */
 /*
  * sched_test.c — start the slot scheduler, and prove each task runs in
- * exactly the slots config/slots.conf gives it.
+ * exactly the slots the kernel config gives it (config/slots.conf built in).
  *
  * One thread is created for every name in the config. Each one loops:
  * "note which slot I'm in, then sleep until the next interrupt". main does
@@ -23,10 +23,10 @@
 
 struct task {
     const char *name;
-    uint32_t ran[SCHED_SLOTS + 1];  /* ran[s] = times this task woke in slot s */
+    uint32_t ran[SCHED_SLOTS];      /* ran[s] = times this task woke in slot s */
 };
 
-static struct task tasks[SCHED_SLOTS + 1];  /* [0] is main */
+static struct task tasks[SCHED_SLOTS];      /* [0] is main */
 static int ntasks;
 static volatile int recording;
 
@@ -56,8 +56,8 @@ void sched_selftest(void)
 {
     /* One record per distinct name: main, then each task in the config. */
     tasks[ntasks++].name = SCHED_SYSTEM_THREAD;
-    for (int s = 1; s <= SCHED_SLOTS; s++) {
-        const char *name = slot_config[s];
+    for (int s = 0; s < SCHED_SLOTS; s++) {
+        const char *name = sched_slot_owner(s);    /* the kernel config's */
         if (name && !find_task(name)) {
             struct task *t = &tasks[ntasks++];
             t->name = name;
@@ -79,7 +79,7 @@ void sched_selftest(void)
     for (int i = 0; i < ntasks; i++) {
         struct task *t = &tasks[i];
         kprintf("  %s ran in slots:", t->name);
-        for (int s = 1; s <= SCHED_SLOTS; s++) {
+        for (int s = 0; s < SCHED_SLOTS; s++) {
             const char *owner = sched_slot_owner(s);
             int mine = owner && strcmp(owner, t->name) == 0;
             if (t->ran[s])

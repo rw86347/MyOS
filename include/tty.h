@@ -52,5 +52,9 @@ int      tty_onlcr(struct tty *t);          /* write '\n' as "\r\n"? */
 void     tty_set_hung(struct tty *t);       /* other end gone: SIGHUP, then EOF */
 int      tty_get_fg(struct tty *t);
 void     tty_set_fg(struct tty *t, int pgid);
+/* The session whose controlling terminal it is (0: none): a pty's from the
+   session leader that took it, the console's from whoever sets its
+   foreground group. Its other groups are background jobs. */
+void     tty_set_session(struct tty *t, int sid);
 
 #endif
