@@ -4,6 +4,7 @@
 #define ARCH_X86_64_PAGING_H
 
 #include <stdint.h>
+#include <types.h>              /* phys_addr_t */
 
 /*
  * x86_64 page table entry flags (bits 11:0). Same meaning as i386 for the
@@ -23,6 +24,10 @@
 #define PTE_SHARED   0x200
 #define PTE_COW      0x400
 #define PTE_MAPSHARED 0x800
+/* No-execute. Not one of the entry's low bits (NX is bit 63): the flags
+   API is 32-bit, so this bit 31 stands for it, and paging.c turns it into
+   bit 63 — only when the CPU has NX (on one without, bit 63 is reserved). */
+#define PTE_NOEXEC   0x80000000u
 
 void vmm_init(void);
 

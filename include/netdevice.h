@@ -149,6 +149,11 @@ struct net_device *dev_get_by_name(const char *name);
 /* NULL for a free slot: walk 1..NETDEV_MAX, don't stop at the first NULL. */
 struct net_device *dev_get_by_index(int ifindex);
 
+/* For /proc/net/wireless (net/wireless/core.c): 0 if dev isn't a Wi-Fi
+   interface; 1 if it is, but not connected; 2 if connected, with *dbm its
+   access point's last signal (0: none heard yet). May sleep (the wiphy lock). */
+int wifi_link_info(struct net_device *dev, int *dbm);
+
 /* The flags as programs see them (IFF_RUNNING, IFF_LOWER_UP and so on
    added: no carrier sense yet). */
 unsigned int dev_get_flags(const struct net_device *dev);

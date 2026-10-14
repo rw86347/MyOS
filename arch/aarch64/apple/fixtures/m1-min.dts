@@ -1,0 +1,28 @@
+/dts-v1/;
+
+/*
+ * MacBook Air (M1, 2020) — J313 subset for host tests (RAM + serial0 reg).
+ * Real hardware DTB from m1n1 fills memory size and more; addresses match Asahi t8103.
+ */
+/ {
+	compatible = "apple,j313", "apple,t8103", "apple,arm-platform";
+	model = "Apple MacBook Air (M1, 2020) — MyOS test fixture";
+	#address-cells = <2>;
+	#size-cells = <2>;
+
+	chosen {
+		stdout-path = "serial0";
+	};
+
+	memory@80000000 {
+		device_type = "memory";
+		reg = <0x0 0x80000000 0x0 0x40000000>;
+	};
+
+	serial0: serial@235200000 {
+		compatible = "apple,s5l-uart";
+		reg = <0x2 0x35200000 0x0 0x1000>;
+		reg-io-width = <4>;
+		status = "okay";
+	};
+};

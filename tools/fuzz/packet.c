@@ -40,7 +40,7 @@ void pk_feed(uint16_t type, const uint8_t *b, uint32_t n, const uint8_t mac[6])
      * fuzzer could detect. Same mistake as the block buffers in the disk
      * target, which got a whole page each -- see docs/security.md.
      */
-    struct sk_buff *skb = alloc_skb(n + 16);
+    struct sk_buff *skb = alloc_skb(n + 16, 0);
     if (!skb)
         return;
     skb_reserve(skb, 16);

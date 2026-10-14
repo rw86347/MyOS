@@ -1,16 +1,41 @@
 /* SPDX-License-Identifier: BSD-2-Clause */
 /* Copyright (c) 2026 Rodger Wilson */
 /*
- * uart.c — PL011 early console (QEMU virt @ 0x09000000)
+ * uart.c — early console: PL011 (QEMU virt) or apple,s5l-uart (M1 hardware DTB).
  *
  * Works with the MMU off (identity map). Later paging must map this device.
  */
+#include "apple/s5l_uart.h"
 #include "uart.h"
 
 #include <stdarg.h>
 #include <stdint.h>
 
-#define UART_BASE 0x09000000u
+enum uart_kind {
+    UART_PL011,
+    UART_APPLE_S5L,
+};
+
+static enum uart_kind s_kind = UART_PL011;
+static uintptr_t s_uart_base = 0x09000000u;
+
+void uart_set_base(uintptr_t phys)
+{
+    if (phys) {
+        s_uart_base = phys;
+        s_kind = UART_PL011;
+    }
+}
+
+void uart_use_apple_s5l(uintptr_t phys)
+{
+    if (phys) {
+        apple_s5l_uart_bind(phys);
+        s_kind = UART_APPLE_S5L;
+    }
+}
+
+#define UART_BASE s_uart_base
 #define UART_DR   0x00u
 #define UART_FR   0x18u
 #define UART_CR   0x30u
@@ -32,16 +57,24 @@ static inline uint32_t mmio_read32(uintptr_t addr)
 
 void uart_init(void)
 {
+    if (s_kind == UART_APPLE_S5L) {
+        apple_s5l_uart_init();
+        return;
+    }
     mmio_write32(UART_BASE + UART_CR, UART_CR_UARTEN | UART_CR_TXE | UART_CR_RXE);
 }
 
 int uart_readable(void)
 {
+    if (s_kind == UART_APPLE_S5L)
+        return apple_s5l_uart_readable();
     return !(mmio_read32(UART_BASE + UART_FR) & UART_FR_RXFE);
 }
 
 int uart_getc(void)
 {
+    if (s_kind == UART_APPLE_S5L)
+        return apple_s5l_uart_getc();
     if (!uart_readable())
         return -1;
     return (int)(mmio_read32(UART_BASE + UART_DR) & 0xff);
@@ -49,6 +82,10 @@ int uart_getc(void)
 
 void uart_putc(char c)
 {
+    if (s_kind == UART_APPLE_S5L) {
+        apple_s5l_uart_putc(c);
+        return;
+    }
     while (mmio_read32(UART_BASE + UART_FR) & UART_FR_TXFF)
         ;
     mmio_write32(UART_BASE + UART_DR, (uint32_t)(unsigned char)c);

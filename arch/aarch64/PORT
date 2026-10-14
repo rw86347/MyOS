@@ -21,4 +21,4 @@ Next (14b rest / 14c):
   - Real VFS + writable files; job control; signals that actually deliver
   - Raspberry Pi bare metal (14c)
 
-Apple Silicon (step 15): m1n1 hand-off, Apple devices under arch/aarch64/apple/.
+Apple Silicon (step 15): see arch/aarch64/apple/PORT (15a doc + DTB probe done).

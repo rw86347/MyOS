@@ -19,6 +19,10 @@
 
 #define USER_LIMIT KERNEL_VBASE
 
+/* SMAP's window (x86_64): the old PCs have no SMAP, so nothing to open. */
+static inline void user_access_begin(void) { }
+static inline void user_access_end(void) { }
+
 int  __copy_user(void *dst, const void *src, uint32_t n);
 int  __get_user32(uint32_t *dst, uint32_t user_addr);
 int  __fault_in_user(uint32_t addr, uint32_t n, int write);

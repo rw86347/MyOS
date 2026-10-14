@@ -45,6 +45,12 @@ void     tty_free(struct tty *t);
 void     tty_feed(struct tty *t, const char *bytes, uint32_t n);    /* typing */
 int32_t  tty_read_from(struct tty *t, struct file *f, void *user_buf, uint32_t n);
 int32_t  tty_ioctl_on(struct tty *t, uint32_t cmd, uintptr_t arg); /* termios, size, pgrp */
+/* Job control (SIGTTOU) for a program's own side of terminal t (NULL: the
+   console), before a write or an ioctl: 0 to go ahead, -ERESTARTSYS once
+   SIGTTOU has stopped a background job (the call runs again after `fg`),
+   or -EIO / -ENOTTY. Not for a pty's master: that's the terminal window. */
+int      tty_write_check(struct tty *t);
+int      tty_ioctl_check(struct tty *t, uint32_t cmd);
 int      tty_readable(struct tty *t);
 uint32_t tty_space(struct tty *t);          /* bytes tty_feed takes without dropping */
 void     tty_wait_space(struct tty *t);     /* sleep until a read makes room */

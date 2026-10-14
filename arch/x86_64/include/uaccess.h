@@ -19,6 +19,27 @@
 
 #define USER_LIMIT USER_ADDR_END
 
+/* SMAP (Intel since Broadwell, AMD since Zen): the kernel can't read or
+   write user memory unless the AC flag says so. The routines below open
+   that window around their one access (uaccess.asm); nothing else in the
+   kernel can be tricked into touching user memory. smap_on: set when
+   CR4.SMAP is on (paging.c), since stac/clac don't exist on older CPUs. */
+extern uint8_t smap_on;
+
+/* The window, for the code that builds a new program's memory at exec
+   (the ELF loader, the first stack) — it writes there directly. */
+static inline void user_access_begin(void)
+{
+    if (smap_on)
+        __asm__ volatile ("stac" ::: "memory", "cc");
+}
+
+static inline void user_access_end(void)
+{
+    if (smap_on)
+        __asm__ volatile ("clac" ::: "memory", "cc");
+}
+
 int  __copy_user(void *dst, const void *src, uint64_t n);
 int  __get_user32(uint32_t *dst, uint64_t user_addr);
 int  __get_user64(uint64_t *dst, uint64_t user_addr);

@@ -28,11 +28,19 @@
  * being wrong (racetest's epoll check, a few times in a hundred). So the
  * test passes the address of its sibling's "done" flag, and the armed copy
  * keeps yielding until the flag is set (at most 200 ms).
+ *
+ * And the sibling must not act too early either: a test that lets it go
+ * first and then makes the call to be interrupted can be preempted in
+ * between, so the sibling acts before the call has even started (racetest's
+ * two waiters, once in four runs under host load). So a test may also pass
+ * its sibling's "go" flag: the armed copy sets it to 1 just before
+ * yielding, the moment the call is where the test wants it.
  */
 
 /* Arm the n'th copy from this thread onwards (n = 1: the very next one);
-   it yields until the user word at `until` is non-zero (0: one yield). */
-void uaccess_test_arm(int n, uintptr_t until);
+   it sets the user word at `go` to 1 (0: none), then yields until the user
+   word at `until` is non-zero (0: one yield). */
+void uaccess_test_arm(int n, uintptr_t until, uintptr_t go);
 
 /* Called from copy_to_user / copy_from_user before the copy. */
 void uaccess_test_pause(void);

@@ -66,6 +66,7 @@ struct termios {
 #define ECHOE   0000020
 #define ECHOK   0000040
 #define ECHONL  0000100
+#define TOSTOP  0000400             /* background jobs' writes: SIGTTOU */
 #define ECHOCTL 0001000
 #define ECHOKE  0004000
 #define IEXTEN  0100000
@@ -343,25 +344,54 @@ uint32_t tty_poll(struct file *f)
     return (tty_readable(&console) ? 0x001 : 0) | 0x004;    /* POLLIN?, always POLLOUT */
 }
 
-/* A background job (its group isn't the foreground one) reading its own
-   terminal: SIGTTIN stops its group, and the shell's `fg` gives it the
-   terminal; the read then runs again (-ERESTARTSYS). One that can't be
-   stopped — it ignores or blocks SIGTTIN, or no shell could continue it —
-   gets EIO. Linux's rules (job_control in n_tty.c). */
-static int background_read(struct tty *t)
+/* A background job (its group isn't the foreground one) using its own
+   terminal: reading it (SIGTTIN), or changing it — its settings, its
+   foreground group, and with TOSTOP set, writing to it (SIGTTOU). The
+   signal stops the job's group; the shell's `fg` gives it the terminal,
+   and the call runs again (-ERESTARTSYS). A job that can't be stopped —
+   no shell could continue an orphaned group — gets EIO; one that ignores
+   or blocks the signal gets EIO for a read and goes ahead with a change
+   (shells ignore SIGTTOU to take the terminal back). Linux's rules
+   (__tty_check_change). */
+static int job_control(struct tty *t, int sig)
 {
     struct process *me = proc_current();
     if (!me || !t->sid || me->sid != t->sid || !t->fg_pgrp || me->pgid == t->fg_pgrp)
         return 0;
-    if (signal_ignored_or_blocked(SIGTTIN) || proc_pgrp_orphaned(me->pgid))
+    if (signal_ignored_or_blocked(sig))
+        return sig == SIGTTIN ? -EIO : 0;
+    if (proc_pgrp_orphaned(me->pgid))
         return -EIO;
-    signal_send_group(me->pgid, SIGTTIN);
+    signal_send_group(me->pgid, sig);
     return -ERESTARTSYS;
+}
+
+int tty_write_check(struct tty *t)
+{
+    if (!t)
+        t = &console;
+    return t->tio.c_lflag & TOSTOP ? job_control(t, SIGTTOU) : 0;  /* off: one test */
+}
+
+int tty_ioctl_check(struct tty *t, uint32_t cmd)
+{
+    if (!t)
+        t = &console;
+    switch (cmd) {
+    case TCSETS: case TCSETSW: case TCSETSF: case TCFLSH:
+        return job_control(t, SIGTTOU);
+    case TIOCSPGRP: {
+        int r = job_control(t, SIGTTOU);
+        return r == -EIO ? -ENOTTY : r;     /* (Linux's answer here) */
+    }
+    default:
+        return 0;
+    }
 }
 
 int32_t tty_read_from(struct tty *t, struct file *f, void *user_buf, uint32_t n)
 {
-    int bg = background_read(t);
+    int bg = job_control(t, SIGTTIN);
     if (bg)
         return bg;
     while (!tty_readable(t)) {
@@ -603,7 +633,10 @@ int32_t tty_ioctl_on(struct tty *t, uint32_t cmd, uintptr_t arg)
 int32_t tty_ioctl(struct file *f, uint32_t cmd, uintptr_t arg)
 {
     (void)f;
-    int32_t r = common_ioctl(&console, cmd, arg);
+    int32_t r = tty_ioctl_check(&console, cmd);
+    if (r)
+        return r;
+    r = common_ioctl(&console, cmd, arg);
     if (r != -ENOIOCTLCMD)
         return r;
     switch (cmd) {

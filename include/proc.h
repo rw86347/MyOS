@@ -72,6 +72,10 @@ struct process {
        of its children it has waited for (with theirs). */
     uint32_t utime, stime, cutime, cstime;
     uint32_t persona;                   /* personality(): 0 = PER_LINUX */
+#define ADDR_NO_RANDOMIZE   0x0040000   /* persona: no ASLR (gdb, setarch -R) */
+/* Persona bits a setuid / setgid program loses (Linux's PER_CLEAR_ON_SETID:
+   MMAP_PAGE_ZERO, ADDR_COMPAT_LAYOUT, READ_IMPLIES_EXEC, and the above). */
+#define PER_CLEAR_ON_SETID  0x0740000
     void *sem_undo;                     /* SEM_UNDO records (sem.c): given back at exit */
     const void *lock_wait;              /* F_SETLKW: whose lock it sleeps for (lock.c) */
     struct wait_queue child_wait;       /* sleeps here in wait4() */

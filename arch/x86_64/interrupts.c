@@ -118,8 +118,9 @@ static int exception_signal(uint64_t vector)
 
 /* A fault in a user program. If it handles the signal, the handler runs on
    the way out (like Linux); otherwise the program dies, and the kernel log
-   says where. */
-static void user_exception(struct regs *r, uint64_t cr2)
+   says where. noinline: its name buffer gets a stack canary (Makefile:
+   KERNEL_SSP); inlined, every interrupt would pay for that check. */
+static __attribute__((noinline)) void user_exception(struct regs *r, uint64_t cr2)
 {
     struct thread *t = thread_current();
     int sig = exception_signal(r->vector);
@@ -234,6 +235,24 @@ static void stack_scan(uint64_t sp)
         if (*p >= (uint64_t)__text_start && *p < (uint64_t)__text_end)
             kprintf("%s%lx", n++ % 4 ? " " : "\n  ", *p);
     kprintf("\n");
+}
+
+/* A protected function (Makefile: KERNEL_SSP) found its stack canary
+   changed on its way out: something wrote past the end of one of its
+   local arrays, and maybe over its return address too. Stop here instead
+   of returning there. The address printed is in that function. */
+void __stack_chk_fail(void) __attribute__((noreturn));
+void __stack_chk_fail(void)
+{
+    __asm__ volatile ("cli");
+    kprintf("\n*** KERNEL STACK SMASHED: the function at %lx overran a local array ***\n",
+            (uint64_t)__builtin_return_address(0));
+    uint64_t sp;
+    __asm__ volatile ("mov %%rsp, %0" : "=r"(sp));
+    stack_scan(sp);
+    serial_flush();
+    for (;;)
+        __asm__ volatile ("cli; hlt");
 }
 
 static void exception(struct regs *r)

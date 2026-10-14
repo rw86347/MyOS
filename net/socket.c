@@ -28,6 +28,7 @@
 #include <socket.h>
 #include <string.h>
 #include <thread.h>
+#include <timer.h>
 #include <stddef.h>
 #include <uaccess.h>
 #include <user.h>
@@ -93,6 +94,7 @@ struct sock {
     unsigned head, count;
     struct sock *raw_next;
     struct tcp_conn *tcp;           /* SOCK_STREAM */
+    uint32_t rcvtimeo, sndtimeo;    /* SO_RCVTIMEO, SO_SNDTIMEO: ms, 0 = none */
 };
 
 static struct sock *raw_list;
@@ -176,6 +178,7 @@ void raw_icmp_input(const uint8_t *ip, uint32_t len)
 /* Wait until a datagram is queued. 0, -EAGAIN, or -EINTR. */
 static int wait_rx(struct sock *s, int nonblock)
 {
+    uint32_t deadline = sock_deadline(s->rcvtimeo);
     for (;;) {
         net_rx_action();
         if (s->count)
@@ -183,9 +186,82 @@ static int wait_rx(struct sock *s, int nonblock)
         if (nonblock)
             return -EAGAIN;
         if (signal_pending())
-            return -ERESTARTSYS;
-        net_sleep(50);
+            return deadline ? -EINTR : -ERESTARTSYS;
+        uint32_t ms = 50, now = timer_ms();
+        if (deadline && (int32_t)(now - deadline) >= 0)
+            return -EAGAIN;             /* SO_RCVTIMEO ran out */
+        if (deadline && deadline - now < ms)
+            ms = deadline - now;
+        net_sleep(ms);
     }
+}
+
+/* --- SO_RCVTIMEO / SO_SNDTIMEO (socket.h) -------------------------------- */
+
+int sock_timeo_set(uint32_t *ms, uint32_t opt, uintptr_t val, uint32_t len)
+{
+    int64_t sec, usec;
+    if (opt >= SO_RCVTIMEO_NEW || sizeof(user_addr_t) == 8) {   /* two 64-bit words */
+        int64_t tv[2];
+        if (len < sizeof tv)
+            return -EINVAL;
+        if (copy_from_user(tv, (const void *)val, sizeof tv) < 0)
+            return -EFAULT;
+        sec = tv[0], usec = tv[1];
+    } else {                                                    /* i386's old timeval */
+        int32_t tv[2];
+        if (len < sizeof tv)
+            return -EINVAL;
+        if (copy_from_user(tv, (const void *)val, sizeof tv) < 0)
+            return -EFAULT;
+        sec = tv[0], usec = tv[1];
+    }
+    if (usec < 0 || usec >= 1000000)
+        return -EDOM;
+    if (sec < 0)
+        *ms = 1;            /* Linux: don't wait at all; the nearest a deadline gets */
+    else if (sec >= 2147483)
+        *ms = 0;            /* longer than a deadline holds (24.8 days): for ever */
+    else
+        *ms = (uint32_t)sec * 1000 + ((uint32_t)usec + 999) / 1000;     /* {0,0}: for ever */
+    return 0;
+}
+
+int sock_timeo_get(uint32_t ms, uint32_t opt, uintptr_t val, uintptr_t lenp)
+{
+    uint32_t len, size;
+    if (get_user32(&len, lenp) < 0)
+        return -EFAULT;
+    if ((int32_t)len < 0)
+        return -EINVAL;
+    int64_t tv64[2] = { ms / 1000, (ms % 1000) * 1000 };
+    int32_t tv32[2] = { (int32_t)(ms / 1000), (int32_t)(ms % 1000) * 1000 };
+    const void *p = tv64;
+    size = sizeof tv64;
+    if (opt < SO_RCVTIMEO_NEW && sizeof(user_addr_t) == 4)
+        p = tv32, size = sizeof tv32;
+    if (len > size)
+        len = size;
+    if (copy_to_user((void *)val, p, len) < 0 || copy_to_user((void *)lenp, &len, 4) < 0)
+        return -EFAULT;
+    return 0;
+}
+
+uint32_t sock_deadline(uint32_t ms)
+{
+    return ms ? (timer_ms() + ms) | 1 : 0;
+}
+
+int sock_wait(struct wait_queue *q, int nonblock, uint32_t deadline)
+{
+    if (nonblock)
+        return -EAGAIN;
+    if (signal_pending())
+        return deadline ? -EINTR : -ERESTARTSYS;
+    if (deadline && (int32_t)(timer_ms() - deadline) >= 0)
+        return -EAGAIN;
+    wq_sleep_until(q, deadline);
+    return 0;
 }
 
 /* --- helpers ----------------------------------------------------------- */
@@ -384,7 +460,7 @@ static int fault_in_iov(const struct user_iovec *iov, uint32_t n, uint32_t cap, 
 static int32_t stream_send(struct sock *s, uintptr_t ubuf, uint32_t len,
                            int nonblock, uint32_t flags)
 {
-    int rc = tcp_write(s->tcp, (const void *)ubuf, len, 1, nonblock);
+    int rc = tcp_write(s->tcp, (const void *)ubuf, len, 1, nonblock, s->sndtimeo);
     if (rc == -EPIPE && !(flags & MSG_NOSIGNAL))
         signal_send(proc_current(), SIGPIPE);
     return rc;
@@ -429,7 +505,7 @@ static int32_t do_recv(struct sock *s, struct file *f, const struct user_iovec *
             if (!iov[i].len)
                 continue;
             int r = tcp_read(s->tcp, (void *)iov[i].base, iov[i].len, 1,
-                             nonblock || done, flags & MSG_PEEK, 0);
+                             nonblock || done, flags & MSG_PEEK, s->rcvtimeo);
             if (r < 0)
                 return done ? done : r;
             done += r;
@@ -492,7 +568,7 @@ static int32_t sock_read(struct file *f, void *ubuf, uint32_t n)
 static int32_t send_kernel(struct sock *s, const void *k, uint32_t len, int nonblock)
 {
     if (s->type == SOCK_STREAM) {
-        int rc = tcp_write(s->tcp, k, len, 0, nonblock);
+        int rc = tcp_write(s->tcp, k, len, 0, nonblock, s->sndtimeo);
         if (rc == -EPIPE)
             signal_send(proc_current(), SIGPIPE);
         return rc;
@@ -718,7 +794,7 @@ SOCK_SYSCALL(sys_connect)
     if (s->type == SOCK_STREAM) {
         if ((ip >> 24) == 127 || ip == 0 || !port)
             return (ip >> 24) == 127 || ip == 0 ? -ENETUNREACH : -EINVAL;
-        return tcp_connect(s->tcp, ip, port, f->flags & O_NONBLOCK);
+        return tcp_connect(s->tcp, ip, port, f->flags & O_NONBLOCK, s->sndtimeo);
     }
     if (s->type == SOCK_DGRAM && !port)
         return -EINVAL;
@@ -916,15 +992,19 @@ SOCK_SYSCALL(sys_recvmsg)
     return r;
 }
 
-/* Options we accept and ignore: buffer sizes, broadcast, reuseaddr, TTL.
-   The values change nothing here yet. */
+/* SO_RCVTIMEO and SO_SNDTIMEO. The rest are accepted and ignored: buffer
+   sizes, broadcast, reuseaddr, TTL; their values change nothing here yet. */
 SOCK_SYSCALL(sys_setsockopt)
 {
     TO_UNIX(unix_setsockopt);
     TO_NETLINK(netlink_setsockopt);
     TO_PACKET(packet_setsockopt);
-    if (!sock_of(a1, 0))
+    struct sock *s = sock_of(a1, 0);
+    if (!s)
         return bad_fd(a1);
+    if (a2 == SOL_SOCKET && SO_IS_TIMEO(a3))
+        return sock_timeo_set(SO_IS_RCVTIMEO(a3) ? &s->rcvtimeo : &s->sndtimeo,
+                              (uint32_t)a3, a4, (uint32_t)a5);
     return 0;
 }
 
@@ -939,6 +1019,9 @@ SOCK_SYSCALL(sys_getsockopt)
     uint32_t val;
     if (a2 != SOL_SOCKET)
         return -ENOPROTOOPT;
+    if (SO_IS_TIMEO(a3))
+        return sock_timeo_get(SO_IS_RCVTIMEO(a3) ? s->rcvtimeo : s->sndtimeo, (uint32_t)a3,
+                              a4, a5);
     switch (a3) {
     case SO_TYPE:   val = (uint32_t)s->type; break;
     case SO_ERROR:  val = s->type == SOCK_STREAM ? (uint32_t)-tcp_error(s->tcp, 1) : 0; break;
@@ -1007,7 +1090,7 @@ SOCK_SYSCALL(sys_accept4)
     if (s->type != SOCK_STREAM)
         return -EOPNOTSUPP;
     struct tcp_conn *c;
-    int rc = tcp_accept(s->tcp, &c, f->flags & O_NONBLOCK, 0);
+    int rc = tcp_accept(s->tcp, &c, f->flags & O_NONBLOCK, s->rcvtimeo);
     if (rc < 0)
         return rc;
     /* The peer's address before the fd: the copy can sleep, and an fd that
@@ -1025,6 +1108,8 @@ SOCK_SYSCALL(sys_accept4)
     memset(n, 0, sizeof *n);
     n->type = SOCK_STREAM;
     n->tcp = c;
+    n->rcvtimeo = s->rcvtimeo;      /* a copy of the listener's (Linux) */
+    n->sndtimeo = s->sndtimeo;
     return sock_install(n, a4);
 }
 

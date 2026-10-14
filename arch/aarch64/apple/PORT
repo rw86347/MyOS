@@ -1,0 +1,22 @@
+Apple Silicon bare metal (roadmap 15) — step by step
+=====================================================
+
+All Apple-only code lives here or in `include/apple/`. QEMU virt stays in sibling
+`arch/aarch64/` files; switch drivers by DTB platform probe.
+
+Done:
+  - `docs/hardware-apple-silicon.md` (15a boot path, M1 target, constraints)
+  - `machine.c`: root `compatible` → QEMU virt vs Apple
+  - `uart_early.c`: `apple,uart` / PL011 base from DTB `reg`
+  - Host: `test-arm64-apple`; QEMU: `test-arm64-apple-boot` (m1-qemu-harness.dtb)
+
+Done (15b staging):
+  - `make ARCH=arm64 m1n1-payload` → `build/arm64/m1n1/`
+  - `arm64_boot_report()` logs x0 vs chosen DTB (`test-arm64-m1n1-payload`)
+
+Next (15b on hardware):
+  - Point m1n1 at `build/arm64/m1n1/kernel.bin` @ 0x40100000, x0 = hardware DTB
+  - `apple,s5l-uart` @ 0x235200000 + `paging_init` MMIO map above 4 GiB; m1n1 hardware boot open
+  - First printk on MacBook Air M1 serial or framebuffer
+
+Then 15c–15f: NVMe, kbd/panel, aarch64 live, Wi‑Fi.

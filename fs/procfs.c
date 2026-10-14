@@ -110,7 +110,7 @@ static uint32_t fmt_dns(uint32_t ip)
    (fs_ino = pid * PID_STEP + kind; pid 0 is whoever reads: /proc/self). */
 enum {
     GEN_CPUINFO = 1, GEN_MEMINFO, GEN_DNS, GEN_ROUTE, GEN_UPTIME, GEN_LOADAVG, GEN_STAT,
-    GEN_PARTITIONS, GEN_HOSTNAME, GEN_UUID, GEN_BOOTID, GEN_NETDEV,
+    GEN_PARTITIONS, GEN_HOSTNAME, GEN_UUID, GEN_BOOTID, GEN_NETDEV, GEN_WIRELESS,
     P_STAT = 64, P_STATUS, P_STATM, P_CMDLINE, P_COMM, P_ENVIRON, P_MAPS, P_LIMITS,
     P_MOUNTS, P_MOUNTINFO, P_CGROUP, P_OOM, P_IO, P_WCHAN,
 };
@@ -160,6 +160,23 @@ static void put_hexw(struct gen *g, uint64_t v, int width)
         b[--i] = "0123456789abcdef"[v & 15];
         v >>= 4;
     } while ((v || 16 - i < width) && i > 0);
+    put(g, b + i);
+}
+
+/* v right-aligned in `width` columns (printf's %*d). */
+static void put_int_w(struct gen *g, int v, int width)
+{
+    char b[12];
+    int i = 11;
+    uint32_t u = v < 0 ? 0u - (uint32_t)v : (uint32_t)v;
+    b[i] = 0;
+    do
+        b[--i] = (char)('0' + u % 10);
+    while (u /= 10);
+    if (v < 0)
+        b[--i] = '-';
+    for (int pad = width - (11 - i); pad > 0; pad--)
+        put(g, " ");
     put(g, b + i);
 }
 
@@ -472,6 +489,37 @@ static void uuid(struct gen *g, int boot)
     put(g, "\n");
 }
 
+/* /proc/net/wireless: Linux's wireless-extensions table (wext-proc.c), as
+   cfg80211 fills it — every Wi-Fi interface; when connected, the link
+   quality (the signal, -110..-40 dBm, as 0..70) and the signal level in dBm
+   ("." = measured). Noise and the discard counters are not kept: 0, as
+   Linux shows them from cfg80211. Settings' Wi-Fi pane and wavemon read it. */
+static void wireless(struct gen *g)
+{
+    put(g, "Inter-| sta-|   Quality        |   Discarded packets               | Missed | WE\n"
+           " face | tus | link level noise |  nwid  crypt   frag  retry   misc | beacon | 22\n");
+    for (int k = 1; k < 32; k++) {
+        struct net_device *d = dev_get_by_index(k);
+        int dbm = 0, link = d ? wifi_link_info(d, &dbm) : 0;
+        if (!link)
+            continue;
+        int qual = 0, level = 0, noise = 0, measured = link == 2 && dbm;
+        if (measured) {
+            qual = (dbm < -110 ? -110 : dbm > -40 ? -40 : dbm) + 110;
+            level = dbm;
+            noise = -256;               /* (Linux: no noise figure, in dBm) */
+        }
+        for (int pad = 6 - (int)strlen(d->name); pad > 0; pad--)
+            put(g, " ");                /* %6s */
+        put(g, d->name);
+        put(g, ": 0000  ");
+        put_int_w(g, qual, 3), put(g, measured ? ".  " : "   ");
+        put_int_w(g, level, 3), put(g, measured ? ".  " : "   ");
+        put_int_w(g, noise, 3), put(g, "   ");
+        put(g, "     0      0      0      0      0        0\n");
+    }
+}
+
 static void netdev(struct gen *g)
 {
     put(g, "Inter-|   Receive                                                |  Transmit\n"
@@ -679,6 +727,7 @@ static int32_t gen_read(struct file *f, void *ubuf, uint32_t n)
     case GEN_UUID:       uuid(&g, 0); break;
     case GEN_BOOTID:     uuid(&g, 1); break;
     case GEN_NETDEV:     netdev(&g); break;
+    case GEN_WIRELESS:   wireless(&g); break;
     case P_STAT:         pid_stat(&g, p); break;
     case P_STATUS:       pid_status(&g, p); break;
     case P_STATM:        put_ul(&g, vsize_of(p) / PAGE_SIZE), put(&g, " 0 0 0 0 0 0\n"); break;
@@ -956,7 +1005,7 @@ int procfs_mount(const char *path)
         !fixed(rnd, "entropy_avail", entropy_text, sizeof entropy_text - 1) ||
         !fixed(vm, "overcommit_memory", zero_text, sizeof zero_text - 1) ||
         !fixed(core, "somaxconn", somaxconn_text, sizeof somaxconn_text - 1) ||
-        !gen_file(net, "dev", GEN_NETDEV) ||
+        !gen_file(net, "dev", GEN_NETDEV) || !gen_file(net, "wireless", GEN_WIRELESS) ||
         !fixed(net, "tcp", tcp_text, sizeof tcp_text - 1) ||
         !fixed(net, "udp", tcp_text, sizeof tcp_text - 1) ||
         !fixed(net, "unix", unix_text, sizeof unix_text - 1))

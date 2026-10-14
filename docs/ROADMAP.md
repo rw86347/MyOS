@@ -286,8 +286,11 @@ Mark a step `[x]` only when its "Done when" check works.
   - [ ] 15a: document the target machines and boot path (`docs/hardware-apple-silicon.md`:
     models, secure boot / recovery constraints, partition layout next to macOS if dual-boot
     is ever wanted — **single-boot MyOS-only is the first goal**).
+    Started (2026-10-11): hardware doc + DTB platform probe (`make ARCH=arm64 test-arm64-apple`).
   - [ ] 15b: boot — load the kernel + DTB on at least one M1-class machine; serial or
     framebuffer text; memory map and CPU features parsed from the DTB.
+    Started (2026-10-11): DTB `apple,uart` harness + `apple,s5l-uart` (M1 Air fixture);
+    `test-arm64-uart-early`, m1n1 payload/x0 sim, `docs/m1n1-chainload.md` (hardware boot open).
   - [ ] 15c: storage — Apple NVMe (or the path Asahi uses) so `myos-root` on the internal
     SSD is visible; USB boot from a stick remains the installer path until internal disk works.
   - [ ] 15d: input and display — built-in keyboard/trackpad and the laptop panel (framebuffer

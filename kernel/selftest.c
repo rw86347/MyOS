@@ -13,6 +13,7 @@
 #include <keyboard.h>
 #include <kprintf.h>
 #include <mem_test.h>
+#include <paging.h>
 #include <random_test.h>
 #include <sched_test.h>
 #include <selftest.h>
@@ -54,6 +55,16 @@ void run_selftests(void)
     sleep_ms(100);
     kprintf("Timer: %u Hz (sleep 100 ms = %lu ticks), keyboard ready\n",
             TIMER_HZ, timer_ms() - t0);
+
+    /* The stack protector's secret (entry.asm): chosen, and on x86_64 in a
+       read-only page, so a bad kernel write can't set it to a known value. */
+    extern const uintptr_t __stack_chk_guard;
+    check(__stack_chk_guard != 0, "stack-protector guard chosen at boot");
+#ifdef ARCH_X86_64
+    check((__stack_chk_guard & 0xFF) == 0, "stack-protector guard: low byte 0");
+    check(!(vmm_get_flags((uintptr_t)&__stack_chk_guard) & PTE_WRITABLE),
+          "stack-protector guard read-only");
+#endif
 
     initrd_selftest();      /* the initramfs arrived intact */
     firmware_selftest();    /* request_firmware, from the archive */

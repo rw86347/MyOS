@@ -62,10 +62,11 @@ static volatile int sib_ready, sib_go, sib_done;
 /* Arm the next copy by this thread to yield before copying — and to keep
    yielding until the sibling has done its part (sib_done), so the
    interleaving happens every time, not only when the scheduler happens to
-   pick the sibling first. */
+   pick the sibling first. (Every argument spelled out: musl's syscall()
+   passes six whatever the call names, and an unnamed one is garbage.) */
 static int arm(void)
 {
-    return (int)syscall(NR_UACCESS_TEST, 1, &sib_done);
+    return (int)syscall(NR_UACCESS_TEST, 1, &sib_done, 0);
 }
 
 static void wait_for(volatile int *flag)
@@ -220,9 +221,11 @@ static void test_wait_reap(void)
     pthread_create(&t, 0, waiter, 0);
     wait_for(&sib_ready);
 
+    /* The sibling goes only once we are inside waitpid, at the status copy
+       (the copy sets sib_go): let go earlier, a preemption before the call
+       let it reap the child first, and all four checks failed. */
     int st = 0;
-    sib_go = 1;
-    arm();                          /* the status copy is what sleeps */
+    syscall(NR_UACCESS_TEST, 1, &sib_done, &sib_go);   /* the status copy sleeps */
     int a = (int)waitpid(-1, &st, 0);
 
     wait_for(&sib_done);
@@ -398,8 +401,9 @@ static int readdir_once(int nth, int *saw_survivor)
        call returns before the loop reads an entry at all, and the test quietly
        stops testing anything -- which it did, until verify-racetests said so. */
     char buf[128] __attribute__((aligned(8)));
-    sib_go = 1;
-    syscall(NR_UACCESS_TEST, nth);
+    sib_go = 1;                     /* (early: if the nth copy never comes, the
+                                       sibling must still run and finish) */
+    syscall(NR_UACCESS_TEST, nth, &sib_done, 0);
 
     *saw_survivor = 0;
     /* The cap is a liveness check as much as a safety net: breaking out of the
@@ -428,7 +432,7 @@ static int readdir_once(int nth, int *saw_survivor)
             off += reclen;
         }
     }
-    syscall(NR_UACCESS_TEST, 0);        /* in case the walk ended early */
+    syscall(NR_UACCESS_TEST, 0, 0, 0);  /* in case the walk ended early */
     wait_for(&sib_done);
     pthread_join(t, 0);
     close(dfd);
@@ -676,7 +680,7 @@ int main(void)
         printf("racetest: the test syscall is missing -- not a `make test` build\n");
         return 1;
     }
-    syscall(NR_UACCESS_TEST, 0);        /* disarm what we just armed */
+    syscall(NR_UACCESS_TEST, 0, 0, 0);  /* disarm what we just armed */
 
     test_pipe_read();
     test_pipe_write();

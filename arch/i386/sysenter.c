@@ -25,6 +25,8 @@
 void sysenter_entry(void);
 extern const char vsyscall_code[], vsyscall_code_end[];
 
+uint32_t sysexit_eip;               /* sysenter.h */
+
 /* sysenter loads ESP from an MSR, but each thread has its own kernel
    stack. Rewriting the MSR on every thread switch would cost ~100 cycles,
    so the MSR points at this little spare stack instead, and the first
@@ -47,18 +49,23 @@ void sysenter_init(void)
     memcpy(P2V(vsyscall_frame), vsyscall_code, vsyscall_code_end - vsyscall_code);
 }
 
-uint32_t vsyscall_map(void)
+uint32_t vsyscall_map(uint32_t at)
 {
     if (!vsyscall_frame)
         return 0;
     /* Read-only and shared: one physical page for every program, which
        freeing an address space must leave alone (PTE_SHARED). */
-    if (vmm_map(VSYSCALL_ADDR, vsyscall_frame, PTE_USER | PTE_SHARED) < 0)
+    if (vmm_map(at, vsyscall_frame, PTE_USER | PTE_SHARED) < 0)
         return 0;
-    return VSYSCALL_ADDR;
+    vsyscall_switch(at);            /* exec moved it: sysexit's return too */
+    return at;
 }
 
-/* Called from sysenter_entry with the same frame int 0x80 builds. */
+/* Called from sysenter_entry with the same frame int 0x80 builds.
+   no_stack_protector: &a6 would make GCC put a canary (Makefile:
+   KERNEL_SSP) on every system call, but get_user32 writes exactly those
+   4 bytes: there is nothing here to overrun. */
+__attribute__((no_stack_protector))
 void sysenter_dispatch(struct regs *r)
 {
     /* Argument 6 would be in EBP, but EBP carries the user stack pointer;

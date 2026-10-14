@@ -35,6 +35,21 @@
 
 #define PTE_ADDR(e)   ((uint64_t)(e) & 0x000FFFFFFFFFF000ull)
 #define PTE_FLAGS(e)  ((uint32_t)(e) & 0xFFFu)
+#define NX_BIT        (1ull << 63)
+
+uint8_t smap_on;                        /* CR4.SMAP is on: uaccess opens a window */
+
+/* NX, when the CPU has it (vmm_init turns it on): data, stacks and heaps
+   of programs can't be run as code — an overflow that writes code into a
+   buffer can't jump to it. 0 on a CPU without NX. */
+static uint64_t nx_bit;
+
+/* The API's flags (low 12 bits, and PTE_NOEXEC) as the entry's bits. */
+static uint64_t entry_bits(uint32_t flags)
+{
+    return (flags & 0xFFFu) | ((flags & PTE_NOEXEC) ? nx_bit : 0);
+}
+
 #define HUGE_2MB      0x200000ull
 #define ENTRIES       512
 
@@ -131,7 +146,7 @@ static int map_2mb(uintptr_t va, uint64_t pa, uint32_t flags)
     uint64_t *pde = get_pde(va, 1);
     if (!pde || (*pde & PTE_PRESENT))
         return -1;
-    *pde = pa | PTE_PRESENT | PTE_PS | global_for(va) | (flags & 0xFFF);
+    *pde = pa | PTE_PRESENT | PTE_PS | global_for(va) | entry_bits(flags);
     invlpg(va);
     return 0;
 }
@@ -144,6 +159,52 @@ static void kernel_pml4_entry(uintptr_t va)
 }
 
 /*
+ * The kernel's own write-xor-execute. Its code is the only kernel memory
+ * that runs, and nothing may write it; everything else in the kernel half
+ * — the direct map, the heap, stacks, device registers — never runs. A
+ * stray kernel write can't change kernel code, and data the kernel was
+ * tricked into holding can't be jumped to.
+ *
+ * By physical address, in the kernel image (linker.ld page-aligns these):
+ *   [0, 1 MiB)              firmware data, VGA text memory: RW, NX
+ *   [1 MiB, __rodata_start) code: read-only, runs (direct map: RO, NX)
+ *   [.., __rodata_end)      read-only data: RO, NX
+ *   [.., end)               data and .bss: RW, NX
+ */
+extern char __rodata_start[], __rodata_end[];
+static int map_2mb(uintptr_t va, uint64_t pa, uint32_t flags);
+#define PTE_EXEC_OK 0x40000000u         /* (internal) this kernel page may run */
+
+static uint32_t kernel_rights(phys_addr_t pa, int image)
+{
+    if (pa >= KERNEL_LOAD && pa < V2P(__rodata_start))
+        return image ? PTE_EXEC_OK : PTE_NOEXEC;            /* code */
+    if (pa >= KERNEL_LOAD && pa < V2P(__rodata_end))
+        return PTE_NOEXEC;                                  /* read-only data */
+    return PTE_WRITABLE | PTE_NOEXEC;
+}
+
+/* Map [pa, end) at base + pa: whole 2 MiB pages where a 2 MiB piece has
+   one set of rights, 4 KiB pages where it doesn't (only around the
+   image's section boundaries). */
+static void map_kernel_range(uint64_t base, phys_addr_t pa, phys_addr_t end, int image)
+{
+    while (pa < end) {
+        uint32_t r = kernel_rights(pa, image);
+        int uniform = !(pa & (HUGE_2MB - 1)) && pa + HUGE_2MB <= end &&
+                      kernel_rights(pa + HUGE_2MB - PAGE_SIZE, image) == r &&
+                      (pa >= V2P(__rodata_end) || pa + HUGE_2MB <= KERNEL_LOAD);
+        if (uniform) {
+            map_2mb(base + pa, pa, r & ~PTE_EXEC_OK);
+            pa += HUGE_2MB;
+        } else {
+            vmm_map(base + pa, pa, r);
+            pa += PAGE_SIZE;
+        }
+    }
+}
+
+/*
  * Build the kernel's page tables and switch to them. Until now we ran on
  * entry.asm's boot tables (identity + direct map + image, the first 1 GiB);
  * the new ones have no identity map, so the bottom half is free for user
@@ -152,6 +213,40 @@ static void kernel_pml4_entry(uintptr_t va)
  */
 void vmm_init(void)
 {
+    /* NX (CPUID 0x80000001 EDX bit 20): EFER.NXE makes bit 63 of an entry
+       mean "no execute" (otherwise it is reserved and must stay 0). */
+    uint32_t ext[4];
+    cpu_cpuid(0x80000000, 0, ext);
+    if (ext[0] >= 0x80000001) {
+        cpu_cpuid(0x80000001, 0, ext);
+        if (ext[3] & (1u << 20)) {
+            wrmsr(0xC0000080, rdmsr(0xC0000080) | (1ull << 11));
+            nx_bit = NX_BIT;
+            klog("paging: NX on: programs' data can't run as code\n");
+        }
+    }
+
+    /* SMEP and SMAP (CPUID 7: EBX bits 7 and 20): the kernel can't run a
+       user page at all, nor read or write one outside the user-copy
+       routines. A bug that makes the kernel jump to, or follow a pointer
+       into, memory a program controls then faults instead of obeying it. */
+    uint32_t l7[4] = { 0 }, l0[4];
+    cpu_cpuid(0, 0, l0);
+    if (l0[0] >= 7)
+        cpu_cpuid(7, 0, l7);
+    uint64_t cr4;
+    __asm__ volatile ("mov %%cr4, %0" : "=r"(cr4));
+    if (l7[1] & (1u << 7))
+        cr4 |= 1ull << 20;              /* SMEP */
+    if (l7[1] & (1u << 20)) {
+        cr4 |= 1ull << 21;              /* SMAP */
+        smap_on = 1;
+    }
+    __asm__ volatile ("mov %0, %%cr4" : : "r"(cr4) : "memory");
+    if (l7[1] & ((1u << 7) | (1u << 20)))
+        klog("paging:%s%s: the kernel can't run user pages, or touch them outside uaccess\n",
+             l7[1] & (1u << 7) ? " SMEP" : "", smap_on ? " SMAP" : "");
+
     /* Global pages first, so the mappings below get the bit. */
     global_bit = 0;
     if (cpu_has(CPU_PGE)) {
@@ -176,10 +271,7 @@ void vmm_init(void)
     if (ram_end > DIRECTMAP_LIMIT)
         ram_end = DIRECTMAP_LIMIT;
     uint64_t pa = 0;
-    for (; pa + HUGE_2MB <= ram_end; pa += HUGE_2MB)
-        map_2mb(DIRECTMAP_BASE + pa, pa, PTE_WRITABLE);
-    for (; pa < ram_end; pa += PAGE_SIZE)
-        vmm_map(DIRECTMAP_BASE + pa, pa, PTE_WRITABLE);
+    map_kernel_range(DIRECTMAP_BASE, 0, ram_end, 0);   /* never runs; the code's view RO */
     /* The high zone: each RAM range above it, in whole 2 MiB pages (a
        range's ragged ends are firmware data next to RAM, never device
        registers: those sit far above the end of RAM). Only RAM is mapped,
@@ -188,16 +280,23 @@ void vmm_init(void)
     for (int i = 0; pmm_high_range(i, &hs, &he); i++)
         for (pa = hs & ~(uint64_t)(HUGE_2MB - 1); pa < he; pa += HUGE_2MB)
             if (pa >= ram_end)
-                map_2mb(DIRECTMAP_BASE + pa, pa, PTE_WRITABLE);     /* -1: mapped already */
+                map_2mb(DIRECTMAP_BASE + pa, pa, PTE_WRITABLE | PTE_NOEXEC);   /* -1: mapped already */
 
-    /* The kernel image (code, data, .bss): 2 MiB pages from physical 0. */
-    uint64_t image_end = V2P(__kernel_end);
-    for (pa = 0; pa < image_end; pa += HUGE_2MB)
-        map_2mb(KERNEL_VBASE + pa, pa, PTE_WRITABLE);
+    /* The kernel image: code read-only and runnable, the rest not runnable
+       (map_kernel_range), from physical 0, to the 2 MiB after its end. */
+    uint64_t image_end = (V2P(__kernel_end) + HUGE_2MB - 1) & ~(uint64_t)(HUGE_2MB - 1);
+    map_kernel_range(KERNEL_VBASE, 0, image_end, 1);
 
     __asm__ volatile ("mov %0, %%cr3" : : "r"(pml4_phys) : "memory");
     cur_pml4 = kernel_pml4;
     cur_pml4_phys = pml4_phys;
+
+    /* Say what the entries now say (one look each, at boot). */
+    static int data_probe = 1;          /* in .data, next to the code's pages */
+    uint32_t cf = vmm_get_flags((uintptr_t)vmm_init), df = vmm_get_flags((uintptr_t)&data_probe);
+    klog("paging: kernel code %s%s, data %s\n", cf & PTE_WRITABLE ? "WRITABLE" : "read-only",
+         cf & PTE_NOEXEC ? " NOT RUNNABLE" : "", nx_bit ? (df & PTE_NOEXEC ? "no-execute" : "RUNNABLE")
+                                                       : "runnable (no NX)");
 
     /* CR0.WP: the kernel, too, faults on writing a read-only page — how a
        copy_to_user into a copy-on-write page gets its own copy. */
@@ -211,7 +310,10 @@ int vmm_map(uintptr_t va, uint64_t pa, uint32_t flags)
     uint64_t *pte = get_pte(va, 1);
     if (!pte || (*pte & PTE_PRESENT))
         return -1;
-    *pte = (pa & 0x000FFFFFFFFFF000ull) | PTE_PRESENT | global_for(va) | (flags & 0xFFF);
+    /* Kernel memory never runs, except the kernel's code (vmm_init). */
+    if (va >= KERNEL_SPACE_START && !(flags & PTE_EXEC_OK))
+        flags |= PTE_NOEXEC;
+    *pte = (pa & 0x000FFFFFFFFFF000ull) | PTE_PRESENT | global_for(va) | entry_bits(flags);
     invlpg(va);
     return 0;
 }
@@ -221,7 +323,7 @@ int vmm_map_big(uintptr_t va, uint64_t pa, uint32_t flags)
 {
     if (va < KERNEL_SPACE_START)
         return -1;                      /* big pages are the kernel's only */
-    return map_2mb(va, pa, flags);
+    return map_2mb(va, pa, flags | PTE_NOEXEC);     /* (framebuffers: never run) */
 }
 
 phys_addr_t vmm_unmap(uintptr_t va)
@@ -251,7 +353,9 @@ phys_addr_t vmm_translate(uintptr_t va)
 uint32_t vmm_get_flags(uintptr_t va)
 {
     uint64_t *pte = get_pte(va, 0);
-    return pte && (*pte & PTE_PRESENT) ? PTE_FLAGS(*pte) : 0;
+    if (!pte || !(*pte & PTE_PRESENT))
+        return 0;
+    return PTE_FLAGS(*pte) | ((*pte & NX_BIT) ? PTE_NOEXEC : 0);
 }
 
 int vmm_protect(uintptr_t va, uint32_t flags)
@@ -259,7 +363,7 @@ int vmm_protect(uintptr_t va, uint32_t flags)
     uint64_t *pte = get_pte(va, 0);
     if (!pte || !(*pte & PTE_PRESENT))
         return -1;
-    *pte = PTE_ADDR(*pte) | PTE_PRESENT | global_for(va) | (flags & 0xFFF);
+    *pte = PTE_ADDR(*pte) | PTE_PRESENT | global_for(va) | entry_bits(flags);
     invlpg(va);
     return 0;
 }
@@ -537,7 +641,8 @@ int vmm_cow_fault(uintptr_t va)
     if (!pte || !(*pte & PTE_PRESENT) || !(*pte & PTE_COW))
         return -1;
     phys_addr_t old = PTE_ADDR(*pte);
-    uint64_t flags = (PTE_FLAGS(*pte) & ~(uint64_t)PTE_COW) | PTE_WRITABLE;
+    uint64_t flags = (PTE_FLAGS(*pte) & ~(uint64_t)PTE_COW) | PTE_WRITABLE |
+                     (*pte & NX_BIT);  /* the copy keeps "no execute" */
     if (pmm_shared(old)) {
         /* Others still use the page: make our own copy (a program's page:
            the high zone's, if there is one). */

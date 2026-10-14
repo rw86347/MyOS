@@ -21,6 +21,7 @@
 #include <paging.h>
 #include <pmm.h>
 #include <string.h>
+#include <sysenter.h>
 #include <thread.h>
 #include <vfs.h>
 
@@ -43,6 +44,7 @@ void mm_switch(struct mm *mm)
     if (mm != current_mm) {
         vmm_pd_switch(mm->pd);
         current_mm = mm;
+        vsyscall_switch(mm->stack_top); /* i386: where sysexit returns (sysenter.h) */
     }
     /* Remember it with the thread: if it sleeps now (loading a program
        from disk), it must get THIS address space back when it wakes, not
@@ -58,6 +60,8 @@ struct mm *mm_create(void)
     if (!mm)
         return NULL;
     memset(mm, 0, sizeof *mm);
+    mm->mmap_base = MMAP_BASE;          /* exec moves both (ASLR) */
+    mm->stack_top = USER_STACK_TOP;
     mm->area = kmalloc(MM_AREAS_FIRST * sizeof *mm->area);
     mm->cap = MM_AREAS_FIRST;
     mm->pd = mm->area ? vmm_pd_create() : 0;
@@ -298,6 +302,7 @@ int mm_fault(user_addr_t va, uint32_t err)
         if (off >= v->file_end)
             return -1;                  /* past the device: SIGSEGV (Linux: SIGBUS) */
         uint32_t flags = PTE_USER | PTE_SHARED | (v->flags & VM_WRITE ? PTE_WRITABLE : 0) |
+                         (v->flags & VM_EXEC ? 0 : PTE_NOEXEC) |
                          (v->flags & VM_RAM ? 0 : v->flags & VM_WC ? pte_write_combining() : PTE_PCD);
         return vmm_map(page, v->phys + off, flags) < 0 ? -1 : 0;
     }
@@ -310,7 +315,8 @@ int mm_fault(user_addr_t va, uint32_t err)
         uint32_t frame = off < PAGE_UP(v->file->size) ? ramfs_page(v->file, off / PAGE_SIZE) : 0;
         if (!frame)
             return -1;                  /* past its end, or out of memory */
-        uint32_t flags = PTE_USER | PTE_SHARED | (v->flags & VM_WRITE ? PTE_WRITABLE : 0);
+        uint32_t flags = PTE_USER | PTE_SHARED | (v->flags & VM_WRITE ? PTE_WRITABLE : 0) |
+                         (v->flags & VM_EXEC ? 0 : PTE_NOEXEC);
         return vmm_map(page, frame, flags) < 0 ? -1 : 0;
     }
 
@@ -354,7 +360,8 @@ int mm_fault(user_addr_t va, uint32_t err)
         }
     }
     memset((uint8_t *)P2V(frame) + n, 0, PAGE_SIZE - n);
-    uint32_t flags = PTE_USER | (v->flags & VM_WRITE ? PTE_WRITABLE : 0);
+    uint32_t flags = PTE_USER | (v->flags & VM_WRITE ? PTE_WRITABLE : 0) |
+                     (v->flags & VM_EXEC ? 0 : PTE_NOEXEC);
     if (vmm_map(page, frame, flags) < 0) {
         pmm_free(frame);
         return -1;
@@ -388,17 +395,18 @@ user_addr_t mm_brk(user_addr_t new_brk)
    can't be writable or executable without being readable (Linux's x86
    rule too). Only PROT_NONE takes it away. */
 #define PROT_ANY      7
+#define PROT_EXEC     4
 #define MAP_SHARED    0x01
 #define MAP_FIXED     0x10
 #define MAP_ANONYMOUS 0x20
 
-/* The lowest gap of len bytes at or above MMAP_BASE, below the stack.
+/* The lowest gap of len bytes at or above mm->mmap_base, below the stack.
    Lengths are address-sized: a 64-bit program may reserve far more than
    4 GiB of address space (Chromium's allocator asks for 32 GiB, untouched
    and so costing nothing until used). */
 user_addr_t mm_find_gap(struct mm *mm, user_addr_t len)
 {
-    user_addr_t addr = MMAP_BASE;
+    user_addr_t addr = mm->mmap_base;
     for (int i = 0; i < mm->nareas; i++) {
         struct vma *v = &mm->area[i];
         if (v->end <= addr)
@@ -407,7 +415,7 @@ user_addr_t mm_find_gap(struct mm *mm, user_addr_t len)
             break;                      /* fits before this area */
         addr = v->end;
     }
-    if (addr + len > USER_STACK_BOTTOM || addr + len < addr)
+    if (addr + len > mm->stack_top - USER_STACK_MAX || addr + len < addr)
         return 0;
     return addr;
 }
@@ -461,7 +469,8 @@ intptr_t mm_mmap(user_addr_t addr, user_addr_t len, uint32_t prot, uint32_t flag
     if (len > USER_ADDR_END)
         return -ENOMEM;                 /* (and PAGE_UP can't wrap) */
     len = PAGE_UP(len);
-    uint32_t vflags = (prot & PROT_ANY ? VM_READ : 0) | (prot & PROT_WRITE ? VM_WRITE : 0) | shared;
+    uint32_t vflags = (prot & PROT_ANY ? VM_READ : 0) | (prot & PROT_WRITE ? VM_WRITE : 0) |
+                      (prot & PROT_EXEC ? VM_EXEC : 0) | shared;
     struct inode *anon = NULL;
     if ((flags & (MAP_SHARED | MAP_ANONYMOUS)) == (MAP_SHARED | MAP_ANONYMOUS)) {
         /* Shared anonymous memory (shared with children after fork): an
@@ -545,6 +554,7 @@ intptr_t mm_mmap_device(user_addr_t addr, user_addr_t len, uint32_t prot, uint32
         return -EINVAL;
     struct vma n = { .start = 0, .end = len, .file = f->inode, .file_off = off,
                      .flags = (prot & PROT_ANY ? VM_READ : 0) | (prot & PROT_WRITE ? VM_WRITE : 0) |
+                              (prot & PROT_EXEC ? VM_EXEC : 0) |
                               ((f->flags & O_ACCMODE) == O_RDWR ? VM_MAYWRITE : 0) };
     int err = f->ops->mmap(f, &n);
     if (err < 0)
@@ -766,9 +776,11 @@ int32_t mm_mprotect(user_addr_t addr, user_addr_t len, uint32_t prot)
         uint32_t f = vmm_get_flags(a);
         if (!(f & PTE_PRESENT))
             continue;
-        f &= ~(PTE_WRITABLE | PTE_USER);
+        f &= ~(PTE_WRITABLE | PTE_USER | PTE_NOEXEC);
         if (vflags & VM_READ)
             f |= PTE_USER;
+        if (!(vflags & VM_EXEC))
+            f |= PTE_NOEXEC;            /* x86_64 with NX: data can't run */
         if ((vflags & VM_WRITE) && !(f & PTE_COW))
             f |= PTE_WRITABLE;
         vmm_protect(a, f);

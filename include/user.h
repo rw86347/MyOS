@@ -33,7 +33,23 @@ typedef uint32_t user_addr_t;
 #define ELF_DYN_BASE      0x00400000u
 #endif
 
-#define USER_STACK_BOTTOM (USER_STACK_TOP - USER_STACK_MAX)
+/* Address space layout randomization (exec, kernel/usermode.c): how far
+   each part of a new program may move, in pages. Linux's ranges, except
+   the mmap area, which gets Linux's largest setting (mmap_rnd_bits max).
+   The stack moves down from USER_STACK_TOP, the mmap area down from
+   MMAP_BASE (so it only gains room), a PIE program up from ELF_DYN_BASE,
+   and the heap up from the program's end. None of them can meet: i386's
+   PIE program ends below 0x10400000 + its size + 32 MiB of heap, its mmap
+   area starts above 0x30000000; x86_64's are 9 TiB apart. */
+#ifdef ARCH_X86_64
+#define ASLR_STACK_PAGES  (1ull << 22)    /* 16 GiB */
+#define ASLR_MMAP_PAGES   (1ull << 32)    /* 16 TiB: libraries, dynamic linker */
+#define ASLR_BRK_PAGES    (1ull << 18)    /* 1 GiB */
+#else
+#define ASLR_STACK_PAGES  (1u << 11)      /* 8 MiB */
+#define ASLR_MMAP_PAGES   (1u << 16)      /* 256 MiB */
+#define ASLR_BRK_PAGES    (1u << 13)      /* 32 MiB */
+#endif
 
 /* Structs a program hands the kernel, as the program lays them out. Their
    pointer and size_t fields are user_addr_t, so one definition is right on

@@ -155,6 +155,7 @@ struct usock {
     uint32_t dq_count, dq_bytes;
     int closed;                     /* its file is gone: sends to it are refused */
     uint8_t passcred;               /* SO_PASSCRED: give receivers the sender */
+    uint32_t rcvtimeo, sndtimeo;    /* SO_RCVTIMEO, SO_SNDTIMEO: ms, 0 = none */
 };
 
 /* A datagram waiting to be read, with its sender's name (for recvfrom). */
@@ -381,7 +382,7 @@ static int install(struct usock *s, uint32_t flags)
 static int32_t usock_write(struct usock *s, const uint8_t *ubuf, uint32_t n,
                            int nonblock, int nosignal, struct ufiles **files)
 {
-    uint32_t done = 0;
+    uint32_t done = 0, deadline = sock_deadline(s->sndtimeo);
     if (s->state != U_CONNECTED)
         return -ENOTCONN;
     while (done < n) {
@@ -397,13 +398,11 @@ static int32_t usock_write(struct usock *s, const uint8_t *ubuf, uint32_t n,
             room = p->size - (p->head - p->tail);
         }
         if (room == 0) {
-            if (nonblock)
-                return done ? (int32_t)done : -EAGAIN;
-            if (signal_pending())
-                return done ? (int32_t)done : -ERESTARTSYS;
             uget(p);                /* its queue must outlive our sleep on it */
-            wq_sleep(&p->wq);       /* its reader will make room */
+            int err = sock_wait(&p->wq, nonblock, deadline);    /* its reader makes room */
             uput(p);
+            if (err)
+                return done ? (int32_t)done : err;
             continue;
         }
         uint32_t k = n - done < room ? n - done : room;
@@ -455,14 +454,13 @@ static int32_t usock_read(struct usock *s, uint8_t *ubuf, uint32_t n, int nonblo
         return -ENOTCONN;
     if (n == 0)
         return 0;
+    uint32_t deadline = sock_deadline(s->rcvtimeo);
     while (s->head == s->tail) {
         if (s->rd_shut)
             return 0;               /* end of file */
-        if (nonblock)
-            return -EAGAIN;
-        if (signal_pending())
-            return -ERESTARTSYS;
-        wq_sleep(&s->wq);
+        int err = sock_wait(&s->wq, nonblock, deadline);
+        if (err)
+            return err;
     }
     uint32_t avail = s->head - s->tail;
     struct ufiles *u = s->fq;
@@ -527,21 +525,19 @@ static int32_t dgram_send(struct usock *s, struct usock *to, const struct user_i
     d->len = len;
     d->fromlen = s->namelen;
     memcpy(d->from, s->name, s->namelen);
+    uint32_t deadline = sock_deadline(s->sndtimeo);
     for (;;) {
         int err = 0;
         if (to->closed)
             err = s->type == SOCK_SEQPACKET ? -EPIPE : -ECONNREFUSED;
         else if (to->dq_count < DQ_MAX && to->dq_bytes + len <= DQ_BYTES)
             break;
-        else if (nonblock)
-            err = -EAGAIN;
-        else if (signal_pending())
-            err = -ERESTARTSYS;
+        else
+            err = sock_wait(&to->wq, nonblock, deadline);  /* its reader makes room */
         if (err) {
             kfree(d);
             return err;
         }
-        wq_sleep(&to->wq);          /* its reader will make room */
     }
     if (files) {                    /* the message carries them now */
         d->files = *files;
@@ -569,14 +565,13 @@ static int32_t dgram_recv(struct usock *s, const struct user_iovec *iov, uint32_
     *fromlen = 0;
     if (s->type == SOCK_SEQPACKET && s->state != U_CONNECTED)
         return -ENOTCONN;
+    uint32_t deadline = sock_deadline(s->rcvtimeo);
     while (!s->dq) {
         if (s->rd_shut)
             return 0;
-        if (nonblock)
-            return -EAGAIN;
-        if (signal_pending())
-            return -ERESTARTSYS;
-        wq_sleep(&s->wq);
+        int err = sock_wait(&s->wq, nonblock, deadline);
+        if (err)
+            return err;
     }
     struct udgram *d = s->dq;       /* out of the queue first: the copy may sleep */
     s->dq = d->next;
@@ -955,16 +950,13 @@ SYSCALL_DEF(unix_connect)
     if (l->state != U_LISTEN)
         return -ECONNREFUSED;
     uget(l);                        /* it may close while we wait */
+    uint32_t deadline = sock_deadline(s->sndtimeo);
     while (l->nback >= l->maxback && l->state == U_LISTEN) {
-        if (f->flags & O_NONBLOCK)
-            err = -EAGAIN;
-        else if (signal_pending())
-            err = -EINTR;
+        err = sock_wait(&l->wq, f->flags & O_NONBLOCK, deadline);
         if (err) {
             uput(l);
-            return err;
+            return err == -ERESTARTSYS ? -EINTR : err;  /* (not run again) */
         }
-        wq_sleep(&l->wq);
     }
     if (l->state != U_LISTEN || !l->namelen) {
         uput(l);
@@ -995,12 +987,11 @@ SYSCALL_DEF(unix_accept4)
         return -EINVAL;
     if (s->state != U_LISTEN)
         return -EINVAL;
+    uint32_t deadline = sock_deadline(s->rcvtimeo);
     while (!s->nback) {
-        if (f->flags & O_NONBLOCK)
-            return -EAGAIN;
-        if (signal_pending())
-            return -ERESTARTSYS;
-        wq_sleep(&s->wq);
+        int err = sock_wait(&s->wq, f->flags & O_NONBLOCK, deadline);
+        if (err)
+            return err;
         if (s->state != U_LISTEN)
             return -EINVAL;
     }
@@ -1311,6 +1302,9 @@ SYSCALL_DEF(unix_recvmsg)
 SYSCALL_DEF(unix_setsockopt)
 {
     struct usock *s = usock_of(a1, NULL);
+    if (a2 == SOL_SOCKET && SO_IS_TIMEO(a3))
+        return sock_timeo_set(SO_IS_RCVTIMEO(a3) ? &s->rcvtimeo : &s->sndtimeo,
+                              (uint32_t)a3, a4, (uint32_t)a5);
     if (a2 == SOL_SOCKET && a3 == SO_PASSCRED) {
         uint32_t on;
         if (a5 < 4)
@@ -1327,6 +1321,9 @@ SYSCALL_DEF(unix_getsockopt)
     struct usock *s = usock_of(a1, NULL);
     if (a2 != SOL_SOCKET)
         return -ENOPROTOOPT;
+    if (SO_IS_TIMEO(a3))
+        return sock_timeo_get(SO_IS_RCVTIMEO(a3) ? s->rcvtimeo : s->sndtimeo, (uint32_t)a3,
+                              a4, a5);
     uint32_t val, size = 4;
     const void *p = &val;
     switch (a3) {

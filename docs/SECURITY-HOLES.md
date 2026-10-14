@@ -150,8 +150,8 @@ Anyone may:
   `CAP_NET_RAW`.
 - `bind` a TCP or raw socket: the call returns 0 and does nothing. A
   program that thinks it owns a port does not.
-- `setsockopt`: every option is accepted and ignored (`SO_RCVTIMEO`
-  included: a "timed" read waits forever).
+- `setsockopt`: most options are accepted and ignored (`SO_RCVTIMEO` and
+  `SO_SNDTIMEO` work since 2026-10-14, except on netlink and packet sockets).
 
 Ports below 1024 on `listen` do require root. That is one of the few
 uid checks that exist.

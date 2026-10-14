@@ -1,0 +1,33 @@
+MyOS aarch64 (QEMU virt)
+  CPU: CurrentEL=1
+Step - Exceptions
+Step - Device tree
+  FDT: magic ok
+  RAM: 0x40000000 + 8000000 bytes
+Step - Memory
+  PMM: 6261 free of 80000 frames
+Step - Paging
+  MMU: on (TTBR0 L0→L1→L2, 4K, EL0 user)
+Step - Timer
+  Timer: 5 ms ticks (1 kHz)
+Step - Heap
+  kheap: kmalloc(128)=0x000000004049ff10 pages=1 used=128
+Hello world from MyOS!  (aarch64, QEMU virt)
+Step - EL0
+  EL0: entering user at 0x0000000040800000 sp=0x000000004080fff0
+  EL0: data access ok
+Step - Initramfs
+  initramfs: 19 files, 3456808 bytes
+  initramfs: /init
+  EL0: /init entry=0x0000000000404400 sp=0x0000000040fffcc0 brk=0x523000
+bash from MyOS
+cat from initramfs
+Error relocating /usr/lib/libreadline.so.8: tgoto: symbol not found
+Error relocating /usr/lib/libreadline.so.8: tgetflag: symbol not found
+Error relocating /usr/lib/libreadline.so.8: tgetstr: symbol not found
+Error relocating /usr/lib/libreadline.so.8: tputs: symbol not found
+Error relocating /usr/lib/libreadline.so.8: tgetent: symbol not found
+Error relocating /usr/lib/libreadline.so.8: tgetnum: symbol not found
+Error relocating /usr/lib/libreadline.so.8: PC: symbol not found
+Error relocating /usr/lib/libreadline.so.8: UP: symbol not found
+Error relocating /usr/lib/libreadline.so.8: BC: symbol not found

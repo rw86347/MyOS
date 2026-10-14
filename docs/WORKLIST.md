@@ -32,8 +32,8 @@ networking depth, then hardware.
 Programs and memory
 - [ ] B1. Use all RAM on x86_64 (2 GiB of the MSI's 16 GiB today)
 - [ ] B2. Loopback: 127.0.0.1 for TCP and UDP
-- [ ] B3. `setsockopt` that does something: `SO_RCVTIMEO`/`SO_SNDTIMEO`,
-      `SO_KEEPALIVE`, `TCP_NODELAY`, `SO_REUSEADDR`, `SO_LINGER`
+- [ ] B3. `setsockopt` that does something: ~~`SO_RCVTIMEO`/`SO_SNDTIMEO`~~
+      (done 2026-10-14), `SO_KEEPALIVE`, `TCP_NODELAY`, `SO_REUSEADDR`, `SO_LINGER`
 - [ ] B4. More than 16 TCP connections in the whole system
 - [ ] B5. `PROT_NONE` enforced, and the no-execute bit on x86_64
 - [ ] B6. `madvise(MADV_DONTNEED)` drops pages (they read back as zeros)

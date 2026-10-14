@@ -45,7 +45,8 @@ void sysenter_init(void)
     syscall_init();
 }
 
-uint32_t vsyscall_map(void)
+uint32_t vsyscall_map(uint64_t at)
 {
+    (void)at;
     return 0;
 }

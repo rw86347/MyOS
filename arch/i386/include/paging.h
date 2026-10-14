@@ -20,6 +20,7 @@
    mapping of it owns one reference, so a file that drops the page while
    it's mapped (truncate) can't free it under a process. */
 #define PTE_MAPSHARED 0x800
+#define PTE_NOEXEC   0          /* no NX bit without PAE: every readable page runs */
 
 /* Map all RAM into the kernel's direct map and remove the low identity map.
    Needs pmm_init() first. */

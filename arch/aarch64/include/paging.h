@@ -5,7 +5,7 @@
 
 #include <stdint.h>
 
-void paging_init(uint64_t ram_base, uint64_t ram_size);
+void paging_init(uintptr_t dtb, uint64_t ram_base, uint64_t ram_size);
 
 /* TCR_EL1 for 48-bit VA, 4 KiB granule, inner WB (matches Linux virt bring-up). */
 uint64_t arm64_tcr_el1(void);

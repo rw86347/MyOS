@@ -40,7 +40,8 @@ enum { S_read = 0, S_write = 1, S_open = 2, S_close = 3, S_lseek = 8, S_mmap = 9
        S_access = 21, S_chmod = 90, S_chown = 92, S_truncate = 76, S_rename = 82,
        S_setresuid = 117, S_utimensat = 280, S_faccessat2 = 439,
        S_setgroups = 116, S_setgid = 106,
-       S_mount = 165, S_umount2 = 166, S_nanosleep = 35 };
+       S_mount = 165, S_umount2 = 166, S_nanosleep = 35,
+       S_brk = 12, S_dup2 = 33, S_execve = 59, S_setsid = 112, S_setpgid = 109 };
 enum { F_GETLK = 5, F_SETLK = 6 };
 #else
 #define X64 0
@@ -69,7 +70,8 @@ enum { S_read = 3, S_write = 4, S_open = 5, S_close = 6, S_lseek = 19, S_mmap = 
        S_access = 33, S_chmod = 15, S_chown = 212 /* chown32 */, S_truncate = 92,
        S_rename = 38, S_setresuid = 208 /* setresuid32 */, S_utimensat = 320,
        S_faccessat2 = 439, S_setgroups = 206 /* setgroups32 */,
-       S_setgid = 214 /* setgid32 */, S_mount = 21, S_umount2 = 52, S_nanosleep = 162 };
+       S_setgid = 214 /* setgid32 */, S_mount = 21, S_umount2 = 52, S_nanosleep = 162,
+       S_brk = 45, S_dup2 = 63, S_execve = 11, S_setsid = 66, S_setpgid = 57 };
 enum { F_GETLK = 12, F_SETLK = 13 };    /* the flock64 ones (musl) */
 #endif
 
@@ -86,7 +88,7 @@ static long sc(long n, long a, long b, long c, long d, long e, long f)
     return ret;
 }
 __asm__(".globl _start\n_start:\n"
-        "  xor %rbp, %rbp\n  and $-16, %rsp\n  call cmain\n  hlt\n"
+        "  xor %rbp, %rbp\n  mov %rsp, %rdi\n  and $-16, %rsp\n  call cmain\n  hlt\n"
         "restore_rt:\n  mov $15, %eax\n  syscall\n");
 #else
 static long sc(long n, long a, long b, long c, long d, long e, long f)
@@ -102,7 +104,8 @@ static long sc(long n, long a, long b, long c, long d, long e, long f)
 /* Two restorers on i386, as in musl: rt_sigreturn for SA_SIGINFO handlers
    (an rt frame), the old sigreturn (which first pops `sig`) for the rest. */
 __asm__(".globl _start\n_start:\n"
-        "  xor %ebp, %ebp\n  and $-16, %esp\n  call cmain\n  hlt\n"
+        "  xor %ebp, %ebp\n  mov %esp, %eax\n  and $-16, %esp\n"
+        "  sub $12, %esp\n  push %eax\n  call cmain\n  hlt\n"
         "restore_rt:\n  mov $173, %eax\n  int $0x80\n"
         "restore:\n  pop %eax\n  mov $119, %eax\n  int $0x80\n");
 #endif
@@ -1059,6 +1062,94 @@ static void t_tcp_listen(void)
     check(wait_child(pid) == 0, "tcp: a user may not bind port 22", 0);
 }
 
+/* --- SO_RCVTIMEO / SO_SNDTIMEO: socket calls that give up ---------------- */
+
+#define SOL_SOCKET      1
+#define SO_RCVTIMEO     20              /* struct timeval of two longs */
+#define SO_SNDTIMEO     21
+#define SO_RCVTIMEO_NEW 66              /* two 64-bit numbers (32-bit musl's) */
+#define EDOM            33
+#define SA_RESTART_     0x10000000
+
+/* A call that should give up after `ms`: 0 if it did, with EAGAIN; else
+   its result, or 100000 + how long it took. */
+static long gives_up(long r, long t0, long ms)
+{
+    long took = now_ms() - t0;
+    if (r != -EAGAIN)
+        return r ? r : -1;
+    return took >= ms - 10 && took < 1000 ? 0 : 100000 + took;
+}
+
+static void t_sotimeo(void)
+{
+    int sv[2] = { -1, -1 };
+    SC4(S_socketpair, AF_UNIX, SOCK_STREAM, 0, sv);
+    long tv[2] = { 0, 50000 }, got[2] = { -1, -1 };     /* 50 ms */
+    uint32_t len = sizeof got;
+    long r1 = SC5(S_setsockopt, sv[0], SOL_SOCKET, SO_RCVTIMEO, tv, sizeof tv);
+    long r2 = SC5(S_getsockopt, sv[0], SOL_SOCKET, SO_RCVTIMEO, got, &len);
+    check(r1 == 0 && r2 == 0 && got[0] == 0 && got[1] == 50000 && len == sizeof got,
+          "SO_RCVTIMEO: set, and read back", r1 ? r1 : r2 ? r2 : got[1]);
+    char c;
+    long t0 = now_ms();
+    long g = gives_up(SC3(S_read, sv[0], &c, 1), t0, 50);
+    check(g == 0, "SO_RCVTIMEO: unix read with nothing to read: EAGAIN after 50 ms", g);
+
+    int64_t tv64[2] = { 0, 30000 }, g64[2] = { -1, -1 };
+    len = sizeof g64;
+    r1 = SC5(S_setsockopt, sv[0], SOL_SOCKET, SO_RCVTIMEO_NEW, tv64, sizeof tv64);
+    r2 = SC5(S_getsockopt, sv[0], SOL_SOCKET, SO_RCVTIMEO_NEW, g64, &len);
+    check(r1 == 0 && r2 == 0 && g64[0] == 0 && g64[1] == 30000 && len == sizeof g64,
+          "SO_RCVTIMEO_NEW: the 64-bit timeval", r1 ? r1 : r2);
+    long bad[2] = { 0, 1000000 };
+    check(SC5(S_setsockopt, sv[0], SOL_SOCKET, SO_RCVTIMEO, bad, sizeof bad) == -EDOM,
+          "SO_RCVTIMEO: 1000000 microseconds is EDOM", 0);
+
+    /* A signal ends a wait that has a timeout with EINTR, even when the
+       handler asks for SA_RESTART (Linux: signal(7)). */
+    long two[2] = { 2, 0 };
+    SC5(S_setsockopt, sv[0], SOL_SOCKET, SO_RCVTIMEO, two, sizeof two);
+    sigaction_k(SIGALRM, (void *)on_alarm, SA_RESTART_);
+    got_sig = 0;
+    long it[4] = { 0, 0, 0, 20000 };    /* once, in 20 ms */
+    SC3(S_setitimer, 0, it, 0);
+    long r = SC3(S_read, sv[0], &c, 1);
+    check(r == -EINTR && got_sig == SIGALRM,
+          "SO_RCVTIMEO: a signal ends the wait (EINTR, despite SA_RESTART)", r);
+
+    /* SO_SNDTIMEO: fill the socket, then a write gives up. */
+    static char blob[4096];
+    for (int k = 0; k < 1024 && SC6(S_sendto, sv[1], blob, sizeof blob, 0x40 /* MSG_DONTWAIT */,
+                                    0, 0) > 0; k++)
+        ;
+    SC5(S_setsockopt, sv[1], SOL_SOCKET, SO_SNDTIMEO, tv, sizeof tv);
+    t0 = now_ms();
+    g = gives_up(SC3(S_write, sv[1], blob, sizeof blob), t0, 50);
+    check(g == 0, "SO_SNDTIMEO: unix write to a full socket: EAGAIN after 50 ms", g);
+    SC1(S_close, sv[0]);
+    SC1(S_close, sv[1]);
+
+    /* UDP (on 127.0.0.1) and a TCP listener's accept. */
+    struct sockaddr_in4 lo = { AF_INET, be16(7778), 0x0100007F, { 0 } };
+    long u = SC3(S_socket, AF_INET, SOCK_DGRAM, 0);
+    SC3(S_bind, u, &lo, sizeof lo);
+    SC5(S_setsockopt, u, SOL_SOCKET, SO_RCVTIMEO, tv, sizeof tv);
+    t0 = now_ms();
+    g = gives_up(SC6(S_recvfrom, u, blob, sizeof blob, 0, 0, 0), t0, 50);
+    check(g == 0, "SO_RCVTIMEO: udp recvfrom: EAGAIN after 50 ms", g);
+    SC1(S_close, u);
+    struct sockaddr_in4 any = { AF_INET, be16(7779), 0, { 0 } };
+    long l = SC3(S_socket, AF_INET, SOCK_STREAM, 0);
+    SC3(S_bind, l, &any, sizeof any);
+    SC2(S_listen, l, 1);
+    SC5(S_setsockopt, l, SOL_SOCKET, SO_RCVTIMEO, tv, sizeof tv);
+    t0 = now_ms();
+    g = gives_up(SC4(S_accept4, l, 0, 0, 0), t0, 50);
+    check(g == 0, "SO_RCVTIMEO: tcp accept with nobody coming: EAGAIN after 50 ms", g);
+    SC1(S_close, l);
+}
+
 /* --- who may signal whom; reboot and the host name are root's ------------ */
 
 #define SIGKILL 9
@@ -1207,6 +1298,104 @@ static void t_fileperm(void)
     SC1(S_rmdir, "/tmp/pt");
 }
 
+/* --- NX: data can't run as code (x86_64; i386 has no NX without PAE) ------- */
+
+#if X64
+#ifndef SIGSEGV
+#define SIGSEGV 11
+#endif
+static int runs(void (*fn)(void))
+{
+    long pid = SC0(S_fork);
+    if (pid == 0) {
+        fn();
+        child_exit(0);
+    }
+    int st = wait_child(pid);
+    return st == 0 ? 1 : (st & 0x7F) == SIGSEGV ? 0 : -1;
+}
+#endif
+
+static void t_nx(void)
+{
+#if X64
+    unsigned char *m = (unsigned char *)SC6(S_mmap, 0, 4096, 3, 0x22, -1, 0);   /* RW */
+    m[0] = 0xC3;                                        /* ret */
+    int data = runs((void (*)(void))m);                 /* NX: SIGSEGV */
+    SC3(S_mprotect, m, 4096, 5);                        /* PROT_READ | PROT_EXEC */
+    int code = runs((void (*)(void))m);                 /* now it may run */
+    volatile unsigned char stack[16];
+    stack[0] = 0xC3;
+    int on_stack = runs((void (*)(void))stack);         /* the stack: never */
+    SC2(S_munmap, m, 4096);
+    check(data == 0 && code == 1 && on_stack == 0,
+          "NX: a data page and the stack can't run code; PROT_EXEC can",
+          data * 100 + code * 10 + on_stack);
+#endif
+}
+
+/* --- ASLR: every exec puts the stack, the heap and mmap somewhere else ---- */
+
+/* `systest aslr` (the probe): where this run's stack, heap and first mmap
+   are, as three words on stdout after a magic word (so that some other
+   program's output can't pass for the probe's). */
+#define ASLR_MAGIC 0x41534C52           /* "ASLR" */
+static void aslr_probe(void)
+{
+    long out[4];
+    out[0] = ASLR_MAGIC;
+    out[1] = (long)&out;
+    out[2] = SC1(S_brk, 0);
+    out[3] = SC6(S_mmap, 0, 4096, 3, 0x22, -1, 0);
+    SC3(S_write, 1, out, sizeof out);
+    child_exit(0);
+}
+
+/* Run the probe (this program again, newly exec'd: /proc/self/exe, or
+   where `make test` (rawsystest) and the shell test (systest) put it) and
+   read its answer. */
+static int aslr_run(long where[3])
+{
+    int fd[2];
+    if (SC1(S_pipe, fd) < 0)
+        return 0;
+    long pid = SC0(S_fork);
+    if (pid == 0) {
+        SC2(S_dup2, fd[1], 1);
+        static const char *const self[] = { "/proc/self/exe", "/bin/rawsystest", "/bin/systest", 0 };
+        for (int k = 0; self[k]; k++) {
+            const char *argv[] = { self[k], "aslr", 0 }, *envp[] = { 0 };
+            SC3(S_execve, self[k], argv, envp);
+        }
+        child_exit(127);
+    }
+    SC1(S_close, fd[1]);
+    long got[4];
+    long n = SC3(S_read, fd[0], got, sizeof got);
+    SC1(S_close, fd[0]);
+    wait_child(pid);
+    for (int i = 0; i < 3; i++)
+        where[i] = got[i + 1];
+    return n == sizeof got && got[0] == ASLR_MAGIC && (unsigned long)got[3] < -4096ul;
+}
+
+static void t_aslr(void)
+{
+    long a[3][3];
+    int ran = aslr_run(a[0]) + aslr_run(a[1]) + aslr_run(a[2]);
+    int moved = 0;                      /* three runs: two can match by chance */
+    for (int i = 0; i < 3; i++)
+        moved += !(a[0][i] == a[1][i] && a[1][i] == a[2][i]);
+    check(ran == 3 && moved == 3, "ASLR: stack, heap and mmap move on every exec",
+          ran * 10 + moved);
+    long old = SC1(S_personality, 0xFFFFFFFF);
+    SC1(S_personality, old | 0x0040000);        /* ADDR_NO_RANDOMIZE */
+    ran = aslr_run(a[0]) + aslr_run(a[1]);
+    SC1(S_personality, old);
+    check(ran == 2 && a[0][0] == a[1][0] && a[0][1] == a[1][1] && a[0][2] == a[1][2],
+          "ASLR: personality(ADDR_NO_RANDOMIZE) turns it off", ran);
+}
+
 /* --- job control: stop, continue, and wait4 tells the parent ------------- */
 
 #define SIGSTOP    19
@@ -1232,6 +1421,83 @@ static void t_jobctl(void)
              w2 == pid && (st2 & 0xFFFF) == 0xFFFF && w3 == pid && (st3 & 0x7F) == SIGKILL;
     check(ok, "job control: SIGSTOP stops, wait4 says so; SIGCONT continues; SIGKILL ends it",
           !(w1 == pid) ? 1 : (st & 0xFF) != 0x7F ? 2 : w2 != pid ? 3 : (st2 & 0xFFFF) != 0xFFFF ? 4 : 5);
+}
+
+/* --- SIGTTOU: a background job changing or writing its terminal ---------- */
+
+#define SIGTTOU    22
+#define O_NOCTTY   0400
+#define TCGETS     0x5401
+#define TCSETS     0x5402
+#define TIOCSCTTY  0x540E
+#define TIOCSPGRP  0x5410
+#define TIOCGPTN   0x80045430
+#define TIOCSPTLCK 0x40045431
+#define TOSTOP     0400
+
+/* In a background group of its own: run fn's call, exit 0 if it worked. */
+static long bg_job(int fd, int what, void *tio)
+{
+    long pid = SC0(S_fork);
+    if (pid == 0) {
+        SC2(S_setpgid, 0, 0);
+        if (what == 2)
+            sigaction_k(SIGTTOU, (void *)1, 0);         /* SIG_IGN */
+        long r = what == 1 ? SC3(S_write, fd, "x", 1) : SC3(S_ioctl, fd, TCSETS, tio);
+        child_exit(r >= 0 ? 0 : 1);
+    }
+    return pid;
+}
+
+/* 0: it was stopped by SIGTTOU (then killed); 1: it ran to the end and
+   exited 0; anything else: wrong. */
+static int bg_result(long pid)
+{
+    int st = 0;
+    SC4(S_wait4, pid, &st, WUNTRACED, 0);
+    if ((st & 0xFF) == 0x7F) {
+        SC2(S_kill, pid, SIGKILL);
+        SC4(S_wait4, pid, 0, 0, 0);
+        return ((st >> 8) & 0xFF) == SIGTTOU ? 0 : 2;
+    }
+    return st == 0 ? 1 : 3;
+}
+
+static void t_ttou(void)
+{
+    long leader = SC0(S_fork);
+    if (leader == 0) {
+        /* A session of its own, with a fresh pty as its terminal and its
+           group in the foreground. */
+        SC0(S_setsid);
+        long m = SC2(S_open, "/dev/ptmx", O_RDWR | O_NOCTTY);
+        int zero = 0, n = -1;
+        SC3(S_ioctl, m, TIOCSPTLCK, &zero);
+        SC3(S_ioctl, m, TIOCGPTN, &n);
+        char path[16] = "/dev/pts/";
+        int k = 9;
+        if (n >= 10)
+            path[k++] = '0' + n / 10;
+        path[k++] = '0' + n % 10;
+        long s = SC2(S_open, path, O_RDWR);
+        SC3(S_ioctl, s, TIOCSCTTY, 0);
+        int me = (int)SC0(S_getpid);
+        SC3(S_ioctl, s, TIOCSPGRP, &me);
+        uint32_t tio[15];                               /* struct termios: 60 bytes */
+        if (m < 0 || n < 0 || s < 0 || SC3(S_ioctl, s, TCGETS, tio) < 0)
+            child_exit(100);
+        int r = bg_result(bg_job((int)s, 0, tio)) * 1        /* tcsetattr: stopped (0) */
+              + (bg_result(bg_job((int)s, 2, tio)) != 1) * 10   /* ignoring SIGTTOU: runs */
+              + (bg_result(bg_job((int)s, 1, tio)) != 1) * 20;  /* write: no TOSTOP, runs */
+        tio[3] |= TOSTOP;                               /* c_lflag */
+        SC3(S_ioctl, s, TCSETS, tio);                   /* (we are the foreground) */
+        r += bg_result(bg_job((int)s, 1, tio)) * 40;    /* write with TOSTOP: stopped */
+        child_exit(r);
+    }
+    int st = 0;
+    SC4(S_wait4, leader, &st, 0, 0);
+    check(st == 0, "SIGTTOU: a background job's tcsetattr and (TOSTOP) write stop it; "
+          "ignored, or no TOSTOP, they run", (st >> 8) & 0xFF);
 }
 
 /* --- SA_RESTART: a read a signal cuts short runs again --------------------- */
@@ -1345,7 +1611,9 @@ static void t_umount(void)
 
 /* --- PROT_NONE: no access at all, yet the page keeps its data -------------- */
 
+#ifndef SIGSEGV
 #define SIGSEGV 11
+#endif
 static void t_protnone(void)
 {
     char *m = (char *)SC6(S_mmap, 0, 4096, 3, 0x22, -1, 0);   /* RW, MAP_PRIVATE|MAP_ANON */
@@ -1512,8 +1780,12 @@ static void t_epoll_poll(void)
     SC1(S_close, p[1]);
 }
 
-void cmain(void)
+void cmain(long *sp)
 {
+    const char *const *argv = (const char *const *)(sp + 1);
+    if (sp[0] == 2 && argv[1][0] == 'a' && argv[1][1] == 's' && argv[1][2] == 'l' &&
+        argv[1][3] == 'r' && argv[1][4] == 0)
+        aslr_probe();                   /* t_aslr's second self */
     t_cputime();
     t_clocks();
     t_sendfile();
@@ -1532,10 +1804,14 @@ void cmain(void)
     t_umount();
     t_restart();
     t_jobctl();
+    t_ttou();
+    t_nx();
+    t_aslr();
     t_netlink();
     t_packet();
     t_nl80211();
     t_tcp_listen();
+    t_sotimeo();
     t_unix_pass();
     t_unix_big();
     t_epoll_poll();

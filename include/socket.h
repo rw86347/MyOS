@@ -18,6 +18,27 @@
 /* Every ICMP packet that arrives, IP header first: raw sockets get a copy. */
 void raw_icmp_input(const uint8_t *ip, uint32_t len);
 
+/* SO_RCVTIMEO / SO_SNDTIMEO, for every kind of socket (socket.c). The
+   option comes as a struct timeval: two longs (20, 21), or two 64-bit
+   numbers (66, 67: what 32-bit musl, with its 64-bit time_t, tries
+   first). Kept as ms, 0 = wait for ever. */
+#define SO_RCVTIMEO_OLD 20
+#define SO_SNDTIMEO_OLD 21
+#define SO_RCVTIMEO_NEW 66
+#define SO_SNDTIMEO_NEW 67
+#define SO_IS_TIMEO(opt) ((opt) == 20 || (opt) == 21 || (opt) == 66 || (opt) == 67)
+#define SO_IS_RCVTIMEO(opt) ((opt) == 20 || (opt) == 66)
+int sock_timeo_set(uint32_t *ms, uint32_t opt, uintptr_t val, uint32_t len);
+int sock_timeo_get(uint32_t ms, uint32_t opt, uintptr_t val, uintptr_t lenp);
+/* When a wait with timeout ms ends (0: never), for sock_wait. */
+uint32_t sock_deadline(uint32_t ms);
+/* One wait for a socket call: -EAGAIN if nonblock or the deadline has
+   passed; a signal: -ERESTARTSYS, or -EINTR when there is a deadline (Linux
+   never restarts a socket call with a timeout); else sleep on q (until
+   woken or the deadline) and 0: check again. Interrupts off. */
+struct wait_queue;
+int sock_wait(struct wait_queue *q, int nonblock, uint32_t deadline);
+
 SYSCALL_DEF(sys_socket);
 SYSCALL_DEF(sys_bind);
 SYSCALL_DEF(sys_connect);

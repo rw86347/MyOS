@@ -16,6 +16,9 @@
 
     .extern kernel_main
     .extern __bss_start, __bss_end
+#ifdef M1N1_SIMULATE_X0
+    .extern apple_harness_dtb_start
+#endif
 
 _start:
     /* QEMU may enter at EL2; drop to EL1 before touching EL1-only state. */
@@ -33,6 +36,12 @@ _start:
 .Lel1_ok:
     /* Preserve FDT pointer for early C (memory map, chosen console, …). */
     mov     x19, x0
+#ifdef M1N1_SIMULATE_X0
+    /* CI: QEMU -kernel ELF often leaves x0=0; m1n1 on hardware passes DTB in x0. */
+    cbnz    x19, .Ldtb_ok
+    ldr     x19, =apple_harness_dtb_start
+.Ldtb_ok:
+#endif
 
     /* Clear .bss — QEMU does not zero it for -kernel ELF loads. */
     ldr     x0, =__bss_start

@@ -178,7 +178,7 @@ struct process *proc_spawn(const char *path, const char *const argv[],
     struct mm *old = mm_current();
     mm_switch(p->mm);
     int err = program_load(path, argv, envp, &p->start_eip, &p->start_esp,
-                           &p->cred, &p->exe);
+                           &p->cred, &p->persona, &p->exe);
     mm_switch(old);
     if (err) {
         mm_destroy(p->mm);
@@ -537,9 +537,10 @@ int proc_execve(uintptr_t user_path, uintptr_t user_argv, uintptr_t user_envp)
     mm_switch(new_mm);
     user_addr_t entry, sp;
     struct cred cred = p->cred;
+    uint32_t persona = p->persona;
     struct inode *exe = NULL;
     err = program_load(prog, argv, (const char *const *)a->envp, &entry, &sp,
-                       &cred, &exe);
+                       &cred, &persona, &exe);
     if (err) {
         mm_switch(old_mm);
         mm_destroy(new_mm);
@@ -565,6 +566,7 @@ int proc_execve(uintptr_t user_path, uintptr_t user_argv, uintptr_t user_envp)
     /* 4. Point of no return: the old program is gone. */
     p->mm = new_mm;
     p->cred = cred;
+    p->persona = persona;
     mm_destroy(old_mm);
     for (int fd = 0; fd < (int)p->nfiles; fd++)
         if (fd_get_cloexec(p, fd))

@@ -5,15 +5,12 @@
 
 #include <stdint.h>
 
-/* Where the vsyscall page (sysentry.asm) sits in every program: the top
-   user page, just above the stack. Keep in sync with sysentry.asm. */
-#define VSYSCALL_ADDR 0xBFFFF000u
-
 /* Set up the sysenter MSRs and the vsyscall page (if the CPU has sysenter). */
 void sysenter_init(void);
 
-/* Map the vsyscall page into the current program. Returns the address to
-   pass as AT_SYSINFO, or 0 if this CPU has no sysenter (int 0x80 only). */
-uint32_t vsyscall_map(void);
+/* i386's vsyscall page; x86_64 programs use `syscall`, so: always 0 (no
+   AT_SYSINFO). */
+uint32_t vsyscall_map(uint64_t at);
+static inline void vsyscall_switch(uint64_t stack_top) { (void)stack_top; }
 
 #endif

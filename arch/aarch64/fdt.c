@@ -7,6 +7,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 struct fdt_header {
     uint32_t magic;
@@ -191,6 +192,218 @@ int fdt_first_ram(uintptr_t dtb_phys, uint64_t *base_out, uint64_t *size_out)
             if (depth == memory_depth && prop_is(key, nameoff, str_size, "reg")) {
                 if (parse_reg(val, len, addr_cells, size_cells, base_out, size_out) == 0)
                     return 0;
+            }
+            break;
+        }
+        case FDT_NOP:
+            break;
+        case FDT_END:
+            return -1;
+        default:
+            break;
+        }
+    }
+    return -1;
+}
+
+static int compat_list_has(const char *list, uint32_t len, const char *needle)
+{
+    size_t i = 0;
+
+    if (!list || !needle[0])
+        return 0;
+    while (i < len) {
+        size_t j = 0;
+
+        while (i + j < len && list[i + j] && list[i + j] != '\0' &&
+               needle[j] && list[i + j] == needle[j])
+            j++;
+        if (needle[j] == '\0' &&
+            (i + j >= len || list[i + j] == '\0' || list[i + j] == ','))
+            return 1;
+        while (i < len && list[i])
+            i++;
+        i++;
+    }
+    return 0;
+}
+
+int fdt_mmio_by_compatible(uintptr_t dtb_phys, const char *compat, uint64_t *base_out,
+                           uint64_t *size_out)
+{
+    const struct fdt_header *h = (const struct fdt_header *)dtb_phys;
+    const uint8_t *p;
+    const uint8_t *struct_end;
+    const uint8_t *blob_end;
+    const char *strings;
+    uint32_t str_size;
+    int depth = 0;
+    int addr_cells = 2;
+    int size_cells = 2;
+    char node_compat[FDT_MAX_DEPTH][128];
+    uint64_t reg_size;
+
+    if (!compat || !base_out)
+        return -1;
+    if (fdt_check_header(dtb_phys) < 0)
+        return -1;
+
+    memset(node_compat, 0, sizeof node_compat);
+    blob_end = (const uint8_t *)dtb_phys + be32(&h->totalsize);
+    str_size = be32(&h->size_dt_strings);
+    strings = (const char *)dtb_phys + be32(&h->off_dt_strings);
+    p = (const uint8_t *)dtb_phys + be32(&h->off_dt_struct);
+    struct_end = (const uint8_t *)dtb_phys + be32(&h->off_dt_struct) + be32(&h->size_dt_struct);
+    if (p >= struct_end || struct_end > blob_end)
+        return -1;
+
+    while (p + 4 <= struct_end) {
+        uint32_t token = be32(p);
+
+        p += 4;
+        switch (token) {
+        case FDT_BEGIN_NODE: {
+            const char *name = (const char *)p;
+            size_t namelen = 0;
+
+            if (depth >= FDT_MAX_DEPTH)
+                return -1;
+            while (p + namelen < struct_end && name[namelen])
+                namelen++;
+            if (p + namelen >= struct_end)
+                return -1;
+            p += namelen + 1;
+            p = fdt_align4(p);
+            depth++;
+            node_compat[depth][0] = '\0';
+            break;
+        }
+        case FDT_END_NODE:
+            if (depth > 0)
+                depth--;
+            break;
+        case FDT_PROP: {
+            uint32_t len = be32(p);
+            uint32_t nameoff = be32(p + 4);
+            const char *key;
+            const uint8_t *val;
+
+            if (p + 8 > struct_end || nameoff >= str_size || depth <= 0)
+                return -1;
+            key = strings + nameoff;
+            val = p + 8;
+            if (p + 8 + len > struct_end)
+                return -1;
+            p += 8 + len;
+            p = fdt_align4(p);
+
+            if (depth == 1) {
+                if (prop_is(key, nameoff, str_size, "#address-cells") && len == 4)
+                    addr_cells = (int)be32(val);
+                if (prop_is(key, nameoff, str_size, "#size-cells") && len == 4)
+                    size_cells = (int)be32(val);
+            }
+            if (prop_is(key, nameoff, str_size, "compatible") && len > 0) {
+                size_t copy = len;
+
+                if (copy >= sizeof node_compat[depth])
+                    copy = sizeof node_compat[depth] - 1;
+                memcpy(node_compat[depth], val, copy);
+                node_compat[depth][copy] = '\0';
+            }
+            if (prop_is(key, nameoff, str_size, "reg") &&
+                node_compat[depth][0] &&
+                compat_list_has(node_compat[depth],
+                                (uint32_t)strlen(node_compat[depth]), compat) &&
+                parse_reg(val, len, addr_cells, size_cells, base_out, &reg_size) == 0) {
+                if (size_out)
+                    *size_out = reg_size;
+                return 0;
+            }
+            break;
+        }
+        case FDT_NOP:
+            break;
+        case FDT_END:
+            return -1;
+        default:
+            break;
+        }
+    }
+    return -1;
+}
+
+int fdt_root_prop(uintptr_t dtb_phys, const char *name, char *out, size_t outsz)
+{
+    const struct fdt_header *h = (const struct fdt_header *)dtb_phys;
+    const uint8_t *p;
+    const uint8_t *struct_end;
+    const uint8_t *blob_end;
+    const char *strings;
+    uint32_t str_size;
+    int depth = 0;
+
+    if (!name || !out || !outsz)
+        return -1;
+    out[0] = '\0';
+    if (fdt_check_header(dtb_phys) < 0)
+        return -1;
+
+    blob_end = (const uint8_t *)dtb_phys + be32(&h->totalsize);
+    str_size = be32(&h->size_dt_strings);
+    strings = (const char *)dtb_phys + be32(&h->off_dt_strings);
+    p = (const uint8_t *)dtb_phys + be32(&h->off_dt_struct);
+    struct_end = (const uint8_t *)dtb_phys + be32(&h->off_dt_struct) + be32(&h->size_dt_struct);
+    if (p >= struct_end || struct_end > blob_end)
+        return -1;
+
+    while (p + 4 <= struct_end) {
+        uint32_t token = be32(p);
+
+        p += 4;
+        switch (token) {
+        case FDT_BEGIN_NODE: {
+            const char *n = (const char *)p;
+            size_t namelen = 0;
+
+            if (depth >= FDT_MAX_DEPTH)
+                return -1;
+            while (p + namelen < struct_end && n[namelen])
+                namelen++;
+            if (p + namelen >= struct_end)
+                return -1;
+            p += namelen + 1;
+            p = fdt_align4(p);
+            depth++;
+            break;
+        }
+        case FDT_END_NODE:
+            if (depth > 0)
+                depth--;
+            break;
+        case FDT_PROP: {
+            uint32_t len = be32(p);
+            uint32_t nameoff = be32(p + 4);
+            const char *key;
+            const uint8_t *val;
+
+            if (p + 8 > struct_end || nameoff >= str_size)
+                return -1;
+            key = strings + nameoff;
+            val = p + 8;
+            if (p + 8 + len > struct_end)
+                return -1;
+            p += 8 + len;
+            p = fdt_align4(p);
+
+            if (depth == 1 && prop_is(key, nameoff, str_size, name)) {
+                size_t copy = len;
+
+                if (copy >= outsz)
+                    copy = outsz - 1;
+                memcpy(out, val, copy);
+                out[copy] = '\0';
+                return 0;
             }
             break;
         }

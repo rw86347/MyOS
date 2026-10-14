@@ -25,7 +25,12 @@ SECTIONS
         __text_end = .;
     }
 
+    /* Page boundaries between code, read-only data and data: paging.c maps
+       each with its own rights (code read-only and runnable, the rest not
+       runnable, read-only data read-only). At most a few KiB of padding. */
+    . = ALIGN(4096);
     .rodata : AT(ADDR(.rodata) - KERNEL_VBASE) {
+        __rodata_start = .;
         *(.rodata .rodata.*)
         . = ALIGN(8);
         __start_ex_table = .;
@@ -33,6 +38,8 @@ SECTIONS
         __stop_ex_table = .;
     }
 
+    . = ALIGN(4096);
+    __rodata_end = .;
     .data : AT(ADDR(.data) - KERNEL_VBASE) {
         *(.data .data.*)
     }

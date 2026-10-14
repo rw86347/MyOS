@@ -190,8 +190,17 @@ endif
 # -mgeneral-regs-only: the kernel never uses FPU/SSE registers (no floats, and
 # no SSE tricks in copies), so kernel threads never need them saved (fpu.c).
 # -march=i686: Pentium Pro instruction set (cmov etc.), which every target has.
+# -fstack-protector-strong: functions with a local array (or a local whose
+# address is taken) put a secret "canary" word below their return address
+# and check it before returning; an overrun of the array changes it, and the
+# kernel stops (__stack_chk_fail, interrupts.c) instead of returning to
+# wherever the overrun pointed. -mstack-protector-guard=global: the secret is
+# one global word, __stack_chk_guard (entry.asm picks it at boot), not the
+# C library's thread-local one — the kernel has no such thing (on x86_64,
+# FS and GS hold the program's values).
+KERNEL_SSP := -fstack-protector-strong -mstack-protector-guard=global
 CFLAGS  := -std=c11 -ffreestanding -O2 -Wall -Wextra -g -march=i686 \
-           -fno-tree-loop-distribute-patterns -mgeneral-regs-only \
+           -fno-tree-loop-distribute-patterns -mgeneral-regs-only $(KERNEL_SSP) \
            -DARCH_I386 -Iinclude -Iarch/i386/include $(MODE_FLAGS)
 # --no-warn-rwx-segments: the kernel is one read/write/execute blob for now
 # (code isn't write-protected; see docs/gaps.md).
@@ -250,7 +259,7 @@ X86_64_KERNEL ?= full
 ifeq ($(ARCH),x86_64)
   CFLAGS  := -std=c11 -ffreestanding -O2 -Wall -Wextra -g \
              -m64 -mno-red-zone -mcmodel=kernel -mgeneral-regs-only \
-             -fno-tree-loop-distribute-patterns -DARCH_X86_64 \
+             -fno-tree-loop-distribute-patterns $(KERNEL_SSP) -DARCH_X86_64 \
              -Iinclude -Iarch/x86_64/include $(MODE_FLAGS)
   LDFLAGS := -T arch/x86_64/linker.ld -nostdlib -ffreestanding -O2 \
              -Wl,--no-warn-rwx-segments
@@ -292,7 +301,9 @@ ifeq ($(ARCH),arm64)
              arch/aarch64/gic.c arch/aarch64/timer.c arch/aarch64/kheap.c \
              arch/aarch64/kprintf.c arch/aarch64/memcpy.c arch/aarch64/syscall.c \
              arch/aarch64/uaccess.c arch/aarch64/elf64_load.c arch/aarch64/cpio.c \
-             arch/aarch64/proc.c \
+             arch/aarch64/proc.c arch/aarch64/apple/machine.c \
+             arch/aarch64/apple/uart_early.c arch/aarch64/apple/s5l_uart.c \
+             arch/aarch64/apple/boot_report.c \
              kernel/string.c
   C_OBJS  := $(patsubst %.c,$(BUILD)/%.o,$(C_SRCS))
   ALPINE_MUSL_ARM64 := build/ext/alpine-arm64-musl
@@ -390,7 +401,7 @@ QEMU_FLAGS = -m 64M -cpu pentium3 \
 # fight over the port.
 HAIRPIN_PORT := 47007
 
-.PHONY: run-uefi test-uefi-shell diskattacks verify-disktests verify-tests attacks all dist utm utm-hd hd live-root live-extra live-theme live-hd utm-live utm-arm64 run-live run-hd test-hd run run-full run-text debug test check-selftests test-shell bench run-bench usb clean fuzz fuzz-build fuzz-replay diskfuzz diskfuzz-replay verify-racetests uefi run-uefi-text test-uefi live-uefi test-live-uefi test-usb live-login-initrd test-uefi-login test-arm64 test-arm64-fdt test-arm64-cpio
+.PHONY: run-uefi test-uefi-shell diskattacks verify-disktests verify-tests attacks all dist utm utm-hd hd live-root live-extra live-theme live-hd utm-live utm-arm64 run-live run-hd test-hd run run-full run-text debug test check-selftests test-shell bench run-bench usb clean fuzz fuzz-build fuzz-replay diskfuzz diskfuzz-replay verify-racetests uefi run-uefi-text test-uefi live-uefi test-live-uefi test-usb live-login-initrd test-uefi-login test-arm64 test-arm64-fdt test-arm64-cpio test-arm64-apple test-arm64-apple-boot test-arm64-m1n1-payload m1n1-payload
 
 ifeq ($(ARCH),arm64)
 all: $(BUILD)/kernel.elf $(BUILD)/virt.dtb
@@ -453,6 +464,16 @@ $(BUILD)/%.o: %.asm
 	$(NASM) -f $(NASM_FMT) $< -o $@
 
 -include $(C_OBJS:.o=.d)
+
+# Every kernel object depends on the compiler flags too: change them (a new
+# flag such as KERNEL_SSP) and all of the kernel is rebuilt, not only the
+# files edited since. cflags.txt is rewritten only when the flags differ.
+$(BUILD)/cflags.txt: FORCE
+	@mkdir -p $(dir $@)
+	@echo '$(CC) $(CFLAGS)' | cmp -s - $@ || echo '$(CC) $(CFLAGS)' > $@
+$(C_OBJS) $(IWL_OBJS) $(GEN_OBJS): $(BUILD)/cflags.txt
+.PHONY: FORCE
+FORCE:
 
 # --- the built-in kernel config ------------------------------------------------
 # config/slots.conf becomes the kernel's default config: the same boot block
@@ -714,7 +735,9 @@ uefi: $(UEFI_IMG)
 QEMU_UEFI_DISK = $(UEFI_IMG)
 # QEMU_UEFI_MEM=8G puts 6 GiB above the low zone (the high zone, pmm.h).
 QEMU_UEFI_MEM ?= 4G
-QEMU_UEFI_FLAGS = -machine q35 -m $(QEMU_UEFI_MEM) -cpu qemu64 \
+# QEMU_UEFI_CPU=max: a CPU with SMEP, SMAP and NX, as the new PCs have.
+QEMU_UEFI_CPU ?= qemu64
+QEMU_UEFI_FLAGS = -machine q35 -m $(QEMU_UEFI_MEM) -cpu $(QEMU_UEFI_CPU) \
 	-drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
 	-drive if=pflash,format=raw,file=$(BUILD)/ovmf-vars.fd \
 	-drive if=none,format=raw,file=$(QEMU_UEFI_DISK),id=bootdisk \
@@ -769,6 +792,31 @@ $(BUILD)/arch/aarch64/dtb.o: arch/aarch64/dtb.S $(BUILD)/virt-embed.dtb
 	$(CC) $(CFLAGS) -DMYOS_DTB_PATH=\"$(abspath $(VIRT_DTB_EMBED))\" \
 	  -c $< -o $@
 
+$(BUILD)/arch/aarch64/boot-harness.o: arch/aarch64/boot.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -DAPPLE_HARNESS_FALLBACK -MMD -MP -c $< -o $@
+
+$(BUILD)/arch/aarch64/harness_dtb.o: arch/aarch64/apple/harness_dtb.S $(BUILD)/m1-qemu-harness.dtb
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -DARM64_HARNESS_DTB_PATH=\"$(abspath $(BUILD)/m1-qemu-harness.dtb)\" \
+	  -c $< -o $@
+
+ARM64_HARNESS_OBJS := $(filter-out $(BUILD)/arch/aarch64/boot.o,$(OBJS)) \
+	$(BUILD)/arch/aarch64/boot-harness.o $(BUILD)/arch/aarch64/harness_dtb.o
+
+$(BUILD)/kernel-apple-harness.elf: $(ARM64_HARNESS_OBJS) $(LINKER_SCRIPT)
+	$(CC) $(LDFLAGS) $(ARM64_HARNESS_OBJS) -o $@ $(LIBS)
+
+$(BUILD)/arch/aarch64/entry-m1n1-sim.o: arch/aarch64/entry.S
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -DM1N1_SIMULATE_X0 -c $< -o $@
+
+ARM64_M1N1_SIM_OBJS := $(filter-out $(BUILD)/arch/aarch64/entry.o,$(OBJS)) \
+	$(BUILD)/arch/aarch64/entry-m1n1-sim.o $(BUILD)/arch/aarch64/harness_dtb.o
+
+$(BUILD)/kernel-m1n1-sim.elf: $(ARM64_M1N1_SIM_OBJS) $(BUILD)/m1-qemu-harness.dtb $(LINKER_SCRIPT)
+	$(CC) $(LDFLAGS) $(ARM64_M1N1_SIM_OBJS) -o $@ $(LIBS)
+
 run-arm64: $(BUILD)/kernel.elf
 	chmod +x tools/run-arm64.sh
 	tools/run-arm64.sh
@@ -786,13 +834,93 @@ test-arm64-cpio:
 	  tools/test-arm64-cpio.c arch/aarch64/cpio.c
 	$(BUILD)/test-arm64-cpio
 
-test-arm64: test-arm64-fdt test-arm64-cpio $(BUILD)/kernel.elf
+$(BUILD)/m1-min.dtb: arch/aarch64/apple/fixtures/m1-min.dts
+	@mkdir -p $(BUILD)
+	dtc -I dts -O dtb -o $@ $<
+
+$(BUILD)/m1-qemu-harness.dtb: arch/aarch64/apple/fixtures/m1-qemu-harness.dts
+	@mkdir -p $(BUILD)
+	dtc -I dts -O dtb -o $@ $<
+
+test-arm64-apple: $(VIRT_DTB_EMBED) $(BUILD)/m1-min.dtb $(BUILD)/m1-qemu-harness.dtb
+	@mkdir -p $(BUILD)
+	gcc -Wall -Wextra -Iarch/aarch64/include -o $(BUILD)/test-arm64-apple \
+	  tools/test-arm64-apple.c arch/aarch64/fdt.c arch/aarch64/apple/machine.c
+	$(BUILD)/test-arm64-apple $(abspath $(VIRT_DTB_EMBED)) \
+	  $(abspath $(BUILD)/m1-min.dtb) $(abspath $(BUILD)/m1-qemu-harness.dtb)
+
+test-arm64-mmio-map: $(BUILD)/m1-min.dtb
+	@mkdir -p $(BUILD)
+	gcc -Wall -Wextra -Iarch/aarch64/include -o $(BUILD)/test-arm64-mmio-map \
+	  tools/test-arm64-mmio-map.c arch/aarch64/apple/uart_early.c \
+	  arch/aarch64/fdt.c arch/aarch64/apple/machine.c
+	$(BUILD)/test-arm64-mmio-map $(abspath $(BUILD)/m1-min.dtb)
+
+test-arm64-uart-early: $(BUILD)/m1-min.dtb $(BUILD)/m1-qemu-harness.dtb
+	@mkdir -p $(BUILD)
+	gcc -Wall -Wextra -Iarch/aarch64/include -o $(BUILD)/test-arm64-uart-early \
+	  tools/test-arm64-uart-early.c arch/aarch64/apple/uart_early.c \
+	  arch/aarch64/fdt.c arch/aarch64/apple/machine.c
+	$(BUILD)/test-arm64-uart-early $(abspath $(BUILD)/m1-min.dtb) \
+	  $(abspath $(BUILD)/m1-qemu-harness.dtb)
+
+m1n1-payload: $(BUILD)/kernel.elf
+	chmod +x tools/mk-m1n1-payload.sh
+	tools/mk-m1n1-payload.sh $(BUILD)/kernel.elf $(BUILD)/m1n1
+
+test-arm64-m1n1-payload: m1n1-payload
+	chmod +x tools/test-arm64-m1n1-payload.sh
+	tools/test-arm64-m1n1-payload.sh
+
+test-arm64-apple-boot: $(BUILD)/kernel-apple-harness.elf $(BUILD)/m1-qemu-harness.dtb
+	@rm -f $(BUILD)/arm64-apple-serial.log
+	@(sleep 8; echo quit) \
+	  | $(QEMU_ARM64) $(QEMU_ARM64_BASE) -display none \
+	    -kernel $(BUILD)/kernel-apple-harness.elf \
+	    -serial file:$(BUILD)/arm64-apple-serial.log -monitor stdio >/dev/null || true
+	@cat $(BUILD)/arm64-apple-serial.log; echo
+	@grep -q "MyOS aarch64 (Apple MacBook" $(BUILD)/arm64-apple-serial.log \
+	  || { echo "FAIL: Apple DTB platform banner missing"; exit 1; }
+	@grep -q "Boot: x0=" $(BUILD)/arm64-apple-serial.log \
+	  || { echo "FAIL: Boot report line missing"; exit 1; }
+	@grep -q "embedded" $(BUILD)/arm64-apple-serial.log \
+	  || { echo "FAIL: harness should use embedded DTB in QEMU"; exit 1; }
+	@grep -q "RAM: 0x40000000" $(BUILD)/arm64-apple-serial.log \
+	  || { echo "FAIL: RAM line with Apple harness DTB"; exit 1; }
+	@grep -q "bash-5.2" $(BUILD)/arm64-apple-serial.log \
+	  || { echo "FAIL: bash prompt missing on Apple harness DTB"; exit 1; }
+	@echo "ARM64 Apple harness OK: DTB hand-off + apple,uart + bash"
+
+test-arm64-m1n1-x0-sim: $(BUILD)/kernel-m1n1-sim.elf
+	@rm -f $(BUILD)/arm64-m1n1-x0-serial.log
+	@(sleep 8; echo quit) \
+	  | $(QEMU_ARM64) $(QEMU_ARM64_BASE) -display none \
+	    -kernel $(BUILD)/kernel-m1n1-sim.elf \
+	    -serial file:$(BUILD)/arm64-m1n1-x0-serial.log -monitor stdio >/dev/null || true
+	@cat $(BUILD)/arm64-m1n1-x0-serial.log; echo
+	@grep -q "MyOS aarch64 (Apple MacBook" $(BUILD)/arm64-m1n1-x0-serial.log \
+	  || { echo "FAIL: Apple platform from x0 DTB"; exit 1; }
+	@grep -q "Boot: x0=" $(BUILD)/arm64-m1n1-x0-serial.log \
+	  || { echo "FAIL: Boot report line missing"; exit 1; }
+	@grep -q "(x0)" $(BUILD)/arm64-m1n1-x0-serial.log \
+	  || { echo "FAIL: expected DTB via x0 (m1n1 hand-off), not embedded fallback"; exit 1; }
+	@grep -q "bash-5.2" $(BUILD)/arm64-m1n1-x0-serial.log \
+	  || { echo "FAIL: bash prompt missing on m1n1 x0 sim"; exit 1; }
+	@echo "ARM64 m1n1 x0 sim OK: entry x0 DTB + Apple platform + bash"
+
+test-arm64: test-arm64-fdt test-arm64-cpio test-arm64-apple test-arm64-mmio-map \
+	test-arm64-uart-early \
+	test-arm64-m1n1-payload test-arm64-apple-boot test-arm64-m1n1-x0-sim $(BUILD)/kernel.elf
 	@rm -f $(BUILD)/arm64-serial.log
 	@(sleep 8; echo quit) \
 	  | $(QEMU_ARM64) $(QEMU_ARM64_BASE) -display none \
 	    -kernel $(BUILD)/kernel.elf \
 	    -serial file:$(BUILD)/arm64-serial.log -monitor stdio >/dev/null || true
 	@cat $(BUILD)/arm64-serial.log; echo
+	@grep -q "MyOS aarch64 (QEMU virt)" $(BUILD)/arm64-serial.log \
+	  || { echo "FAIL: ARM64 platform line missing"; exit 1; }
+	@grep -q "Boot: x0=" $(BUILD)/arm64-serial.log \
+	  || { echo "FAIL: Boot report line missing"; exit 1; }
 	@grep -q "Hello world from MyOS" $(BUILD)/arm64-serial.log \
 	  || { echo "FAIL: ARM64 hello did not run on virt"; exit 1; }
 	@grep -q "FDT: magic ok" $(BUILD)/arm64-serial.log \

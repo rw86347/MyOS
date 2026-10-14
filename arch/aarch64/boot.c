@@ -3,6 +3,9 @@
 /*
  * boot.c — ARM64 bring-up (step 14a, one milestone at a time)
  */
+#include "apple/m1n1.h"
+#include "apple/machine.h"
+#include "apple/uart_early.h"
 #include "exceptions.h"
 #include "fdt.h"
 #include "arm64_pmm.h"
@@ -17,6 +20,21 @@
 
 extern char myos_dtb_start[];
 extern char myos_dtb_end[];
+#ifdef APPLE_HARNESS_FALLBACK
+extern char apple_harness_dtb_start[];
+extern char apple_harness_dtb_end[];
+#endif
+
+static uintptr_t pick_dtb(unsigned long from_boot)
+{
+    if (from_boot && fdt_check_header((uintptr_t)from_boot) == 0)
+        return (uintptr_t)from_boot;
+#ifdef APPLE_HARNESS_FALLBACK
+    if (fdt_check_header((uintptr_t)apple_harness_dtb_start) == 0)
+        return (uintptr_t)apple_harness_dtb_start;
+#endif
+    return (uintptr_t)myos_dtb_start;
+}
 
 static void stage(const char *name)
 {
@@ -29,15 +47,23 @@ static void launch_init(void);
 
 void kernel_main(unsigned long dtb_from_boot)
 {
-    unsigned long dtb = dtb_from_boot ? dtb_from_boot : (unsigned long)myos_dtb_start;
+    unsigned long dtb = (unsigned long)pick_dtb(dtb_from_boot);
     (void)myos_dtb_end;
+#ifdef APPLE_HARNESS_FALLBACK
+    (void)apple_harness_dtb_end;
+#endif
     uint64_t ram_base = 0;
     uint64_t ram_size = 0;
 
     uint64_t el;
 
+    char plat[96];
+
+    arm64_uart_init_from_dtb(dtb);
     uart_init();
-    uart_puts("MyOS aarch64 (QEMU virt)\n");
+    arm64_platform_label(dtb, plat, sizeof plat);
+    kprintf("MyOS aarch64 (%s)\n", plat);
+    arm64_boot_report(dtb_from_boot, (uintptr_t)dtb);
     __asm__ volatile("mrs %0, CurrentEL" : "=r"(el));
     kprintf("  CPU: CurrentEL=%u\n", (unsigned)((el >> 2) & 3u));
 
@@ -73,7 +99,7 @@ void kernel_main(unsigned long dtb_from_boot)
     uart_puts(" frames\n");
 
     stage("Paging");
-    paging_init(ram_base, ram_size);
+    paging_init(dtb, ram_base, ram_size);
 
     stage("Timer");
     timer_init();

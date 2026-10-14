@@ -43,7 +43,8 @@ class Machine:
         shutil.copy(OVMF_VARS, vars_fd)
         self.t0 = time.time()
         self.q = subprocess.Popen(
-            ["qemu-system-x86_64", "-machine", "q35,vmport=off,hpet=off", "-m", "4G", "-cpu", "qemu64",
+            ["qemu-system-x86_64", "-machine", "q35,vmport=off,hpet=off", "-m", "4G",
+             "-cpu", os.environ.get("BOOTTIME_CPU", "qemu64"),      # max: SMEP, SMAP
              "-vga", "none", "-device", "VGA",
              "-drive", f"if=pflash,format=raw,readonly=on,file={OVMF_CODE}",
              "-drive", f"if=pflash,format=raw,file={vars_fd}",

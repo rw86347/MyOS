@@ -276,7 +276,7 @@ static void t_tcp(const uint8_t *d, size_t n)
     our_seq = our_len = their_seq = 0;
     set_ip_sink(tcp_record);
     fuzz_set_inject(pump);
-    tcp_connect(c, PEER_IP, PEER_PORT, 1 /* nonblock */);
+    tcp_connect(c, PEER_IP, PEER_PORT, 1 /* nonblock */, 0);
     /* A non-blocking connect returns the moment the SYN is handed to
        ip_send, without ever waiting, so nothing has called pump yet. Do it
        here or the SYN is never drained and its sequence number never read. */

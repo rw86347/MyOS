@@ -34,6 +34,7 @@
 #include <kheap.h>
 #include <memlayout.h>
 #include <mm.h>
+#include <proc.h>              /* ADDR_NO_RANDOMIZE */
 #include <random.h>
 #include <string.h>
 #include <sysenter.h>
@@ -103,13 +104,14 @@ static user_addr_t put_strings(user_addr_t at, const char *const v[], uint32_t n
    pointer. Every entry of the table is one machine word (user_addr_t): 4
    bytes on i386, 8 on x86_64. The kernel writes straight into the new
    program's stack: its pages appear on first touch (demand paging), like
-   the program's own would. */
+   the program's own would. It starts at sp: the stack's top, less ASLR's
+   few random bytes. */
 static user_addr_t build_stack(const char *const argv[], const char *const envp[],
                                const struct elf_info *info, user_addr_t sysinfo,
-                               user_addr_t interp_base, const struct cred *c)
+                               user_addr_t interp_base, const struct cred *c,
+                               user_addr_t sp)
 {
     uint32_t argc = count(argv), envc = count(envp);
-    user_addr_t sp = USER_STACK_TOP;
 
     /* 1. 16 random bytes for AT_RANDOM. musl uses these to pick its stack
        guard value and to seed its hash tables, so a predictable 16 bytes
@@ -195,11 +197,11 @@ static int script_interp(struct inode *ino, char *head, char *interp, char *arg)
 
 static int load_elf(struct inode *ino, const char *const argv[],
                     const char *const envp[], user_addr_t *entry, user_addr_t *sp,
-                    struct cred *cred);
+                    struct cred *cred, uint32_t *persona);
 
 int program_load(const char *path, const char *const argv[],
                  const char *const envp[], user_addr_t *entry, user_addr_t *sp,
-                 struct cred *cred, struct inode **exe_out)
+                 struct cred *cred, uint32_t *persona, struct inode **exe_out)
 {
     if (exe_out)
         *exe_out = NULL;
@@ -239,13 +241,13 @@ int program_load(const char *path, const char *const argv[],
                      vfs_permission(interp, MAY_EXEC)))
             err = -EACCES;
         if (!err)                       /* (one level: no #! interpreters) */
-            err = load_elf(interp, s->argv, envp, entry, sp, cred);
+            err = load_elf(interp, s->argv, envp, entry, sp, cred, persona);
         kfree(s);
         if (!err)
             exe = interp;               /* /proc/self/exe is the interpreter */
     } else {
         kfree(s);
-        err = load_elf(ino, argv, envp, entry, sp, cred);
+        err = load_elf(ino, argv, envp, entry, sp, cred, persona);
     }
     if (!err && exe_out) {
         vfs_get(exe);
@@ -256,20 +258,48 @@ int program_load(const char *path, const char *const argv[],
 
 static int load_elf(struct inode *ino, const char *const argv[],
                     const char *const envp[], user_addr_t *entry, user_addr_t *sp,
-                    struct cred *cred)
+                    struct cred *cred, uint32_t *persona)
 {
     int err;
+
+    /* ASLR: every exec puts the stack, the mmap area (the dynamic linker
+       and the libraries), a PIE program and the heap somewhere else
+       (user.h: how far), so an attack can't know where code or data is.
+       personality(ADDR_NO_RANDOMIZE) turns it off (gdb, setarch -R) —
+       not for a setuid or setgid program, which loses the flag, as on
+       Linux: otherwise anyone could take the randomness away from a
+       program that runs with more rights than they have. */
+    int setid = (ino->mode & S_ISUID) || (ino->mode & (S_ISGID | S_IXGRP)) == (S_ISGID | S_IXGRP);
+    if (setid)
+        *persona &= ~PER_CLEAR_ON_SETID;
+    struct mm *mm = mm_current();
+    user_addr_t dyn_base = ELF_DYN_BASE, brk_shift = 0, sp_shift = 0;
+    int aslr = !(*persona & ADDR_NO_RANDOMIZE);
+    if (aslr) {
+        /* 16 bytes: with AT_RANDOM's 16, one ChaCha20 block per exec
+           (random.c). The stack takes at most 22 bits of r[0]; its top
+           9 bits move the first stack pointer within 8 KiB. */
+        uint32_t r[4];
+        random_bytes(r, sizeof r);
+        mm->stack_top -= (r[0] & (ASLR_STACK_PAGES - 1)) * PAGE_SIZE;
+        sp_shift = (r[0] >> 23) << 4;   /* 0 .. 8176, 16-byte aligned */
+        mm->mmap_base -= (r[1] & (ASLR_MMAP_PAGES - 1)) * PAGE_SIZE;
+        dyn_base += (r[2] & (ASLR_MMAP_PAGES - 1)) * PAGE_SIZE;
+        brk_shift = (r[3] & (ASLR_BRK_PAGES - 1)) * PAGE_SIZE;
+    }
 
     /* Map the file. Pages are read when the program touches them (and the
        next page is read ahead), so a binary on disk is not copied whole. */
     struct elf_info info;
     char interp[PATH_MAX];
-    err = elf_map(ino, ELF_DYN_BASE, &info, interp, sizeof interp);
+    err = elf_map(ino, dyn_base, &info, interp, sizeof interp);
     if (err)
         return err;
 
-    struct mm *mm = mm_current();
-    mm->brk_start = mm->brk = info.brk_start;
+    /* The heap starts after the program; moved, at a page boundary (its
+       first page must be one brk() maps). */
+    user_addr_t page_up = (info.brk_start + PAGE_SIZE - 1) & ~(user_addr_t)(PAGE_SIZE - 1);
+    mm->brk_start = mm->brk = aslr ? page_up + brk_shift : info.brk_start;
 
     /* Dynamically linked? Load its dynamic linker too (into the mmap area)
        and start THAT: it reads the auxiliary vector to find the program
@@ -292,7 +322,7 @@ static int load_elf(struct inode *ino, const char *const argv[],
         start = linfo.entry;
         interp_base = linfo.base;
     }
-    err = mm_add(mm, USER_STACK_BOTTOM, USER_STACK_TOP, VM_READ | VM_WRITE);
+    err = mm_add(mm, mm->stack_top - USER_STACK_MAX, mm->stack_top, VM_READ | VM_WRITE);
     if (err)
         return err;
 
@@ -306,8 +336,10 @@ static int load_elf(struct inode *ino, const char *const argv[],
     cred->suid = cred->fsuid = cred->euid;
     cred->sgid = cred->fsgid = cred->egid;
 
-    user_addr_t sysinfo = vsyscall_map();   /* 0: CPU has no sysenter */
+    user_addr_t sysinfo = vsyscall_map(mm->stack_top);  /* above the stack; 0: no sysenter */
     *entry = start;
-    *sp = build_stack(argv, envp, &info, sysinfo, interp_base, cred);
+    user_access_begin();                /* SMAP: it writes the new stack directly */
+    *sp = build_stack(argv, envp, &info, sysinfo, interp_base, cred, mm->stack_top - sp_shift);
+    user_access_end();
     return 0;
 }

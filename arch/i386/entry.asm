@@ -20,7 +20,8 @@
 ;      We use one 4 MiB "big page" for each (PSE, every Pentium and later
 ;      has it), so no page table is needed at all.
 ;   3. turn paging on, jump to the higher-half address
-;   4. switch to our own stack and call kernel_main()
+;   4. switch to our own stack
+;   5. pick the stack-protector guard, and call kernel_main()
 ; The C code (paging.c) later maps all of RAM and removes the identity map.
 ;
 ; How x86 paging translates a 32-bit virtual address:
@@ -78,6 +79,28 @@ _start:
 higher_half:
     ; --- 4. From here on, addresses are what the linker expected ------------
     mov esp, boot_stack_top
+
+    ; --- 5. The stack-protector guard (Makefile: KERNEL_SSP) ----------------
+    ; Every protected C function copies __stack_chk_guard below its return
+    ; address and checks it before returning, so it is chosen now, before
+    ; the first C function runs, and never changes. Someone overrunning a
+    ; kernel stack buffer must guess it. Its sources: the cycle counter
+    ; (how long the BIOS and the boot loader took, which varies by millions
+    ; of cycles from boot to boot), mixed with the CPU's own random number
+    ; generator (RDRAND) where there is one (CPUID.1:ECX bit 30: newer PCs,
+    ; none of the old ones). All 32 bits are random, as on 32-bit Linux:
+    ; fewer would be too easy to guess.
+    rdtsc
+    mov esi, eax                        ; (the low half changes fastest)
+    mov eax, 1
+    cpuid                               ; (overwrites EBX, ECX, EDX)
+    bt ecx, 30
+    jnc .no_rdrand
+    rdrand eax                          ; (if it fails: EAX = 0, no harm)
+    xor esi, eax
+.no_rdrand:
+    mov [__stack_chk_guard], esi
+
     call kernel_main
 
 .hang:                                  ; kernel_main should never return
@@ -86,6 +109,14 @@ higher_half:
     jmp .hang
 
 ; -----------------------------------------------------------------------------
+; Step 5's guard. In read-only data: written once, above, before paging.c
+; maps the kernel (the x86_64 kernel then maps it read-only; this one has
+; no read-only kernel pages yet — docs/gaps.md).
+section .rodata
+global __stack_chk_guard
+align 4
+__stack_chk_guard:  dd 0
+
 section .bss nobits alloc noexec write align=4096
 
 global boot_page_directory

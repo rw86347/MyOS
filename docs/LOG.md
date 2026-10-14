@@ -3821,3 +3821,215 @@ Checked: `user/sys/systest.c` (stop, wait4, continue, kill) on both CPUs,
 and on the live disk's console: `sleep 100`, Ctrl-Z → "[1]+ Stopped",
 `ps` T, `bg` → Running, `kill`; `cat &` → "Stopped (tty input)", then
 `kill -9` → "Killed".
+
+## 2026-10-13 — NX: programs' data can't run as code (x86_64)
+
+The x86_64 kernel never set the no-execute bit: any page a program could
+read, it could run — the classic way an overflow turns into running
+attacker code. Now `vmm_init` turns on EFER.NXE when CPUID says the CPU
+has NX, and every page of a program gets NX unless its area may run:
+`mmap`/`mprotect` with PROT_EXEC (mmap didn't record PROT_EXEC before), or
+an ELF segment marked X. The flags API is 32-bit and NX is bit 63, so the
+API carries `PTE_NOEXEC` (bit 31), which paging.c turns into bit 63 (and
+back for `vmm_get_flags`); copy-on-write keeps it. The kernel's eager ELF
+path also used to leave a program's code pages writable: each page now
+gets its segments' rights (W only if one is PF_W, X only if one is PF_X).
+Checked: `user/sys/systest.c` (a `ret` in a RW page and on the stack:
+SIGSEGV; after PROT_EXEC: runs), and the live desktop with Chromium (its
+JIT maps code with PROT_EXEC). i386 without PAE has no NX bit.
+
+## 2026-10-13 — The kernel's own W^X (x86_64)
+
+The x86_64 kernel image was mapped writable and runnable throughout: a
+stray or malicious kernel write could change kernel code, and any kernel
+data could be jumped to. Now (`vmm_init`, `map_kernel_range`): its code
+is read-only and the only kernel memory that runs; read-only data is
+read-only; data, `.bss`, the heap, stacks, device registers and the
+direct map never run (`vmm_map` sets NX on every kernel-half address
+unless told the page is code), and the direct map's view of the code is
+read-only too. `linker.ld` page-aligns the three parts (a few KiB). The
+first 2 MiB, where they meet, are 4 KiB pages; everything else keeps
+2 MiB pages, so the TLB cost is one page table. The boot log checks
+itself: "paging: kernel code read-only, data no-execute".
+A Chromium crash during the live-disk check looked like it came from
+this; an A/B against the committed version showed the same crash there
+(1 in 3 runs, a pointer with bit 44 set): the known crash in gaps.md.
+
+## 2026-10-13 — SMEP and SMAP (x86_64)
+
+On CPUs that have them (Intel since Broadwell/Skylake, AMD since Zen: the
+MSI, the Pocket 4), the kernel now sets CR4.SMEP and CR4.SMAP: it can't
+run code from a user page, and can't read or write user memory except
+inside the user-copy routines. A kernel bug tricked into jumping to, or
+following a pointer into, memory a program controls then faults instead.
+- `uaccess.asm` opens the window (stac) around each access and shuts it
+  (clac) on every way out, the fault's included; only when `smap_on`,
+  since stac/clac don't exist on older CPUs (a load and a predicted branch).
+- exec writes the new program's pages and first stack directly:
+  `user_access_begin/end` around those (no-ops on i386).
+- every interrupt and fault entry clears AC (a program may set it, and an
+  interrupt may arrive mid-copy); `syscall` already cleared it (SFMASK).
+Checked with `QEMU_UEFI_CPU=max` (new: the shell test's CPU) and the live
+desktop with `BOOTTIME_CPU=max` (tools/boottime.py): "paging: SMEP SMAP",
+everything runs. Chromium's known crash (gaps.md) showed up there too.
+
+## 2026-10-13 — Stack canaries in the kernel
+
+The kernel is built with `-fstack-protector-strong` now (both CPUs):
+a function with a local array keeps a secret word between the array and
+its return address, and checks it before returning. A buffer overrun that
+reaches the return address changes the word first, and the kernel stops
+with "KERNEL STACK SMASHED: the function at ADDRESS overran a local array"
+and its call chain, instead of returning to wherever the overrun pointed.
+- The secret (`__stack_chk_guard`, one word, `-mstack-protector-guard=global`:
+  the kernel has no thread-local storage of its own) is chosen in
+  `entry.asm` before the first C function: the cycle counter, mixed with
+  RDRAND where the CPU has it. On x86_64 its low byte is 0 (a string copy
+  stops there) and it lives in read-only data, which `vmm_init` maps
+  read-only.
+- `__stack_chk_fail` is in `interrupts.c`, next to the crash report's
+  stack scan (i386's is now a function, like x86_64's).
+- The Makefile now rebuilds the whole kernel when its compiler flags change
+  (`$(BUILD)/cflags.txt`); before, a new flag reached only the files edited
+  since.
+- Cost: none on system calls and interrupts, +2% on open and stat
+  (docs/performance.md).
+Checked: `make test` (229 self-tests pass; new: the guard is set, and on
+x86_64 its low byte is 0 and its page read-only),
+`make ARCH=x86_64 test-uefi-shell`, and once with a deliberate overrun
+(removed again): the kernel stopped and named the function.
+
+## 2026-10-14 — ASLR: every program somewhere else
+
+Until now every program ran at the same addresses every time: the stack
+right under 0xBFFFF000 (i386) / 0x7FFFFFFFE000, libraries from 0x40000000 /
+0x7F0000000000, a PIE program at 0x00400000 / 0x555555554000. An attacker
+who found a bug knew where to aim. Now each exec moves each part by a random
+amount (`load_elf` in `kernel/usermode.c`, ranges in `include/user.h`):
+
+| | i386 | x86_64 |
+|---|---|---|
+| stack (down) | 8 MiB, and within 8 KiB | 16 GiB, and within 8 KiB |
+| mmap area: dynamic linker, libraries (down) | 256 MiB | 16 TiB |
+| PIE program (up) | 256 MiB | 16 TiB |
+| heap (up, after the program) | 32 MiB | 1 GiB |
+
+Linux's ranges, except the mmap area: Linux's largest setting. The parts
+can't meet (`user.h` says why). The mmap area and the stack ends are per
+address space now (`mm->mmap_base`, `mm->stack_top`).
+- `personality(ADDR_NO_RANDOMIZE)` turns it off for a program (gdb,
+  `setarch -R`); a setuid or setgid program loses that flag (and the other
+  `PER_CLEAR_ON_SETID` bits), as on Linux, so nobody can take the
+  randomness away from a program with more rights. exec gets the persona
+  in and out like the credentials, committed only when exec succeeds.
+- i386's vsyscall page (the sysenter code) moved too: it is the page right
+  above each program's stack, so it shares the stack's page table, and isn't
+  at a fixed address any more. sysexit returns through `sysexit_eip`, set in
+  `mm_switch` and by exec.
+- Cost: +4% on exec, +1 cycle on a sysenter syscall (docs/performance.md).
+Checked: systest runs a probe (itself, re-exec'd) three times and sees the
+stack, heap and first mmap move each time, and stay put with
+ADDR_NO_RANDOMIZE; `make test`, `make ARCH=x86_64 test-uefi-shell`, and the
+live desktop with Chromium.
+
+## 2026-10-14 — SIGTTOU: background jobs that change the terminal
+
+A background job could change the terminal under the foreground program:
+turn echo off, switch it to raw mode, or take the foreground away — and
+with `stty tostop`, its output still appeared. Now (`drivers/tty.c`,
+Linux's `tty_check_change` rules) a background job's tcsetattr (TCSETS*),
+tcsetpgrp (TIOCSPGRP) or tcflush, and its writes when TOSTOP is set, send
+SIGTTOU to its group: it stops, `jobs` says "Stopped (tty output)", and
+after `fg` the call runs again. A job that ignores or blocks SIGTTOU goes
+ahead — shells ignore it to take the terminal back when a job ends — and
+an orphaned group gets EIO (TIOCSPGRP: ENOTTY), as on Linux.
+- One check for both kinds of terminal (`job_control`, shared with the
+  SIGTTIN read check): the console and a pty's slave side; the master is
+  the terminal window itself and never stops.
+- The write path costs one flag test while TOSTOP is off (the default).
+Checked: systest (a session on a fresh pty, background jobs that call
+tcsetattr, ignore SIGTTOU, write without and with TOSTOP), `make test`,
+`make ARCH=x86_64 test-uefi-shell`, and bash on the live disk
+(`stty tostop; echo hi &`, `stty -echo &`).
+
+## 2026-10-14 — SO_RCVTIMEO and SO_SNDTIMEO
+
+`setsockopt` took both and ignored them, so a program that asked for a
+read "with a timeout" waited for ever when the other end went quiet. Now
+they work on TCP, UDP and Unix sockets, as on Linux:
+- receive and accept (SO_RCVTIMEO), send and Unix connect (SO_SNDTIMEO)
+  give up with EAGAIN once the time is over, or return what they moved;
+  a TCP connect returns EINPROGRESS (the handshake goes on; poll, then
+  SO_ERROR); an accepted TCP socket gets the listener's values;
+- a signal ends such a wait with EINTR even under SA_RESTART (signal(7):
+  socket calls with a timeout are never restarted);
+- both timeval layouts: two longs (options 20/21) and two 64-bit numbers
+  (66/67), which 32-bit musl, with its 64-bit time_t, tries first;
+  getsockopt gives the value back; microseconds out of range are EDOM.
+- One wait helper for every socket kind (`sock_wait`, `socket.c`); TCP's
+  `tcp_write` and `tcp_connect` take a timeout as `tcp_read` did. TCP's and
+  UDP's 50 ms naps shorten to the deadline, so a 10 ms timeout ends on time.
+Checked: systest (Unix, UDP and a TCP listener give up after 50 ms; the
+64-bit layout; EDOM; EINTR under SA_RESTART), `make test`,
+`make ARCH=x86_64 test-uefi-shell`.
+Found on the way: the network fuzz harness (`make fuzz-build`, `make
+attacks`) stopped building some commits ago (its stubs fell behind the
+kernel); `tools/fuzz/packet.c`'s `alloc_skb` call is fixed, the missing
+stubs are not yet.
+
+## 2026-10-14 — /proc/net/wireless, and Settings' Wi-Fi pane
+
+Wi-Fi works from the tray icon, but Settings still said "No Wi-Fi hardware
+found": its pane looks for cards in `/proc/net/wireless`, as on Linux, and
+MyOS had no such file. Now `fs/procfs.c` writes it in Linux's exact layout
+(wext-proc.c's columns): every Wi-Fi interface, and while it is connected
+the link quality (the AP's signal, -110..-40 dBm, as 0..70) and the signal
+level, as cfg80211 fills it. The Wi-Fi core answers one question for it,
+`wifi_link_info` (`net/wireless/core.c`), reading the connection under the
+wiphy lock (freeing the AP's entry can sleep, so an unlocked read could see
+it half gone). Settings' Wi-Fi pane now names the card, says whether it is
+connected and how strong the signal is, and points at the panel's Wi-Fi icon
+for choosing a network; its old "MyOS has no Wi-Fi drivers yet" text and the
+switch that couldn't be turned on are gone. The Network pane's Wi-Fi row says
+Connected / Not connected too.
+Checked: the Wi-Fi self-test (simulated radio): connected at -61 dBm, then
+not connected after the disconnect, eth0 not listed; `make test`; the live
+disk (`cat /proc/net/wireless`: the two header lines; QEMU has no Wi-Fi card).
+
+## 2026-10-14 — racetest: the two-waiters flake, and two stale mutations
+
+racetest's "two waiters for one child" lost about once in four runs under
+host load: the test let its sibling go (`sib_go = 1`) and then called
+`waitpid`, and a preemption in between let the sibling's `WNOHANG` reap the
+child first — all four wait checks failed with nothing wrong in the kernel.
+Now the armed copy itself releases the sibling: the test syscall (423, test
+builds only) takes a third address, a "go" flag the copy sets just before
+it yields, so the sibling can only start once the main thread is inside
+`waitpid`, at its status copy. Every call to 423 now passes all three
+arguments: musl's `syscall()` passes six whatever the caller names, so the
+readdir test had been handing the kernel garbage as its "done" flag; it now
+waits for its sibling like the others.
+`make verify-racetests` (each check against the bug it is for) had two
+mutations that no longer applied, leaving their checks unverified: read/write
+gained NULL-operation checks, and wait4's reap moved into `wait_child` with
+job control. Both are rewritten for the code as it is (run_case takes several
+old/new pairs now: putting the wait bug back means leaving the zombie in
+`wait_child` and reaping it after the copy).
+Checked: `make verify-racetests`: all eight bugs caught again (against the
+wait bug, the sibling's two checks fail, as they should); `make test` three
+times in a row with two other QEMUs running: racetest 18/18 each time.
+
+## 2026-10-14 — The live disk's sshd and wpa_supplicant didn't start
+
+Found while adding a service: five of the repository's 19 symlinks were
+plain files in the working tree (dated 2026-10-11), each holding its link's
+target as text — `live/overlay/etc/runit/runsvdir/default/sshd` and
+`.../wpa_supplicant`, and the `supervise` links of sshd, httpd and
+wpa_supplicant. This clone has `core.symlinks = false` in `.git/config`, so
+git writes symlinks out that way and `git status` doesn't notice. runsvdir
+only follows real links, so a live disk built from this tree started
+neither sshd nor wpa_supplicant (the live boot's `ps` showed two `runsv`,
+the console and the login screen): no SSH, and the Wi-Fi icon had no
+supplicant to talk to. The five are real symlinks again (git sees no
+change: the link targets are what it stores). Until `core.symlinks` is set
+back to true, a checkout can flatten them again.

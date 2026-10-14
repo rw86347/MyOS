@@ -163,12 +163,12 @@ void net_selftest(void)
     if (dr == 0) {
         static const char req[] = "GET / HTTP/1.0\r\nHost: example.com\r\n\r\n";
         struct tcp_conn *c = tcp_open();
-        int tc = c ? tcp_connect(c, ip, 80, 0) : -ENOMEM;
+        int tc = c ? tcp_connect(c, ip, 80, 0, 0) : -ENOMEM;
         if (tc != 0)
             kprintf("net: tcp connect failed %d\n", tc);
         check(tc == 0, "net: tcp connect example.com:80");
         if (tc == 0) {
-            int ts = tcp_write(c, req, (uint32_t)strlen(req), 0, 0);
+            int ts = tcp_write(c, req, (uint32_t)strlen(req), 0, 0, 0);
             char buf[64];
             /* 5s, not 2s. Fetching this needs a handshake and a round trip
                to a real server, so on a link with a 350ms round trip 2s left
@@ -241,16 +241,16 @@ static void tcp_listen_selftest(void)
     check(tcp_accept(l, &a, 1, 0) == -EAGAIN, "net: tcp a forged ACK makes no connection");
 
     struct tcp_conn *cl = tcp_open();
-    int cr = cl ? tcp_connect(cl, 0x0A000202u, HAIRPIN_PORT, 0) : -ENOMEM;
+    int cr = cl ? tcp_connect(cl, 0x0A000202u, HAIRPIN_PORT, 0, 0) : -ENOMEM;
     if (cr != 0) {
         kprintf("net: tcp listen test skipped: no port forward (%d)\n", cr);
     } else {
         char b[16];
         int ar = tcp_accept(l, &a, 0, 5000);
         check(ar == 0, "net: tcp accept");
-        int ok = ar == 0 && tcp_write(cl, "ping\n", 5, 0, 0) == 5 &&
+        int ok = ar == 0 && tcp_write(cl, "ping\n", 5, 0, 0, 0) == 5 &&
                  tcp_read(a, b, sizeof b, 0, 0, 0, 5000) == 5 && !memcmp(b, "ping\n", 5) &&
-                 tcp_write(a, "pong\n", 5, 0, 0) == 5 &&
+                 tcp_write(a, "pong\n", 5, 0, 0, 0) == 5 &&
                  tcp_read(cl, b, sizeof b, 0, 0, 0, 5000) == 5 && !memcmp(b, "pong\n", 5);
         check(ok, "net: tcp data both ways on an accepted connection");
         if (ok) {

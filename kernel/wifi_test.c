@@ -188,6 +188,8 @@ void wifi_selftest(void)
         kprintf("wifi: ping %d; the AP heard %d data frames, %d ARP, %d pings\n", pong, data, arp, ping);
     }
     check(pong == 0, "wifi: ping 192.168.77.1 across the air (ARP, ICMP)");
+    int dbm = 0, link = wifi_link_info(dev, &dbm);
+    check(link == 2 && dbm == -61, "wifi: /proc/net/wireless: connected, the AP heard at -61 dBm");
 
     /* The firmware crashes and the driver asks for a restart: the core
        tells it everything again (the peer, channel, timing) and the
@@ -210,6 +212,8 @@ void wifi_selftest(void)
           "wifi: disconnect: deauthenticated, the peer gone from the driver");
     check(eth ? ipv4_dev() == eth && ipv4_addr == eth_addr : ipv4_dev() == NULL,
           "wifi: IPv4 back on eth0 with its own lease");
+    check(wifi_link_info(dev, &dbm) == 1 && (!eth || wifi_link_info(eth, &dbm) == 0),
+          "wifi: /proc/net/wireless: wlan0 listed, not connected; eth0 not listed");
 
     check(sim_wifi_violations() == 0,
           "wifi: the core kept iwlwifi's rules all along (bssid, ERP after assoc, link address, EDCA)");

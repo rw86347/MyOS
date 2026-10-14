@@ -4,7 +4,10 @@
 #define ARCH_AARCH64_UART_H
 
 #include <stddef.h>
+#include <stdint.h>
 
+void uart_set_base(uintptr_t phys);
+void uart_use_apple_s5l(uintptr_t phys);
 void uart_init(void);
 void uart_putc(char c);
 int  uart_readable(void);

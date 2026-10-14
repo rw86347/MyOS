@@ -269,7 +269,9 @@ static int32_t slave_write(struct file *f, const void *user_buf, uint32_t n)
     struct pty *p = f->priv;
     char chunk[128];
     uint32_t done = 0;
-    int32_t err = 0;
+    int32_t err = tty_write_check(p->tty);  /* a background job, `stty tostop` */
+    if (err)
+        return err;
     if (n > RW_MAX)
         n = RW_MAX;
     pget(p);
@@ -349,8 +351,10 @@ static int32_t slave_ioctl(struct file *f, uint32_t cmd, uintptr_t arg)
         if (!p->sid)
             return -ENOTTY;
         return copy_to_user((void *)arg, &p->sid, sizeof p->sid);
-    default:
-        return tty_ioctl_on(p->tty, cmd, arg);
+    default: {
+        int32_t r = tty_ioctl_check(p->tty, cmd);   /* a background job: SIGTTOU */
+        return r ? r : tty_ioctl_on(p->tty, cmd, arg);
+    }
     }
 }
 

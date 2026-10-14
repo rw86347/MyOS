@@ -36,15 +36,16 @@
 GDT_USER_CODE   equ 0x1B
 GDT_USER_DATA   equ 0x23
 GDT_KERNEL_DATA equ 0x10
-VSYSCALL_ADDR   equ 0xBFFFF000      ; keep in sync with sysenter.h
 
 extern kernel_tss
+extern sysexit_eip
 extern sysenter_dispatch
 extern isr_return
 
 ; ---------------------------------------------------------------------------
 ; The vsyscall page's code. Copied into a page at boot (sysenter.c) and
-; mapped at VSYSCALL_ADDR, read-only, in every program.
+; mapped read-only in every program, in the page right above its stack —
+; which exec puts at a random address (ASLR), so this page moves with it.
 section .rodata
 global vsyscall_code, vsyscall_code_end
 vsyscall_code:
@@ -64,7 +65,9 @@ vsyscall_code:
     ret
 vsyscall_code_end:
 
-VSYSCALL_RET equ VSYSCALL_ADDR + (vsyscall_code.ret - vsyscall_code)
+; Where in the page sysexit returns to (sysenter.h adds the page's address).
+global vsyscall_ret_offset
+vsyscall_ret_offset equ vsyscall_code.ret - vsyscall_code
 
 ; ---------------------------------------------------------------------------
 section .text
@@ -83,7 +86,7 @@ sysenter_entry:
     push 2                          ; ...and the kernel starts with clean flags
     popfd                           ;   (no stray direction/trap/NT flag)
     push GDT_USER_CODE              ; user CS
-    push VSYSCALL_RET               ; user EIP: back into the vsyscall page
+    push dword [sysexit_eip]        ; user EIP: .ret in this program's vsyscall page
     push 0                          ; error code  } as the isr.asm stubs push
     push 0x80                       ; vector      }
     pushad
@@ -105,7 +108,8 @@ sysenter_entry:
     ; an ordinary syscall: the vsyscall code saved them. But if the return
     ; address changed — a signal handler to run, sigreturn, execve — every
     ; register must come back exactly: take the full `iret` way instead.
-    cmp dword [esp + 56], VSYSCALL_RET  ; the frame's EIP
+    mov ecx, [sysexit_eip]              ; (popad restores ECX)
+    cmp [esp + 56], ecx                 ; the frame's EIP
     jne isr_return
 
     pop gs

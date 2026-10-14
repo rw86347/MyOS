@@ -142,8 +142,10 @@ int elf_load(const void *image, uint32_t size, user_addr_t dyn_base, struct elf_
         uint64_t va = ph->p_vaddr + bias;
         if (map_seg(va, ph->p_memsz) < 0)
             return -ENOMEM;
+        user_access_begin();            /* SMAP: the new program's pages, directly */
         memcpy((void *)(uintptr_t)va, file + ph->p_offset, (size_t)ph->p_filesz);
         memset((void *)(uintptr_t)(va + ph->p_filesz), 0, (size_t)(ph->p_memsz - ph->p_filesz));
+        user_access_end();
         uint32_t flags = VM_READ | ((ph->p_flags & PF_W) ? VM_WRITE : 0)
                        | ((ph->p_flags & PF_X) ? VM_EXEC : 0);
         mm_add(mm_current(), va & ~0xFFFull, page_up(va + ph->p_memsz), flags);
@@ -151,6 +153,29 @@ int elf_load(const void *image, uint32_t size, user_addr_t dyn_base, struct elf_
            musl needs them in memory (AT_PHDR) for thread-local storage. */
         if (!info->phdr && ph->p_offset == 0 && eh->e_phoff < ph->p_filesz)
             info->phdr = va + eh->e_phoff;
+    }
+    /* The pages were made writable to copy the file in. Now each gets the
+       rights of the segments on it: writable only if one of them is PF_W,
+       runnable only if one is PF_X — a program's code isn't writable, and
+       (with NX) its data can't run. */
+    for (uint16_t i = 0; i < eh->e_phnum; i++) {
+        const struct elf64_phdr *ph = PH(i);
+        if (ph->p_type != PT_LOAD || !ph->p_memsz)
+            continue;
+        uint64_t va = ph->p_vaddr + bias;
+        for (uint64_t page = va & ~0xFFFull; page < va + ph->p_memsz; page += PAGE_SIZE) {
+            int w = 0, x = 0;
+            for (uint16_t j = 0; j < eh->e_phnum; j++) {
+                const struct elf64_phdr *q = PH(j);
+                uint64_t qa = q->p_vaddr + bias;
+                if (q->p_type == PT_LOAD && q->p_memsz && qa < page + PAGE_SIZE &&
+                    qa + q->p_memsz > page) {
+                    w |= (q->p_flags & PF_W) != 0;
+                    x |= (q->p_flags & PF_X) != 0;
+                }
+            }
+            vmm_protect(page, PTE_USER | (w ? PTE_WRITABLE : 0) | (x ? 0 : PTE_NOEXEC));
+        }
     }
 #undef PH
     info->entry = eh->e_entry + bias;

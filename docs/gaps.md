@@ -30,10 +30,12 @@ most likely to trip over, each item checked in the source on the date above.
   of the 176 it lacks are legacy calls left out on purpose (`docs/DESIGN.md`).
 - **Memory**: the x86_64 kernel uses all RAM, but only programs' private pages
   live above 2 GiB: the kernel, its caches and RAM files fit in the first 2 GiB;
-  i386 uses 768 MiB. There is no no-execute bit on either CPU. A disk file can't be mapped `MAP_SHARED` for
+  i386 uses 768 MiB. On x86_64 programs' data, stacks and heaps can't run as code
+  (NX); i386 has no NX bit without PAE. A disk file can't be mapped `MAP_SHARED` for
   writing (ENODEV; read-only it is a snapshot); RAM files and
-  `MAP_SHARED|MAP_ANONYMOUS` are really shared. No address-space randomisation.
-- **Processes and signals**: job control works (Ctrl-Z, `fg`, `bg`; SIGTTIN, not SIGTTOU), no
+  `MAP_SHARED|MAP_ANONYMOUS` are really shared. Programs' addresses are randomised
+  (ASLR, since 2026-10-14); the kernel's are not.
+- **Processes and signals**: job control works (Ctrl-Z, `fg`, `bg`, SIGTTIN, SIGTTOU), no
   ptrace or core dumps, signals are one bit each (not queued, no `si_pid` for
   `kill`). 512 threads and 256 processes in the whole system on x86_64 (256 and
   128 on i386); 1024 open files per process.
@@ -60,9 +62,11 @@ most likely to trip over, each item checked in the source on the date above.
     out-of-order queue (dropped, the peer resends), no SACK, no timestamps, no RTT
     estimate (retransmit 250 ms doubling to 4 s, 8 tries), no Nagle, TIME_WAIT 2 s.
   - **Loopback is UDP only**: TCP and ping to 127.0.0.1 fail with ENETUNREACH.
-  - **`setsockopt` accepts every option and ignores it**: `SO_RCVTIMEO`/
-    `SO_SNDTIMEO` (a read with a timeout waits for ever), `SO_KEEPALIVE`,
-    `TCP_NODELAY`, `SO_REUSEADDR`, `SO_LINGER`... `getsockopt` knows four.
+  - **`setsockopt` ignores most options**: `SO_KEEPALIVE`, `TCP_NODELAY`,
+    `SO_REUSEADDR`, `SO_LINGER`... are accepted and change nothing. `SO_RCVTIMEO` /
+    `SO_SNDTIMEO` work (since 2026-10-14) on TCP, UDP and Unix sockets — not yet on
+    netlink and packet sockets, where they are accepted and ignored. A negative
+    timeout means "don't wait" on Linux; here it waits 1 ms.
   - **No IPv6** at any layer (AF_INET6 is EAFNOSUPPORT, as musl expects).
   - IPv4: one device at a time, one default route, no fragments (dropped), no IP
     options, no multicast or broadcast received (DHCP excepted), 8 ARP entries.
@@ -136,9 +140,12 @@ most likely to trip over, each item checked in the source on the date above.
   typed for such an account without asking. `myos-adduser` and the login screen
   (since 2026-10-13) refuse a typed password for an account whose password is empty;
   `su` doesn't. The installer gives both real passwords (and locks root's).
-- **Settings' Wi-Fi pane is still empty**, though Wi-Fi works (the MSI's AX201,
-  from the tray icon): the pane reads `/proc/net/wireless`, which MyOS doesn't
-  have, so it says "No Wi-Fi hardware found".
+- **Settings' Wi-Fi pane only shows the state** (since 2026-10-14: `/proc/net/wireless`):
+  the card, connected or not, and the signal. Choosing a network is still the tray
+  icon's job (myos-wifi); the pane has no network list of its own. The kernel's
+  `/proc/net/wireless` has no noise figure and no discard counters (zeros, as Linux
+  shows them for cfg80211 cards). The connected line has been seen on the simulated
+  radio (`make test`), not yet on the MSI's AX201.
 - **Nothing reads the syslog socket.** `net/unix.c` has UNIX sockets now, but no
   syslog daemon runs, so login failures still go nowhere.
 - **Permissions are checked, the plain Unix way only** (`fs/perm.c`, since
@@ -302,12 +309,15 @@ most likely to trip over, each item checked in the source on the date above.
 ## Processes, signals, terminal (step 8)
 - **`ppoll`/`pselect6` cut a wait longer than ~24.8 days to that** (the wait counts
   in 32-bit ms, `ts_ms` in `fs/poll.c`); it then ends early, as a timeout.
-- **Job control, without SIGTTOU** (since 2026-10-13: `kernel/signal.c`): stop signals
-  stop the process, SIGCONT continues it, `wait4`/`waitid` report both (WUNTRACED,
-  WCONTINUED), `ps` shows T, a terminal stop doesn't reach an orphaned group, and a
-  background job reading its terminal gets SIGTTIN (or EIO). Not yet: SIGTTOU for a
-  background job that writes with TOSTOP set or changes the terminal's settings;
-  threads asleep in a syscall stop only when it returns; ptrace stops. The console
+- **Job control** (since 2026-10-13: `kernel/signal.c`; SIGTTOU since 2026-10-14):
+  stop signals stop the process, SIGCONT continues it, `wait4`/`waitid` report both
+  (WUNTRACED, WCONTINUED), `ps` shows T, a terminal stop doesn't reach an orphaned
+  group; a background job reading its terminal gets SIGTTIN, and one changing it
+  (tcsetattr, tcsetpgrp, tcflush) or writing to it with TOSTOP set gets SIGTTOU (or
+  EIO; Linux's `tty_check_change` rules, `drivers/tty.c`). Not yet: SIGTTOU for the
+  rarer terminal calls Linux also checks (TCXONC, TIOCSETD, TCSBRK, ...: not
+  implemented here); threads asleep in a syscall stop only when it returns; ptrace
+  stops. The console
   is a controlling terminal like a pty now (TIOCSCTTY, TIOCNOTTY, TIOCGPGRP only for
   its own session).
 - **Syscall restart follows Linux's lists, mostly** (since 2026-10-13: `-ERESTARTSYS`,
@@ -354,7 +364,15 @@ most likely to trip over, each item checked in the source on the date above.
   SMAP the kernel's own accesses pass, so `write(fd, prot_none_page, n)` sends its
   data where Linux says EFAULT. A page never touched faults for the kernel too
   (EFAULT), and every program access faults (`mm_fault`, 2026-10-13).
-- **No address-space randomisation**: static PIEs always load at 0x00400000.
+- **ASLR covers programs, not the kernel** (since 2026-10-14). Every exec moves the
+  stack, the mmap area (dynamic linker, libraries), a PIE program, the heap and
+  i386's vsyscall page by Linux's amounts (`include/user.h`); a program built
+  without PIE (ET_EXEC) stays where it was linked, as on Linux. The kernel is
+  always at the same address (no KASLR), so a kernel bug's exploit knows where
+  kernel code is. 32-bit address space limits i386 to 65,536 places for the
+  mmap area and 2,048 (×512 within 8 KiB) for the stack. Turned off only per
+  program, with `personality(ADDR_NO_RANDOMIZE)` (lost on a setuid exec);
+  there is no `/proc/sys/kernel/randomize_va_space`.
 - **Disk-file mappings are private copies** (made per page on first touch), not the
   page cache's pages. Since 2026-10-09, `MAP_SHARED` of a disk file opened for writing
   fails with ENODEV: as a copy it read stale pages after `write()`, and writes through
@@ -363,12 +381,14 @@ most likely to trip over, each item checked in the source on the date above.
   is ROADMAP step 11's single page cache behind both `read()` and `mmap()`. Programs are mapped from their file and paged in on touch, on both CPUs
   (x86_64's loader read the whole file into one buffer until 2026-10-07).
 - **Dynamic linking**: one interpreter level; the interpreter is put at the first free
-  place in the mmap area (no randomisation).
+  place in the mmap area (which starts at a random place: ASLR).
 - **Arguments + environment: 64 KiB, 1024 entries; paths 255 bytes** (Linux: 128 KiB+, 4096).
 - **Syscalls run with interrupts off** (interrupt gate); long ones are capped (reads at
   256 KiB, console writes return short). Needs locks to change.
-- **Execute permission isn't enforced**: i386 has no NX bit without PAE, and the
-  x86_64 kernel doesn't set NX either.
+- **No-execute only on x86_64** (since 2026-10-13): a program's pages run only where
+  it asked (PROT_EXEC, an ELF segment marked X); stacks, heaps and data don't. i386
+  without PAE has no NX bit, so there every readable page can run. An executable
+  stack (PT_GNU_STACK with X) isn't honoured: stacks never run.
 - **CPU exceptions become signals** (SIGSEGV/SIGFPE/SIGILL); a handler for them is called
   but the faulting instruction runs again when it returns (like Linux).
 
@@ -938,11 +958,10 @@ All of these are fixed; what is left is the testing gap and the capability one.
   most 200 ms; `kernel/uaccess_test.c`). `make verify-racetests` passes again: three of
   its mutations had stopped applying after the `pread`/`pwrite` and `file_copy_in`
   changes of 2026-10-05, so those fixes went unverified until today.
-- **racetest's two-waiters case can still lose under host load** (once in four runs on
-  2026-10-13, with two other QEMUs running): the sibling is let go (`sib_go = 1`)
-  just before the main thread calls `waitpid`, so a preemption in that gap lets the
-  sibling's `WNOHANG` reap the child first, and all four wait checks fail. The fix is
-  in the test: let the armed copy itself release the sibling.
+- ~~racetest's two-waiters case could lose under host load~~ (fixed 2026-10-14): the
+  sibling was let go just before `waitpid`, so a preemption in that gap let it reap
+  the child first. The armed copy now releases the sibling itself (a third argument
+  to the test syscall, `kernel/uaccess_test.c`), from inside `waitpid`.
 
 ## The graphical desktop (step 11b, 2026-10-04)
 
@@ -1128,19 +1147,31 @@ own, `cld` on every entry and page-table checks are in (docs/LOG.md,
 - **"main" (the boot thread) has no guard page.** Its stack is in the
   kernel image, which is mapped with big pages (2 MiB / 4 MiB), so no
   single page under it can be left out. It only idles after boot.
-- **The kernel image is writable and executable throughout.** Text is not
-  read-only and data is not no-execute (x86_64 has NX; non-PAE i386 has
-  none). A stray kernel write can change kernel code. Fix: map .text
-  read-only and the rest NX, which costs TLB entries unless the sections
-  are aligned to the big pages.
+- **The kernel's write-xor-execute is x86_64 only** (since 2026-10-13: its code
+  read-only and the only kernel memory that runs; read-only data read-only; the rest
+  — data, heap, stacks, device registers, the direct map — not runnable). The i386
+  kernel is still one writable, runnable image: no NX without PAE, and 4 MiB pages.
+  The direct map's view of x86_64's code is read-only too.
 - **The stack pool keeps its pages.** A window's pages stay with it after
   its thread dies, for the next thread: the pages held are the most
   threads ever alive at once (16 KiB each on x86_64), never given back.
 - **MEMDEBUG has no red zones.** It catches a write to freed memory (pages
   and kmalloc objects), not an overrun into a neighbour that is in use.
-- **Not yet: stack canaries** (-fstack-protector-strong) against a buffer
-  overrun inside a frame overwriting a return address; SMEP/SMAP (the
-  kernel must not run, or quietly read, user pages).
+- **The stack canary is one value for the whole kernel**, chosen once at
+  boot (since 2026-10-13: `-fstack-protector-strong`, entry.asm). Linux
+  gives each thread its own; a leaked canary here works on every stack.
+  On the old PCs (no RDRAND) it comes from the cycle counter alone: how
+  long the BIOS and the boot loader took, which varies by millions of
+  cycles, but isn't a real random source. On i386 it isn't read-only either
+  (no read-only kernel pages there yet). Two hot entry points go without
+  one on purpose: `sysenter_dispatch` (its only buffer is a 4-byte word
+  `get_user32` fills) and `interrupt_dispatch` (a crashing program's
+  report, which has a name buffer, is kept out of line so it doesn't add
+  one there).
+- SMEP and SMAP are on (x86_64, CPUs that have them, since 2026-10-13): the
+  kernel can't run a user page, nor touch one outside the user-copy
+  routines and exec's stack and ELF setup. The old PCs (and i386) have
+  neither.
 
 ## Disk files and /proc per process (2026-10-09)
 
@@ -1162,7 +1193,12 @@ own, `cld` on every entry and page-table checks are in (docs/LOG.md,
   is right only for readers that read until EAGAIN.
 - **Chromium crashes in the browser process soon after loading a page**
   (a use-after-free-looking read). Not yet found; see docs/LOG.md
-  2026-10-09. No `ptrace` (crashpad can't take its dump), and no
+  2026-10-09. Seen again 2026-10-13 in about 1 run in 3, 25-50 s after
+  starting it on the live disk: a thread pool thread reads a pointer with
+  bit 44 set (0x65555a7d0000, which is Chromium's 0x55555a7d0000 + 2^44) at
+  chromium+649c2f7, then the crash handler faults or hits its int3. The
+  same with and without NX and the kernel's W^X (an A/B on the committed
+  version), so not caused by them. No `ptrace` (crashpad can't take its dump), and no
   `/proc/<pid>/task` for other processes.
 - **A deleted file that is still open reports `st_nlink` 1** (Linux: 0). SQLite only
   logs a warning about it.

@@ -859,7 +859,8 @@ SYSCALL(sys_getcwd)
    `make test` only — docs/security.md explains why it has to exist. */
 SYSCALL(sys_uaccess_test)
 {
-    uaccess_test_arm((int)a1, a2);      /* a2: the sibling's "done" flag, or 0 */
+    uaccess_test_arm((int)a1, a2, a3);  /* a2: the sibling's "done" flag, a3: its
+                                           "go" flag (the copy sets it), or 0 */
     return 0;
 }
 #endif

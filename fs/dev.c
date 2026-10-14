@@ -56,6 +56,9 @@ static int32_t console_write_user(struct file *f, const void *user_buf, uint32_t
 {
     char chunk[256];                /* copy in pieces via the stack */
     uint32_t done = 0;
+    int32_t bg = tty_write_check(NULL);     /* a background job, `stty tostop` */
+    if (bg)
+        return bg;
     while (done < count) {
         uint32_t n = count - done < sizeof chunk ? count - done : sizeof chunk;
         uint32_t room = serial_space() / 2;     /* worst case: all '\n' */

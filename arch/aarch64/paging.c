@@ -12,6 +12,8 @@
  * AP[2:1] (ARM D5): 00 EL1 RW; 01 EL0+EL1 RW; 11 is read-only (not "user RW").
  */
 #include "paging.h"
+#include "apple/mmio_map.h"
+#include "apple/uart_early.h"
 #include "memlayout.h"
 #include "arm64_pmm.h"
 #include "uaccess.h"
@@ -48,6 +50,14 @@ static uint64_t l2_low[512]
     __attribute__((section(".pagetables"), __aligned__(4096)));
 static unsigned s_ram_l1;
 
+#define PAGING_EXTRA_L1 4
+
+static struct paging_l1_extra {
+    uint8_t active;
+    uint8_t l1_idx;
+    uint64_t l2[512] __attribute__((aligned(4096)));
+} s_l1_extra[PAGING_EXTRA_L1];
+
 static uint64_t block_pte(uint64_t pa, uint64_t mask, unsigned attr_idx, uint64_t extra)
 {
     return (pa & ~mask) | PTE_TYPE_BLOCK | PTE_AF | PTE_SH_INNER |
@@ -61,13 +71,83 @@ uint64_t arm64_tcr_el1(void)
            (16ull << 16) | (1ull << 23) | (2ull << 30) | (2ull << 32);
 }
 
-void paging_init(uint64_t ram_base, uint64_t ram_size)
+static uint64_t *l2_table_for_l1(unsigned l1, int create)
+{
+    unsigned i;
+
+    if (l1 == 0)
+        return l2_low;
+    if (l1 == s_ram_l1)
+        return l2_ram;
+    for (i = 0; i < PAGING_EXTRA_L1; i++) {
+        if (s_l1_extra[i].active && s_l1_extra[i].l1_idx == l1)
+            return s_l1_extra[i].l2;
+    }
+    if (!create)
+        return NULL;
+    for (i = 0; i < PAGING_EXTRA_L1; i++) {
+        if (!s_l1_extra[i].active) {
+            memset(s_l1_extra[i].l2, 0, sizeof s_l1_extra[i].l2);
+            s_l1_extra[i].active = 1;
+            s_l1_extra[i].l1_idx = (uint8_t)l1;
+            return s_l1_extra[i].l2;
+        }
+    }
+    return NULL;
+}
+
+static void map_device_mmio_range(uint64_t base, uint64_t size)
+{
+    uint64_t end = base + (size ? size : 0x1000u);
+    uint64_t pa = arm64_mmio_block_align(base);
+
+    for (; pa < end; pa += ARM64_MMIO_L2_SIZE) {
+        unsigned l1;
+        unsigned l2i;
+        uint64_t *l2;
+
+        arm64_mmio_block_indices(pa, &l1, &l2i);
+        l2 = l2_table_for_l1(l1, 1);
+        if (!l2)
+            return;
+        l2[l2i] = block_pte(pa, L2_SIZE - 1, 1, PTE_UXN);
+        l1_table[l1] = ((uint64_t)(uintptr_t)l2) | PTE_TYPE_TABLE;
+    }
+}
+
+static void map_kernel_gib_if_split(unsigned ram_l1)
+{
+    unsigned kl1 = (unsigned)(KERNEL_LOAD_PHYS >> L1_SHIFT);
+    uint64_t gib_base;
+    uint64_t *l2;
+
+    if (kl1 == ram_l1)
+        return;
+    l2 = l2_table_for_l1(kl1, 1);
+    if (!l2)
+        return;
+    gib_base = (uint64_t)kl1 << L1_SHIFT;
+    for (unsigned i = 0; i < 512; i++) {
+        uint64_t pa = gib_base + ((uint64_t)i << L2_SHIFT);
+        uint64_t extra = PTE_UXN;
+
+        if (pa >= ARM64_USER_MIN)
+            extra = PTE_AP_EL0_RW;
+        l2[i] = block_pte(pa, L2_SIZE - 1, 0, extra);
+    }
+    l1_table[kl1] = ((uint64_t)(uintptr_t)l2) | PTE_TYPE_TABLE;
+}
+
+void paging_init(uintptr_t dtb, uint64_t ram_base, uint64_t ram_size)
 {
     uint64_t tcr = arm64_tcr_el1();
     unsigned ram_l1 = (unsigned)(ram_base >> L1_SHIFT);
     uint64_t ram_end = ram_base + ram_size;
 
     s_ram_l1 = ram_l1;
+
+    for (unsigned e = 0; e < PAGING_EXTRA_L1; e++)
+        s_l1_extra[e].active = 0;
 
     for (unsigned i = 0; i < 512; i++) {
         l0_table[i] = 0;
@@ -108,6 +188,21 @@ void paging_init(uint64_t ram_base, uint64_t ram_size)
 
     l1_table[ram_l1] = ((uint64_t)(uintptr_t)l2_ram) | PTE_TYPE_TABLE;
     l0_table[0] = ((uint64_t)(uintptr_t)l1_table) | PTE_TYPE_TABLE;
+
+    map_kernel_gib_if_split(ram_l1);
+
+    {
+        uint64_t mmio_base = 0;
+        uint64_t mmio_size = 0;
+
+        if (dtb && arm64_early_console_mmio(dtb, &mmio_base, &mmio_size) == 0 &&
+            mmio_base >= (1ull << 32)) {
+            map_device_mmio_range(mmio_base, mmio_size);
+            uart_puts("  MMU: early console MMIO @ 0x");
+            uart_puthex((unsigned long)mmio_base);
+            uart_puts("\n");
+        }
+    }
 
     arm64_mmu_configure(tcr, (MAIR_ATTR_NORM << 0) | (MAIR_ATTR_DEV << 8));
     arm64_mmu_enable((uint64_t)(uintptr_t)l0_table);
@@ -163,12 +258,25 @@ static void fill_from_boot(struct arm64_as *as)
     uint64_t *l0 = (uint64_t *)(uintptr_t)as->l0_pa;
     uint64_t *l1 = (uint64_t *)(uintptr_t)as->l1_pa;
 
+    unsigned e;
+
     memcpy(l0, l0_table, 4096);
     memcpy(l1, l1_table, 4096);
     memcpy((void *)(uintptr_t)as->l2_low_pa, l2_low, 4096);
     memcpy((void *)(uintptr_t)as->l2_ram_pa, l2_ram, 4096);
     l1[0] = as->l2_low_pa | PTE_TYPE_TABLE;
     l1[s_ram_l1] = as->l2_ram_pa | PTE_TYPE_TABLE;
+    for (e = 0; e < PAGING_EXTRA_L1; e++) {
+        uint32_t pg;
+
+        if (!s_l1_extra[e].active)
+            continue;
+        pg = arm64_pmm_alloc();
+        if (!pg)
+            continue;
+        memcpy((void *)(uintptr_t)pg, s_l1_extra[e].l2, 4096);
+        l1[s_l1_extra[e].l1_idx] = (uint64_t)pg | PTE_TYPE_TABLE;
+    }
     l0[0] = as->l1_pa | PTE_TYPE_TABLE;
 }
 

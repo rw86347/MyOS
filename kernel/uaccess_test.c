@@ -17,12 +17,14 @@
 static struct thread *armed_for;
 static int countdown;
 static uintptr_t until;                 /* a user flag: yield until it's set */
+static uintptr_t go;                    /* a user flag: set it, to release the sibling */
 
-void uaccess_test_arm(int n, uintptr_t flag)
+void uaccess_test_arm(int n, uintptr_t flag, uintptr_t go_flag)
 {
     armed_for = n > 0 ? thread_current() : 0;
     countdown = n;
     until = flag;
+    go = go_flag;
 }
 
 void uaccess_test_pause(void)
@@ -35,7 +37,11 @@ void uaccess_test_pause(void)
        page fault goes to the disk, so this is faithful rather than merely
        convenient. Until the sibling says it has acted: a yield may go to
        some other thread first. (Reading the flag is a copy too; disarmed
-       above, so it doesn't come back here.) */
+       above, so it doesn't come back here.) The sibling may only start now,
+       if the test said so: its "go" flag. */
+    uint32_t one = 1;
+    if (go)
+        copy_to_user((void *)go, &one, sizeof one);
     uint32_t end = timer_ms() + 200, done = 0;
     do {
         thread_yield();

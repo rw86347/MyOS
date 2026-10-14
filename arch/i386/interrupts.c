@@ -129,8 +129,10 @@ static int exception_signal(uint32_t vector)
 
 /* A fault in a user program: kill just that program, like Linux's SIGSEGV.
    The kernel is fine — the program did something it isn't allowed to.
-   (Programs catching these signals comes with signals, step 8f.) */
-static int user_exception(struct regs *r, uint32_t cr2)
+   (Programs catching these signals comes with signals, step 8f.)
+   noinline: its name buffer gets a stack canary (Makefile: KERNEL_SSP);
+   inlined, every interrupt and int 0x80 would pay for that check. */
+static __attribute__((noinline)) int user_exception(struct regs *r, uint32_t cr2)
 {
     struct thread *t = thread_current();
     kprintf("%s: killed by CPU exception %lu (%s) at EIP %08lx",
@@ -184,6 +186,44 @@ static int fixup_user_access(struct regs *r)
     return 0;
 }
 
+/* Who called whom: return addresses on the stack (no frame pointers, so a
+   scan, as Linux does without them; some values are stale), from sp up to
+   the top of the thread's own stack. */
+static void stack_scan(uint32_t sp)
+{
+    extern char __text_start[], __text_end[], boot_stack_top[];
+    struct thread *t = thread_current();
+    uint32_t top = t && t->stack ? (uint32_t)t->stack + THREAD_STACK : (uint32_t)boot_stack_top;
+    uint32_t bottom = t && t->stack ? (uint32_t)t->stack : top - 16384;
+    if (sp < bottom || sp >= top)
+        return;
+    kprintf("In thread \"%s\"; called from (newest first):", t ? t->name : "?");
+    int n = 0;
+    for (const uint32_t *p = (const uint32_t *)sp; (uint32_t)p < top && n < 16; p++)
+        if (*p >= (uint32_t)__text_start && *p < (uint32_t)__text_end)
+            kprintf("%s%08lx", n++ % 6 ? " " : "\n  ", *p);
+    kprintf("\n");
+}
+
+/* A protected function (Makefile: KERNEL_SSP) found its stack canary
+   changed on its way out: something wrote past the end of one of its
+   local arrays, and maybe over its return address too. Stop here instead
+   of returning there. The address printed is in that function. */
+void __stack_chk_fail(void) __attribute__((noreturn));
+void __stack_chk_fail(void)
+{
+    __asm__ volatile ("cli");
+    kprintf("\n*** KERNEL STACK SMASHED: the function at %08lx overran a local array ***\n",
+            (unsigned long)__builtin_return_address(0));
+    uint32_t sp;
+    __asm__ volatile ("mov %%esp, %0" : "=r"(sp));
+    stack_scan(sp);
+    kprintf("System halted. (Look it up with: i686-elf-addr2line -f -e build/kernel.elf ADDRESS)\n");
+    serial_flush();
+    for (;;)
+        __asm__ volatile ("cli; hlt");
+}
+
 /* A CPU exception in the kernel is a bug: show everything we know, then stop
    (instead of the CPU giving up and rebooting — a "triple fault"). */
 static void exception(struct regs *r)
@@ -223,24 +263,8 @@ static void exception(struct regs *r)
                 "stack (stopped at its guard page)\n", over->name, (unsigned)THREAD_STACK);
     kprintf("EAX=%08lx EBX=%08lx ECX=%08lx EDX=%08lx\n", r->eax, r->ebx, r->ecx, r->edx);
     kprintf("ESI=%08lx EDI=%08lx EBP=%08lx\n", r->esi, r->edi, r->ebp);
-    /* Who called whom: return addresses on the stack (no frame pointers,
-       so a scan, as Linux does without them; some values are stale). In
-       ring 0 the CPU pushed no ESP: the stack went on right after eflags. */
-    {
-        extern char __text_start[], __text_end[], boot_stack_top[];
-        struct thread *t = thread_current();
-        uint32_t sp = (uint32_t)&r->user_esp;
-        uint32_t top = t && t->stack ? (uint32_t)t->stack + THREAD_STACK : (uint32_t)boot_stack_top;
-        uint32_t bottom = t && t->stack ? (uint32_t)t->stack : top - 16384;
-        if (sp >= bottom && sp < top) {
-            kprintf("In thread \"%s\"; called from (newest first):", t ? t->name : "?");
-            int n = 0;
-            for (const uint32_t *p = (const uint32_t *)sp; (uint32_t)p < top && n < 16; p++)
-                if (*p >= (uint32_t)__text_start && *p < (uint32_t)__text_end)
-                    kprintf("%s%08lx", n++ % 6 ? " " : "\n  ", *p);
-            kprintf("\n");
-        }
-    }
+    /* In ring 0 the CPU pushed no ESP: the stack went on right after eflags. */
+    stack_scan((uint32_t)&r->user_esp);
     kprintf("System halted. (Look up EIP with: i686-elf-addr2line -e build/kernel.elf %lx)\n",
             r->eip);
     serial_flush();                 /* interrupts are off: send it all now */

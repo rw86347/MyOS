@@ -361,22 +361,29 @@ struct tcp_conn *tcp_open(void)
     return c;
 }
 
-/* Sleep a little; the e1000 interrupt or the cap ends it. */
+/* Sleep a little; the e1000 interrupt, the cap or the deadline ends it.
+   -ETIMEDOUT once the deadline (0: none) has passed. A signal: run the call
+   again — unless it has a timeout (SO_RCVTIMEO / SO_SNDTIMEO), which
+   Linux never restarts (signal(7)): -EINTR. */
 static int nap(int nonblock, uint32_t deadline)
 {
     if (nonblock)
         return -EAGAIN;
     if (signal_pending())
-        return -ERESTARTSYS;
-    if (deadline && due(deadline, timer_ms()))
+        return deadline ? -EINTR : -ERESTARTSYS;
+    uint32_t now = timer_ms(), ms = 50;
+    if (deadline && due(deadline, now))
         return -ETIMEDOUT;
-    net_sleep(50);
+    if (deadline && deadline - now < ms)
+        ms = deadline - now;        /* (a short timeout ends on time) */
+    net_sleep(ms);
     net_rx_action();
     tcp_timers(timer_ms());
     return 0;
 }
 
-int tcp_connect(struct tcp_conn *c, uint32_t dst, uint16_t port, int nonblock)
+int tcp_connect(struct tcp_conn *c, uint32_t dst, uint16_t port, int nonblock,
+                uint32_t timeout_ms)
 {
     if (c->state == ST_SYN_SENT)
         return nonblock ? -EALREADY : -EINPROGRESS;
@@ -405,11 +412,14 @@ int tcp_connect(struct tcp_conn *c, uint32_t dst, uint16_t port, int nonblock)
     arm(c);
     if (nonblock)
         return -EINPROGRESS;
+    uint32_t deadline = timeout_ms ? (timer_ms() + timeout_ms) | 1 : 0;
     while (c->state == ST_SYN_SENT) {
-        int rc = nap(0, 0);
+        int rc = nap(0, deadline);
         if (rc < 0)                 /* the handshake goes on; connect isn't run
-                                       again (it would find it under way): EINTR */
-            return rc == -ERESTARTSYS ? -EINTR : rc;
+                                       again (it would find it under way): EINTR,
+                                       and when the timeout is over, EINPROGRESS
+                                       (Linux): poll, then SO_ERROR */
+            return rc == -ERESTARTSYS ? -EINTR : rc == -ETIMEDOUT ? -EINPROGRESS : rc;
     }
     if (c->state == ST_CLOSED) {
         int e = c->err;
@@ -480,17 +490,19 @@ uint32_t tcp_buf_max(void)
     return TXBUF > RXBUF ? TXBUF : RXBUF;
 }
 
-int tcp_write(struct tcp_conn *c, const void *src, uint32_t len, int user, int nonblock)
+int tcp_write(struct tcp_conn *c, const void *src, uint32_t len, int user, int nonblock,
+              uint32_t timeout_ms)
 {
     if (!len)
         return 0;
+    uint32_t deadline = timeout_ms ? (timer_ms() + timeout_ms) | 1 : 0;
     for (;;) {
         if (c->err && c->state == ST_CLOSED)
             return c->err;
         if (c->state == ST_SYN_SENT) {
-            int rc = nap(nonblock, 0);
+            int rc = nap(nonblock, deadline);
             if (rc < 0)
-                return rc;
+                return rc == -ETIMEDOUT ? -EAGAIN : rc;     /* SO_SNDTIMEO's answer */
             continue;
         }
         if ((c->state != ST_EST && c->state != ST_CLOSE_WAIT) || c->fin_queued)
@@ -500,9 +512,9 @@ int tcp_write(struct tcp_conn *c, const void *src, uint32_t len, int user, int n
         net_rx_action();            /* ACKs may be waiting in the card's ring */
         if (c->tx_len < TXBUF)
             continue;
-        int rc = nap(nonblock, 0);
+        int rc = nap(nonblock, deadline);
         if (rc < 0)
-            return rc;
+            return rc == -ETIMEDOUT ? -EAGAIN : rc;
     }
     /* room, not TXBUF - tx_len: copy_from_user can sleep (it may demand-page
        an mmap'd file), so a second writer on the same socket -- a fork shares
@@ -553,7 +565,7 @@ int tcp_read(struct tcp_conn *c, void *dst, uint32_t len, int user, int nonblock
             return c->err ? c->err : (c->remote ? 0 : -ENOTCONN);
         int rc = nap(nonblock, deadline);
         if (rc < 0)
-            return rc;
+            return rc == -ETIMEDOUT ? -EAGAIN : rc;     /* SO_RCVTIMEO's answer */
     }
     /* Clamped to RXBUF as well as to rx_len, and consumed before the copy:
        copying can sleep, so a second reader on the same socket can run in

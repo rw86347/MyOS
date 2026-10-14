@@ -40,6 +40,7 @@
 #define EMLINK   31     /* too many links */
 #define EROFS    30     /* read-only file system */
 #define EPIPE    32     /* reading end of the pipe is closed */
+#define EDOM     33     /* argument out of range (a socket timeout's microseconds) */
 #define ERANGE   34     /* result too large (e.g. getcwd buffer) */
 #define E2BIG     7     /* argument list too long */
 #define ENAMETOOLONG 36 /* file name too long */

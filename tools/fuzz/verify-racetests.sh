@@ -30,11 +30,13 @@ run_case() {
     restore
     if ! python3 - "$@" <<'PY'
 import sys
-path, old, new = sys.argv[1], sys.argv[2], sys.argv[3]
+path, pairs = sys.argv[1], sys.argv[2:]     # old new [old new ...]
 s = open(path).read()
-if s.count(old) != 1:
-    sys.exit("patch did not apply to %s (%d matches)" % (path, s.count(old)))
-open(path, 'w').write(s.replace(old, new))
+for old, new in zip(pairs[0::2], pairs[1::2]):
+    if s.count(old) != 1:
+        sys.exit("patch did not apply to %s (%d matches)" % (path, s.count(old)))
+    s = s.replace(old, new)
+open(path, 'w').write(s)
 PY
     then
         # Otherwise the unmodified kernel gets rebuilt, every check passes, and
@@ -102,16 +104,23 @@ run_case "pipe_write claiming room after the copy instead of before it" \
         p->head += k;
         done += k;' || fail=1
 
+# (wait_child reaps since job control, 2026-10-13, and proc_wait4 copies
+# after it returns: the bug is wait_child leaving the zombie, and the reap
+# coming after the copy.)
 run_case "wait4 copying the status before reaping the child" \
     kernel/proc.c \
-    '                me->cstime += cs;
-                reap(c);
-                if (user_status && copy_to_user((void *)user_status, &status, 4) < 0)
-                    return -EFAULT;' \
-    '                me->cstime += cs;
-                if (user_status && copy_to_user((void *)user_status, &status, 4) < 0)
-                    return -EFAULT;
-                reap(c);' || fail=1
+    '            me->cstime += end->stime;
+            reap(c);
+            return 1;' \
+    '            me->cstime += end->stime;
+            return 1;' \
+    '    if (user_status && copy_to_user((void *)user_status, &end.status, 4) < 0)
+        return -EFAULT;' \
+    '    if (user_status && copy_to_user((void *)user_status, &end.status, 4) < 0)
+        return -EFAULT;
+    struct process *z = proc_find(end.pid);
+    if (found == 1 && z && z->state == PROC_ZOMBIE)
+        reap(z);' || fail=1
 
 run_case "getdents64 not holding the entry it is about to read" \
     kernel/syscall.c \
@@ -151,8 +160,14 @@ run_case "read/write not holding the open file across the call" \
         copy.pos = (uint32_t)at;
         use = &copy;
     }
-    int32_t rc = writing ? use->ops->write(use, (const void *)buf, len)
-                         : use->ops->read(use, (void *)buf, len);
+    /* A file may go one way only (sysrq-trigger has no read, /proc/uptime
+       no write, epoll neither): -EINVAL, as on Linux — never a call through
+       NULL, which any program could use to bring the kernel down. Free: the
+       pointer is loaded for the call anyway. */
+    int32_t (*rd)(struct file *, void *, uint32_t) = use->ops->read;
+    int32_t (*wr)(struct file *, const void *, uint32_t) = use->ops->write;
+    int32_t rc = writing ? (wr ? wr(use, (const void *)buf, len) : -EINVAL)
+                         : (rd ? rd(use, (void *)buf, len) : -EINVAL);
     if (rc > 0)
         notify(f->inode, writing ? IN_MODIFY : IN_ACCESS);
     file_put(f);
@@ -164,8 +179,10 @@ run_case "read/write not holding the open file across the call" \
         copy.pos = (uint32_t)at;
         use = &copy;
     }
-    int32_t rc = writing ? use->ops->write(use, (const void *)buf, len)
-                         : use->ops->read(use, (void *)buf, len);
+    int32_t (*rd)(struct file *, void *, uint32_t) = use->ops->read;
+    int32_t (*wr)(struct file *, const void *, uint32_t) = use->ops->write;
+    int32_t rc = writing ? (wr ? wr(use, (const void *)buf, len) : -EINVAL)
+                         : (rd ? rd(use, (void *)buf, len) : -EINVAL);
     if (rc > 0)
         notify(f->inode, writing ? IN_MODIFY : IN_ACCESS);
     return rc;' || fail=1

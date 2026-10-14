@@ -39,6 +39,7 @@ global isr_spurious
 isr_spurious:
     iretq
 
+extern smap_on                  ; paging.c: CR4.SMAP is on
 isr_common:
     ; The direction flag first. An interrupt or fault keeps the interrupted
     ; code's flags, and a program may have DF set at that moment (musl's
@@ -48,6 +49,13 @@ isr_common:
     ; the IDT (a triple fault). C code expects it clear; iretq gives the
     ; program its own flag back. (syscall clears it through SFMASK.)
     cld
+    ; AC too, on a CPU with SMAP: a program may set it, and an interrupt
+    ; can arrive in the middle of a user copy — a handler must not run
+    ; with the user-memory window open. (iretq gives the flag back.)
+    cmp byte [rel smap_on], 0
+    je .ac_shut
+    clac
+.ac_shut:
     push rax
     push rcx
     push rdx

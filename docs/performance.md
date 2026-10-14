@@ -774,3 +774,64 @@ is "everyone may":
 The first try called into `perm.c` on every open (+98); the general inline
 test in the walk cost ~10 more per directory than the x-bits one (stat 1362),
 so the walk keeps its own.
+
+## Stack canaries in the kernel (2026-10-13)
+
+`-fstack-protector-strong` (Makefile: `KERNEL_SSP`): every kernel function
+with a local array, or a local whose address is taken, checks a secret word
+below its return address before returning (a load, a store, a load and a
+compare on the way out). 406 functions on i386, 677 on x86_64 (iwlwifi
+included); kernel code +13 KiB on i386 (2.5%).
+
+`make bench` (QEMU, `-icount`, i386):
+
+| | before | first try | after |
+|---|---|---|---|
+| null syscall, int 0x80 | 129 | 134 | 129 cycles |
+| null syscall, sysenter | 159 | 164 | 159 cycles |
+| open + close (2-part path) | 1667 | 1709 | 1699 cycles (+1.9%) |
+| lseek + read 4 KiB | 1613 | 1623 | 1613 cycles |
+| stat (statx) | 1346 | 1379 | 1374 cycles (+2.1%) |
+| exec + exit | 36875 | 36982 | 36954 cycles (+0.2%) |
+| fork + exec + exit + wait | 91662 | 91818 | 91765 cycles (+0.1%) |
+| thread switch, kmalloc | 97, 72 | same | same |
+
+The first try put a canary on every system call and interrupt: on
+`interrupt_dispatch`, because the crashing-program report (`user_exception`,
+which has a name buffer) was inlined into it, and on `sysenter_dispatch`,
+because it passes `&a6` to `get_user32`. `user_exception` is now
+`noinline` (a cold path anyway), and `sysenter_dispatch` is
+`no_stack_protector` (nothing in it can overrun). What remains is the path
+walk (`walk`, `vfs_lookup*`, `do_open`, `sys_statx`), which copies names a
+program chose into fixed buffers: the place a canary is worth the most.
+
+## ASLR: what moving every program costs (2026-10-14)
+
+Every exec now takes 16 more random bytes and puts the stack, the mmap
+area, a PIE program and the heap at random places (`kernel/usermode.c`).
+
+`make bench` (QEMU, `-icount`, i386; three boots, three random layouts):
+
+| | before | first try | after |
+|---|---|---|---|
+| exec + exit (ELF 'true') | 36954 | 43844 | ~38500 cycles (+4.2%) |
+| fork + exec + exit + wait | 91662 | 98270 | ~93240 cycles (+1.7%) |
+| null syscall, sysenter | 159 | 159 | 160 cycles |
+
+The first try cost ~4,700 cycles per exec in page tables: i386's vsyscall
+page stayed at 0xBFFFF000, the old stack top, where it had shared the
+stack's page table (one per 4 MiB); a stack moved down usually lands under
+another one, so exec built, and exit freed, a page table for that one page.
+Found by turning the parts on one at a time (stack: +4,700; heap, the stack's
+offset within 8 KiB: nothing). Now the vsyscall page sits right above each
+program's stack and moves with it, as Linux's vDSO moves — a fixed runnable
+page was also a gift to an attacker. sysexit's return address can't be a
+constant then: `sysexit_eip` holds it, set when the address space changes
+(`mm_switch`, with CR3) and when exec maps the page: one load per syscall
+(+1). Working it out per syscall from the thread (three dependent loads)
+had cost +10.
+
+What remains is random numbers: AT_RANDOM's 16 bytes and ASLR's 16 make one
+ChaCha20 block (32 bytes of output; `kernel/random.c`) per exec, where
+AT_RANDOM alone took half of one. A refill that makes two or more blocks per
+key would roughly halve that, at the price of more work with interrupts off.

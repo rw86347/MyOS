@@ -491,7 +491,7 @@ static struct tcp_conn *establish(uint16_t *lport)
     struct tcp_conn *c = tcp_open();
     if (!c)
         return NULL;
-    tcp_connect(c, PEER_IP, PEER_PORT, 1);
+    tcp_connect(c, PEER_IP, PEER_PORT, 1, 0);
     pk_pump();
     uint32_t raddr = 0;
     uint16_t rport = 0;
@@ -569,7 +569,7 @@ static void test_tcp(void)
         seg_send(lport, 0x10 /* ACK */, t_their_seq, t_our_seq + t_our_len, NULL, 0);
         pk_pump();
         t_payloads = 0;
-        tcp_write(c, queued, sizeof queued, 0, 1 /* nonblock */);
+        tcp_write(c, queued, sizeof queued, 0, 1 /* nonblock */, 0);
         pk_pump();
         int probed = t_payloads >= 1 && t_payload_n == 1;
         unsigned first = t_payloads;
@@ -595,7 +595,7 @@ static void test_tcp(void)
         t_window = 0;
         seg_send(lport, 0x10, t_their_seq, t_our_seq + t_our_len, NULL, 0);
         pk_pump();
-        tcp_write(c, queued, sizeof queued, 0, 1);
+        tcp_write(c, queued, sizeof queued, 0, 1, 0);
         pk_pump();
         for (int k = 0; k < 14; k++) {  /* comfortably more than PROBES */
             fuzz_clock_add(70000);
@@ -619,7 +619,7 @@ static void test_tcp(void)
         t_window = 0;
         seg_send(lport, 0x10, t_their_seq, t_our_seq + t_our_len, NULL, 0);
         pk_pump();
-        tcp_write(c, queued, sizeof queued, 0, 1);
+        tcp_write(c, queued, sizeof queued, 0, 1, 0);
         pk_pump();
         una = t_our_seq;
         t_window = 0xFFFF;
@@ -642,7 +642,7 @@ static void test_tcp(void)
         t_window = 0;
         seg_send(lport, 0x10, t_their_seq, t_our_seq + t_our_len, NULL, 0);
         pk_pump();
-        tcp_write(c, queued, sizeof queued, 0, 1);
+        tcp_write(c, queued, sizeof queued, 0, 1, 0);
         pk_pump();
         una = t_our_seq;
         for (int k = 0; k < 8; k++) {   /* probe nearly to the limit */
@@ -968,7 +968,7 @@ static int peek_at_a_syn(void)
     struct tcp_conn *c = tcp_open();
     if (!c)
         return 0;
-    tcp_connect(c, PEER_IP, PEER_PORT, 1 /* nonblock */);
+    tcp_connect(c, PEER_IP, PEER_PORT, 1 /* nonblock */, 0);
     pk_pump();
     tcp_release(c);
     drain();

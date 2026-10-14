@@ -19,12 +19,13 @@
 ;        PML4[256] direct map        DIRECTMAP_BASE + (0 .. 1 GiB)  (P2V)
 ;        PML4[511] kernel image      KERNEL_VBASE   + (0 .. 1 GiB)
 ;   3. load CR3, and jump to the high address of the next instruction
+;   4. our GDT and stack, the stack-protector guard, and kernel_main
 ;
 ; Nothing the firmware owns may be touched after step 3 — not even its
 ; stack: it can lie above 1 GiB.
 ;
-; Then our GDT, our stack, and kernel_main. vmm_init (paging.c) replaces
-; these tables with the real ones, which no longer have the identity map.
+; vmm_init (paging.c) then replaces these tables with the real ones,
+; which no longer have the identity map.
 
 [bits 64]
 default rel
@@ -116,6 +117,31 @@ _start:
 
     lea rsp, [boot_stack_top]
     xor ebp, ebp
+
+    ; The stack-protector guard (Makefile: KERNEL_SSP). Every protected C
+    ; function copies __stack_chk_guard below its return address and checks
+    ; it before returning, so it is chosen now, before the first C function
+    ; runs, and never changes. Someone overrunning a kernel stack buffer
+    ; must guess it. Its sources: the cycle counter (how long the firmware
+    ; and the loader took, which varies from boot to boot), mixed with the
+    ; CPU's random number generator (RDRAND, CPUID.1:ECX bit 30), which
+    ; every 64-bit PC we aim at has. The low byte is 0, as on 64-bit Linux:
+    ; a runaway string copy stops at a 0 byte, so it can't write the guard
+    ; back unchanged.
+    rdtsc
+    shl rdx, 32
+    or rax, rdx
+    mov rsi, rax
+    mov eax, 1
+    cpuid                               ; (overwrites EBX, ECX, EDX)
+    bt ecx, 30
+    jnc .no_rdrand
+    rdrand rax                          ; (if it fails: RAX = 0, no harm)
+    xor rsi, rax
+.no_rdrand:
+    and rsi, ~0xFF
+    mov [__stack_chk_guard], rsi
+
     call kernel_main
 
 .hang:
@@ -124,6 +150,13 @@ _start:
     jmp .hang
 
 section .rodata
+; The guard, above. In read-only data: written once, before vmm_init maps
+; the kernel's read-only data read-only — then not even a bad kernel write
+; can set it to a value an attacker knows.
+global __stack_chk_guard
+align 8
+__stack_chk_guard:  dq 0
+
 align 16
 gdt:
     dq 0

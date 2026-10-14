@@ -1,0 +1,23 @@
+/dts-v1/;
+
+/*
+ * Apple platform strings with QEMU virt RAM + PL011 for automated boot test (15b).
+ * Real M1 DTBs use different reg values; m1n1 will pass hardware DTB in x0.
+ */
+/ {
+	compatible = "apple,t8103", "apple,silicon";
+	model = "Apple MacBook Air (M1, 2020) — QEMU harness";
+	#address-cells = <2>;
+	#size-cells = <2>;
+
+	memory@40000000 {
+		device_type = "memory";
+		reg = <0x0 0x40000000 0x0 0x08000000>;
+	};
+
+	uart@9000000 {
+		compatible = "apple,uart", "arm,pl011", "arm,primecell";
+		reg = <0x0 0x09000000 0x0 0x1000>;
+		status = "okay";
+	};
+};

@@ -74,6 +74,9 @@ struct mm {
     struct vma *area;                   /* sorted by start, no overlaps */
     int nareas, cap;                    /* in use, room for */
     user_addr_t brk_start, brk;         /* the heap: [brk_start, brk) */
+    /* Where the mmap area starts and the stack ends: MMAP_BASE and
+       USER_STACK_TOP, each moved by a random amount on exec (ASLR). */
+    user_addr_t mmap_base, stack_top;
 };
 
 void mm_init(void);                     /* after vmm_init() */
@@ -95,7 +98,7 @@ int mm_add(struct mm *mm, user_addr_t start, user_addr_t end, uint32_t flags);
 int mm_add_file(struct mm *mm, user_addr_t start, user_addr_t end, uint32_t flags,
                 struct inode *file, uint32_t file_off, uint32_t file_end);
 
-/* The lowest free stretch of len bytes from MMAP_BASE up, or 0. */
+/* The lowest free stretch of len bytes from mm->mmap_base up, or 0. */
 user_addr_t mm_find_gap(struct mm *mm, user_addr_t len);
 
 /* Remove [start, end) from the areas and unmap its pages. */

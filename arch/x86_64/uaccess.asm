@@ -22,6 +22,24 @@
 default rel
 EFAULT equ 14
 
+; SMAP: open the window to user memory (stac) for one access, and shut it
+; (clac) on every way out, the fault's included. Only when the CPU has SMAP
+; (smap_on, paging.c): stac/clac don't exist before it. A load and a
+; branch the CPU always predicts.
+extern smap_on
+%macro USER_BEGIN 0
+    cmp byte [rel smap_on], 0
+    je %%no
+    stac
+%%no:
+%endmacro
+%macro USER_END 0
+    cmp byte [rel smap_on], 0
+    je %%no
+    clac
+%%no:
+%endmacro
+
 %macro EX_ENTRY 2               ; instruction that may fault, where to go then
   section __ex_table progbits alloc noexec nowrite align=8
     dq %1, %2
@@ -34,6 +52,7 @@ section .text
 ;   Copy n bytes; either side may be user memory. 0, or -EFAULT.
 global __copy_user
 __copy_user:
+    USER_BEGIN
     mov rcx, rdx                ; rdi = dst, rsi = src already: what movs wants
     shr rcx, 3
 .qwords:
@@ -42,9 +61,11 @@ __copy_user:
     and ecx, 7
 .bytes:
     rep movsb                   ; the last 0-7 bytes
+    USER_END
     xor eax, eax
     ret
 .fault:
+    USER_END
     mov eax, -EFAULT
     ret
 EX_ENTRY __copy_user.qwords, __copy_user.fault
@@ -54,12 +75,15 @@ EX_ENTRY __copy_user.bytes, __copy_user.fault
 ;   Read one 32-bit word from user memory. 0, or -EFAULT.
 global __get_user32
 __get_user32:
+    USER_BEGIN
 .load:
     mov eax, [rsi]
+    USER_END
     mov [rdi], eax
     xor eax, eax
     ret
 .fault:
+    USER_END
     mov eax, -EFAULT
     ret
 EX_ENTRY __get_user32.load, __get_user32.fault
@@ -68,12 +92,15 @@ EX_ENTRY __get_user32.load, __get_user32.fault
 ;   Read one 64-bit word (a pointer in an argv array, an iovec). 0, or -EFAULT.
 global __get_user64
 __get_user64:
+    USER_BEGIN
 .load:
     mov rax, [rsi]
+    USER_END
     mov [rdi], rax
     xor eax, eax
     ret
 .fault:
+    USER_END
     mov eax, -EFAULT
     ret
 EX_ENTRY __get_user64.load, __get_user64.fault
@@ -84,6 +111,7 @@ EX_ENTRY __get_user64.load, __get_user64.fault
 ;   write probe is `or [x], 0`: arch/i386/uaccess.asm.)
 global __fault_in_user
 __fault_in_user:
+    USER_BEGIN
     test rsi, rsi
     jz .ok                      ; nothing to touch
     add rsi, rdi                ; one past the end; the caller range-checked,
@@ -97,6 +125,7 @@ __fault_in_user:
     cmp rdi, rsi
     jb .rloop
 .ok:
+    USER_END
     xor eax, eax
     ret
 .wloop:
@@ -108,6 +137,7 @@ __fault_in_user:
     jb .wloop
     jmp .ok
 .fault:
+    USER_END
     mov eax, -EFAULT
     ret
 EX_ENTRY __fault_in_user.rprobe, __fault_in_user.fault
@@ -118,6 +148,7 @@ EX_ENTRY __fault_in_user.wprobe, __fault_in_user.fault
 ;   Returns its length without the NUL, max if no NUL was found, or -EFAULT.
 global __strncpy_user
 __strncpy_user:
+    USER_BEGIN
     xor eax, eax                ; rax = length so far
 .next:
     cmp rax, rdx
@@ -130,8 +161,10 @@ __strncpy_user:
     inc rax
     jmp .next
 .done:
+    USER_END
     ret
 .fault:
+    USER_END
     mov rax, -EFAULT
     ret
 EX_ENTRY __strncpy_user.load, __strncpy_user.fault

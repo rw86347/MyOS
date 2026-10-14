@@ -218,6 +218,23 @@ struct ieee80211_sub_if_data *wifi_sdata_by_dev(struct net_device *dev)
     return dev && dev->netdev_ops == &wifi_netdev_ops ? netdev_priv(dev) : NULL;
 }
 
+int wifi_link_info(struct net_device *dev, int *dbm)
+{
+    struct ieee80211_sub_if_data *sdata = wifi_sdata_by_dev(dev);
+    if (!sdata)
+        return 0;
+    struct wiphy *wiphy = sdata->local->hw.wiphy;
+    int r = 1;
+    wiphy_lock(wiphy);              /* the connection changes under it (mlme.c), and
+                                       freeing the AP's entry can sleep */
+    if (sdata->conn.state == MLME_CONNECTED && sdata->conn.ap) {
+        *dbm = sdata->conn.ap->last_signal;
+        r = 2;
+    }
+    wiphy_unlock(wiphy);
+    return r;
+}
+
 static int if_add(struct ieee80211_local *local, const char *name, enum nl80211_iftype type)
 {
     struct wiphy *wiphy = local->hw.wiphy;
