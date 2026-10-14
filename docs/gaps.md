@@ -146,8 +146,12 @@ most likely to trip over, each item checked in the source on the date above.
   `/proc/net/wireless` has no noise figure and no discard counters (zeros, as Linux
   shows them for cfg80211 cards). The connected line has been seen on the simulated
   radio (`make test`), not yet on the MSI's AX201.
-- **Nothing reads the syslog socket.** `net/unix.c` has UNIX sockets now, but no
-  syslog daemon runs, so login failures still go nowhere.
+- **The system log is plain files, root only** (since 2026-10-14: socklog, the
+  runit way): `/var/log/socklog/current`, 10 MB at most, one log for everything (no
+  separate auth log); read it with `doas cat`. Nothing sends it elsewhere, and the
+  kernel's own messages (`dmesg`) don't go into it (no klogd: socklog's `klog`
+  service needs `/proc/kmsg`, which MyOS doesn't have). Messages sent before it
+  starts, early in boot, are lost (as on Linux without a kernel log buffer for them).
 - **Permissions are checked, the plain Unix way only** (`fs/perm.c`, since
   2026-10-13): owner/group/other bits, the sticky bit, setgid directories, and
   Linux's rules for open, create, delete, rename, chmod, chown, utimensat,

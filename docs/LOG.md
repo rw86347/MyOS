@@ -4033,3 +4033,20 @@ the console and the login screen): no SSH, and the Wi-Fi icon had no
 supplicant to talk to. The five are real symlinks again (git sees no
 change: the link targets are what it stores). Until `core.symlinks` is set
 back to true, a checkout can flatten them again.
+
+## 2026-10-14 — A system log on the live disk
+
+Login, PAM, sshd and doas send their messages to /dev/log (syslog(3)), and
+nothing was listening, so a failed login left no trace anywhere. The live
+disk now runs socklog (Alpine's `socklog`, 31 KB; the live disk has no
+BusyBox, so not its syslogd), the runit way, as Void Linux does:
+`/etc/sv/socklog-unix` binds /dev/log as root and drops to `nobody`; its
+`log` service, runit's own svlogd, writes `/var/log/socklog/current` with a
+timestamp per line, starting a new file at 1 MB and keeping ten, so the log
+never takes more than 10 MB. The directory is root's only (0700): login
+failures are in it.
+Checked on the 64-bit live disk: `/dev/log` is there; `logger` messages
+arrive with their facility; the boot's own PAM messages are in the log
+("session opened for user myos", "LOGIN ON console BY myos", and pam_unix
+noting the empty password). sshd runs again (the symlink repair, above):
+five runsv now, where there were two.
