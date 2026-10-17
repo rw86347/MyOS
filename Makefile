@@ -645,6 +645,11 @@ $(BUILD)/stage2.bin: arch/i386/boot/stage2.asm arch/i386/boot/layout.inc \
 	  -DINITRD_LOAD=$$(( (END - 0xC0000000 + 4095) / 4096 * 4096 )) \
 	  $< -o $@
 
+# The 8x16 font the UEFI loader gives the kernel console (EFI/MYOS/FONT.BIN):
+# taken from QEMU's VGA BIOS on this machine (tools/mkfont.py), not kept here.
+arch/i386/boot/efi/vga-font.bin: tools/mkfont.py
+	python3 tools/mkfont.py $@
+
 # --- disk image --------------------------------------------------------------
 # 1.44 MB of zeros (it grows if the pieces need more), then the pieces one
 # after another. "conv=notrunc" overwrites without shrinking the file;
