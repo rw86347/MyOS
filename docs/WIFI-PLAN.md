@@ -257,7 +257,7 @@ Each step ends with something visible in QEMU, except W7.
   pinned by SHA-256) in `/lib/firmware`; `/etc/wpa_supplicant/
   wpa_supplicant.conf` (control by the netdev group, which every account
   gets; networks saved there); a runit service that waits for wlan0;
-  the tray icon in IceWM's startup. `tools/fetch-live.py --add` pins new
+  the tray icon in IceWM's startup. `live/tools/fetch-live.py --add` pins new
   packages without re-resolving the rest. *Check:* `make ARCH=x86_64
   test-uefi-login` still reaches the X login screen. A machine's own
   network can go in `live/overlay.local/` (never committed): the image

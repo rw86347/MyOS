@@ -10,3 +10,12 @@ make        # build
 make run    # boot in QEMU
 make debug  # boot paused, attach gdb to localhost:1234
 ```
+
+The live and installer disks (the desktop, its programs, the image builders)
+are a second repo, [myos-live](https://github.com/rw86347/myos-live), checked
+out inside this one:
+
+```
+git clone https://github.com/rw86347/myos-live.git live
+make ARCH=x86_64 live-uefi
+```

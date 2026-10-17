@@ -13,12 +13,9 @@ shell, over the serial console, records what event2 says. The machine has
 no PS/2 controller and no USB mouse, so the tablet is the only pointer and
 every event goes to it.
 """
-import importlib.util, json, os, re, shutil, socket, sys, time
+import json, os, shutil, socket, sys, time
 
-spec = importlib.util.spec_from_file_location(
-    "test_install", os.path.join(os.path.dirname(os.path.abspath(__file__)), "test-install.py"))
-ti = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(ti)                 # its Machine: QEMU with a serial console
+import qemu_serial as ti                    # QEMU with a serial console
 
 
 def main():

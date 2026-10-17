@@ -5,10 +5,10 @@ A desktop look for MyOS. It keeps what people liked about the early-2000s deskto
 details to be its own look. MyOS has no graphical desktop yet. This is the design
 to build when it does.
 
-![Golden Hour mockup](../assets/themes/golden-hour/mockup.png)
+![Golden Hour mockup](../live/assets/themes/golden-hour/mockup.png)
 
 Everything here is drawn by one script from one palette:
-`assets/themes/golden-hour/make-theme.py`. Change a color or size there and run
+`live/assets/themes/golden-hour/make-theme.py`. Change a color or size there and run
 it again (it needs `rsvg-convert`, from Homebrew's `librsvg`). Don't edit the
 generated files by hand.
 
@@ -30,7 +30,7 @@ The color tables under "Elements and states" are written by the script too, from
 same table it draws with. Change a color in the script, not in this file.
 | `wallpaper.jpg` | the wallpaper (1152×864, generated) |
 
-The first ideas (`assets/themes/myos-xp-*.jpg`, `start-button-options.*`,
+The first ideas (`live/assets/themes/myos-xp-*.jpg`, `start-button-options.*`,
 `start-button-in-menu.*`) are kept for the record. Shape C was the one picked.
 
 ## What makes it different from the old XP look
@@ -100,7 +100,7 @@ outline `#a87412`); globes `#9fd8ff` → `#1f6fd1` → `#0f3f8a` (radial); scree
 
 ## Login screen
 
-![Login screen](../assets/themes/golden-hour/login.png)
+![Login screen](../live/assets/themes/golden-hour/login.png)
 
 The same wallpaper as the desktop, blurred and tinted dark teal, so the desktop
 seems to come into focus when you log on.
@@ -119,7 +119,7 @@ The colors are in the tables below under "Login background", "Login bands" and "
 
 ## Settings
 
-![Settings: Users](../assets/themes/golden-hour/settings.png)
+![Settings: Users](../live/assets/themes/golden-hour/settings.png)
 
 The Settings window follows the same category order as macOS System Settings,
 without Apple-only items (iCloud, Wallet, Family, and the like). **Wi-Fi is in
@@ -156,7 +156,7 @@ What each part of the screen looks like in each state: active and inactive windo
 hover, pressed, focused, disabled. The colors in the base palette above are the
 starting points; these tables give the exact fill of every element.
 
-![Every element in every state](../assets/themes/golden-hour/ui-states.png)
+![Every element in every state](../live/assets/themes/golden-hour/ui-states.png)
 
 The rules behind the states:
 
@@ -355,7 +355,7 @@ cheaper than drawing outlines on the old PCs.
 
 ## Icons
 
-![All icons](../assets/themes/golden-hour/icon-sheet.png)
+![All icons](../live/assets/themes/golden-hour/icon-sheet.png)
 
 | icon | where it is used |
 |---|---|

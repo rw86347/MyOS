@@ -240,7 +240,7 @@ They do **not** share a kernel binary or a `/usr` tree.
   long-mode hello kernel; portable `kernel/*.c` is not linked yet.
 - **Userland.** One `live/packages.txt` (package *names*).
   `live/packages.x86_64.txt` is only the delta (`!firefox`, `chromium`).
-  `tools/fetch-live.py --arch x86_64` merges them and writes
+  `live/tools/fetch-live.py --arch x86_64` merges them and writes
   `live/packages.x86_64.lock` and `build/live/rootfs-x86_64.tar`. Optional
   files: `live/overlay.x86_64/`, `build/live/extra.x86_64/`. Do not copy
   `live/overlay/` or `live/myos-login/`. MyOS's own programs are compiled

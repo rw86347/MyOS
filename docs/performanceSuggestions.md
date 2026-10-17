@@ -22,7 +22,7 @@ go to `docs/performance.md` (CLAUDE.md, rule 3). Done or decided so far
   QEMU, 1-3 s on a real network, up to 15 s on one that doesn't answer.
 - **C1, the first boot at build time:** done for the UEFI live disk
   (2026-10-17): its login screen is up at 8.6 s in QEMU instead of 15.7 s
-  (`tools/live-prepare.py`). The BIOS live disk still does it at first boot.
+  (`live/tools/live-prepare.py`). The BIOS live disk still does it at first boot.
 - **A1, an installed system without the fallback:** done (2026-10-17): the
   loader's step goes from 1.46 s to 0.01 s in QEMU, and 240 MB of RAM stay
   free. A2 (the stick deciding for itself) not yet: see docs/performance.md.
@@ -312,7 +312,7 @@ and icon caches.
   - **Lost:** nothing. A missing or stale profile only means reading
     as today.
 - **E2. Lay the boot's files out in boot order** when the image is built
-  (`tools/mklivehd.sh`), so those reads are sequential even without a
+  (`live/tools/mklivehd.sh`), so those reads are sequential even without a
   profile.
 - **E3. Sleep instead of shutting down.** `s2idle` or S3
   (docs/power-performance-settings.md): back at the desktop in about a
@@ -579,7 +579,7 @@ Missing:
 | `myos-xsettings` | XSETTINGS for scale, DPI and cursor | labwc's output scale + `XCURSOR_THEME`/`XCURSOR_SIZE` + `~/.config/gtk-3.0/settings.ini` |
 | `myos-login` | starts Xorg, draws with Xlib | first: unchanged, then hands over to the Wayland session. Later: a native greeter |
 | Force Quit (`myos-forcequit`) | `_NET_WM_PID` from the window manager | the panel's toplevel list, plus the client's pid from the compositor |
-| window decorations (the theme) | IceWM theme | a labwc theme made from `assets/themes/golden-hour` |
+| window decorations (the theme) | IceWM theme | a labwc theme made from `live/assets/themes/golden-hour` |
 
 **What gets faster, and how we'll know:**
 - No `XPutImage`: a window's pixels stay in the `memfd` the program drew

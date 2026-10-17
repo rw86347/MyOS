@@ -13,9 +13,9 @@ since 2026-10-10) and BIOS PCs (an MBR, the whole disk; since 2026-10-17).
 `make ARCH=x86_64 test-install` installs from the stick onto an empty NVMe,
 SATA and USB disk and onto the GPD P2 Max's shape; `make test-install`
 (i386) onto an old PC's IDE and SATA disk. Each then starts the new disk
-alone and logs in with the new account (tools/test-install.py). The MSI's
+alone and logs in with the new account (live/tools/test-install.py). The MSI's
 own SSD is still not visible (VMD). The mockups are drawn by
-`assets/themes/golden-hour/make-installer.py`.
+`live/assets/themes/golden-hour/make-installer.py`.
 
 ## What it must do
 
@@ -70,7 +70,7 @@ and Heard & McDonald Islands, which nobody lives on, have none. UTC is
 offered too. The map is the real Earth (the mockup's blobs were a
 placeholder): Natural Earth's public-domain 1:110m coastlines, cut off at
 84°S below the Antarctic stations, made into a C table by
-`tools/make-worldmap.py` (`live/myos-install/worldmap.h`, about 12 KB), and
+`live/tools/make-worldmap.py` (`live/myos-install/worldmap.h`, about 12 KB), and
 drawn equirectangular so every zone's dot sits at its city. A click picks
 the nearest dot. The helper only accepts a zone name made of tzdata's
 characters (no `.`, so no `..`): it copies `/usr/share/zoneinfo/NAME`. The

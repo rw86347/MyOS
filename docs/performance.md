@@ -1032,7 +1032,7 @@ A fresh live disk ran Alpine's install scripts at its first boot (font
 cache, icon caches, MIME database, GLib schemas; `/etc/myos/first-boot.sh`):
 9-14 s in QEMU, minutes on a Pentium 4, on every stick and every install,
 always with the same results. Now `make live-uefi` boots the new image once
-in QEMU with no screen (`tools/live-prepare.py`, 13 s on the build machine):
+in QEMU with no screen (`live/tools/live-prepare.py`, 13 s on the build machine):
 a marker file makes stage 1 run the first boot, delete what must differ
 between machines (`/etc/machine-id`; SSH host keys, which `first-boot.sh`
 no longer makes: sshd's service makes them at its start), and shut down

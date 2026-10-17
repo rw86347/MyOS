@@ -224,7 +224,7 @@ Mark a step `[x]` only when its "Done when" check works.
     draws the Golden Hour login screen, checks the password with PAM and runs the
     session; runit keeps it alive. The desktop wears the same theme
     (`live/theme/make-live-theme.py` writes IceWM's theme and the login screen's
-    pictures from the palette in `assets/themes/golden-hour`).
+    pictures from the palette in `live/assets/themes/golden-hour`).
   - [x] The mockup's Start menu and Start button (`live/myos-menu/myos-menu.c`),
     on Ctrl+Esc, the Windows key or a click; lists only programs that exist.
   - [x] Firefox on the live disk (`[browser]` in `live/packages.txt`): Alpine's

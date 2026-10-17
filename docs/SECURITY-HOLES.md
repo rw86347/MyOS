@@ -72,7 +72,7 @@ person's typing.
 ## 2. Passwords on the live disk
 
 `root` and `myos` are baked in with an empty shadow field
-(`tools/fetch-live.py`). Alpine PAM is built with `nullok`, so
+(`live/tools/fetch-live.py`). Alpine PAM is built with `nullok`, so
 **pam_unix accepts any string** for those accounts: the graphical login,
 `su`, and anything else that uses `base-auth`. `myos-adduser` refuses a
 typed password for an empty account; the login screen does not.
@@ -104,7 +104,7 @@ Any local process of any uid can connect to `/tmp/.X11-unix/X0` and:
 - inject input
 
 SSH into the live user and `DISPLAY=:0 chromium` works for this reason.
-`tools/qemu-desktop.py`'s `xdo` relies on it. The Linux fix is a cookie
+`live/tools/qemu-desktop.py`'s `xdo` relies on it. The Linux fix is a cookie
 only root can read, `X -auth`, and `~/.Xauthority` for the session
 (`docs/gaps.md`, 2026-10-09).
 

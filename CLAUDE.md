@@ -94,7 +94,14 @@ net/           TCP/IP (likely lwIP port)
 include/       headers
 user/          test programs: asm, and C with user/lib (a tiny libc); real musl programs later
 docs/          ROADMAP.md, LOG.md, notes
+live/          the live and installer disks: a repo of its own (myos-live), checked out here;
+               its rules are in live/live.mk, which the Makefile includes when it is present
 ```
+Two repos (2026-10-17): this one, github.com/rw86347/MyOS (the kernel, its tools and tests,
+the docs), and github.com/rw86347/myos-live (the desktop programs, the overlay, the package
+lists, the image builders, assets/themes), cloned into `live/`. WritePerfect is a third
+(github.com/rw86347/writePerfect, all rights reserved: never copy its files into these two);
+the live build reads it from `../wp51/wp51c` (`WP_DIR`).
 Keep all CPU-specific code inside `arch/` from day one so the ARM port stays possible.
 
 ## Conventions

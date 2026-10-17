@@ -19,7 +19,7 @@ Use this note to continue **Phase F** (live desktop on the x86_64 kernel).
 **Commands used:**
 
 ```bash
-python3 tools/fetch-live.py --arch x86_64 --update   # stale gcc apk in lock; re-resolve
+python3 live/tools/fetch-live.py --arch x86_64 --update   # stale gcc apk in lock; re-resolve
 make ARCH=x86_64 build/live/sysroot-x86_64/.done
 make ARCH=x86_64 live-extra
 make ARCH=x86_64 live-login-initrd live-hd live-uefi

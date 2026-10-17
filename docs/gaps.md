@@ -140,7 +140,7 @@ most likely to trip over, each item checked in the source on the date above.
   `/dev/console`: `/dev/tty1`-`tty7` are all that one console, and there is no
   `/dev/ttyS0` node. Alpine's apk was never run against the generated database
   (no Docker).
-- **The live user is made at build time** (`tools/fetch-live.py`, `add_live_user`):
+- **The live user is made at build time** (`live/tools/fetch-live.py`, `add_live_user`):
   shadow's `useradd` and `passwd` lock `/etc/passwd` with a hard link, and the VFS has
   none (each name is its inode). Until `link()` exists they fail. Settings' **Add User…**
   works around it: `/usr/libexec/myos-adduser` (setuid root, `live/myos-settings/
@@ -219,7 +219,7 @@ most likely to trip over, each item checked in the source on the date above.
   `/bin/ls`, `/bin/cp`... as links to it (Debian has separate files). Same code.
   Overlaying one of those names must replace the symlink, never write through it
   (that replaces every applet). So ours are symlinks too: `/bin/rm` and
-  `/usr/bin/rm` point at `/usr/bin/myos-rm` (and `tools/mklivehd.sh` unlinks first
+  `/usr/bin/rm` point at `/usr/bin/myos-rm` (and `live/tools/mklivehd.sh` unlinks first
   anyway). apk puts coreutils' `/bin/rm` back on an upgrade;
   `/etc/apk/commit_hooks.d/myos-rm.post-commit` re-points it after every apk run.
 - **People's `rm` moves to `~/Trash`** (`live/myos-rm`): uid 1000-59999. Root and
