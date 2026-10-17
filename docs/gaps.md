@@ -377,12 +377,15 @@ most likely to trip over, each item checked in the source on the date above.
   mmap area and 2,048 (×512 within 8 KiB) for the stack. Turned off only per
   program, with `personality(ADDR_NO_RANDOMIZE)` (lost on a setuid exec);
   there is no `/proc/sys/kernel/randomize_va_space`.
-- **Disk-file mappings are private copies** (made per page on first touch), not the
-  page cache's pages. Since 2026-10-09, `MAP_SHARED` of a disk file opened for writing
-  fails with ENODEV: as a copy it read stale pages after `write()`, and writes through
-  it never reached the disk. SQLite's memory-mapped I/O falls back to `read()`; LMDB,
-  which needs it, can't run. A read-only open still maps, as a snapshot. The real fix
-  is ROADMAP step 11's single page cache behind both `read()` and `mmap()`. Programs are mapped from their file and paged in on touch, on both CPUs
+- **Only private, read-only use of a disk file's pages is shared with the page cache**
+  (since 2026-10-15: a read fault maps the cache's frame, copy-on-write; docs/performance.md).
+  `MAP_SHARED` of a disk file is still a private copy made per page on first touch, and
+  since 2026-10-09 a disk file opened for writing can't be mapped shared (ENODEV): writes
+  through it never reached the disk. SQLite's memory-mapped I/O falls back to `read()`;
+  LMDB, which needs it, can't run. A read-only open still maps, as a snapshot. The rest
+  of ROADMAP step 11 (a shared, writable map that the cache writes back) is still to do.
+  A private map whose file is truncated keeps the old pages (Linux: SIGBUS past the end).
+  Files in the initramfs and in RAM file systems are still copied page by page. Programs are mapped from their file and paged in on touch, on both CPUs
   (x86_64's loader read the whole file into one buffer until 2026-10-07).
 - **Dynamic linking**: one interpreter level; the interpreter is put at the first free
   place in the mmap area (which starts at a random place: ASLR).

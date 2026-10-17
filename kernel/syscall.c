@@ -2211,12 +2211,10 @@ intptr_t syscall_dispatch(uint32_t nr, uintptr_t a1, uintptr_t a2, uintptr_t a3,
        Many programs try a new call first and fall back to an old one, so
        -ENOSYS is often fine. */
     static uint32_t logged[512 / 32];
-    const char *who = thread_current()->name;
     int again = nr < 512 && (logged[nr / 32] & (1u << (nr % 32)));
-    int watch = who[0] == 'f' && who[1] == 'i' && who[2] == 'r'; /* firefox */
     if (nr < 512 && !again)
         logged[nr / 32] |= 1u << (nr % 32);
-    if (!again || watch)
-        klog("syscall %lu not implemented (%s)\n", nr, who);
+    if (!again)
+        klog("syscall %lu not implemented (%s)\n", nr, thread_current()->name);
     return -ENOSYS;
 }

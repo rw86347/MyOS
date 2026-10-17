@@ -4050,3 +4050,39 @@ arrive with their facility; the boot's own PAM messages are in the log
 ("session opened for user myos", "LOGIN ON console BY myos", and pam_unix
 noting the empty password). sshd runs again (the symlink repair, above):
 five runsv now, where there were two.
+
+## 2026-10-15 — Performance: idle waste, MIT-SHM, page faults, shared library pages
+
+Measured first, then fixed, each with its numbers in docs/performance.md:
+- **The idle desktop** used 3.9% of the CPU and started about 63 programs a
+  minute; now 1.4% and none. The wpa_supplicant service restarted itself
+  every 5 s with no Wi-Fi card (four programs each time); `myos-wifi` woke
+  every 300 ms for an animation that only runs while connecting, and drew
+  its tray icon again every 5 s unchanged; `myos-trash` read its folder
+  every 2 s (now inotify, through GIO). A debugging leftover in the kernel
+  logged every unimplemented system call Firefox made, not once per number.
+- **MIT-SHM is on** (X had it switched off from before MyOS had shared
+  memory): pictures reach X 2.3–2.5× faster, small ones on the screen 6×.
+  systest checks shared memory the way X and a client use it.
+  `tools/xshmbench.c` measures it.
+- **Page faults are counted** (`ru_minflt`, `/proc/<pid>/stat`), and
+  `make bench` times one (1584 cycles for a file page, 1380 for a zero
+  page, about 1000 of it the copy).
+- **Programs share the page cache's pages** of the disk files they run and
+  read: a read fault maps the cache's frame, read-only and copy-on-write,
+  and up to 15 cached pages around it. A GTK program starts 5.4× faster,
+  Python 4.9×, bash 13×, Chromium 2.2×; the idle desktop uses 117 MB less
+  memory; the login screen came up 10 s sooner on the test boot. Writes
+  always make a copy (systest: mprotect, fork, read-only maps, a writing
+  first touch), so no program can change what the others or `read()` see.
+  Chromium found a bug in the first version within a minute: fault-around
+  could sleep (by starting a read-ahead) and then map pages into memory
+  another thread had meanwhile unmapped and reused. Fault-around never
+  sleeps now; Chromium ran four times in four.
+- **The login screen** says how long its start took ("X answered at …, the
+  picture took …"); most of its picture time at boot is waiting for the
+  processor, not drawing. Its rounded corners no longer take a square root
+  per pixel (31 → 23 ms CPU).
+- Tried and reverted: starting the desktop's programs alongside IceWM, not
+  after it. On one processor it took the CPU from the wallpaper and the
+  taskbar: a black screen until 6.5 s instead of the wallpaper at 2.5 s.

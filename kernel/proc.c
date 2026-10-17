@@ -729,7 +729,7 @@ void proc_thread_exit(int status)
 /* What a finished child left: wait4 and waitid report it differently. */
 struct child_end {
     int pid, status;                    /* status in wait4's encoding */
-    uint32_t uid, utime, stime;
+    uint32_t uid, utime, stime, minflt;
 };
 
 /* The waiting wait4 and waitid share: a child that has ended — pid > 0 that
@@ -752,13 +752,13 @@ static int wait_child(int pid, int options, struct child_end *end)
             have_children = 1;
             if (c->state == PROC_ALIVE && (options & WUNTRACED) && c->stop_report) {
                 *end = (struct child_end){ c->pid, 0x7F | c->stop_report << 8, c->cred.uid,
-                                           c->utime, c->stime };
+                                           c->utime, c->stime, 0 };
                 if (!(options & WNOWAIT))
                     c->stop_report = 0;
                 return 2;
             }
             if (c->state == PROC_ALIVE && (options & WCONTINUED) && c->cont_report) {
-                *end = (struct child_end){ c->pid, 0xFFFF, c->cred.uid, c->utime, c->stime };
+                *end = (struct child_end){ c->pid, 0xFFFF, c->cred.uid, c->utime, c->stime, 0 };
                 if (!(options & WNOWAIT))
                     c->cont_report = 0;
                 return 3;
@@ -766,7 +766,8 @@ static int wait_child(int pid, int options, struct child_end *end)
             if (c->state != PROC_ZOMBIE || !(options & WEXITED))
                 continue;
             *end = (struct child_end){ c->pid, c->status, c->cred.uid,
-                                       c->utime + c->cutime, c->stime + c->cstime };
+                                       c->utime + c->cutime, c->stime + c->cstime,
+                                       c->minflt + c->cminflt };
             if (options & WNOWAIT)
                 return 1;
             /* Reap before the caller copies anything out, because the copy
@@ -778,6 +779,7 @@ static int wait_child(int pid, int options, struct child_end *end)
                with a bad pointer as well. */
             me->cutime += end->utime;   /* times(): children's, with theirs */
             me->cstime += end->stime;
+            me->cminflt += end->minflt;
             reap(c);
             return 1;
         }
@@ -799,7 +801,7 @@ int proc_wait4(int pid, uintptr_t user_status, int options, uintptr_t user_rusag
         return found;
     if (user_status && copy_to_user((void *)user_status, &end.status, 4) < 0)
         return -EFAULT;
-    if (user_rusage && rusage_to_user(user_rusage, end.utime, end.stime) < 0)
+    if (user_rusage && rusage_to_user(user_rusage, end.utime, end.stime, end.minflt) < 0)
         return -EFAULT;
     return end.pid;
 }
@@ -844,7 +846,7 @@ int proc_waitid(int idtype, int id, uintptr_t user_info, int options, uintptr_t 
     }
     if (user_info && copy_to_user((void *)user_info, &si, sizeof si) < 0)
         return -EFAULT;
-    if (found && user_rusage && rusage_to_user(user_rusage, end.utime, end.stime) < 0)
+    if (found && user_rusage && rusage_to_user(user_rusage, end.utime, end.stime, end.minflt) < 0)
         return -EFAULT;
     return 0;
 }

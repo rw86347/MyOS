@@ -397,6 +397,24 @@ void pmm_ref(phys_addr_t phys)
     extra_refs[phys / PAGE_SIZE]++;
 }
 
+int pmm_ref_if_room(phys_addr_t phys)
+{
+    int64_t h = high_frame(phys);
+#ifdef HIGHMEM
+    if (h >= 0) {
+        if (high_refs[h] >= 0xFFF0)
+            return 0;
+        high_refs[h]++;
+        return 1;
+    }
+#endif
+    (void)h;
+    if (!extra_refs || extra_refs[phys / PAGE_SIZE] >= 0xFFF0)
+        return 0;
+    extra_refs[phys / PAGE_SIZE]++;
+    return 1;
+}
+
 int pmm_shared(phys_addr_t phys)
 {
     int64_t h = high_frame(phys);

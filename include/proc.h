@@ -71,6 +71,9 @@ struct process {
     /* CPU time in ms (see thread.h): of its threads that have ended, and
        of its children it has waited for (with theirs). */
     uint32_t utime, stime, cutime, cstime;
+    /* Page faults resolved without waiting (Linux's minor faults), its own
+       and those of the children it has waited for: getrusage, ps. */
+    uint32_t minflt, cminflt;
     uint32_t persona;                   /* personality(): 0 = PER_LINUX */
 #define ADDR_NO_RANDOMIZE   0x0040000   /* persona: no ASLR (gdb, setarch -R) */
 /* Persona bits a setuid / setgid program loses (Linux's PER_CLEAR_ON_SETID:
@@ -146,7 +149,7 @@ void proc_thread_exit(int status) __attribute__((noreturn)); /* exit */
 int  proc_wait4(int pid, uintptr_t user_status, int options, uintptr_t user_rusage);
 int  proc_waitid(int idtype, int id, uintptr_t user_info, int options, uintptr_t user_rusage);
 /* Write a struct rusage with these CPU times (ms) to user memory. (sys_info.c) */
-int  rusage_to_user(uintptr_t user, uint32_t user_ms, uint32_t sys_ms);
+int  rusage_to_user(uintptr_t user, uint32_t user_ms, uint32_t sys_ms, uint32_t minflt);
 int  proc_setpgid(int pid, int pgid);
 int  proc_setsid(void);
 /* No member of the group has a parent in another group of its session:

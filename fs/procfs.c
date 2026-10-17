@@ -589,7 +589,8 @@ static void pid_stat(struct gen *g, struct process *p)
     put(g, st), put(g, " ");
     put_u(g, (uint32_t)(p->parent ? p->parent->pid : 0)), put(g, " ");
     put_u(g, (uint32_t)p->pgid), put(g, " "), put_u(g, (uint32_t)p->sid);
-    put(g, " 0 -1 4194304 0 0 0 0 ");                   /* tty, tpgid, flags, faults */
+    put(g, " 0 -1 4194304 "), put_u(g, p->minflt), put(g, " ");    /* tty, tpgid, flags */
+    put_u(g, p->cminflt), put(g, " 0 0 ");          /* minor faults (and children's); major */
     put_u(g, user / 10), put(g, " "), put_u(g, sys / 10), put(g, " ");
     put_u(g, p->cutime / 10), put(g, " "), put_u(g, p->cstime / 10);
     put(g, " 20 0 "), put_u(g, (uint32_t)(p->nthreads ? p->nthreads : 1));

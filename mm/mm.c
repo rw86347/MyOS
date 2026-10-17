@@ -19,7 +19,9 @@
 #include <memlayout.h>
 #include <mm.h>
 #include <paging.h>
+#include <pcache.h>
 #include <pmm.h>
+#include <proc.h>
 #include <string.h>
 #include <sysenter.h>
 #include <thread.h>
@@ -274,7 +276,78 @@ int mm_mincore(user_addr_t start, uint32_t pages, uint8_t *vec)
     return 0;
 }
 
+static int fault(user_addr_t va, uint32_t err);
+
+/* --- disk files' pages, shared with the page cache ------------------------- */
+
+/* Can `page` of area v show the page cache's own frame? Only a whole page
+   of the file's bytes, page-aligned in the file: the zeros after an ELF
+   segment's p_filesz, or after the file's end, must be the program's own.
+   Gives the page number in the file. */
+static int share_index(const struct vma *v, user_addr_t page, uint32_t *index)
+{
+    uint32_t off = v->file_off + (page - v->start);
+    uint32_t limit = v->file_end == ~0u ? v->file->size : v->file_end;
+    if (limit > v->file->size)
+        limit = v->file->size;
+    if ((off & (PAGE_SIZE - 1)) || off >= limit || limit - off < PAGE_SIZE)
+        return 0;
+    *index = off / PAGE_SIZE;
+    return 1;
+}
+
+/* Map the cache's frame at `page`. Read-only, and PTE_COW even where the
+   area itself is read-only: a write — after an mprotect too, which leaves
+   PTE_COW pages read-only — goes to vmm_cow_fault, which copies the page
+   while the cache (or anyone else) still owns it. So no program can ever
+   write the cache's page, which every other program and read() see. */
+static int map_shared(const struct vma *v, user_addr_t page, uint32_t frame)
+{
+    uint32_t flags = PTE_USER | PTE_COW | (v->flags & VM_EXEC ? 0 : PTE_NOEXEC);
+    if (vmm_map(page, frame, flags) < 0) {
+        pmm_free(frame);                /* the owner the cache gave us */
+        return -1;
+    }
+    return 0;
+}
+
+/* Fault-around: the program will most likely touch the pages next to the
+   one it faulted on (code and data are read in runs), and mapping a page
+   the cache already has costs no copy and no disk. So map those of the
+   64 KiB around `page` that are there, and not mapped yet: one fault
+   instead of up to sixteen. Never sleeps. */
+#define AROUND_PAGES 16
+static void fault_around(const struct vma *v, user_addr_t page)
+{
+    user_addr_t span = AROUND_PAGES * PAGE_SIZE;
+    user_addr_t from = page & ~(span - 1), to = from + span;
+    if (from < v->start)
+        from = v->start;
+    if (to > v->end || to < from)
+        to = v->end;
+    for (user_addr_t a = from; a < to; a += PAGE_SIZE) {
+        uint32_t index, frame;
+        if (a == page || vmm_translate(a) || !share_index(v, a, &index))
+            continue;
+        if (!(frame = pcache_map_cached(v->file, index)))
+            continue;
+        if (map_shared(v, a, frame) < 0)
+            return;                     /* out of memory for a page table: stop */
+    }
+}
+
+/* Every fault mm can resolve is a "minor fault" for getrusage and ps
+   (proc.h): one count, then the work. */
 int mm_fault(user_addr_t va, uint32_t err)
+{
+    int r = fault(va, err);
+    struct thread *t = thread_current();
+    if (r == 0 && t->proc)
+        t->proc->minflt++;
+    return r;
+}
+
+static int fault(user_addr_t va, uint32_t err)
 {
     if (va >= USER_ADDR_END)
         return -1;
@@ -318,6 +391,39 @@ int mm_fault(user_addr_t va, uint32_t err)
         uint32_t flags = PTE_USER | PTE_SHARED | (v->flags & VM_WRITE ? PTE_WRITABLE : 0) |
                          (v->flags & VM_EXEC ? 0 : PTE_NOEXEC);
         return vmm_map(page, frame, flags) < 0 ? -1 : 0;
+    }
+
+    /* A disk file's page that the program reads (or runs): the page cache's
+       own frame, shared, not a copy; and the cached pages around it. A
+       first touch that writes still gets its own copy below, at once. */
+    if (!write && v->file && v->file->fs && !(v->flags & VM_SHARED)) {
+        user_addr_t page = PAGE_DOWN(va);
+        uint32_t index, again;
+        if (share_index(v, page, &index)) {
+            /* Reading it in may sleep on the disk. Meanwhile another thread
+               of this process can munmap the area (dropping the file) or
+               fault the same page in: hold the file, and look again. */
+            struct inode *file = v->file;
+            vfs_get(file);
+            uint32_t frame = pcache_map(file, index);
+            v = find(current_mm, va);
+            int same = v && v->file == file && share_index(v, page, &again) && again == index;
+            vfs_put(file);
+            if (frame && (!same || vmm_translate(page))) {
+                pmm_free(frame);
+                return 0;               /* run it again: it faults afresh */
+            }
+            if (frame) {
+                if (map_shared(v, page, frame) < 0)
+                    return -1;
+                fault_around(v, page);
+                return 0;
+            }
+            if (!same)
+                return 0;
+            /* No frame to share (no memory, an I/O error, too many
+               owners): make the program its own copy, as below. */
+        }
     }
 
     /* Demand paging: the first touch of a page in an area creates it —

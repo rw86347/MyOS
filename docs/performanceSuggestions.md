@@ -1,8 +1,21 @@
 # Performance suggestions: making MyOS faster without losing anything
 
 Status: **suggestions** (2026-10-12), each grounded in a measurement or in
-the code as it is today. Nothing here is done yet. Measured results,
-before and after each change, go to `docs/performance.md` (CLAUDE.md, rule 3).
+the code as it is today. Measured results, before and after each change,
+go to `docs/performance.md` (CLAUDE.md, rule 3). Done or decided so far
+(2026-10-15):
+- **G1, MIT-SHM on:** done (2.3–2.5× faster transfers, 6× for small pictures).
+- **B6, faster `exec`:** programs map the page cache's pages of their files
+  instead of copying them, with fault-around (a GTK program starts 5.4×
+  faster, the idle desktop uses ~115 MB less). Read-ahead was there already.
+- **C5, the login screen's cached picture:** not worth it. Its own work is
+  ~240 ms of CPU in QEMU; the rest of its time it waits for the processor
+  (C3 is what would help).
+- **D1, the gap after icewm starts:** starting the programs alongside IceWM
+  made the desktop appear later on one processor (tried, reverted). It is
+  work, not waiting; B6 shortened it.
+- **The idle desktop's wake-ups:** not in this list, but done: 3.9% → 1.4%
+  CPU, no programs started in the background.
 
 The rule for everything below: **no capability is given up**. Every
 fallback, driver, service and program still exists; things are only done:

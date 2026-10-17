@@ -281,7 +281,9 @@ uint32_t pcache_reclaim(uint32_t want)
             if (!p->frame)
                 continue;
             looked++;
-            if (p->readers || (p->flags & P_DIRTY))
+            /* (A page programs have mapped: dropping it frees nothing, the
+               frame stays theirs; and it is a page in use.) */
+            if (p->readers || (p->flags & P_DIRTY) || pmm_shared(p->frame))
                 continue;
             if ((p->flags & P_USED) && round == 0) {
                 p->flags &= ~P_USED;
@@ -578,6 +580,45 @@ static int copy_out(struct inode *ino, uint32_t pos, void *dst, uint32_t n, int 
     irq_restore(flags);
     int done = out - (uint8_t *)dst;
     return done ? done : err;           /* like read(): a short count first */
+}
+
+/* --- pages programs map (pcache.h) ---------------------------------------- */
+
+uint32_t pcache_map(struct inode *ino, uint32_t index)
+{
+    if (!ino->fs || !table)
+        return 0;
+    uint32_t flags = irq_save(), frame = 0;
+    int err = 0;
+    struct pc_page *p = get_read(ino, index, 1, &err);     /* pinned, filled */
+    if (p) {
+        if (p->frame && pmm_ref_if_room(p->frame))
+            frame = p->frame;
+        p->readers--;
+    }
+    irq_restore(flags);
+    return frame;
+}
+
+uint32_t pcache_map_cached(struct inode *ino, uint32_t index)
+{
+    if (!ino->fs || !table)
+        return 0;
+    uint32_t flags = irq_save(), frame = 0;
+    struct pc_page *p = find(id_of(ino), index);
+    /* Not a page the disk is still filling, nor the one that starts the
+       next read-ahead: starting it can sleep (it looks up the file's blocks
+       and lets the disk start), and fault-around must never sleep — another
+       thread could unmap or move the area meanwhile, and the pages would go
+       to whatever is there now. That page gets a real fault, which starts
+       the read-ahead the usual way. */
+    if (p && p->frame && !(p->flags & (P_IO | P_RA))) {
+        p->flags |= P_USED;
+        if (pmm_ref_if_room(p->frame))
+            frame = p->frame;
+    }
+    irq_restore(flags);
+    return frame;
 }
 
 int pcache_read(struct inode *ino, uint32_t pos, void *dst, uint32_t n)

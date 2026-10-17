@@ -107,5 +107,34 @@ int main(int argc, char **argv)
         wait4(pid, 0, 0, 0);
     }
     report_n("fork + exec + exit + wait", rdtsc() - t, P);
+
+    /* Page faults, the cost programs start with (thousands each: a GTK
+       program ~1300, Chromium ~8600, docs/performance.md): the first touch
+       of each page of a mapped file (a private copy of the initramfs's
+       bytes) and of fresh memory (zeros). Each round maps 200 pages,
+       touches them all and unmaps them, so the unmap is in the count.
+       Last: the page tables they leave would slow the forks above. */
+    enum { FP = 200, FR = 10 };
+    int bfd = open("/bin/busybox", O_RDONLY);
+    if (bfd >= 0) {
+        t = rdtsc();
+        for (int r = 0; r < FR; r++) {
+            volatile char *m = mmap(0, FP * 4096, PROT_READ, MAP_PRIVATE, bfd, 0);
+            for (int i = 0; i < FP; i++)
+                (void)m[i * 4096];
+            munmap((void *)m, FP * 4096);
+        }
+        report_n("page fault, file (+unmap)", rdtsc() - t, FR * FP);
+        close(bfd);
+    }
+    t = rdtsc();
+    for (int r = 0; r < FR; r++) {
+        volatile char *m = mmap(0, FP * 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS,
+                                -1, 0);
+        for (int i = 0; i < FP; i++)
+            m[i * 4096] = 1;
+        munmap((void *)m, FP * 4096);
+    }
+    report_n("page fault, zero (+unmap)", rdtsc() - t, FR * FP);
     return 0;
 }

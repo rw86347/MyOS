@@ -35,6 +35,19 @@ int  pcache_too_dirty(void);    /* the writer should flush its file now */
 int pcache_flush(struct inode *ino);    /* write the file's dirty pages; sleeps */
 int pcache_sync(void);                  /* ...every file's */
 
+/* For a program's page fault (mm.c): the frame holding page `index` of the
+   file, read in first if need be (may sleep), with one more owner
+   (pmm_ref) for the program that maps it: the cache's own page, shared, not
+   a copy. The program must map it read-only (a write makes its own copy),
+   and unmapping it gives the owner back (pmm_free). The cache may drop the
+   page meanwhile: the frame then lives on until its last mapping goes.
+   0: none (an I/O error, no memory, too many owners): copy instead. */
+uint32_t pcache_map(struct inode *ino, uint32_t index);
+/* The same, only if the page is in the cache already and needs nothing
+   started: never sleeps or reads the disk (fault-around: the pages next to
+   a fault, which run with the area as the fault found it). */
+uint32_t pcache_map_cached(struct inode *ino, uint32_t index);
+
 /* Forget every cached page of this file, dirty ones too. */
 void pcache_invalidate(struct inode *ino);
 

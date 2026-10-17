@@ -852,12 +852,13 @@ SYSCALL_DEF(sys_times)
 }
 
 /* struct rusage: user and system time (struct timevals: two longs each),
-   then 14 long counters, which stay 0 here (maxrss, page faults, context
-   switches... nothing counts them yet). */
-int rusage_to_user(uintptr_t user, uint32_t user_ms, uint32_t sys_ms)
+   then 14 long counters, of which only ru_minflt is counted here (maxrss,
+   major faults, context switches...: 0). */
+int rusage_to_user(uintptr_t user, uint32_t user_ms, uint32_t sys_ms, uint32_t minflt)
 {
     long ru[18];
     memset(ru, 0, sizeof ru);
+    ru[8] = (long)minflt;               /* ru_minflt */
     ru[0] = (long)(user_ms / 1000);
     ru[1] = (long)(user_ms % 1000) * 1000;
     ru[2] = (long)(sys_ms / 1000);
@@ -874,14 +875,14 @@ SYSCALL_DEF(sys_getrusage)
 {
     struct process *p = proc_current();
     struct thread *t = thread_current();
-    uint32_t user, sys;
+    uint32_t user, sys, flt = p->minflt;   /* (the thread's: its process's) */
     switch ((int32_t)a1) {
     case RUSAGE_SELF:     self_times(p, &user, &sys); break;
-    case RUSAGE_CHILDREN: user = p->cutime; sys = p->cstime; break;
+    case RUSAGE_CHILDREN: user = p->cutime; sys = p->cstime; flt = p->cminflt; break;
     case RUSAGE_THREAD:   user = t->utime; sys = t->stime; break;
     default:              return -EINVAL;
     }
-    return rusage_to_user(a2, user, sys);
+    return rusage_to_user(a2, user, sys, flt);
 }
 
 SYSCALL_DEF(sys_sysinfo)

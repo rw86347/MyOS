@@ -835,3 +835,164 @@ What remains is random numbers: AT_RANDOM's 16 bytes and ASLR's 16 make one
 ChaCha20 block (32 bytes of output; `kernel/random.c`) per exec, where
 AT_RANDOM alone took half of one. A refill that makes two or more blocks per
 key would roughly halve that, at the price of more work with interrupts off.
+
+## The idle desktop: what woke up for nothing (2026-10-14)
+
+Measured on the 64-bit live disk in QEMU, logged in, after 30 s to settle:
+`/proc/stat` over 60 s, and the newest process id (`/proc/loadavg`) before
+and after, which counts the programs started in that minute.
+
+| | before | after |
+|---|---|---|
+| CPU busy, idle desktop | 3.9% (228 of 5857 ticks) | **1.4%** (82 of 5864) |
+| programs started per minute | ~63 | **0** (12 a minute during the first 2 minutes after boot) |
+| `myos-wifi` | 0.2–0.3% | 0.0% |
+| `myos-trash` | read its folder every 2 s | 0.0% |
+
+What it was:
+- **The wpa_supplicant service** (`/etc/sv/wpa_supplicant/run`) with no Wi-Fi
+  card exited every 5 s and was started again by runit: a shell, `iw`, `sed`
+  and `sleep`, about 48 program starts a minute, for ever. Now it waits in
+  one loop, looks at `/proc/net/wireless` with the shell's own `read` (no
+  program), every 5 s for the first 2 minutes after boot and then once a
+  minute. Connected, its "was wlan0 made again?" look (three programs) is
+  every 30 s instead of 5.
+- **`myos-wifi`** ran its "connecting" animation timer every 300 ms whether
+  connecting or not, and drew its tray icon again every 5 s even when nothing
+  had changed (each new picture goes to the X server and makes the panel
+  repaint). The timer now runs only while connecting; the icon is drawn only
+  when its picture or tip would change.
+- **`myos-trash`** read the trash folder every 2 s; the kernel now tells it
+  (inotify, through GIO's file monitor), with the 2 s look kept as the
+  fallback.
+
+Left: `myos-menu` wakes once a second to stay above IceWM's taskbar clock,
+which IceWM restacks every second (0.2%, with Xorg's and IceWM's share of
+answering it), and the kernel's 1000 Hz timer tick (most of the rest; the
+one-shot timer CLAUDE.md plans for, which skips ticks nobody needs).
+
+## MIT-SHM on: pictures through shared memory (2026-10-14)
+
+The X server had MIT-SHM switched off (`10-myos.conf`), from when MyOS had no
+System V shared memory, so every picture a program drew went down the socket
+and was copied by the server again. `kernel/shm.c` has had what the server
+needs for a while; systest's "shm as X uses it" now checks it the way X and a
+client use it (the server attaches the client's segment read-only by id,
+`IPC_STAT` gives owner, mode and attach count, `IPC_RMID` while both are
+attached keeps it until the last detach). The block is gone; GTK (cairo) and
+Imlib2 use the extension by themselves when the server offers it.
+
+`tools/xshmbench.c` (built against the live sysroot, fetched into the live
+disk in QEMU): the same picture sent 30 times (200 for the small one), after
+an untimed first, to a window on the screen and to a pixmap in the server's
+RAM (the transfer alone).
+
+| picture | down the socket | shared memory | |
+|---|---|---|---|
+| 1024×768, to a pixmap | 14.53 ms | 5.77 ms | 2.5× |
+| 1920×1200, to a pixmap | 40.20 ms | 17.75 ms | 2.3× |
+| 256×256, to the screen | 6.75 ms | 1.08 ms | **6.2×** |
+| 1024×768, to the screen | 80.23 ms | 70.73 ms | 1.1× |
+| 1920×1200, to the screen | 210.60 ms | 189.75 ms | 1.1× |
+
+Small pictures (icons, buttons, a line of text: most of what a desktop
+draws) reach the screen six times as fast. Big ones barely change in QEMU,
+because there the time goes into writing QEMU's emulated video memory
+(about 50 MB/s: the shadow framebuffer's copy to `/dev/fb0`). On the MSI the
+framebuffer is real memory, written at GB/s, so the transfer's 2.3–2.5× is
+expected to carry through; to be measured there. Checked on screen: the
+login screen's photograph (Imlib2) and the desktop, icons, tray and clock
+draw as before.
+
+## The login screen and the session: where the start-up time goes (2026-10-15)
+
+`myos-login` now says how its start went, on the console and the serial
+log: "the login screen is up (X answered at 1981 ms, the picture took
+670 ms, shown at 2662 ms)". A one-off breakdown of the picture (wall time /
+the program's own CPU time, ms, 64-bit live disk in QEMU):
+
+| decode | scale | compose | user tile | icons | upload | text |
+|---|---|---|---|---|---|---|
+| 86 / 68 | 92 / 88 | 26 / 24 | 224 / 23 | 1 / 1 | 63 / 21 | 31 / 14 |
+
+About 240 ms is its own work; the rest of the 670 ms it waits for the
+processor, which the boot's other services have (on these test boots,
+which are always a first boot, sshd making its host keys). So caching the
+finished picture (suggestion C5) isn't worth it: 9 MB to read at every
+boot, against a quarter of a second of CPU in QEMU and a few tens of
+milliseconds on the MSI. What would help is C3: the login screen and X get
+the processor first.
+
+The user tile's rounded corners took a floating-point square root per
+pixel (and the whole tile, twice); now squared distances, and only the edge
+band: **31 → 23 ms** of CPU for the tile, the same pixels.
+
+**Starting the desktop's programs alongside IceWM made it slower.** The
+programs (Start menu, tray icons, desktop icons) start 2 s after IceWM,
+because icewm-session runs its startup script only once IceWM says it is
+ready. Started together with IceWM instead (tried 2026-10-15), they began
+0.3 s before it, but on one processor they took the CPU from what is seen
+first: screenshots 1.5–8 s after logging in showed a black screen until
+6.5 s, where the old order has the wallpaper at 2.5 s, the taskbar at 5 s
+and everything at 6.5 s. Reverted. That time is work, not waiting: IceWM,
+the wallpaper, and four GTK programs of ~1300 page faults and copies each.
+Less of it (sharing the page cache's pages, next) is what can shorten it.
+
+## Programs share the page cache's pages (2026-10-15)
+
+Every page a program touched in a disk file (its code, its libraries' code
+and read-only data) used to cost a fault, a fresh frame and a 4 KiB copy
+out of the page cache, and every process kept its own copy of the same
+library pages. A read (or run) fault on a private map of a disk file now
+maps the page cache's own frame (`mm.c`: `share_index`, `map_shared`;
+`pcache.c`: `pcache_map`), with one more owner on the frame (`pmm_ref`), and
+the pages around it that the cache already has (fault-around, 64 KiB,
+`pcache_map_cached`: no copy, no disk). The rules that keep it safe:
+- the page is mapped read-only and PTE_COW, even in a read-only area, so a
+  write (after an mprotect too, which leaves PTE_COW pages read-only) makes
+  the program its own copy (`vmm_cow_fault`: the cache still owns the
+  frame). No program can write the cache's page, which every other program
+  and `read()` see. systest checks mprotect + write, a fork's write, a
+  write to a read-only map (SIGSEGV), a first touch that writes;
+- only whole pages of the file's bytes: the zeros after an ELF segment's
+  p_filesz or the file's end stay each program's own;
+- the cache may drop a page while it is mapped: `pmm_free` only takes its
+  owner away, and the frame lives until the last mapping goes. Reclaim
+  skips mapped pages (dropping them frees nothing);
+- an owner count near its 16-bit limit makes the program copy instead
+  (`pmm_ref_if_room`): a count must never wrap to "free".
+Files in the initramfs and in RAM file systems still copy.
+
+Measured on the 64-bit live disk in QEMU (warm starts, the same three runs
+each as before; faults from the new `ru_minflt` / `/proc/<pid>/stat`):
+
+| program | page faults | start |
+|---|---|---|
+| a GTK program (no display: loads its ~50 libraries) | 1288 → **613** | 0.19 → **0.035 s** (5.4×) |
+| `python3 -c pass` | 1437 → **978** | 0.46 → **0.09 s** (4.9×) |
+| `chromium --version` | 8597 → **5228** | 0.54 → **0.24 s** (2.2×) |
+| `bash -c true` | 286 → **113** | 0.066 → **0.005 s** (13×) |
+
+The idle desktop uses **117 MB less memory** (584 → 468 MB: MemTotal less
+MemFree, after logging in): the libraries' pages are there once. The boot
+got faster with it: the login screen was up at 14.9 s (24–30 s before on
+these test boots), X answering after 1.31 s (1.9–2.4 s).
+
+A bug the live disk found at once: Chromium crashed in two of three runs (a
+thread reading garbage, in ICU). Fault-around started the next read-ahead
+when it passed the page marked for it, and that can sleep (it looks up the
+file's blocks, and lets the disk start); another thread of the program then
+unmapped or moved memory, and fault-around went on mapping file pages into
+whatever was there now, such as memory Chromium's allocator had just taken
+back and expected to be zeros. Fault-around now never sleeps: it leaves that
+page to a real fault. Then Chromium ran four times in four, with no CPU
+exception logged; a second measurement gave 0.025 s for the GTK program,
+0.075 s for Python, 0.17 s for Chromium and 0.003 s for bash, and 112 MB
+less memory in use.
+
+The kernel's own benchmark doesn't change (`make bench` runs from the
+initramfs, which still copies); counting the fault costs 2–5 cycles of it
+(1584 → 1589, 1380 → 1382). `make bench`'s new lines give the cost of
+one fault there, for reference: 1584 cycles for a file page, 1380 for a
+zero page, each with its share of the unmap; about 1000 of either is the
+4 KiB copy or clear.

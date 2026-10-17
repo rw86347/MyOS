@@ -41,7 +41,7 @@ enum { S_read = 0, S_write = 1, S_open = 2, S_close = 3, S_lseek = 8, S_mmap = 9
        S_setresuid = 117, S_utimensat = 280, S_faccessat2 = 439,
        S_setgroups = 116, S_setgid = 106,
        S_mount = 165, S_umount2 = 166, S_nanosleep = 35,
-       S_brk = 12, S_dup2 = 33, S_execve = 59, S_setsid = 112, S_setpgid = 109 };
+       S_brk = 12, S_dup2 = 33, S_execve = 59, S_setsid = 112, S_setpgid = 109, S_geteuid = 107 };
 enum { F_GETLK = 5, F_SETLK = 6 };
 #else
 #define X64 0
@@ -71,7 +71,7 @@ enum { S_read = 3, S_write = 4, S_open = 5, S_close = 6, S_lseek = 19, S_mmap = 
        S_rename = 38, S_setresuid = 208 /* setresuid32 */, S_utimensat = 320,
        S_faccessat2 = 439, S_setgroups = 206 /* setgroups32 */,
        S_setgid = 214 /* setgid32 */, S_mount = 21, S_umount2 = 52, S_nanosleep = 162,
-       S_brk = 45, S_dup2 = 63, S_execve = 11, S_setsid = 66, S_setpgid = 57 };
+       S_brk = 45, S_dup2 = 63, S_execve = 11, S_setsid = 66, S_setpgid = 57, S_geteuid = 201 /* geteuid32 */ };
 enum { F_GETLK = 12, F_SETLK = 13 };    /* the flock64 ones (musl) */
 #endif
 
@@ -466,6 +466,65 @@ static void t_shm(void)                 /* the direct calls, on both CPUs */
     wait_child(pid);
     check(id >= 0 && (long)p > 0 && p[1] == 'c', "shmget/shmat direct", (long)p);
     check(SC1(S_shmdt, p) == 0 && SC3(S_shmctl, id, IPC_RMID, 0) == 0, "shmdt + shmctl", 0);
+}
+
+/* MIT-SHM the way the X server and a client use it (G1 in
+   docs/performanceSuggestions.md): the client makes a segment and draws in
+   it; the server attaches it by id, read-only, and checks its owner and
+   mode with IPC_STAT; the client removes it while both still have it, and
+   it lives until the last detach. */
+#define SHM_RDONLY 010000
+static void t_shm_xlike(void)
+{
+    const long size = 64 * 1024;
+    long id = SC3(S_shmget, IPC_PRIVATE, size, IPC_CREAT | 0600);
+    unsigned char *p = (unsigned char *)SC3(S_shmat, id, 0, 0);
+    if (id < 0 || (unsigned long)p > -4096ul) {
+        check(0, "shm as X uses it: create and attach", id < 0 ? id : (long)p);
+        return;
+    }
+    for (long k = 0; k < size; k++)
+        p[k] = (unsigned char)(k * 7);              /* the client's pixels */
+    int go[2], back[2];
+    SC1(S_pipe, go);
+    SC1(S_pipe, back);
+    long pid = SC0(S_fork);
+    if (pid == 0) {                                 /* the server */
+        SC1(S_shmdt, p);                            /* (fork's copy of the client's) */
+        const unsigned char *q = (const unsigned char *)SC3(S_shmat, id, 0, SHM_RDONLY);
+        char c = 'a';
+        SC3(S_write, back[1], &c, 1);               /* attached */
+        SC3(S_read, go[0], &c, 1);                  /* the client has removed it */
+        int ok = (unsigned long)q <= -4096ul;
+        for (long k = 0; ok && k < size; k++)
+            ok = q[k] == (unsigned char)(k * 7);
+        SC1(S_shmdt, q);
+        child_exit(ok ? 0 : 1);
+    }
+    char c;
+    SC3(S_read, back[0], &c, 1);
+    uint64_t ds[16] = { 0 };                        /* struct shmid64_ds */
+    long st = SC3(S_shmctl, id, IPC_STAT | IPC_64, ds);
+    const unsigned char *b = (const unsigned char *)ds;
+    uint32_t cuid = *(const uint32_t *)(b + 12), mode = *(const uint16_t *)(b + 20);
+    unsigned long segsz = X64 ? *(const uint64_t *)(b + 48) : *(const uint32_t *)(b + 36);
+    unsigned long nattch = X64 ? *(const uint64_t *)(b + 88) : *(const uint32_t *)(b + 72);
+    check(st == 0 && cuid == (uint32_t)SC0(S_geteuid) && (mode & 0777) == 0600 &&
+          segsz == (unsigned long)size && nattch == 2,
+          "shm as X uses it: IPC_STAT says owner, mode 0600, size, two attached",
+          st ? st : (long)nattch);
+    long rm = SC3(S_shmctl, id, IPC_RMID, 0);       /* while both have it */
+    SC3(S_write, go[1], &c, 1);
+    int status = wait_child(pid);
+    SC1(S_shmdt, p);
+    long again = SC3(S_shmat, id, 0, SHM_RDONLY);   /* the last detach freed it */
+    check(rm == 0 && status == 0 && again == -EINVAL,
+          "shm as X uses it: the server reads every pixel, read-only, after IPC_RMID; "
+          "gone after the last detach", status ? status : again);
+    SC1(S_close, go[0]);
+    SC1(S_close, go[1]);
+    SC1(S_close, back[0]);
+    SC1(S_close, back[1]);
 }
 
 /* --- the direction flag ------------------------------------------------------ */
@@ -1539,6 +1598,102 @@ static void t_restart(void)
           with != 1 ? with : without);
 }
 
+/* --- a disk file's pages, shared with the page cache ---------------------- */
+
+/* Since 2026-10-15 a read fault on a private map of a disk file maps the
+   page cache's own frame (mm.c, share_index): never writable through the
+   map, so every write — after mprotect, in a fork, a first touch that
+   writes — must make the program its own copy and leave the file, read()
+   and other maps as they were. On /data (ext2, i386's make test). */
+#define MAP_PRIVATE_ 0x02
+static long minflt(void)
+{
+    long ru[18] = { 0 };
+    SC2(S_getrusage, 0, ru);
+    return ru[8];
+}
+
+static unsigned char file_byte(long fd, long at)
+{
+    unsigned char c = 0;
+    SC3(S_lseek, fd, at, 0);
+    SC3(S_read, fd, &c, 1);
+    return c;
+}
+
+static void t_mmap_shared(void)
+{
+    const char *path = "/data/mmtest";
+    long fd = SC3(S_open, path, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0)
+        return;                         /* no /data here (x86_64's tests): nothing to do */
+    static unsigned char page[4096];
+    const long npages = 64;             /* (and a partial last page, below) */
+    for (long k = 0; k < npages; k++) {
+        fill(page, (int)(k + 1), sizeof page);
+        SC3(S_write, fd, page, sizeof page);
+    }
+    fill(page, 0x77, 100);
+    SC3(S_write, fd, page, 100);
+    const long len = (npages + 1) * 4096;
+
+    /* 1. Read-only: the file's bytes; zeros past its end. Fault-around:
+       touching all 64 pages takes about one fault per 16 (the file is in
+       the cache: we just wrote it). */
+    unsigned char *p = (unsigned char *)SC6(S_mmap, 0, len, 1, MAP_PRIVATE_, fd, 0);
+    if ((unsigned long)p > -4096ul) {
+        check(0, "mmap of a disk file", (long)p);
+        return;
+    }
+    long f0 = minflt(), ok = 1;
+    for (long k = 0; k < npages; k++)
+        ok &= p[k * 4096] == (unsigned char)(k + 1) && p[k * 4096 + 4095] == (unsigned char)(k + 1);
+    long faults = minflt() - f0;
+    ok &= p[npages * 4096 + 99] == 0x77 && p[npages * 4096 + 100] == 0;
+    check(ok && faults <= 8, "disk file map: the file's bytes, zeros past its end, "
+          "about one fault per 16 pages", faults);
+
+    /* 2. mprotect to writable, write: ours only. */
+    long q_addr = SC6(S_mmap, 0, len, 1, MAP_PRIVATE_, fd, 0);
+    unsigned char *q = (unsigned char *)q_addr;
+    long mp = SC3(S_mprotect, p, len, 3);
+    p[0] = 'X';
+    p[4096 * 5 + 7] = 'Y';
+    check(mp == 0 && p[0] == 'X' && p[4096 * 5 + 7] == 'Y' && q[0] == 1 &&
+          q[4096 * 5 + 7] == 6 && file_byte(fd, 0) == 1 && file_byte(fd, 4096 * 5 + 7) == 6,
+          "disk file map: mprotect + write changes our copy, not the file or another map", mp);
+
+    /* 3. A fork writes its own copy; 4. a read-only map can't be written. */
+    long pid = SC0(S_fork);
+    if (pid == 0) {
+        SC3(S_mprotect, q, len, 3);
+        q[4096 * 9] = 'C';
+        child_exit(q[4096 * 9] == 'C' ? 0 : 1);
+    }
+    int st_fork = wait_child(pid);
+    pid = SC0(S_fork);
+    if (pid == 0) {
+        ((volatile unsigned char *)q)[4096 * 10] = 'W';     /* PROT_READ: SIGSEGV */
+        child_exit(0);
+    }
+    int st_ro = wait_child(pid);
+    check(st_fork == 0 && q[4096 * 9] == 10 && file_byte(fd, 4096 * 9) == 10 &&
+          (st_ro & 0x7F) == 11 && q[4096 * 10] == 11 && file_byte(fd, 4096 * 10) == 11,
+          "disk file map: a fork's write is its own; a read-only map can't be written",
+          st_fork ? st_fork : st_ro);
+
+    /* 5. A first touch that writes: a private copy at once. */
+    unsigned char *r = (unsigned char *)SC6(S_mmap, 0, len, 3, MAP_PRIVATE_, fd, 0);
+    r[4096 * 20] = 'Z';
+    check((unsigned long)r <= -4096ul && r[4096 * 20] == 'Z' && q[4096 * 20] == 21 &&
+          file_byte(fd, 4096 * 20) == 21, "disk file map: a writing first touch is private", 0);
+    SC2(S_munmap, p, len);
+    SC2(S_munmap, q, len);
+    SC2(S_munmap, r, len);
+    SC1(S_close, fd);
+    SC1(S_unlink, path);
+}
+
 /* --- umount: a disk file system comes off, and back --------------------- */
 
 #define EBUSY 16
@@ -1794,6 +1949,7 @@ void cmain(long *sp)
     t_sem();
     t_msg();
     t_shm();
+    t_shm_xlike();
     t_dirflag();
     t_inotify();
     t_locks();
@@ -1801,6 +1957,7 @@ void cmain(long *sp)
     t_perm();
     t_protnone();
     t_fileperm();
+    t_mmap_shared();
     t_umount();
     t_restart();
     t_jobctl();

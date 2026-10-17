@@ -28,6 +28,9 @@ uint32_t pmm_alloc_run(uint32_t pages);
 void     pmm_free(phys_addr_t phys); /* drop one owner; freed when none left */
 void     pmm_refs_init(void);        /* after vmm_init(): sharing, the high zone */
 void     pmm_ref(phys_addr_t phys);  /* one more owner (copy-on-write) */
+/* One more owner, if the count has room: 1, or 0 (then the caller copies
+   the page instead of sharing it; a count must never wrap to "free"). */
+int      pmm_ref_if_room(phys_addr_t phys);
 int      pmm_shared(phys_addr_t phys);  /* more than one owner? */
 phys_addr_t pmm_alloc_user(void);    /* a frame for a program's private page */
 uint32_t pmm_free_count(void);       /* frames currently free (both zones) */
