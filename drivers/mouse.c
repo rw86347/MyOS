@@ -117,16 +117,21 @@ static void mouse_irq(struct regs *r)
     e.dx = (int16_t)(packet[1] - ((packet[0] << 4) & 0x100));   /* bit 4: dx < 0 */
     e.dy = (int16_t)(packet[2] - ((packet[0] << 3) & 0x100));   /* bit 5: dy < 0 */
     e.wheel = packet_size == 4 ? (int8_t)(packet[3] << 4) >> 4 : 0;   /* 4-bit signed */
-    evdev_mouse(&e);                    /* /dev/input/event1 (X) */
+    mouse_report(&e);
+}
+
+/* --- for the rest of the kernel ------------------------------------------------- */
+
+void mouse_report(const struct mouse_event *e)
+{
+    evdev_mouse(e);                     /* /dev/input/event1 (X) */
     if (head - tail == RING)
         return;                         /* nobody reads: keep the oldest */
-    ring[head % RING] = e;
+    ring[head % RING] = *e;
     head++;
     if (listener)
         listener();
 }
-
-/* --- for the rest of the kernel ------------------------------------------------- */
 
 int mouse_get(struct mouse_event *e)
 {
@@ -148,8 +153,11 @@ void mouse_set_listener(void (*fn)(void))
 int mouse_init(void)
 {
     /* Interrupts are still off: everything here is polled. */
-    while (inb(STATUS) & ST_OUT_FULL)
+    for (int n = 0; inb(STATUS) & ST_OUT_FULL; n++) {
+        if (n == 16)
+            return -1;                  /* no controller (keyboard_init) */
         inb(DATA);                      /* stale bytes from the BIOS */
+    }
     if (ctrl_cmd(0xA8) < 0)             /* AUX port on */
         return -1;
 

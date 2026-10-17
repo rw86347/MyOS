@@ -718,6 +718,56 @@ static void print_ip(const char *label, uint32_t ip)
             (unsigned)(ip >> 8) & 0xFF, (unsigned)ip & 0xFF);
 }
 
+/* eth0's address is settled (a lease, or the fixed fallback): keep it with
+   the device, use it if eth0 is still the one IPv4 runs on (Wi-Fi may have
+   come up meanwhile), and say so. */
+static void eth0_settled(struct net_device *dev, const struct dhcp_lease *l)
+{
+    dev->in4.addr = l->addr;
+    dev->in4.mask = l->mask;
+    dev->in4.gw = l->gw;
+    dev->in4.dns = l->dns;
+    if (eth == dev) {
+        ipv4_addr = l->addr;
+        ipv4_mask = l->mask;
+        ipv4_gw = l->gw;
+        ipv4_dns = l->dns;
+    }
+    int bits = 0;
+    for (uint32_t m = l->mask; m & 0x80000000u; m <<= 1)
+        bits++;
+    print_ip("ipv4: eth0 is ", l->addr);
+    klog("/%d", bits);
+    print_ip(" gateway ", l->gw);
+    print_ip(" dns ", l->dns);
+    klog("\n");
+}
+
+/* DHCP for eth0, or QEMU's fixed addresses if nobody answers. */
+static void eth0_lease(struct net_device *dev)
+{
+    struct dhcp_lease l;
+    if (dhcp_lease(dev, &l) < 0) {
+        print_ip("dhcp: no answer, using ", IPV4_ADDR_STATIC);
+        klog("\n");
+        l = (struct dhcp_lease){ IPV4_ADDR_STATIC, IPV4_MASK_STATIC, IPV4_GW_STATIC,
+                                 IPV4_DNS_STATIC };
+    }
+    eth0_settled(dev, &l);
+}
+
+/* At boot, in a thread of its own: the exchange takes a while (1 s in QEMU,
+   1-3 s on a real network, all of DHCP_TRIES on one that never answers),
+   and the boot needn't wait for it. The address arrives while runit and X
+   start; a program that wants the network meanwhile is where it would be
+   on a slow network (the DNS server comes live from /proc/net/dns). */
+static void eth0_lease_thread(void *arg)
+{
+    irq_save();                         /* (like the net thread: no interrupt races it) */
+    eth0_lease(arg);
+    thread_exit();
+}
+
 void ipv4_init(void)
 {
     /* Unguessable before the first packet: the IP ID counters start at a
@@ -726,26 +776,19 @@ void ipv4_init(void)
     ident_key = random_u32();
     rl_key = random_u32();
     /* The handlers first, always: a machine whose only network is Wi-Fi has
-       no eth0 now and needs them later; with eth0, the reply to our own
-       first broadcast arrives inside dhcp_configure. */
+       no eth0 now and needs them later; with eth0, the replies to the DHCP
+       exchange arrive through them. */
     dev_add_pack(&arp_pt);
     dev_add_pack(&ip_pt);
     eth = dev_get_by_name("eth0");
     if (!eth)
         return;
-    dhcp_configure();
-    eth->in4.addr = ipv4_addr;
-    eth->in4.mask = ipv4_mask;
-    eth->in4.gw = ipv4_gw;
-    eth->in4.dns = ipv4_dns;
-    int bits = 0;
-    for (uint32_t m = ipv4_mask; m & 0x80000000u; m <<= 1)
-        bits++;
-    print_ip("ipv4: eth0 is ", ipv4_addr);
-    klog("/%d", bits);
-    print_ip(" gateway ", ipv4_gw);
-    print_ip(" dns ", ipv4_dns);
-    klog("\n");
+#if defined(SELFTEST) || defined(BENCH)
+    eth0_lease(eth);                    /* their network tests start at once */
+#else
+    if (!thread_create("ipconfig", eth0_lease_thread, eth))
+        eth0_lease(eth);                /* no thread: wait for it, as it used to */
+#endif
 }
 
 /* --- which device IPv4 runs on ------------------------------------------------- */

@@ -19,9 +19,9 @@
 #     256), IDE disks
 #   - "VGA" display = QEMU's std VGA (Bochs, 1234:1111): MyOS's DRM driver
 #     switches it to 1920x1200 with a pixel console and /dev/fb0
-#   - USB off and the PS/2 controller on: with USB on, UTM gives the machine
-#     a USB keyboard (and with "PS/2" unticked removes the PS/2 controller
-#     altogether) — MyOS only has a PS/2 keyboard driver so far
+#   - USB off and the PS/2 controller on, as the old PCs have it (their USB
+#     is UHCI/EHCI, which MyOS doesn't drive; its USB keyboards, mice and
+#     tablets need xHCI)
 #   - an Intel e1000 network card, in one of UTM's three QEMU network modes
 #     (--net, default "shared"):
 #       shared    Apple's vmnet, NAT'd behind the Mac. A real router: it
@@ -59,10 +59,27 @@
 #     Audio with UTM's duplex codec (drivers/sound)
 #   - two disks: the live system (changes kept in it), and an empty 32 GB
 #     one to install MyOS on (made once; a rebuild keeps it)
+#
+#   tools/mkutm.sh --x86_64 --usb-stick build/x86_64/myos-live-uefi.img "out.utm"
+#
+# installs the way a real laptop does: the live system is a USB stick on
+# UTM's USB 3 bus (a NEC xHCI), started from first, and the empty disk is
+# NVMe, as in the GPD P2 Max. With USB on, UTM puts its USB keyboard, mouse
+# and tablet on a *USB 2* controller of its own (QEMU's -usb: EHCI and
+# UHCI), which MyOS doesn't drive, and its xHCI gets only the stick and its
+# USB-sharing slots. So the machine also gets a keyboard and a tablet on
+# the xHCI (QEMU sends keys to the keyboard made last, and the pointer to
+# the tablet the system reads), and the tablet is how UTM hands over the
+# Mac's pointer without capturing it (drivers/hid/hid.c, /dev/input/event2).
+# Found 2026-10-17 from UTM's own debug log (--debug-port turns it on).
+# After installing, move the NVMe disk above the USB drive in UTM's settings
+# (Drives): the firmware starts the first one. (Removing the USB drive there
+# deletes its image.)
 set -e
 installed=0
 replace_disk=0
 x64=0
+usb_stick=0
 memory=256
 net=Shared
 debug_port=
@@ -70,6 +87,7 @@ while :; do
     case "$1" in
     --installed) installed=1; shift ;;
     --x86_64) x64=1; installed=1; replace_disk=1; memory=4096; shift ;;
+    --usb-stick) usb_stick=1; shift ;;
     # Overwrite the system disk even if this VM already exists. Default for
     # --installed is to keep it (your files). The live image is the software
     # on the disk, so `make utm-live` always replaces it.
@@ -98,11 +116,22 @@ done
 img=$1
 out=$2
 [ -f "$img" ] && [ -n "$out" ] || {
-    echo "usage: $0 [--installed] [--net shared|emulated|bridged] [--debug-dir DIR] disk.img out.utm [uuid]" >&2
+    echo "usage: $0 [--installed | --x86_64 [--usb-stick]] [--net shared|emulated|bridged] [--debug-port PORT] disk.img out.utm [uuid]" >&2
     exit 1; }
 MKE2FS=${MKE2FS:-/opt/homebrew/opt/e2fsprogs/sbin/mke2fs}
 
-if [ $x64 = 1 ]; then
+if [ $usb_stick = 1 ] && [ $x64 = 0 ]; then
+    echo "$0: --usb-stick is for --x86_64 (a UEFI machine)" >&2
+    exit 1
+fi
+DISK_IF=IDE TARGET_IF=IDE USB_BUS=Disabled
+if [ $usb_stick = 1 ]; then
+    DISK_IF=USB TARGET_IF=NVMe USB_BUS=3.0
+fi
+if [ $usb_stick = 1 ]; then
+    VM_UUID=${3:-8F3D6A21-C47B-4E95-9B0A-1D5E7C2F64B8}
+    DISK_UUID=7D2E4A91-3B6C-4F05-9A18-E5C0B7D24F66
+elif [ $x64 = 1 ]; then
     VM_UUID=${3:-0C6F4B2A-9E1D-4C37-B85A-64F2D1E0A9C3}
     DISK_UUID=7D2E4A91-3B6C-4F05-9A18-E5C0B7D24F66
 elif [ $installed = 1 ]; then
@@ -155,7 +184,7 @@ if [ $x64 = 1 ]; then
 			<key>ImageType</key>
 			<string>Disk</string>
 			<key>Interface</key>
-			<string>IDE</string>
+			<string>$TARGET_IF</string>
 			<key>InterfaceVersion</key>
 			<integer>1</integer>
 			<key>ReadOnly</key>
@@ -200,9 +229,31 @@ else
 fi
 
 EXTRA_ARGS=
+DEBUG_LOG="<false/>"
+if [ -n "$debug_port" ]; then
+    # UTM's own log too (in the VM's Data/): the QEMU command line it built
+    # and what QEMU printed.
+    DEBUG_LOG="<true/>"
+fi
+if [ $usb_stick = 1 ]; then
+    # The keyboard and tablet on UTM's xHCI ("usb-controller-0", UTM's name
+    # for its first USB controller). It has 4 ports, and with the stick and
+    # UTM's 3 USB-sharing slots there are 6 devices: QEMU would add a hub by
+    # itself once down to its last free port, and MyOS has no hub driver yet
+    # (docs/gaps.md, USB). 8 ports: no hub.
+    EXTRA_ARGS="
+			<string>-global</string>
+			<string>nec-usb-xhci.p2=8</string>
+			<string>-global</string>
+			<string>nec-usb-xhci.p3=8</string>
+			<string>-device</string>
+			<string>usb-kbd,bus=usb-controller-0.0</string>
+			<string>-device</string>
+			<string>usb-tablet,bus=usb-controller-0.0</string>"
+fi
 if [ -n "$debug_port" ]; then
     serial_port=$((debug_port + 1))
-    EXTRA_ARGS="
+    EXTRA_ARGS="$EXTRA_ARGS
 			<string>-monitor</string>
 			<string>tcp:127.0.0.1:$debug_port,server,nowait</string>
 			<string>-serial</string>
@@ -243,7 +294,7 @@ cat > "$out/config.plist" <<EOF
 			<key>ImageType</key>
 			<string>Disk</string>
 			<key>Interface</key>
-			<string>IDE</string>
+			<string>$DISK_IF</string>
 			<key>InterfaceVersion</key>
 			<integer>1</integer>
 			<key>ReadOnly</key>
@@ -265,7 +316,7 @@ $DATA_DRIVE
 		<key>MaximumUsbShare</key>
 		<integer>3</integer>
 		<key>UsbBusSupport</key>
-		<string>Disabled</string>
+		<string>$USB_BUS</string>
 		<key>UsbSharing</key>
 		<false/>
 	</dict>
@@ -292,7 +343,7 @@ $DATA_DRIVE
 		<key>BalloonDevice</key>
 		<false/>
 		<key>DebugLog</key>
-		<false/>
+		$DEBUG_LOG
 		<key>Hypervisor</key>
 		<false/>
 		<key>PS2Controller</key>

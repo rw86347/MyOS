@@ -214,7 +214,7 @@ BENCH_SRCS := kernel/bench.c
 C_SRCS  := $(filter-out $(TEST_SRCS) $(BENCH_SRCS), \
              $(wildcard arch/i386/*.c kernel/*.c drivers/*.c fs/*.c mm/*.c net/*.c \
                         drivers/gpu/drm/*.c drivers/gpu/drm/tiny/*.c drivers/video/*.c \
-                        drivers/usb/*.c drivers/sound/*.c net/wireless/*.c))
+                        drivers/usb/*.c drivers/hid/*.c drivers/sound/*.c net/wireless/*.c))
 ifeq ($(MODE),test)
   C_SRCS += $(TEST_SRCS)
 endif
@@ -269,7 +269,7 @@ ifeq ($(ARCH),x86_64)
     C_SRCS  := $(filter-out $(TEST_SRCS) $(BENCH_SRCS) arch/x86_64/early.c kernel/elf.c, \
                $(wildcard arch/x86_64/*.c kernel/*.c drivers/*.c fs/*.c mm/*.c net/*.c \
                           drivers/gpu/drm/*.c drivers/gpu/drm/tiny/*.c drivers/video/*.c \
-                          drivers/usb/*.c drivers/sound/*.c net/wireless/*.c))
+                          drivers/usb/*.c drivers/hid/*.c drivers/sound/*.c net/wireless/*.c))
     ifeq ($(MODE),test)
       C_SRCS += $(TEST_SRCS)
     endif
@@ -401,7 +401,7 @@ QEMU_FLAGS = -m 64M -cpu pentium3 \
 # fight over the port.
 HAIRPIN_PORT := 47007
 
-.PHONY: run-uefi test-uefi-shell diskattacks verify-disktests verify-tests attacks all dist utm utm-hd hd live-root live-extra live-theme live-hd utm-live utm-arm64 run-live run-hd test-hd run run-full run-text debug test check-selftests test-shell bench run-bench usb clean fuzz fuzz-build fuzz-replay diskfuzz diskfuzz-replay verify-racetests uefi run-uefi-text test-uefi live-uefi test-live-uefi test-usb live-login-initrd test-uefi-login test-arm64 test-arm64-fdt test-arm64-cpio test-arm64-apple test-arm64-apple-boot test-arm64-m1n1-payload m1n1-payload
+.PHONY: run-uefi test-uefi-shell diskattacks verify-disktests verify-tests attacks all dist utm utm-hd utm-install hd live-root live-extra live-theme live-hd utm-live utm-arm64 run-live run-hd test-hd run run-full run-text debug test check-selftests test-shell bench run-bench usb clean fuzz fuzz-build fuzz-replay diskfuzz diskfuzz-replay verify-racetests uefi run-uefi-text test-uefi live-uefi test-live-uefi test-usb test-usb-hid test-usb-tablet test-install live-login-initrd test-uefi-login test-arm64 test-arm64-fdt test-arm64-cpio test-arm64-apple test-arm64-apple-boot test-arm64-m1n1-payload m1n1-payload
 
 ifeq ($(ARCH),arm64)
 all: $(BUILD)/kernel.elf $(BUILD)/virt.dtb
@@ -1049,7 +1049,7 @@ test-uefi-shell: $(UEFI_TEST_IMG) $(USB)
 	  grep -q "^4.5" $$L || { echo "FAIL: floating point"; ok=0; }; \
 	  grep -q "^after ctrl-c" $$L || { echo "FAIL: Ctrl-C"; ok=0; }; \
 	  if [ "$(ARCH)" = x86_64 ]; then \
-	    grep -q "^ *nvme: nvme0n1: .*MSI-X irq 16" $$L || { echo "FAIL: NVMe on MSI-X"; ok=0; }; \
+	    grep -q "^ *nvme: nvme0n1: .*MSI-X irq [0-9]" $$L || { echo "FAIL: NVMe on MSI-X"; ok=0; }; \
 	    grep -q "^ *fat32: nvme0n1.* mounted" $$L || { echo "FAIL: read through MSI-X"; ok=0; }; \
 	  else \
 	    grep -q "^ *nvme: cannot map .*above 4 GiB" $$L || { echo "FAIL: NVMe above 4 GiB not reported"; ok=0; }; \
@@ -1116,8 +1116,13 @@ endif
 # x86_64: full kernel + login initrd; userland may still need syscalls (see
 # docs/x86_64-LIVE-HANDOFF.md) before myos-login appears.
 LIVE_UEFI := $(BUILD)/myos-live-uefi.img
+# Then its first boot runs here, once, in QEMU (tools/live-prepare.py): the
+# caches and databases a fresh disk used to make at every stick's first boot
+# (10-15 s in QEMU, minutes on a Pentium 4). LIVE_PREPARE=0 skips it (the
+# disk then does it at its own first boot, as before).
+LIVE_PREPARE ?= 1
 $(LIVE_UEFI): $(BUILD)/BOOTX64.EFI $(BUILD)/kernel.bin $(LIVE_LOGIN_INITRD) $(LIVE_HD) \
-              arch/i386/boot/efi/vga-font.bin tools/mkuefi.py
+              arch/i386/boot/efi/vga-font.bin tools/mkuefi.py tools/live-prepare.py
 	ESP=$$(( $$(wc -c < $(LIVE_LOGIN_INITRD)) / 1048576 + 32 )); \
 	  [ $$ESP -lt 128 ] && ESP=128; \
 	  python3 tools/mkuefi.py --out $@ --esp-mb $$ESP $(MKUEFI_ROOT) --config-mb 1 \
@@ -1125,6 +1130,9 @@ $(LIVE_UEFI): $(BUILD)/BOOTX64.EFI $(BUILD)/kernel.bin $(LIVE_LOGIN_INITRD) $(LI
 	    --file EFI/MYOS/KERNEL.BIN=$(BUILD)/kernel.bin \
 	    --file EFI/MYOS/INITRD.CPIO=$(LIVE_LOGIN_INITRD) \
 	    --file EFI/MYOS/FONT.BIN=arch/i386/boot/efi/vga-font.bin
+	@if [ "$(LIVE_PREPARE)" != 0 ]; then \
+	  python3 tools/live-prepare.py $@ --debugfs $(DEBUGFS) --e2fsck $(E2FSCK) \
+	    --ovmf-code $(OVMF_CODE) --ovmf-vars $(OVMF_VARS); fi
 live-uefi: $(LIVE_UEFI)
 
 test-live-uefi: $(LIVE_UEFI)
@@ -1171,6 +1179,90 @@ test-usb: $(LIVE_UEFI)
 	  grep -q "^ *ext2: sda2 mounted at /:" $$L || { echo "FAIL: myos-root from the stick"; ok=0; }; \
 	  grep -q "the login screen is up" $$L || { echo "FAIL: the login screen"; ok=0; }; \
 	  [ $$ok = 1 ] && echo "USB TEST OK ($(ARCH)): the live system runs from a USB stick" || exit 1
+
+# The installer, end to end (tools/test-install.py; docs/INSTALLER-PLAN.md):
+# the live stick installs onto an empty disk in QEMU, through the installer
+# window's own helper, over the serial console; e2fsck checks the result;
+# the disk then starts alone and the new account logs in. One run per
+# MACHINE:DISK. x86_64: UEFI machines (q35; p2max = no PS/2, USB input) onto
+# nvme, sata or usb. i386: an old BIOS PC (pc) onto ide or sata, an MBR
+# disk. Each run writes ~4 GB to a sparse disk in $(BUILD)/test-install and
+# deletes it after.
+ifeq ($(ARCH),x86_64)
+INSTALL_TESTS ?= q35:nvme q35:sata q35:usb p2max:nvme
+INSTALL_IMG   := $(LIVE_UEFI)
+INSTALL_FW    := --ovmf-code $(OVMF_CODE) --ovmf-vars $(OVMF_VARS)
+else
+INSTALL_TESTS ?= pc:ide pc:sata
+INSTALL_IMG   := $(LIVE_HD)
+INSTALL_FW    :=
+endif
+test-install: $(INSTALL_IMG)
+	@ok=1; for t in $(INSTALL_TESTS); do \
+	  python3 tools/test-install.py --image $(INSTALL_IMG) $(INSTALL_FW) \
+	    --e2fsck $(E2FS)/e2fsck --work $(BUILD)/test-install \
+	    --machine $${t%%:*} --disk $${t##*:} || ok=0; done; \
+	  [ $$ok = 1 ] && echo "INSTALL TEST OK ($(ARCH)): $(INSTALL_TESTS)" || exit 1
+
+# An absolute pointer (QEMU's usb-tablet: how UTM hands over the Mac's
+# pointer, and what a USB touch screen looks like) reaches /dev/input/event2:
+# its place and its button (tools/test-tablet.py).
+test-usb-tablet: $(UEFI_IMG)
+	@[ "$(ARCH)" = x86_64 ] || { echo "test-usb-tablet: make ARCH=x86_64 test-usb-tablet"; exit 1; }
+	python3 tools/test-tablet.py $(UEFI_IMG) $(OVMF_CODE) $(OVMF_VARS) $(BUILD)
+
+# USB keyboard and mouse on a PC with no PS/2 controller at all (as on the
+# GPD P2 Max): the shell is typed at with QEMU's usb-kbd (12 Mb/s, as laptop
+# keyboards are), and /dev/input/event1 must get usb-mouse's move, right
+# click and wheel. An input event is 24 bytes on x86_64, 16 on i386; od
+# prints it as 16-bit numbers ending in type, code, value. x86_64 boots by
+# UEFI; i386 by BIOS, as the old PCs do (and OVMF puts the xHCI's registers
+# above 4 GiB, where the i386 kernel can't reach), with SMM off: SeaBIOS
+# polls its USB keyboard through SMM, which hangs once the boot loader has
+# switched to the picture's mode (docs/gaps.md, Boot). docs/USB-PLAN.md U5.
+ifeq ($(ARCH),x86_64)
+test-usb-hid: EV = 24
+test-usb-hid: HID_BOOT = $(QEMU64) -machine q35,i8042=off -m 1G -cpu qemu64 \
+    -drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
+    -drive if=pflash,format=raw,file=$(BUILD)/ovmf-vars.fd \
+    -drive if=none,format=raw,file=$(UEFI_IMG),id=bootdisk,snapshot=on \
+    -device ide-hd,drive=bootdisk,bootindex=0
+test-usb-hid: $(UEFI_IMG)
+else
+test-usb-hid: EV = 16
+test-usb-hid: HID_BOOT = $(QEMU) -machine pc,i8042=off,smm=off -m 64M -cpu pentium3 \
+    -drive format=raw,file=$(IMG),index=0,media=disk,snapshot=on
+test-usb-hid: $(IMG)
+endif
+	@rm -f $(BUILD)/usb-hid.log
+	@[ ! -f $(OVMF_VARS) ] || cp $(OVMF_VARS) $(BUILD)/ovmf-vars.fd
+	@(for i in $$(seq 60); do sleep 1; \
+	    grep -q "Welcome to MyOS" $(BUILD)/usb-hid.log 2>/dev/null && break; done; sleep 1; \
+	  tools/qemu-type.sh 'echo USB-KBD $$((6*7)) ~ok; head -c $$((9*$(EV))) /dev/input/event1 | od -An -v -tu2 -w$(EV) > /tmp/m &' \
+	    | while read k; do echo "$$k"; sleep 0.05; done; sleep 1; \
+	  echo "mouse_move 10 5"; sleep 0.3; echo "mouse_button 2"; sleep 0.3; \
+	  echo "mouse_button 0"; sleep 0.3; echo "mouse_move 0 0 1"; sleep 1; \
+	  tools/qemu-type.sh 'echo EVENTS; cat /tmp/m; echo END' | while read k; do echo "$$k"; sleep 0.05; done; \
+	  sleep 2; echo quit) \
+	  | $(HID_BOOT) \
+	    -device qemu-xhci,id=xhci -device usb-kbd,bus=xhci.0,usb_version=1 \
+	    -device usb-mouse,bus=xhci.0 \
+	    -net none -no-reboot -display none \
+	    -serial file:$(BUILD)/usb-hid.log -monitor stdio >/dev/null || true
+	@perl -pe 's/\e\[[0-9;?]*[A-Za-z]//g; s/\r//g' $(BUILD)/usb-hid.log > $(BUILD)/usb-hid.txt
+	@L=$(BUILD)/usb-hid.txt; E=$(BUILD)/usb-hid-events.txt; ok=1; \
+	  sed -n '/^EVENTS/,/^END/p' $$L | tr -s ' ' > $$E; \
+	  grep -a "PS/2\|usb\|USB-KBD" $$L; cat $$E; \
+	  grep -q "^ *keyboard: no PS/2 controller" $$L || { echo "FAIL: no PS/2 controller seen"; ok=0; }; \
+	  grep -q "^ *usb-hid: .* Keyboard: a keyboard" $$L || { echo "FAIL: the USB keyboard found"; ok=0; }; \
+	  grep -q "^ *usb-hid: .* Mouse: a mouse" $$L || { echo "FAIL: the USB mouse found"; ok=0; }; \
+	  grep -q "^USB-KBD 42 ~ok" $$L || { echo "FAIL: typing on the USB keyboard"; ok=0; }; \
+	  grep -q " 2 0 10 0$$" $$E || { echo "FAIL: mouse moved right 10"; ok=0; }; \
+	  grep -q " 2 1 5 0$$" $$E || { echo "FAIL: mouse moved down 5"; ok=0; }; \
+	  grep -q " 1 273 1 0$$" $$E || { echo "FAIL: right button down"; ok=0; }; \
+	  grep -q " 1 273 0 0$$" $$E || { echo "FAIL: right button up"; ok=0; }; \
+	  grep -q " 2 8 1 0$$" $$E || { echo "FAIL: wheel up"; ok=0; }; \
+	  [ $$ok = 1 ] && echo "USB HID TEST OK ($(ARCH)): USB keyboard and mouse, no PS/2" || exit 1
 
 # RAM-only login (no ext2): what a real UEFI laptop does until USB MSC exists.
 UEFI_LOGIN_IMG := $(BUILD)/myos-uefi-login.img
@@ -1653,6 +1745,14 @@ live-login-initrd: $(LIVE_LOGIN_INITRD)
 
 # The live disk in UTM, as its own machine (its own UUID).
 UTM_LIVE_VM := dist/MyOS live.utm
+# A UEFI machine for trying the installer the way a laptop does it: the live
+# system as a USB stick on UTM's USB 3 bus, an empty NVMe disk to install on
+# (tools/mkutm.sh --usb-stick). UTM_INSTALL_VM picks where it goes.
+UTM_INSTALL_VM ?= dist/MyOS UEFI Install.utm
+utm-install: $(LIVE_UEFI)
+	@[ "$(ARCH)" = x86_64 ] || { echo "utm-install: make ARCH=x86_64 utm-install"; exit 1; }
+	tools/mkutm.sh --x86_64 --usb-stick $(LIVE_UEFI) "$(UTM_INSTALL_VM)"
+
 utm-live: $(LIVE_HD)
 	@mkdir -p dist
 	tools/mkutm.sh --installed --replace-disk --memory 1024 $(LIVE_HD) "$(UTM_LIVE_VM)" 5C81D2E7-0B4F-4A93-8E6D-71F3A9C2B540

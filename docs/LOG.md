@@ -4086,3 +4086,125 @@ Measured first, then fixed, each with its numbers in docs/performance.md:
 - Tried and reverted: starting the desktop's programs alongside IceWM, not
   after it. On one processor it took the CPU from the wallpaper and the
   taskbar: a black screen until 6.5 s instead of the wallpaper at 2.5 s.
+
+## 2026-10-17 — Boot: seconds off every start
+
+The cheap and large items of docs/performanceSuggestions.md, each measured
+(docs/performance.md):
+- **The 32-bit loader's 2 s pause is gone** (A5): it held the boot picture
+  so it could be seen in QEMU. An i386 BIOS boot reaches the kernel in
+  ~0.45 s instead of ~2.45 s.
+- **eth0's DHCP lease comes in the background** (B1): boot step 13 took
+  1.0 s in QEMU, 1-3 s on a real network, up to 15 s on one that doesn't
+  answer; now 0. Test and benchmark builds still wait for it.
+- **The live disk's first boot happens when the image is built** (C1):
+  `tools/live-prepare.py` boots the new image once in QEMU with no screen,
+  runs the first-boot scripts, removes the machine id and the SSH host keys
+  (each machine makes its own: dbus-uuidgen in stage 1, sshd's service),
+  shuts down, and checks the result with debugfs and e2fsck, deleting the
+  image if anything is wrong. A fresh live disk's login screen in QEMU: 8.6 s,
+  where it was 16.7 s before these three.
+- **An installed system doesn't load the stick's 240 MB fallback** (A1):
+  `myos-mkesp --without`, a loader that starts without one, and /dev made
+  by the kernel when there is none. The loader's step: 1.46 s → 0.01 s.
+- Not done: A2 (the stick decides for itself: a wrong guess means a machine
+  that can't start), and G4 (the 32-bit kernel's whole-screen copy every
+  16 ms: only when the 32-bit kernel runs on a UEFI machine whose screen is
+  above 4 GiB, which QEMU can't show us).
+
+## 2026-10-17 — USB keyboards and mice
+
+For the GPD P2 Max, whose built-in keyboard and touchpad are one USB device
+(HAILUCK) and which may have no PS/2 controller at all:
+- **Interrupt endpoints in xHCI** (`usb_intr_start`). A keyboard answers the
+  controller's poll only when something changed; the completion, in the
+  interrupt, hands the report to the class driver and queues the next
+  transfer. Nothing runs while nobody types (SET_IDLE 0 also stops the
+  twice-a-second repeat keyboards default to). A failed endpoint is cleared
+  and restarted by the usb thread, and given up on after a few tries.
+- **HID** (`drivers/usb/usb_hid.c`, `drivers/hid/hid.c`): each HID interface's
+  report descriptor is read once and turned into a short list of fields
+  (where the keys, buttons, X, Y and wheel are); each report is picked
+  apart with a few shifts. Keys become Linux key codes by Linux's table and
+  go to `keyboard_key`, movements to `mouse_report`: the paths the PS/2
+  drivers now share, so the console and X see USB devices as event0 and
+  event1 with no change.
+- **A PC with no PS/2 controller hung at boot**: port 0x64 reads 0xFF,
+  "a byte is waiting", and the keyboard and mouse setup emptied it forever.
+  QEMU's `-machine q35,i8042=off` showed it. Now 16 bytes means no controller,
+  as in Linux.
+- Tested in QEMU, i386 and x86_64, 12 and 480 Mb/s: typing in the shell
+  (Shift, `$`, `~`...), and event1 got the moves, both buttons and the wheel.
+
+## 2026-10-17 — make test-install, BIOS installs, three SATA bugs
+
+Before development moves onto the GPD P2 Max the kernel is to be finished
+and frozen, and the installer proven. So:
+- **`make test-install`** (`tools/test-install.py`): QEMU starts the live
+  stick next to an empty 16 GiB disk; the test logs in on the serial console
+  (it reads the serial port like the keyboard), writes a plan and runs
+  `myos-install-helper --apply`, the program the installer window runs. On
+  the Mac it checks the new partition table and runs e2fsck on both file
+  systems; then it starts the new disk alone and logs in with the new
+  account's password, and checks the user, the computer name, / and /data,
+  the kernel config partition, and that the live user and the installer are
+  gone. x86_64 (UEFI): NVMe, SATA, USB, and the P2 Max's shape (no PS/2, USB
+  input); i386 (BIOS): IDE and SATA. About 2 minutes each.
+- **Installing on a BIOS PC** (the old Pentium 4/M machines): the disk gets
+  what `make hd` and the 32-bit stick have, an MBR whose code loads stage 2
+  from sector 1, partition 1 the boot area (the stick's, copied sector for
+  sector), then myos-root, myos-config (type 0xDA: MBR partitions have no
+  names) and myos-data. The whole disk only: MyOS can't start another system
+  yet, so the window and the helper refuse to share a BIOS disk.
+- **The SATA driver missed a disk the firmware hadn't used**: it read the
+  port's signature before turning on the port's FIS receive area, which is
+  what fills it in (QEMU always; real hardware after a firmware reset). Only
+  the disk the firmware started from was ever found.
+- **Then each SATA command took exactly 5 s**: the port being set up
+  interrupts as soon as the disk says hello, and the interrupt handler
+  cleared only ports it already knew, so the interrupt line stayed raised,
+  the 8259 saw no new edge, and every command ended at its timeout, quietly.
+  The handler now clears every port that asks. The driver uses MSI where the
+  controller has it, and if its interrupt never comes it says so once and
+  looks every 1 ms instead of waiting 5 s (it waits for 16 commands in a row
+  without one before deciding: one command ending on a look proves nothing,
+  the look's timer tick can come just before the interrupt). Measured in
+  QEMU: 200 single-sector reads 1000 s → 0.010 s; 10 MB written in 0.021 s.
+- Found on the way: starting from a SATA disk under SeaBIOS hangs in stage 2
+  when SMM is on (docs/gaps.md, Boot); the SATA BIOS test runs with
+  `smm=off`. And three `%lu`-for-`uint32_t` prints on x86_64 (main.c,
+  ahci.c), which could print garbage there.
+
+## 2026-10-17 — Touch screens and tablets; a UTM machine for installing
+
+- **Absolute pointers**: a USB touch screen, a pen tablet, and QEMU's
+  usb-tablet (how UTM hands the Mac's pointer over without capturing it)
+  say WHERE they point. hid.c now keeps absolute X and Y and the
+  digitizer's tip switch (a finger or pen is down), scales each device's
+  range to 0..32767, and sends them to a new /dev/input/event2 (EV_ABS
+  ABS_X/ABS_Y, the buttons (a touch is the left one), a wheel; EVIOCGABS
+  gives the range).
+  X reads it as a second pointer next to the mouse (10-myos.conf). A
+  multi-touch screen's first finger points and taps. `make ARCH=x86_64
+  test-usb-tablet` puts QEMU's tablet at exact places through QMP and reads
+  event2.
+- **The GPD P2 Max's touch screen** (Goodix) is probably on I2C, not USB:
+  event2 is its top half; the bottom half is the I2C, ACPI and chip work
+  docs/TOUCHPAD-PLAN.md plans for the MSI's touchpad.
+- **`make ARCH=x86_64 utm-install`** (`tools/mkutm.sh --x86_64 --usb-stick`):
+  a UEFI machine for UTM that installs the way a laptop does, with the live
+  system as a USB stick on UTM's USB 3 bus and an empty 32 GB NVMe disk.
+  In UTM itself Rodger couldn't log in: no keyboard. UTM's debug log showed
+  why: it puts its USB keyboard, mouse and tablet on a USB 2 controller
+  (QEMU's `-usb`: EHCI + UHCI), which MyOS doesn't drive, and the xHCI gets
+  only the stick. The VM now adds its own keyboard and tablet on the xHCI;
+  QEMU uses those. Proved inside UTM first, by plugging them into the
+  running VM through QEMU's monitor: Enter logged in. The xHCI gets 8 ports
+  (QEMU adds a hub by itself when a controller is down to its last free
+  port, and MyOS has no hub driver). Two more things found on the way:
+  - X took event2 for a touchpad (BTN_TOUCH next to buttons), which moves
+    the pointer only while a finger is down; a touch is now the left button,
+    and X takes it for a touch screen: it points.
+  - `/var/log/boot.log` (runit stage 1): the kernel's messages from each
+    start, kept on disk (root only), for machines with no serial port or
+    network to read them from.

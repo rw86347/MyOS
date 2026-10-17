@@ -423,32 +423,38 @@ efi_status efi_main(efi_handle image, struct efi_system_table *st)
         return give_up("kernel not loaded");
 
     /* Size first: the live login initrd is tens of MiB, not 4. Leave the
-       32-bit kernel room under the 768 MiB direct-map cap. */
+       32-bit kernel room under the 768 MiB direct-map cap. No INITRD.CPIO
+       at all is an installed system's ESP: its root is on a disk MyOS
+       drives, and the live stick's fallback (a quarter of a gigabyte to
+       read at every start) was left out (myos-mkesp --without). */
     if (file_size(root, iname, &isize) < 0)
-        return give_up("no initrd");
-    if (!isize || isize > (384ull << 20))
+        isize = 0;
+    if (isize > (384ull << 20))
         return give_up("initrd too big");
     ipages = pages_for(isize);
     extra = INITRD_LOAD;
-    /* The 32-bit kernel only direct-maps 768 MiB. Firmware often has a
-       hole around 8 MiB, so a large login initrd cannot sit at INITRD_LOAD
-       (right after .bss). Fall back to the highest fit under 768 MiB. */
-    if (!alloc_at(bs, INITRD_LOAD, ipages)) {
-        extra = 0x30000000ull;
-        if (bs->allocate_pages(AllocateMaxAddress, EfiLoaderData, ipages, &extra)
-            != EFI_SUCCESS || extra >= 0x30000000ull
-            || extra + isize > 0x30000000ull)
-            return give_up("no room for the initrd below 768 MiB");
+    if (isize) {
+        /* The 32-bit kernel only direct-maps 768 MiB. Firmware often has a
+           hole around 8 MiB, so a large login initrd cannot sit at
+           INITRD_LOAD (right after .bss). Fall back to the highest fit under
+           768 MiB. */
+        if (!alloc_at(bs, INITRD_LOAD, ipages)) {
+            extra = 0x30000000ull;
+            if (bs->allocate_pages(AllocateMaxAddress, EfiLoaderData, ipages, &extra)
+                != EFI_SUCCESS || extra >= 0x30000000ull
+                || extra + isize > 0x30000000ull)
+                return give_up("no room for the initrd below 768 MiB");
+        }
+        if (load_file(root, iname, (void *)extra, isize, &isize) < 0)
+            return give_up("initrd not loaded");
     }
-    if (load_file(root, iname, (void *)extra, isize, &isize) < 0)
-        return give_up("initrd not loaded");
 
     if (load_file(root, fname, (void *)(low + (FONT_PHYS - BOOTINFO_PHYS)),
                   4096, &fsize) < 0 || fsize != 4096)
         say("\r\n    no font (fbcon will stay off)");
 
     bi = (struct bootinfo *)low;
-    bi->initrd_phys = (u32)extra;
+    bi->initrd_phys = isize ? (u32)extra : 0;
     bi->initrd_size = (u32)isize;
     bi->font_phys = (fsize == 4096) ? FONT_PHYS : 0;
     say("\r\n");                    /* the end of Step 01's line */

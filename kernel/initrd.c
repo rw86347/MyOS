@@ -30,7 +30,11 @@ void initrd_init(void)
 {
     const struct bootinfo *bi = P2V(BOOTINFO_PHYS);
     if (!bi->initrd_size) {
+        /* An installed system's loader brings none (its root is on a disk
+           MyOS drives). /dev is still made here, in RAM: mount_root puts
+           it over the disk's own. */
         klog("initramfs: none\n");
+        dev_init();
         return;
     }
     data = P2V(bi->initrd_phys);

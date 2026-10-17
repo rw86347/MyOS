@@ -3,12 +3,22 @@
 #ifndef KEYBOARD_H
 #define KEYBOARD_H
 
+#include <stdint.h>
+
 /* Special keys, returned outside the ASCII range. */
 #define KEY_F10 0x100
 #define KEY_F11 0x101
 #define KEY_F12 0x102
 
-void keyboard_init(void);
+/* Start the PS/2 keyboard (IRQ 1). 0, or -1 if the PC has no PS/2
+   controller (then there is no PS/2 mouse either). */
+int keyboard_init(void);
+
+/* A key went down (pressed = 1; again while held: it repeats) or up (0),
+   by its Linux code (KEY_*: input-event-codes.h). From any keyboard's
+   interrupt (PS/2 here, USB in usb_hid.c): to /dev/input/event0 and to
+   the terminal. */
+void keyboard_key(uint16_t key, int pressed);
 
 /* Next typed character (ASCII, or a KEY_* value), or -1 if none waiting.
    (Only while no listener is set.) */

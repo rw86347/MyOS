@@ -51,6 +51,37 @@ tools/mkutm.sh --installed --net shared build/myos-hd.img \
 | `emulated` | `-netdev user` (SLIRP) | DHCP, 10.0.2.15 | no — ICMP not forwarded |
 | `bridged` | `vmnet-bridged` | DHCP, from the real router | works, on the real LAN |
 
+### A UEFI machine for trying the installer
+
+```sh
+make ARCH=x86_64 utm-install UTM_INSTALL_VM="$HOME/Desktop/MyOS UEFI Install.utm"
+```
+
+A q35 machine starting through UEFI, the live system as a USB stick on UTM's
+USB 3 bus (started first), and an empty 32 GB NVMe disk, as on the GPD P2
+Max. Start it, click **Install MyOS** in the Start menu, choose the NVMe
+disk. Afterwards, in the VM's settings (Drives), move the NVMe disk above the
+USB drive and it starts from the disk. (Removing the USB drive there would
+delete the stick's image from the VM.)
+
+How UTM wires USB, read from its own debug log (2026-10-17): with USB 3 on,
+UTM passes QEMU `-usb`, which on q35 is an ICH9 EHCI with UHCI companions,
+and puts its USB keyboard, mouse and tablet there; its NEC xHCI
+(`usb-controller-0`) gets only the USB drives and its three USB-sharing
+slots. MyOS drives xHCI only, so the keyboard was dead. `mkutm.sh` adds a
+keyboard and a tablet of its own on the xHCI in the VM's extra QEMU
+arguments, which UTM puts after its own devices: QEMU sends keys to the
+keyboard made last and the pointer to the tablet the system reads, so
+those are the ones used. The xHCI gets 8 ports, because with its 4 and six
+devices QEMU would put some behind a hub, which MyOS can't drive yet.
+
+### UTM keeps a loaded VM's settings in memory
+
+Rewriting `config.plist` while UTM has the VM open changes nothing: the next
+start uses the settings UTM read before (its debug log shows the old QEMU
+arguments). Quit UTM, or remove the VM from UTM's list, before starting it
+again.
+
 ### The MAC address must differ per VM
 
 `mkutm.sh` derives it from the VM's UUID. A fixed MAC is a trap in `shared`

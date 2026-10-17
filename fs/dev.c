@@ -20,6 +20,7 @@
  *   4,n  ttyN      virtual terminals: the console too, for now
  *  13,64 input/event0   the keyboard as input events (evdev.c)
  *  13,65 input/event1   the mouse
+ *  13,66 input/event2   touch screens and tablets
  *  29,0  fb0       the screen's pixels (drivers/video/fbmem.c), once a
  *                  display driver has registered one
  * 116,n  snd/...   sound cards (drivers/sound/core.c): controlC0, pcmC0D0p...
@@ -530,7 +531,7 @@ void dev_attach(struct inode *i)
         else if ((i->rdev >> 8) == PTY_SLAVE_MAJOR)
             i->ops = pty_slave_ops();       /* pts/N: open() checks N */
         else if ((i->rdev >> 8) == 13)
-            i->ops = evdev_ops(i->rdev & 0xFF);     /* input/event0, event1 */
+            i->ops = evdev_ops(i->rdev & 0xFF);     /* input/event0-2 */
         else if ((i->rdev >> 8) == 116)
             i->ops = snd_file_ops(i->rdev & 0xFF);  /* snd/controlC0, pcmC0D0p... */
         break;                              /* unknown: open() fails */
@@ -630,6 +631,7 @@ void dev_init(void)
     if (input) {
         make_node(input, "event0", DEV(13, 64));    /* keyboard (evdev.c) */
         make_node(input, "event1", DEV(13, 65));    /* mouse */
+        make_node(input, "event2", DEV(13, 66));    /* touch screens, tablets */
     }
     for (int k = 0; k < blockdev_count(); k++)     /* disks found before /dev */
         dev_block_add(blockdev_get(k));

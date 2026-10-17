@@ -80,8 +80,8 @@ most likely to trip over, each item checked in the source on the date above.
   - No `sendmmsg`/`recvmmsg`, no packet filter (netfilter), one rate-limit bucket.
 - **Devices**: serial input reaches the console, but there is no `/dev/ttyS0`.
   One CPU (no SMP), the 8259 PIC plus the local APIC for MSI only (no IOAPIC), no
-  ACPI tables read but the power-off numbers (drivers/acpi.c). USB: xHCI and mass storage
-  only, no hubs, no USB keyboards/mice; no touchpad (I2C HID,
+  ACPI tables read but the power-off numbers (drivers/acpi.c). USB: xHCI, mass storage
+  and HID keyboards/mice only, no hubs; no I2C touchpad (I2C HID,
   `docs/TOUCHPAD-PLAN.md`); sound is HD Audio, one program at a time; graphics is
   the firmware framebuffer or QEMU's Bochs card, no DRM/KMS.
 - **Programs**: Chromium (x86_64) is the Start menu's browser; it runs without
@@ -107,6 +107,18 @@ most likely to trip over, each item checked in the source on the date above.
   initramfs; /data must be on another disk. Only ext2 disks labelled `myos-data` are
   mounted — any other (someone's Linux disk in an old PC) is left alone.
 - **E820 map holds at most 32 entries.** (`layout.inc`, `E820_MAX`)
+- **SeaBIOS (QEMU's BIOS) hangs after stage 2 sets the picture's mode** when
+  System Management Mode is on (QEMU's default). SeaBIOS runs some of its
+  drivers (AHCI, USB) in 32-bit mode and gets there through SMM; once the
+  video BIOS has switched to mode 13h (`int 0x10`, AX=0x13: that call alone
+  does it, found by taking stage 2 apart), the next trip through SMM never
+  comes back. So a BIOS boot from a SATA disk hangs at stage 2's first read,
+  every time, and a machine with a USB keyboard hangs now and then (SeaBIOS
+  polls it). Found 2026-10-17 by `make test-install` and `make test-usb-hid`,
+  which start those machines with `smm=off`. IDE disks without USB devices
+  (UTM's old-PC VMs) never go that way. Real old PCs have other BIOSes, whose
+  SATA ROMs are 16-bit code; mode 13h is the oldest graphics mode there is.
+  Not reported to SeaBIOS/QEMU yet.
 - **x86_64 live system** (`make ARCH=x86_64 live-uefi`): boots to the graphical
   login and desktop, from a USB stick too. First boot still logs `fsopen` (430,
   util-linux `mount`) and `get_mempolicy` (239, gdk-pixbuf-query-loaders) as not
@@ -229,7 +241,8 @@ most likely to trip over, each item checked in the source on the date above.
   never given back; every message goes to the boot CPU. No IOAPIC: a device
   whose only interrupt is a line the 8259 can't see, and that has no MSI,
   gets none. The i386 kernel can't map registers above 4 GiB (no PAE), so
-  under UEFI firmware that places 64-bit BARs high its NVMe stays off.
+  under UEFI firmware that places 64-bit BARs high its NVMe and xHCI (USB)
+  stay off (QEMU's OVMF does: `make test-usb-hid` boots i386 by BIOS).
 
 - The tick: the 8254 PIT, or the HPET in legacy replacement mode when the PIT
   is silent (gated on new Intel chipsets; found on the MSI 2026-10-06). The
@@ -387,6 +400,9 @@ most likely to trip over, each item checked in the source on the date above.
   A private map whose file is truncated keeps the old pages (Linux: SIGBUS past the end).
   Files in the initramfs and in RAM file systems are still copied page by page. Programs are mapped from their file and paged in on touch, on both CPUs
   (x86_64's loader read the whole file into one buffer until 2026-10-07).
+- **`myos-mkesp` can't make a small EFI partition** (found 2026-10-17): its FAT32
+  geometry comes out too small for the FAT on a 64 MiB partition ("negative count"
+  in `finish`). The installer's 512 MiB partitions are fine.
 - **Dynamic linking**: one interpreter level; the interpreter is put at the first free
   place in the mmap area (which starts at a random place: ASLR).
 - **Arguments + environment: 64 KiB, 1024 entries; paths 255 bytes** (Linux: 128 KiB+, 4096).
@@ -716,15 +732,45 @@ most likely to trip over, each item checked in the source on the date above.
 - USB (`drivers/usb/`, 2026-10-07; `docs/USB-PLAN.md`): enough to run from
   a USB stick. Missing:
   - Hubs: a device behind a hub (or a laptop whose ports sit behind an
-    internal one) is listed as "a hub: not supported yet".
+    internal one) is listed as "a hub: not supported yet". QEMU adds a hub
+    by itself when a controller is down to its last free port: UTM's USB 3
+    controller has 4 ports and UTM puts 4 devices on it, so
+    `tools/mkutm.sh --usb-stick` gives it 8 (`-global nec-usb-xhci.p2=8`).
   - Unplugging: the kernel says so but keeps the disk; its I/O then times
     out (10 s per command). Its memory is not given back.
   - Only xHCI. Old PCs (the Pentium 4 / M targets) have UHCI + EHCI, so
-    their USB sticks don't work yet. Intel 7/8-series chipsets (2012-2014)
+    their USB sticks don't work yet. Nor do UTM's own USB keyboard and
+    mouse: UTM puts them on an EHCI (docs/utm.md; `mkutm.sh --usb-stick`
+    adds its own on the xHCI). Intel 7/8-series chipsets (2012-2014)
     start with their USB 3 ports routed to EHCI; Linux switches them over
     (`usb_enable_intel_xhci_ports`), we don't.
-  - Bulk endpoints only: no keyboards or mice (interrupt endpoints), no
-    webcams (isochronous). Mass storage only; other classes are listed.
+  - Bulk and interrupt endpoints: no webcams (isochronous). Mass storage
+    and HID only; other classes are listed.
+  - HID (`drivers/usb/usb_hid.c`, `drivers/hid/hid.c`, 2026-10-17): keys,
+    buttons, relative X/Y and the wheel, into the PS/2 paths (event0/event1);
+    absolute pointers (USB touch screens, pen tablets, QEMU's `usb-tablet`)
+    into event2, scaled to 0..32767, a touch as the left button. Missing:
+    - Multi-touch: a touch screen's first finger points and taps; the others
+      are ignored (no pinch or two-finger scroll), and there is no
+      `ABS_MT_*` (docs/TOUCHPAD-PLAN.md).
+    - Touch screens not on USB: most laptops' are I2C (the GPD P2 Max's is
+      a Goodix part, probably on I2C), which needs the I2C and ACPI work of
+      docs/TOUCHPAD-PLAN.md and the chip's own protocol. They would feed
+      the same event2 (`evdev_touch`).
+    - One event2 for every absolute pointer, with no rotation or
+      calibration: a panel mounted sideways needs its axes swapped.
+    - The Consumer page: volume, brightness and media keys.
+    - The keyboard's lights (Caps Lock): no SET_REPORT.
+    - Key repeat on the text console: a USB keyboard doesn't repeat by
+      itself (PS/2 ones do), and nothing repeats for it. X repeats keys
+      itself, so the desktop is fine; Linux does it in its input core.
+    - Touchpads' finger reports (precision-touchpad mode,
+      `docs/TOUCHPAD-PLAN.md`): a USB touchpad works as a mouse.
+    - The parser keeps 24 fields and 8 report IDs per interface and reads
+      descriptors up to 1024 bytes (a cut one loses its last fields); 4 HID
+      interfaces per device. No boot-protocol fallback for a descriptor it
+      can't read.
+    - A keyboard unplugged with a key held leaves that key down.
   - Mass storage: bulk-only transport, LUN 0, 512-byte sectors; no UAS (a
     faster USB 3 protocol), no write-protect check, no TRIM.
   - One command at a time per controller's command ring, and a command that
@@ -778,7 +824,13 @@ most likely to trip over, each item checked in the source on the date above.
 - **PS/2 mouse** (`drivers/mouse.c`): found and set up at boot by polling ~10 command/ACK
   round trips (instant in QEMU; on a real mouse maybe 10-30 ms of boot time — make it
   interrupt-driven if a real machine shows it). Movements go to X through
-  `/dev/input/event1` (`drivers/evdev.c`). No USB mouse.
+  `/dev/input/event1` (`drivers/evdev.c`), as USB mice's do (`drivers/usb/usb_hid.c`).
+- **A PC without a PS/2 controller hung at boot** (found 2026-10-17 with QEMU's
+  `i8042=off`, while adding USB keyboards for the GPD P2 Max): such a PC reads 0xFF
+  from port 0x64, "a byte waiting", forever, and `keyboard_init` and `mouse_init`
+  emptied the controller until it was empty. Fixed: after 16 bytes there is no
+  controller (Linux's `i8042_flush`), and the PS/2 keyboard and mouse are skipped.
+  Not done: ACPI's "no 8042" flag (FADT `IAPC_BOOT_ARCH`), which Linux also reads.
 - **Laptop touchpad is I2C HID, not the PS/2 mouse** (MSI Katana GF66 11UE,
   `docs/hardware-msi-katana-gf66.md`, 2026-10-06; the plan: `docs/TOUCHPAD-PLAN.md`). The pad (Synaptics `06CB:7E7E`
   or ELAN `04F3:30AA` on `PNP0C50`) reports each finger. Two-finger scrolling
@@ -1212,20 +1264,24 @@ own, `cld` on every entry and page-table checks are in (docs/LOG.md,
 
 ## The installer (2026-10-10)
 
-- **UEFI only, and only onto a disk without an EFI partition** (or by
-  erasing). Next to Windows it would have to add EFI/MYOS to Windows' FAT
-  partition, and MyOS's FAT driver only reads. Installing on a BIOS PC
-  isn't written either (the helper refuses both, before writing).
+- **UEFI: only onto a disk without an EFI partition** (or by erasing).
+  Next to Windows it would have to add EFI/MYOS to Windows' FAT partition,
+  and MyOS's FAT driver only reads (the helper refuses, before writing).
+- **BIOS (2026-10-17): a whole disk only.** MyOS has no boot menu to start
+  another system, so it never shares a BIOS disk (the window and the helper
+  say so). An MBR: disks up to 2 TB, four primary partitions (boot area,
+  myos-root, myos-config, myos-data). The boot area is 64 MiB, of which
+  today's stage 2, kernel and initramfs use 3.6 MB.
 - **No boot entry is written** (no efibootmgr / SetVariable). The firmware
   finds EFI/BOOT/BOOTX64.EFI by itself on most PCs. On others, pick the
   disk in the boot menu (F11 on the MSI).
-- **The installed EFI partition carries the live login initrd** (240 MB),
-  which an installed system doesn't need, and the firmware loads it at
-  every start. A small one, or none, would start faster.
 - **ssh login is off on an installed system.** Turn it on with
   `doas ln -s /etc/sv/sshd /var/service/` (a new host key is made then).
-- **The window's install flow was not clicked through in QEMU**, only
-  the helper with a written plan, then a boot of the result.
+- **The window's install flow is not clicked through in QEMU**:
+  `make test-install` (2026-10-17) runs the window's helper with a written
+  plan, then starts the result and logs in (UEFI: NVMe, SATA, USB and the
+  P2 Max's shape; BIOS: IDE and SATA). The window's pages themselves are
+  only tried by hand.
 
 ## Kernel config (2026-10-10)
 

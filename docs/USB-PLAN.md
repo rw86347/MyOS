@@ -57,6 +57,18 @@ Steps (each ends with something visible in QEMU):
   480 Mb/s on a USB 2 port: open whether it was in the USB 2.0 socket or
   the USB 3 link did not come up after our reset.
 
-Later (not needed for the stick): hubs, unplugging, USB keyboards and mice
-(HID boot protocol), UAS (faster USB 3 disks), EHCI/UHCI for the old PCs,
-and Linux's USB driver API (`usb_driver`, URBs) for drivers like `btusb`.
+- [x] **U5** USB keyboards and mice (2026-10-17, for the GPD P2 Max, whose
+  built-in keyboard and touchpad are one USB device): interrupt-IN
+  endpoints in `xhci.c` (`usb_intr_start`: the completion, in the
+  interrupt, hands the report over and queues the next transfer; a failed
+  endpoint is cleared and restarted by the usb thread), `usb_hid.c` for
+  the class, and a report-descriptor parser (`drivers/hid/hid.c`), not the
+  boot protocol, so wheels, extra buttons and composite devices work.
+  Reports become the same key and movement events as PS/2's
+  (`keyboard_key`, `mouse_report`), so X needed no change. Tested in QEMU
+  with `usb-kbd` and `usb-mouse` at 12 and 480 Mb/s, on i386 and x86_64,
+  and with no PS/2 controller at all (`-machine q35,i8042=off`).
+
+Later (not needed for the stick): hubs, unplugging, UAS (faster USB 3
+disks), EHCI/UHCI for the old PCs, and Linux's USB driver API
+(`usb_driver`, URBs) for drivers like `btusb`.

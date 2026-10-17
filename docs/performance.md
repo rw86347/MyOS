@@ -996,3 +996,100 @@ initramfs, which still copies); counting the fault costs 2–5 cycles of it
 one fault there, for reference: 1584 cycles for a file page, 1380 for a
 zero page, each with its share of the unmap; about 1000 of either is the
 4 KiB copy or clear.
+
+## Boot: the 32-bit loader's 2 s pause is gone (2026-10-17)
+
+`arch/i386/boot/stage2.asm` held the boot picture on the screen for 2 s after
+loading the kernel and the initramfs, so it could be seen in QEMU, where
+loading takes no time. Every old PC paid it at every boot. The picture still
+shows while the disk is read.
+
+| i386 BIOS boot in QEMU, to the kernel's first line on the serial port | before | after |
+|---|---|---|
+| three boots | 2.44, 2.47, 2.42 s | 0.48, 0.41, 0.50 s |
+
+## Boot: eth0's DHCP lease in the background (2026-10-17)
+
+Boot step 13 waited for eth0's DHCP lease: 1.0 s in QEMU, 1-3 s on a real
+network, and all of DHCP_TRIES (1+2+4+8 s) on one that never answers. Now
+`ipv4_init` hands the exchange to a thread ("ipconfig"), as Wi-Fi's
+`lease_thread` already did, and the boot goes on; the lease (or QEMU's fixed
+addresses, if nobody answers) arrives while runit starts, and if Wi-Fi came
+up meanwhile, a late eth0 lease doesn't take IPv4 back. Test and benchmark
+builds still wait: their network tests start at once.
+
+`tools/boottime.py --no-login`, 64-bit live disk in QEMU:
+
+| | before | after |
+|---|---|---|
+| kernel steps 11-15 | 1.03 s (1.01 of it step 13) | 0.02 s |
+| the lease | at the end of step 13 | 0.7 s into runit stage 1 |
+| login screen up | 16.67 s | 15.66 s |
+
+## Boot: the live disk's first boot happens when the image is built (2026-10-17)
+
+A fresh live disk ran Alpine's install scripts at its first boot (font
+cache, icon caches, MIME database, GLib schemas; `/etc/myos/first-boot.sh`):
+9-14 s in QEMU, minutes on a Pentium 4, on every stick and every install,
+always with the same results. Now `make live-uefi` boots the new image once
+in QEMU with no screen (`tools/live-prepare.py`, 13 s on the build machine):
+a marker file makes stage 1 run the first boot, delete what must differ
+between machines (`/etc/machine-id`; SSH host keys, which `first-boot.sh`
+no longer makes: sshd's service makes them at its start), and shut down
+cleanly (exit 100: runit runs stage 3). The script then checks with Linux's
+`debugfs` and `e2fsck` that the work is done, the marker and the machine's
+own files are gone and the file system is clean, and deletes the image if
+not. `LIVE_PREPARE=0` skips it. A machine makes its own machine id at its
+first real boot (one `dbus-uuidgen`).
+
+| 64-bit live disk in QEMU, a fresh image's boot | before | after |
+|---|---|---|
+| runit stage 1 | 9.0 s | 0.27 s |
+| login screen up | 15.66 s | **8.60 s** |
+
+With A5 and B1 the login screen of a fresh live disk in QEMU went from
+16.67 s to 8.60 s. The BIOS live disk (`make live-hd`, the old PCs) isn't
+prepared this way yet: its first boot still does the work.
+
+## Boot: an installed system doesn't load the live stick's fallback (2026-10-17)
+
+The live stick's EFI partition carries `INITRD.CPIO`, a 240 MB login system
+in RAM for machines whose disk MyOS can't drive. The installer copied it to
+every installed system, where it is never used (the installer only installs
+onto a disk MyOS drives), and the loader read it at every start, and it then
+sat in RAM. Now `myos-mkesp --without EFI/MYOS/INITRD.CPIO` leaves it out,
+the loader starts without one when there is none, and the kernel makes /dev
+in RAM by itself then (it came with the initramfs before).
+
+| 64-bit, QEMU: the loader's step (reading the files) | with the fallback | without |
+|---|---|---|
+| Step 01 | 1.46 s | 0.01 s |
+
+On a real disk the 240 MB take longer than in QEMU, and the RAM they held
+(nothing gives it back after the disk's root is mounted) is free now.
+Checked: an image like an installed system's (the live root, no
+`INITRD.CPIO`) boots, says "initramfs: none", mounts its root and logs in.
+
+Not done (A2): the live stick still loads its fallback at every start. Its
+loader would have to know, before the kernel runs, that the kernel will find
+its disk, and a wrong guess leaves that machine unable to start at all.
+
+## SATA: MSI, a cleared interrupt, and polling only when it's missing (2026-10-17)
+
+`make test-install` found a SATA disk the firmware hadn't touched taking
+exactly 5 s per command: its interrupt line stayed raised (the handler
+cleared only ports it already knew), so every command ended at its timeout
+(docs/LOG.md, 2026-10-17). Now the handler clears every port, the
+controller uses MSI where it has it, and a controller whose interrupt never
+arrives is polled every 1 ms after 16 commands in a row without one. While
+the interrupt works the driver looks only every 50 ms, so a disk wait
+doesn't wake the CPU every millisecond.
+
+| 64-bit, QEMU q35, `dd` on the second SATA disk | before | after (MSI) | no interrupt at all |
+|---|---|---|---|
+| 200 reads of 1 sector | 5.0 s each (measured 1 read 5.0 s, 4 reads 20.0 s; 200 ≈ 1000 s) | 0.010 s | 0.745 s |
+| 10 MB written, 64 KiB at a time | ≈ 800 s (160 commands × 5 s; not run) | 0.021 s | — |
+| The installer onto it (`make test-install`) | stuck in sfdisk | 129 s in all | — |
+
+The "no interrupt" column is the fallback forced on in a scratch build (no
+handler installed); it is what a machine with broken interrupt routing gets.

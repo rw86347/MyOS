@@ -35,6 +35,9 @@
 
 #define PORTS_MAX  4                    /* disks we drive */
 #define TIMEOUT    5000                 /* ms */
+#define POLL_MS    1                    /* without the interrupt: look this often */
+#define CHECK_MS   50                   /* with it: look anyway, now and then */
+#define QUIET_MAX  16                   /* commands in a row with no interrupt: polling */
 
 /* HBA registers */
 #define CAP   0x00
@@ -113,6 +116,8 @@ struct port {
 static volatile uint32_t *hba;
 static struct port ports[PORTS_MAX];
 static int nports;
+static int polling;                     /* the interrupt doesn't come: poll */
+static uint32_t irqs, quiet;            /* interrupts seen; commands in a row without one */
 
 static void ahci_irq(struct regs *r)
 {
@@ -120,14 +125,20 @@ static void ahci_irq(struct regs *r)
     uint32_t is = hba[IS / 4];
     if (!is)
         return;                         /* another device on this line */
-    for (int k = 0; k < nports; k++) {
-        struct port *p = &ports[k];
-        if (!(is & (1u << p->num)))
-            continue;
-        uint32_t pis = p->r[PX_IS / 4];
-        p->r[PX_IS / 4] = pis;          /* write 1 to clear */
-        p->is |= pis;
-        wq_wake_all(&p->irq_wait);
+    irqs++;
+    /* Every port that asks is answered, ours or not yet: a port being set
+       up (add_port) interrupts as soon as the disk says hello, and a bit
+       left set would raise the interrupt again at once, forever. */
+    for (uint32_t bits = is; bits; bits &= bits - 1) {
+        int n = __builtin_ctz(bits);
+        volatile uint32_t *r = hba + (0x100 + n * 0x80) / 4;
+        uint32_t pis = r[PX_IS / 4];
+        r[PX_IS / 4] = pis;             /* write 1 to clear */
+        for (int k = 0; k < nports; k++)
+            if (ports[k].num == n) {
+                ports[k].is |= pis;
+                wq_wake_all(&ports[k].irq_wait);
+            }
     }
     hba[IS / 4] = is;
 }
@@ -193,13 +204,36 @@ static int issue(struct port *p, uint8_t cmd, uint64_t lba, uint32_t count,
     p->is = 0;
     __asm__ volatile ("" ::: "memory");
     p->r[PX_CI / 4] = 1;
-    uint32_t deadline = timer_ms() + TIMEOUT;
-    while ((p->r[PX_CI / 4] & 1) && !(p->is & IS_ERR))
-        if (wq_sleep_until(&p->irq_wait, deadline) && (p->r[PX_CI / 4] & 1))
+    /* Sleep until the interrupt says done, but look at the port now and
+       then too, so that a machine whose interrupt never arrives (it
+       happened: QEMU's q35 under UEFI, on the 8259 line) isn't stuck.
+       After QUIET_MAX commands in a row that ended with no interrupt at
+       all, it says so once and looks every POLL_MS: slow, not 5 s a
+       command. (One command ending on a look proves nothing: the look's
+       timer tick and the interrupt can come together, the tick first.) */
+    uint32_t deadline = timer_ms() + TIMEOUT, seen = irqs;
+    while ((p->r[PX_CI / 4] & 1) && !(p->is & IS_ERR)) {
+        uint32_t now = timer_ms(), next = now + (polling ? POLL_MS : CHECK_MS);
+        if ((int32_t)(now - deadline) >= 0)
             break;
+        if ((int32_t)(next - deadline) > 0)
+            next = deadline;
+        if (wq_sleep_until(&p->irq_wait, next)) {
+            uint32_t pis = p->r[PX_IS / 4];
+            p->r[PX_IS / 4] = pis;      /* what the interrupt handler would have seen */
+            p->is |= pis;
+        }
+    }
+    if (irqs != seen) {
+        quiet = 0;
+    } else if (++quiet == QUIET_MAX && !polling) {
+        kprintf("ahci: its interrupt does not arrive: polling every %d ms\n", POLL_MS);
+        polling = 1;
+    }
     int err = (p->r[PX_CI / 4] & 1) || (p->is & IS_ERR) || (p->r[PX_TFD / 4] & TFD_ERR);
     if (err) {
-        kprintf("ahci: command %x failed (is %lx, tfd %lx)\n", cmd, p->is, p->r[PX_TFD / 4]);
+        kprintf("ahci: command %x failed (is %lx, tfd %lx)\n", cmd, (unsigned long)p->is,
+                (unsigned long)p->r[PX_TFD / 4]);
         port_stop(p);
         port_start(p);
     }
@@ -255,9 +289,8 @@ static void add_port(int n)
     struct port *p = &ports[nports];
     p->r = hba + (0x100 + n * 0x80) / 4;
     p->num = n;
-    uint32_t ssts = p->r[PX_SSTS / 4];
-    if ((ssts & 0xF) != 3 || p->r[PX_SIG / 4] != SIG_DISK)
-        return;                         /* nothing there, or not a disk */
+    if ((p->r[PX_SSTS / 4] & 0xF) != 3)
+        return;                         /* nothing there */
     uint32_t frame = pmm_alloc(), idframe = pmm_alloc();
     if (!frame || !idframe) {
         if (frame)
@@ -278,6 +311,20 @@ static void add_port(int n)
     p->mem->list[0].ctba = frame + 1280;
     p->r[PX_IE / 4] = IE_BITS;
     port_start(p);
+    /* What the device is (its signature) comes in its first register FIS,
+       which the port takes only once FIS receiving is on (port_start). A
+       port the firmware never used, or reset, still says 0xFFFFFFFF until
+       then (QEMU's always does), so it is read only now, after waiting a
+       moment for a slow device. */
+    uint32_t end = timer_ms() + 100;
+    while (p->r[PX_SIG / 4] == 0xFFFFFFFFu && (int32_t)(timer_ms() - end) < 0)
+        ;
+    if (p->r[PX_SIG / 4] != SIG_DISK) { /* a CD drive, or no answer */
+        port_stop(p);
+        pmm_free(frame);
+        pmm_free(idframe);
+        return;
+    }
     nports++;
 
     uint16_t *id = P2V(idframe);
@@ -310,7 +357,7 @@ static void add_port(int n)
     pmm_free(idframe);
     blockdev_sd_name(dev.name);
     blockdev_register(&dev);
-    klog("ahci: %s: port %d, %lu MiB\n", dev.name, n, sectors / 2048);
+    klog("ahci: %s: port %d, %lu MiB\n", dev.name, n, (unsigned long)(sectors / 2048));
 }
 
 void ahci_init(void)
@@ -326,10 +373,18 @@ void ahci_init(void)
         return;
     pci_write_config(pci, 4, pci_read_config(pci, 4) | 0x6);  /* memory + bus master */
     hba[GHC / 4] |= GHC_AE;
-    irq_install(pci->irq, ahci_irq);
+    /* MSI where the controller has it (its own vector, no shared line to
+       route), else the 8259 line. */
+    if (pci_alloc_irq_vectors(pci, 1, 1, PCI_IRQ_MSI | PCI_IRQ_INTX) < 0)
+        kprintf("ahci: no interrupt: polling\n");
+    else
+        irq_install(pci_irq_vector(pci, 0), ahci_irq);
     hba[GHC / 4] |= GHC_IE;
     uint32_t pi = hba[PI / 4];
     for (int n = 0; n < 32 && nports < PORTS_MAX; n++)
         if (pi & (1u << n))
             add_port(n);
+    if (nports)
+        klog("ahci: %04x:%04x, %s irq %d\n", pci->vendor, pci->device,
+             pci->irq_type == PCI_IRQ_MSI ? "MSI" : "pin", pci_irq_vector(pci, 0));
 }

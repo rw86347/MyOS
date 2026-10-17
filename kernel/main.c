@@ -317,13 +317,13 @@ void kernel_main(void)
     pmm_refs_init();        /* pages may now be shared (copy-on-write) */
     mm_init();              /* address spaces */
     klog("Memory: %lu MiB usable, paging on, kernel at %p, heap at %p\n",
-         pmm_usable_count() / 256, (void *)_start, (void *)KHEAP_START);
+         (unsigned long)(pmm_usable_count() / 256), (void *)_start, (void *)KHEAP_START);
     sysenter_init();        /* fast syscalls, if the CPU has sysenter */
 
     boot_step("Timer and input");
     timer_init();           /* IRQ 0: 1 ms tick */
-    keyboard_init();        /* IRQ 1 */
-    mouse_init();           /* IRQ 12, if there is a PS/2 mouse */
+    if (keyboard_init() == 0)   /* IRQ 1, if the PC has a PS/2 controller */
+        mouse_init();           /* IRQ 12, if there is a PS/2 mouse */
     interrupts_enable();    /* sti: from now on, IRQs can arrive */
     timer_check();          /* a PIT that never ticks (new chipsets): the HPET */
 

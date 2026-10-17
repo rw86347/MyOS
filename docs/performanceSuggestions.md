@@ -16,6 +16,16 @@ go to `docs/performance.md` (CLAUDE.md, rule 3). Done or decided so far
   work, not waiting; B6 shortened it.
 - **The idle desktop's wake-ups:** not in this list, but done: 3.9% → 1.4%
   CPU, no programs started in the background.
+- **A5, the 32-bit loader's 2 s pause:** removed (2026-10-17): 2 s off every
+  old PC's boot.
+- **B1, DHCP in the background:** done (2026-10-17): 1 s off every boot in
+  QEMU, 1-3 s on a real network, up to 15 s on one that doesn't answer.
+- **C1, the first boot at build time:** done for the UEFI live disk
+  (2026-10-17): its login screen is up at 8.6 s in QEMU instead of 15.7 s
+  (`tools/live-prepare.py`). The BIOS live disk still does it at first boot.
+- **A1, an installed system without the fallback:** done (2026-10-17): the
+  loader's step goes from 1.46 s to 0.01 s in QEMU, and 240 MB of RAM stay
+  free. A2 (the stick deciding for itself) not yet: see docs/performance.md.
 
 The rule for everything below: **no capability is given up**. Every
 fallback, driver, service and program still exists; things are only done:

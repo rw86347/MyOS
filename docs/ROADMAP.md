@@ -74,6 +74,9 @@ Mark a step `[x]` only when its "Done when" check works.
     not re-measured.
   - [ ] 9c-3: the live disk's installer (partition, mke2fs, copy, boot area), raw block
     devices (/dev/hda...), and the UTM VM on the installed layout.
+    - [x] The installer installs, for UEFI (2026-10-10) and BIOS (2026-10-17), and
+      `make test-install` checks it in QEMU end to end: install from the stick, start
+      the new disk alone, log in (docs/INSTALLER-PLAN.md).
     - [x] The live disk's software: `make live-root` gathers `live/packages.txt`
       (IceWM desktop, logins, AbiWord, gcc/make/python3/adb, apk) as pinned Alpine
       packages plus the MyOS source into `build/live/rootfs.tar`.
@@ -128,6 +131,9 @@ Mark a step `[x]` only when its "Done when" check works.
   - [x] USB sticks and disks on xHCI (2026-10-07): our own xHCI and mass-storage
     (bulk-only, SCSI) drivers; the live system runs from a USB stick in QEMU
     (`make test-usb`). `docs/USB-PLAN.md`. Old PCs still need UHCI/EHCI.
+  - [x] USB keyboards and mice (HID, 2026-10-17): interrupt endpoints and a
+    report-descriptor parser; they reach the console and X as PS/2 ones do.
+    A PC with no PS/2 controller boots now (it used to hang).
   - Later: ext4 read, exFAT, ext4 write (needs a journal). NTFS is out of scope.
 
 ## Phase 3 — Networking & beyond

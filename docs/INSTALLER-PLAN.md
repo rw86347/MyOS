@@ -6,12 +6,16 @@ machine's own disk, the way Windows Setup or Ubuntu's installer does: it asks
 a few questions, partitions the disk, copies the system, and makes the
 machine start MyOS without the stick.
 
-Status: the wizard and helper exist (2026-10-07). `myos-install` (GTK, or
-`--text`) writes a plan; `myos-install-helper` (setuid root) checks it and
-would run the steps. On today's kernel it stops before writing: there are
-still no block device nodes, and the MSI's SSD is not visible. The mockups
-are drawn by `assets/themes/golden-hour/make-installer.py`. `make test-install`
-in QEMU is not built yet.
+Status (2026-10-17): it installs, and `make test-install` proves it in QEMU.
+`myos-install` (GTK, or `--text`) writes a plan; `myos-install-helper`
+(setuid root) checks it and runs the steps, onto UEFI machines (a GPT;
+since 2026-10-10) and BIOS PCs (an MBR, the whole disk; since 2026-10-17).
+`make ARCH=x86_64 test-install` installs from the stick onto an empty NVMe,
+SATA and USB disk and onto the GPD P2 Max's shape; `make test-install`
+(i386) onto an old PC's IDE and SATA disk. Each then starts the new disk
+alone and logs in with the new account (tools/test-install.py). The MSI's
+own SSD is still not visible (VMD). The mockups are drawn by
+`assets/themes/golden-hour/make-installer.py`.
 
 ## What it must do
 

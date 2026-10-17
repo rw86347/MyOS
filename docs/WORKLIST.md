@@ -89,7 +89,7 @@ Files and storage
 - [ ] B49. `epoll` with a ready list and real `EPOLLET`
 
 Hardware
-- [ ] B50. USB keyboards and mice (HID)
+- [x] B50. USB keyboards and mice (HID) (2026-10-17; limits: docs/gaps.md, USB)
 - [ ] B51. USB hubs
 - [ ] B52. The MSI's touchpad (I2C HID), two-finger scrolling (plan: docs/TOUCHPAD-PLAN.md)
 - [ ] B53. ACPI: power off and reboot on real PCs

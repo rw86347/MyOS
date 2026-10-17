@@ -145,8 +145,11 @@ including `06CB:7E7E` or `04F3:30AA`.
 - Commands go through the command register: `RESET`, `SET_POWER` (on),
   and `GET_REPORT` / `SET_REPORT` for feature reports.
 
-**The report descriptor parser**: general HID, so later USB keyboards
-and mice (B50) and the Pocket 4's touchscreen use it too.
+**The report descriptor parser**: general HID, so USB keyboards and mice
+(B50) and the Pocket 4's touchscreen use it too. A first one exists
+(`drivers/hid/hid.c`, 2026-10-17, for USB keyboards and mice): it keeps
+keys, buttons and relative X/Y/wheel; this step adds the digitizer page,
+absolute values with their physical size, and feature reports.
 - It walks the items (Usage Page, Usage, Logical Min/Max, Physical
   Min/Max and Unit, Report Size/Count, Report ID, Input/Output/Feature,
   Collection/End Collection).

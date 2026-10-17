@@ -70,7 +70,9 @@ stage2:
     mov edi, INITRD_LOAD
     call load
 
-    call hold                       ; so the picture can be seen; QEMU loads fast
+    ; (No pause here for the picture: it is on the screen while the disk is
+    ; read, and an old PC's boot is too long already. It used to hold it
+    ; 2 s more, on every machine: docs/performance.md, 2026-10-17.)
     call graphics_off               ; kernel console is the VGA text screen
 
     ; --- 4. Tell the kernel where the initramfs is ------------------------------
@@ -210,32 +212,6 @@ copy_font:
     mov dword [BOOTINFO + BOOTINFO_FONT + 24], eax
     mov dword [BOOTINFO + BOOTINFO_FONT + 28], eax
     mov dword [BOOTINFO + BOOTINFO_FONT + 32], eax   ; fb_phys_hi
-    ret
-
-; hold: ~2 seconds, so the picture is visible. QEMU finishes the disk copy
-; in a flash. The BIOS tick counter (int 0x1A) runs at 18.2 Hz. Disk and
-; video calls can come back with interrupts off, which freezes that counter,
-; so interrupts are turned on first. A spin cap keeps a broken clock from
-; hanging the boot.
-hold:
-    sti
-    call segs                   ; BIOS calls may return with DS changed
-    mov ah, 0
-    int 0x1A
-    call segs
-    mov [hold_tick], dx
-    mov dword [hold_spins], 0
-.wait:
-    mov ah, 0
-    int 0x1A
-    call segs
-    sub dx, [hold_tick]
-    cmp dx, 36                  ; 36/18.2 ≈ 2 seconds
-    jae .done
-    inc dword [hold_spins]
-    cmp dword [hold_spins], 2000000
-    jb .wait
-.done:
     ret
 
 ; segs: DS = ES = 0, which is where our data and the BIOS packet live.
@@ -464,8 +440,6 @@ dap_lba:
 boot_drive:     db 0
 prog_done:      dd 0            ; sectors copied, for the progress bar
 prog_total:     dd 0
-hold_tick:      dw 0
-hold_spins:     dd 0            ; a cap, in case the BIOS clock never ticks
 msg_disk_error: db 13, 10, "MyOS: disk read error!", 13, 10, 0
 msg_move_error: db 13, 10, "MyOS: copy above 1 MiB failed!", 13, 10, 0
 

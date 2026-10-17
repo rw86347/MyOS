@@ -20,6 +20,11 @@ int mouse_init(void);
 /* The oldest movement not yet taken: 0, or -1 if there is none. */
 int mouse_get(struct mouse_event *e);
 
+/* One movement, from any mouse's interrupt (PS/2 here, USB in usb_hid.c),
+   in PS/2's directions (dy > 0: up; wheel > 0: towards the user): to
+   /dev/input/event1 and to mouse_get. */
+void mouse_report(const struct mouse_event *e);
+
 /* Called (in the interrupt) after each new movement: wake whoever waits. */
 void mouse_set_listener(void (*fn)(void));
 

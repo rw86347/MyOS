@@ -1,7 +1,8 @@
 /* SPDX-License-Identifier: BSD-2-Clause */
 /* Copyright (c) 2026 Rodger Wilson */
 /*
- * usb.h — USB devices, as the class drivers (usb_storage.c) see them.
+ * usb.h — USB devices, as the class drivers (usb_storage.c, usb_hid.c)
+ * see them.
  *
  * A device has numbered endpoints: one-way pipes. Endpoint 0 is the
  * control pipe every device has (questions and settings); a USB stick adds
@@ -33,6 +34,7 @@
 #define USB_ENDPOINT_XFER_BULK 2
 #define USB_ENDPOINT_XFER_INT  3
 
+#define USB_CLASS_HID          3
 #define USB_CLASS_MASS_STORAGE 8
 
 /* Speeds, as xHCI numbers them (PORTSC, the slot context). */
@@ -130,11 +132,25 @@ int usb_halted(struct usb_device *d, uint8_t ep);
 int usb_reset_ep(struct usb_device *d, uint8_t ep);
 int usb_clear_halt(struct usb_device *d, uint8_t ep);
 
+/*
+ * Interrupt-IN transfers (keyboards, mice). The controller asks the device
+ * every bInterval whether it has news; it answers only when it does.
+ * usb_intr_start keeps one transfer of len bytes into phys queued on IN
+ * endpoint `ep` for good: each time the device answers, fn(arg, n) runs
+ * in the controller's interrupt with the n bytes it sent, and the
+ * transfer is queued again. An endpoint that fails (a stall, an error) is
+ * cleared and started again by the usb thread. The endpoint must be one
+ * of those given to usb_configure.
+ */
+int usb_intr_start(struct usb_device *d, uint8_t ep, uint32_t phys, uint16_t len,
+                   void (*fn)(void *arg, int n), void *arg);
+
 /* Sleep (a kernel thread, interrupts on). */
 void usb_sleep(uint32_t ms);
 
 /* The class drivers: 0 if this one takes the device. */
 int usb_storage_probe(struct usb_device *d, const uint8_t *config, int len);
+int usb_hid_probe(struct usb_device *d, const uint8_t *config, int len);
 
 /* Boot: start the controllers and their thread; then wait (at most ms) for
    the devices already plugged in to be found. */

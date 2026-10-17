@@ -1,7 +1,8 @@
 /* SPDX-License-Identifier: BSD-2-Clause */
 /* Copyright (c) 2026 Rodger Wilson */
 /*
- * evdev.c — /dev/input/event0 (keyboard) and event1 (mouse)
+ * evdev.c — /dev/input/event0 (keyboard), event1 (mouse) and event2
+ * (touch screens and tablets: absolute pointers)
  *
  * Linux hands keyboards and mice to programs as streams of small fixed
  * records, "input events", one per change:
@@ -10,6 +11,7 @@
  *
  *   EV_KEY  KEY_A, 1     the A key went down (0: up, 2: auto-repeat)
  *   EV_REL  REL_X, -3    the mouse moved 3 left
+ *   EV_ABS  ABS_X, 900   a finger (or a tablet's pen) is at x = 900
  *   EV_SYN  SYN_REPORT   end of one report: apply what came before together
  *
  * The X server opens these files (xf86-input-evdev) and asks with ioctls
@@ -38,6 +40,7 @@
 #define EV_SYN 0x00
 #define EV_KEY 0x01
 #define EV_REL 0x02
+#define EV_ABS 0x03
 #define EV_LED 0x11
 #define EV_REP 0x14
 #define SYN_REPORT  0
@@ -45,8 +48,11 @@
 #define REL_X     0x00
 #define REL_Y     0x01
 #define REL_WHEEL 0x08
+#define ABS_X     0x00
+#define ABS_Y     0x01
 #define BTN_LEFT  0x110
 #define KEY_CNT   0x300
+#define BUS_USB   0x03
 #define BUS_I8042 0x11
 
 #define QLEN    128                 /* events per reader */
@@ -71,13 +77,22 @@ struct evdev {
     uint8_t ev_bits[4];             /* EV_* it sends */
     uint8_t key_bits[KEY_CNT / 8];  /* KEY_* / BTN_* it has */
     uint8_t rel_bits[2];
+    uint8_t abs_bits[8];            /* ABS_* it has (event2: X and Y) */
+    int32_t abs[2];                 /* where X and Y are now (EVIOCGABS) */
     uint8_t key_down[KEY_CNT / 8];  /* held now (EVIOCGKEY) */
     struct wait_queue wq;
 };
 
-static struct evdev devs[2] = {
+#define NDEVS 3
+static struct evdev devs[NDEVS] = {
     { .name = "AT Translated Set 2 keyboard", .product = 1 },
     { .name = "ImExPS/2 Generic Explorer Mouse", .product = 2 },
+    /* Every absolute pointer, in one range (EVDEV_ABS_MAX): X maps it
+       onto the screen. A touch is the left button: X's evdev driver takes
+       a device with BTN_TOUCH *and* buttons for a touchpad, which moves
+       the pointer only while a finger is down (UTM's tablet never says
+       one is). With the buttons alone it is a touch screen: it points. */
+    { .name = "MyOS touch screen", .product = 3 },
 };
 
 static void set_bit(uint8_t *bits, unsigned n) { bits[n / 8] |= 1 << (n % 8); }
@@ -88,7 +103,7 @@ static void init_bits(void)
     if (done)
         return;
     done = 1;
-    struct evdev *k = &devs[0], *m = &devs[1];
+    struct evdev *k = &devs[0], *m = &devs[1], *t = &devs[2];
     set_bit(k->ev_bits, EV_SYN), set_bit(k->ev_bits, EV_KEY);
     set_bit(k->ev_bits, EV_LED), set_bit(k->ev_bits, EV_REP);
     for (unsigned c = 1; c <= 88; c++)
@@ -102,6 +117,12 @@ static void init_bits(void)
     for (unsigned b = 0; b < 3; b++)
         set_bit(m->key_bits, BTN_LEFT + b);     /* left, right, middle */
     set_bit(m->rel_bits, REL_X), set_bit(m->rel_bits, REL_Y), set_bit(m->rel_bits, REL_WHEEL);
+    set_bit(t->ev_bits, EV_SYN), set_bit(t->ev_bits, EV_KEY);
+    set_bit(t->ev_bits, EV_ABS), set_bit(t->ev_bits, EV_REL);
+    for (unsigned b = 0; b < 3; b++)
+        set_bit(t->key_bits, BTN_LEFT + b);     /* a tablet's (or QEMU's) buttons; a touch */
+    set_bit(t->abs_bits, ABS_X), set_bit(t->abs_bits, ABS_Y);
+    set_bit(t->rel_bits, REL_WHEEL);
 }
 
 /* --- from the interrupt handlers ----------------------------------------------- */
@@ -173,6 +194,30 @@ void evdev_mouse(const struct mouse_event *e)
         emit(d, EV_REL, REL_Y, -e->dy);         /* PS/2 counts up, screens down */
     if (e->wheel)
         emit(d, EV_REL, REL_WHEEL, -e->wheel);  /* as Linux's psmouse does */
+    report(d);
+}
+
+/* A button (key) on device d is held or not: an event only if that changed. */
+static void button(struct evdev *d, uint16_t code, int now)
+{
+    int was = (d->key_down[code / 8] >> (code % 8)) & 1;
+    if (now != was) {
+        d->key_down[code / 8] ^= 1 << (code % 8);
+        emit(d, EV_KEY, code, now);
+    }
+}
+
+void evdev_touch(const struct touch_event *e)
+{
+    struct evdev *d = &devs[2];
+    if (e->x != d->abs[0])
+        emit(d, EV_ABS, ABS_X, d->abs[0] = e->x);
+    if (e->y != d->abs[1])
+        emit(d, EV_ABS, ABS_Y, d->abs[1] = e->y);
+    for (int b = 0; b < 3; b++)            /* a finger or pen down is a left click */
+        button(d, BTN_LEFT + b, ((e->buttons >> b) & 1) || (b == 0 && e->touch > 0));
+    if (e->wheel)
+        emit(d, EV_REL, REL_WHEEL, e->wheel);
     report(d);
 }
 
@@ -288,18 +333,25 @@ static int32_t ev_ioctl(struct file *f, uint32_t cmd, uintptr_t arg)
             case 0:      return give(arg, d->ev_bits, sizeof d->ev_bits, len);
             case EV_KEY: return give(arg, d->key_bits, sizeof d->key_bits, len);
             case EV_REL: return give(arg, d->rel_bits, sizeof d->rel_bits, len);
+            case EV_ABS: return give(arg, d->abs_bits, sizeof d->abs_bits, len);
             default:     return give(arg, zeros, sizeof zeros, len);
             }
         }
-        if (nr >= 0x40 && nr < 0x80)
-            return -EINVAL;                     /* EVIOCGABS: no absolute axes */
+        if (nr >= 0x40 && nr < 0x80) {          /* EVIOCGABS(axis): its range */
+            uint32_t axis = nr - 0x40;
+            if (r->dev != 2 || axis > ABS_Y)
+                return -EINVAL;
+            /* struct input_absinfo: value, minimum, maximum, fuzz, flat, resolution */
+            int32_t info[6] = { d->abs[axis], 0, EVDEV_ABS_MAX, 0, 0, 0 };
+            return give(arg, info, sizeof info, len) < 0 ? -EFAULT : 0;
+        }
         switch (nr) {
         case 0x01: {                            /* EVIOCGVERSION */
             int32_t v = 0x010001;
             return give(arg, &v, 4, len) < 0 ? -EFAULT : 0;
         }
         case 0x02: {                            /* EVIOCGID */
-            uint16_t id[4] = { BUS_I8042, 1, d->product, 0xAB41 };
+            uint16_t id[4] = { r->dev == 2 ? BUS_USB : BUS_I8042, 1, d->product, 0xAB41 };
             return give(arg, id, sizeof id, len) < 0 ? -EFAULT : 0;
         }
         case 0x03: {                            /* EVIOCGREP: delay, period (ms) */
@@ -310,9 +362,11 @@ static int32_t ev_ioctl(struct file *f, uint32_t cmd, uintptr_t arg)
         }
         case 0x06:                              /* EVIOCGNAME */
             return give(arg, d->name, strlen(d->name) + 1, len);
-        case 0x07:                              /* EVIOCGPHYS */
-            return give(arg, r->dev ? "isa0060/serio1/input0" : "isa0060/serio0/input0",
-                        22, len);
+        case 0x07: {                            /* EVIOCGPHYS */
+            static const char *const phys[NDEVS] = {
+                "isa0060/serio0/input0", "isa0060/serio1/input0", "usb-myos/input0" };
+            return give(arg, phys[r->dev], strlen(phys[r->dev]) + 1, len);
+        }
         case 0x08:                              /* EVIOCGUNIQ */
             return -ENOENT;
         case 0x09:                              /* EVIOCGPROP */
@@ -363,5 +417,5 @@ static const struct file_ops ev_ops = {
 
 const struct file_ops *evdev_ops(uint32_t minor)
 {
-    return minor == 64 || minor == 65 ? &ev_ops : NULL;
+    return minor >= 64 && minor < 64 + NDEVS ? &ev_ops : NULL;
 }

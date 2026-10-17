@@ -9,7 +9,7 @@
  * every device has. A new device answers at address 0: the host resets
  * its port, gives it an address, reads its descriptors (what it is, which
  * endpoints it has) and picks a configuration. Then a class driver takes
- * over (usb_storage.c for USB sticks).
+ * over (usb_storage.c for USB sticks, usb_hid.c for keyboards and mice).
  *
  * xHCI works much like NVMe (nvme.c): rings of 16-byte entries ("TRBs")
  * in RAM, shared with the controller. One command ring (enable a slot,
@@ -32,10 +32,13 @@
  * Who runs what: the "usb" thread starts the controllers, finds and
  * addresses devices and probes class drivers; it alone uses a
  * controller's input context. Transfers come from any thread, one at a
- * time per endpoint (the class driver keeps that order).
+ * time per endpoint (the class driver keeps that order). Interrupt
+ * endpoints (a keyboard's reports) run themselves: their completion, in
+ * the interrupt, hands the data to the class driver and queues the next
+ * transfer (usb_intr_start).
  *
  * Not done (docs/USB-PLAN.md): hubs, unplugging (a gone device just stops
- * answering), interrupt and isochronous endpoints, streams.
+ * answering), isochronous endpoints, streams.
  */
 #include <interrupts.h>
 #include <kheap.h>
@@ -170,6 +173,14 @@ struct ep {
     volatile uint8_t done;
     volatile uint8_t code;              /* the completion code it ended with */
     volatile uint32_t residue;          /* bytes not moved (a short packet) */
+    /* An interrupt-IN endpoint (usb_intr_start): its one transfer, and
+       whom to give the data. */
+    void (*fn)(void *arg, int n);
+    void *arg;
+    uint32_t intr_phys;
+    uint16_t intr_len;
+    volatile uint8_t broken;            /* it failed: the usb thread restarts it */
+    uint8_t fails;                      /* restarts since its last report */
 };
 
 struct xhci;
@@ -177,6 +188,7 @@ struct usb_device {
     struct xhci *hc;
     uint8_t slot, port, speed;
     volatile uint8_t failed;            /* a transfer failed: its completion code */
+    uint8_t gone;                       /* unplugged */
     void *out;                          /* the device context (the controller's) */
     uint32_t out_phys;
     uint8_t *buf;                       /* a page for control transfers */
@@ -205,6 +217,7 @@ struct xhci {
     uint8_t cmd_busy, warned;
     struct wait_queue cmd_turn;
     volatile uint8_t port_change;
+    volatile uint8_t ep_fix;            /* an interrupt endpoint is broken */
     struct usb_device *dev[MAX_SLOTS + 1];
     struct usb_device *port_dev[MAX_PORTS + 1];
     uint8_t port_tried[MAX_PORTS + 1];
@@ -308,6 +321,14 @@ static void doorbell(struct xhci *hc, int slot, int target)
 
 /* ---- events (the interrupt, or a waiter polling; interrupts off) ---- */
 
+/* An interrupt endpoint's next transfer: one TRB, an event when it ends
+   (short or not), and the doorbell. Interrupts off. */
+static void intr_queue(struct usb_device *d, struct ep *ep, int dci)
+{
+    ring_put(&ep->ring, ep->intr_phys, ep->intr_len, T_TYPE(TRB_NORMAL) | T_ISP | T_IOC);
+    doorbell(d->hc, d->slot, dci);
+}
+
 static void transfer_event(struct xhci *hc, struct trb *e)
 {
     uint8_t slot = e->control >> 24, dci = (e->control >> 16) & 0x1F;
@@ -316,6 +337,20 @@ static void transfer_event(struct xhci *hc, struct trb *e)
     struct ep *ep = d ? d->ep[dci] : NULL;
     if (!ep)
         return;
+    if (ep->fn) {                       /* an interrupt endpoint: a report came */
+        if (code == CC_SUCCESS || code == CC_SHORT) {
+            int n = (int)ep->intr_len - (int)(e->status & 0xFFFFFF);
+            ep->fails = 0;
+            ep->fn(ep->arg, n > 0 ? n : 0);
+            intr_queue(d, ep, dci);     /* and listen for the next one */
+        } else if (code != CC_STOPPED && code != CC_STOPPED_LEN && code != CC_STOPPED_SHORT) {
+            ep->broken = 1;             /* commands sleep: the usb thread does it */
+            hc->ep_fix = 1;
+            if (boot_done)
+                wq_wake_all(&port_wq);
+        }
+        return;
+    }
     if (code == CC_SHORT)
         ep->residue = e->status & 0xFFFFFF;
     if (code == CC_SUCCESS || code == CC_SHORT) {
@@ -544,6 +579,23 @@ int usb_clear_halt(struct usb_device *d, uint8_t epa)
     return halted;
 }
 
+int usb_intr_start(struct usb_device *d, uint8_t epa, uint32_t phys, uint16_t len,
+                   void (*fn)(void *arg, int n), void *arg)
+{
+    int dci = dci_of(epa);
+    struct ep *ep = d->ep[dci];
+    if (!ep || !(epa & USB_DIR_IN) || !len)
+        return -1;
+    uint32_t flags = irq_save();
+    ep->intr_phys = phys;
+    ep->intr_len = len;
+    ep->arg = arg;
+    ep->fn = fn;
+    intr_queue(d, ep, dci);
+    irq_restore(flags);
+    return 0;
+}
+
 int usb_control(struct usb_device *d, uint8_t type, uint8_t req, uint16_t value,
                 uint16_t index, void *data, uint16_t len)
 {
@@ -603,6 +655,21 @@ static struct ep *ep_new(struct usb_device *d, int dci, uint16_t mps)
     return ep;
 }
 
+/* An interrupt endpoint's Interval: the controller polls it every
+   2^n x 125 us. A full- or low-speed bInterval counts milliseconds; a
+   high-speed or USB 3 one is the exponent already, plus one (xHCI 6.2.3.6;
+   rounded down, as Linux's xhci_get_endpoint_interval does). */
+static uint32_t interval(int speed, uint8_t b)
+{
+    if (speed == USB_SPEED_FULL || speed == USB_SPEED_LOW) {
+        uint32_t n = 0;
+        for (uint32_t uframes = (b ? b : 1) * 8u; uframes > 1; uframes >>= 1)
+            n++;                        /* floor(log2(bInterval x 8)) */
+        return n < 3 ? 3 : n > 10 ? 10 : n;
+    }
+    return b ? (b > 16 ? 15u : b - 1u) : 0;
+}
+
 int usb_configure(struct usb_device *d, uint8_t config, const struct usb_ep_want *eps, int n)
 {
     struct xhci *hc = d->hc;
@@ -610,18 +677,29 @@ int usb_configure(struct usb_device *d, uint8_t config, const struct usb_ep_want
     uint32_t add = 1, last = 1;
     for (int k = 0; k < n; k++) {
         const struct usb_endpoint_descriptor *e = eps[k].desc;
-        if ((e->bmAttributes & 3) != USB_ENDPOINT_XFER_BULK)
-            return -1;                  /* only bulk so far */
+        int type = e->bmAttributes & 3;
+        if (type != USB_ENDPOINT_XFER_BULK && type != USB_ENDPOINT_XFER_INT)
+            return -1;                  /* no isochronous yet */
         int in = e->bEndpointAddress & USB_DIR_IN, dci = dci_of(e->bEndpointAddress);
         uint16_t mps = e->wMaxPacketSize & 0x7FF;
         struct ep *ep = ep_new(d, dci, mps);
         if (!ep)
             return -1;
         uint32_t *c = ctx(hc, hc->in, 1 + dci);
-        c[1] = (3u << 1) | ((in ? 6u : 2u) << 3) | ((uint32_t)eps[k].burst << 8) |
-               ((uint32_t)mps << 16);  /* 3 retries, bulk in/out, burst, packet size */
+        /* Endpoint types (xHCI 6.2.3): 2/6 bulk out/in, 3/7 interrupt out/in. */
+        uint32_t kind = (type == USB_ENDPOINT_XFER_BULK ? 2u : 3u) + (in ? 4u : 0u);
+        c[1] = (3u << 1) | (kind << 3) | ((uint32_t)eps[k].burst << 8) |
+               ((uint32_t)mps << 16);  /* 3 retries, the type, burst, packet size */
         c[2] = ep->ring.phys | 1;       /* where it starts; cycle 1 */
-        c[4] = 3072;                    /* average TRB length (xHCI 4.14.1.1: bulk) */
+        if (type == USB_ENDPOINT_XFER_BULK) {
+            c[4] = 3072;                /* average TRB length (xHCI 4.14.1.1: bulk) */
+        } else {
+            /* The most it moves per poll ("Max ESIT Payload"), which is
+               also its average TRB: one report. */
+            uint32_t esit = (uint32_t)mps * (eps[k].burst + 1u);
+            c[0] = interval(d->speed, e->bInterval) << 16;
+            c[4] = esit | esit << 16;
+        }
         add |= 1u << dci;
         if ((uint32_t)dci > last)
             last = dci;
@@ -775,7 +853,7 @@ static struct usb_device *attach(struct xhci *hc, int p)
     klog("usb %d-%d: %04x:%04x %s%s(USB %x.%x, %s), class %d\n", bus, p,
             d->desc.idVendor, d->desc.idProduct, d->name, *d->name ? " " : "",
             d->desc.bcdUSB >> 8, (d->desc.bcdUSB >> 4) & 0xF, speed_name(speed), cls);
-    if (usb_storage_probe(d, cfg, len) < 0) {
+    if (usb_storage_probe(d, cfg, len) < 0 && usb_hid_probe(d, cfg, len) < 0) {
         if (cls == 9)
             kprintf("usb %d-%d: a hub: not supported yet\n", bus, p);
     }
@@ -816,8 +894,10 @@ static void ports_scan(struct xhci *hc, int debounce)
         if (sc & PS_CHANGES)
             wr(hc->op, OP_PORTSC(p), (sc & PS_KEEP) | (sc & PS_CHANGES));
         if (!(sc & PS_CCS)) {
-            if (hc->port_dev[p])
+            if (hc->port_dev[p]) {
                 kprintf("usb %d-%d: unplugged (the kernel can't let go of it yet)\n", bus, p);
+                hc->port_dev[p]->gone = 1;
+            }
             hc->port_dev[p] = NULL;
             hc->port_tried[p] = 0;
             continue;
@@ -1020,6 +1100,40 @@ static int hc_start(struct pci_dev *pci)
     return 0;
 }
 
+/* Interrupt endpoints that failed (transfer_event): a stall or a
+   transaction error halts one. Clear it on both sides and start it again;
+   after a few failures in a row with no report between them, give up on
+   it (it says so). The usb thread, interrupts on. */
+static void ep_fix(struct xhci *hc)
+{
+    for (int s = 1; s <= hc->slots; s++) {
+        struct usb_device *d = hc->dev[s];
+        for (int dci = 2; d && !d->gone && dci < 32; dci++) {
+            struct ep *ep = d->ep[dci];
+            if (!ep || !ep->fn || !ep->broken)
+                continue;
+            ep->broken = 0;
+            uint8_t epa = (uint8_t)(dci / 2) | ((dci & 1) ? USB_DIR_IN : 0);
+            if (!(rd(hc->op, OP_PORTSC(d->port)) & PS_CCS))
+                continue;               /* unplugged (ports_scan says so) */
+            if (++ep->fails > 3) {
+                kprintf("usb %d-%d: endpoint %02x keeps failing: stopped\n",
+                        (int)(hc - hcs) + 1, d->port, epa);
+                continue;
+            }
+            usb_sleep(10u << ep->fails);
+            if (usb_clear_halt(d, epa) < 0) {
+                ep->broken = 1;         /* try again next time round */
+                hc->ep_fix = 1;
+                continue;
+            }
+            uint32_t flags = irq_save();
+            intr_queue(d, ep, dci);
+            irq_restore(flags);
+        }
+    }
+}
+
 static void usb_thread(void *arg)
 {
     (void)arg;
@@ -1040,17 +1154,21 @@ static void usb_thread(void *arg)
     uint32_t flags = irq_save();
     boot_done = 1;
     wq_wake_all(&boot_wq);
-    for (;;) {                          /* then: something plugged in later */
+    for (;;) {                  /* then: something plugged in later, or a fix */
         int i;
-        for (i = 0; i < nhc && !hcs[i].port_change; i++)
+        for (i = 0; i < nhc && !hcs[i].port_change && !hcs[i].ep_fix; i++)
             ;
         if (i == nhc) {
             wq_sleep(&port_wq);         /* (interrupts are off: no wake-up is missed) */
             continue;
         }
-        hcs[i].port_change = 0;
+        int ports = hcs[i].port_change, fix = hcs[i].ep_fix;
+        hcs[i].port_change = hcs[i].ep_fix = 0;
         irq_restore(flags);
-        ports_scan(&hcs[i], 1);
+        if (ports)
+            ports_scan(&hcs[i], 1);
+        if (fix)
+            ep_fix(&hcs[i]);
         flags = irq_save();
     }
 }
