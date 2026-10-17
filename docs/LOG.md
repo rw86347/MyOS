@@ -4234,3 +4234,13 @@ it from QEMU's VGA BIOS at build time. The live-disk rules moved from the
 Makefile to `live/live.mk`, included when `live/` is there; every command
 stays the same.
 
+This folder then became real clones of both (the old combined branches
+stay in `.git`, local only), and everything was remade from clean (keeping
+only the download cache, `build/ext`) and tested: i386 build, `make test`,
+test-usb-hid, test-uefi, test-hd, live-hd, test-install (BIOS: IDE, SATA);
+x86_64 uefi, test-uefi-shell, test-usb-hid, test-usb-tablet, live-uefi,
+test-usb, test-uefi-login, test-install (UEFI: NVMe, SATA, USB, P2 Max);
+arm64 build and `make ARCH=arm64 test`. All pass. The clean build found one
+thing: WritePerfect's C++ include path was worked out before a clean build
+had unpacked the sysroot (fixed in myos-live).
+
