@@ -4212,3 +4212,25 @@ and frozen, and the installer proven. So:
     and POPCNT, which QEMU's qemu64 CPU doesn't have ("Illegal instruction",
     exit 132; on `-cpu max` it prints `2.1.295 (Claude Code)`). The install
     VM's CPU is now `max`; the GPD P2 Max (Kaby Lake) has all three.
+
+## 2026-10-17 — Two repos on GitHub
+
+MyOS is published as two public repos: github.com/rw86347/MyOS, the kernel
+with its tools, tests and docs, and github.com/rw86347/myos-live, the live
+and installer disks, checked out inside it as `live/`. Both histories were
+filtered out of the combined one (`git filter-branch`, run by a script that
+has served its purpose and is gone; it is in commit c026d66's tree):
+- MyOS keeps every commit, without `live/` and the live-only tools and
+  theme files, and without `docs/hardwareRequirements.md`, which is private.
+- myos-live has `live/` as its top, with the history of the tools and
+  theme files that moved into it, and never WritePerfect's files (all
+  rights reserved), which now sit in WritePerfect's own repo
+  (`../wp51/wp51c/myos`) and are read from there.
+Before the push, the whole history was searched for keys, tokens and Wi-Fi
+passwords (only the simulated test network's), and fresh clones of both
+were checked to find every build target. That found one real problem: the
+UEFI console font had never been committed, so `tools/mkfont.py` now takes
+it from QEMU's VGA BIOS at build time. The live-disk rules moved from the
+Makefile to `live/live.mk`, included when `live/` is there; every command
+stays the same.
+

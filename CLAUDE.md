@@ -102,6 +102,9 @@ the docs), and github.com/rw86347/myos-live (the desktop programs, the overlay, 
 lists, the image builders, assets/themes), cloned into `live/`. WritePerfect is a third
 (github.com/rw86347/writePerfect, all rights reserved: never copy its files into these two);
 the live build reads it from `../wp51/wp51c` (`WP_DIR`).
+Commit each change in the repo its files belong to (`git -C live ...` for `live/`). On Rodger's
+Mac this clone's `.git` also keeps the old combined history (branches `m1`, `master`,
+`dualChip`): local only, never push them; `main` is the published kernel history.
 Keep all CPU-specific code inside `arch/` from day one so the ARM port stays possible.
 
 ## Conventions
