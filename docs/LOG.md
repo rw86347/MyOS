@@ -4208,3 +4208,7 @@ and frozen, and the installer proven. So:
   - `/var/log/boot.log` (runit stage 1): the kernel's messages from each
     start, kept on disk (root only), for machines with no serial port or
     network to read them from.
+  - Claude Code "crashed at once" in the VM: its build uses SSSE3, SSE4.2
+    and POPCNT, which QEMU's qemu64 CPU doesn't have ("Illegal instruction",
+    exit 132; on `-cpu max` it prints `2.1.295 (Claude Code)`). The install
+    VM's CPU is now `max`; the GPD P2 Max (Kaby Lake) has all three.

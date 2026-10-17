@@ -75,6 +75,9 @@ keyboard made last and the pointer to the tablet the system reads, so
 those are the ones used. The xHCI gets 8 ports, because with its 4 and six
 devices QEMU would put some behind a hub, which MyOS can't drive yet.
 
+Its CPU is QEMU's `max`, not `qemu64`: Claude Code is built for SSSE3,
+SSE4.2 and POPCNT and stops with "Illegal instruction" without them.
+
 ### UTM keeps a loaded VM's settings in memory
 
 Rewriting `config.plist` while UTM has the VM open changes nothing: the next

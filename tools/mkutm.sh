@@ -72,7 +72,8 @@
 # the tablet the system reads), and the tablet is how UTM hands over the
 # Mac's pointer without capturing it (drivers/hid/hid.c, /dev/input/event2).
 # Found 2026-10-17 from UTM's own debug log (--debug-port turns it on).
-# After installing, move the NVMe disk above the USB drive in UTM's settings
+# Its CPU is QEMU's "max" (SSSE3, SSE4.2, POPCNT, as a new laptop has), which
+# Claude Code needs. After installing, move the NVMe disk above the USB drive in UTM's settings
 # (Drives): the firmware starts the first one. (Removing the USB drive there
 # deletes its image.)
 set -e
@@ -218,6 +219,10 @@ fi
 # The machine itself: an old PC, or (--x86_64) a modern UEFI one.
 if [ $x64 = 1 ]; then
     ARCH=x86_64 CPU=qemu64 TARGET=q35 UEFI="<true/>"
+    # The install machine is a modern laptop's: QEMU's "max" CPU has SSSE3,
+    # SSE4.2 and POPCNT, as the GPD P2 Max (Kaby Lake) has. Claude Code's
+    # build uses them: on qemu64 it stops at once ("Illegal instruction").
+    [ $usb_stick = 1 ] && CPU=max
     SOUND="
 		<dict>
 			<key>Hardware</key>
