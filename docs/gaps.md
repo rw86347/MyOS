@@ -1307,3 +1307,20 @@ own, `cld` on every entry and page-table checks are in (docs/LOG.md,
   can't see them, and the kernel will skip what isn't there.
 - **MyOS's /proc/cpuinfo leaves out flags** such as `est`, `acpi` and `tm`,
   so Settings reads CPUID itself.
+
+## Chinese input (2026-10-21)
+- **dconf works only because of `$XDG_RUNTIME_DIR`.** dconf maps a one-byte file
+  `MAP_SHARED`; a disk file opened for writing can't be mapped shared here (worklist
+  B13), so with the file in `~/.cache` (ext2) every GSettings reader aborted:
+  IBus's settings service, panel and pinyin engine. `myos-login` now makes
+  `/run/user/UID` in RAM, as logind does. A console or ssh login gets none, so
+  GSettings programs started from there still abort until B13 or a PAM module
+  makes it.
+- **No IBus icon in the tray**: `ibus-ui-gtk3` runs, but IceWM's tray shows nothing
+  for it. English / 中文 is told only by the candidate window.
+- **The 32-bit disk doesn't have it yet**: `live/packages.lock` needs
+  `live/tools/fetch-live.py --add` (about 20 MB of i386 packages), and until then a
+  32-bit build needs `LIVE_STALE_LOCK=1`. The installer's "Also install fonts and
+  input for Chinese" doesn't copy `[input]` yet.
+- **`pidfd_open` (434) is missing**: GLib falls back to SIGCHLD to watch IBus's
+  children, so it costs nothing visible.

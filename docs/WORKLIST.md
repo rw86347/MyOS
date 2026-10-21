@@ -106,7 +106,10 @@ real passwords B34 are there already), then the installer itself.
 - [ ] C3. UEFI runtime services: boot entries (`efivarfs`, `efibootmgr`)
 - [ ] C4. Console key maps; the hardware clock in local time (an option)
 - [ ] C5. `dosfstools`, `efibootmgr`, CJK fonts and pinyin on the live disk
-      (CJK fonts are in: Noto Sans/Serif CJK, `[fonts]` in live/packages.txt)
+      (CJK fonts are in: Noto Sans/Serif CJK, `[fonts]` in live/packages.txt;
+      pinyin is in on the 64-bit disk: IBus + libpinyin, `[input]`, Ctrl+Space.
+      The 32-bit lock still needs `fetch-live.py --add`, and the installer's
+      Chinese checkbox doesn't install `[input]` yet)
 - [ ] C6. `make test-install` in QEMU (helper and plan file exist)
 - [x] C7. `myos-install --text`
 - [x] C8. The GTK installer (the mockups' nine pages)

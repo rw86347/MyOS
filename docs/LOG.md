@@ -4244,3 +4244,20 @@ arm64 build and `make ARCH=arm64 test`. All pass. The clean build found one
 thing: WritePerfect's C++ include path was worked out before a clean build
 had unpacked the sysroot (fixed in myos-live).
 
+## 2026-10-21 — Typing Chinese: IBus pinyin on the 64-bit live disk
+
+Ctrl+Space switches between English and 中文 (pinyin) in every GTK program and,
+through XIM, in xterm: `ibus`, `ibus-libpinyin` and `ibus-gtk3` are a new
+`[input]` group in live/packages.txt (94 MiB with what they bring, most of it
+libpinyin's dictionary). `/etc/myos/xsession` starts `ibus-daemon` before the
+desktop and exports `GTK_IM_MODULE`, `QT_IM_MODULE` and `XMODIFIERS`; a GSettings
+override sets the trigger to Ctrl+Space (IceWM takes the Windows key IBus would
+use) and preloads English and libpinyin; Settings > Mouse & Keyboard lists the
+key. IBus first timed out choosing the engine: its settings service crashed in
+dconf, whose `mmap(MAP_SHARED)` of `~/.cache/dconf/user` this kernel refuses for
+a disk file open for writing (B13). Linux keeps that file in RAM under
+`$XDG_RUNTIME_DIR`, which logind makes; now `myos-login` makes `/run/user/UID`
+(tmpfs, 0700, the user's) and sets it. Checked in QEMU on the built
+`myos-live-uefi.img` with real keystrokes: Ctrl+Space, `nihao`, Space, Ctrl+Space,
+` ok` saves `你好 ok` from Geany. A language model to rank the candidates (passage,
+history, typos) can come later as an IBus engine on top of this.
