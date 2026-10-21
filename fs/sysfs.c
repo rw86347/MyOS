@@ -47,11 +47,14 @@
  * transparent_hugepage.
  */
 #include <blockdev.h>
+#include <drm/drm_drv.h>
 #include <errno.h>
+#include <evdev.h>
 #include <interrupts.h>
 #include <kheap.h>
 #include <linux/fb.h>
 #include <netdevice.h>
+#include <pci.h>
 #include <string.h>
 #include <uaccess.h>
 #include <vfs.h>
@@ -294,6 +297,161 @@ void sysfs_net_add(struct net_device *d)
     irq_restore(flags);
 }
 
+/* --- /sys/class/drm ----------------------------------------------------------- */
+
+/*
+ * /dev/dri/card0 shown as Linux shows a display card, for libudev (a
+ * Wayland compositor finds its GPU through it) and libdrm (which checks
+ * a node is DRM by its .../device/drm directory, and reads its name from
+ * uevent):
+ *
+ *   /sys/devices/pci0000:00/0000:00:02.0/          the card: vendor, device,
+ *       uevent, subsystem -> bus/pci, boot_vga    class, ...; boot_vga 1
+ *   /sys/devices/.../0000:00:02.0/drm/card0/       MAJOR=226 MINOR=0
+ *       uevent, dev, subsystem -> class/drm,      DEVNAME=dri/card0
+ *       device -> the card
+ *   /sys/class/drm/card0, /sys/dev/char/226:0      links to card0
+ *
+ * The UEFI screen has no PCI card to show: it is a platform device,
+ * devices/platform/simple-framebuffer.0, as Linux's simpledrm is.
+ */
+static char drm_slot[16];               /* "0000:00:02.0": a node's name, kept */
+
+static char *put_hex(char *s, uint32_t v, int digits)
+{
+    for (int k = digits - 1; k >= 0; k--)
+        *s++ = "0123456789abcdef"[v >> (k * 4) & 15];
+    *s = 0;
+    return s;
+}
+
+/* "0x" and v in digits hex digits, and a newline. */
+static int hex_file(struct inode *dir, const char *name, uint32_t v, int digits)
+{
+    char text[16] = "0x";
+    strcat(put_hex(text + 2, v, digits), "\n");
+    return text_file(dir, name, text);
+}
+
+static int sys_link(struct inode *dir, const char *name, const char *target)
+{
+    uint32_t len = (uint32_t)strlen(name);
+    if (vfs_child(dir, name, len))
+        return 0;
+    return vfs_symlink(dir, name, len, target, (uint32_t)strlen(target));
+}
+
+static int sysfs_drm(struct inode *sys)
+{
+    struct pci_dev *p;
+    if (!drm_card0(&p))
+        return 0;
+    const char *parent = "platform", *name = "simple-framebuffer.0";
+    char uevent[160], target[96];
+    if (p) {
+        parent = "pci0000:00";
+        strcpy(drm_slot, "0000:");
+        char *s = put_hex(drm_slot + 5, p->busnr, 2);
+        *s++ = ':';
+        s = put_hex(s, p->slot, 2);
+        *s++ = '.';
+        put_hex(s, p->func, 1);
+        name = drm_slot;
+    }
+    const char *const devdir[] = { "devices", parent, NULL };
+    const char *const busdir[] = { "bus", p ? "pci" : "platform", "devices", NULL };
+    static const char *const classdrm[] = { "class", "drm", NULL };
+    static const char *const devchar[] = { "dev", "char", NULL };
+    struct inode *top = mkdirs(sys, devdir), *bus = mkdirs(sys, busdir);
+    struct inode *cls = mkdirs(sys, classdrm), *chr = mkdirs(sys, devchar);
+    if (!top || !bus || !cls || !chr)
+        return -ENOMEM;
+    uint32_t len = (uint32_t)strlen(name);
+    struct inode *card = vfs_child(top, name, len);
+    if (!card)
+        card = vfs_add(top, name, len, S_IFDIR | 0555);
+    static const char *const drmdir[] = { "drm", "card0", NULL };
+    struct inode *minor = card ? mkdirs(card, drmdir) : NULL;
+    if (!minor)
+        return -ENOMEM;
+
+    int err = 0;
+    if (p) {
+        strcpy(uevent, "DRIVER=bochs-drm\nPCI_CLASS=");
+        char *s = put_hex(uevent + strlen(uevent), p->class_rev >> 8, 6);
+        strcpy(s, "\nPCI_ID=");
+        s = put_hex(s + 8, p->vendor, 4);
+        *s++ = ':';
+        s = put_hex(s, p->device, 4);
+        strcpy(s, "\nPCI_SLOT_NAME=");
+        strcat(strcat(s, drm_slot), "\n");
+        err |= hex_file(card, "vendor", p->vendor, 4) | hex_file(card, "device", p->device, 4) |
+               hex_file(card, "subsystem_vendor", p->subsystem_vendor, 4) |
+               hex_file(card, "subsystem_device", p->subsystem_device, 4) |
+               hex_file(card, "class", p->class_rev >> 8, 6) |
+               hex_file(card, "revision", p->class_rev & 0xFF, 2) |
+               text_file(card, "boot_vga", "1\n") | sys_link(card, "subsystem", "../../../bus/pci");
+    } else {
+        strcpy(uevent, "DRIVER=simple-framebuffer\n");
+        err |= sys_link(card, "subsystem", "../../../bus/platform");
+    }
+    err |= text_file(card, "uevent", uevent);
+    err |= text_file(minor, "uevent", "MAJOR=226\nMINOR=0\nDEVNAME=dri/card0\nDEVTYPE=drm_minor\n") |
+           text_file(minor, "dev", "226:0\n") | sys_link(minor, "subsystem", "../../../../../class/drm");
+    strcpy(target, "../../../");
+    err |= sys_link(minor, "device", strcat(target, name));
+    strcpy(target, "../../../devices/");
+    strcat(strcat(strcat(target, parent), "/"), name);
+    err |= sys_link(bus, name, target);
+    memmove(target, target + 3, strlen(target + 3) + 1);   /* "../../devices/..." */
+    strcat(target, "/drm/card0");
+    err |= sys_link(cls, "card0", target) | sys_link(chr, "226:0", target);
+    return err ? -ENOMEM : 0;
+}
+
+/* --- /sys/class/input ------------------------------------------------------- */
+
+/*
+ * The evdev devices, for libudev and so libinput (a Wayland compositor's
+ * keyboard and mouse):
+ *
+ *   /sys/devices/virtual/input/input0/uevent       NAME, EV=, KEY=, REL=...
+ *   /sys/devices/virtual/input/input0/event0/uevent MAJOR=13 MINOR=64
+ *                                                  DEVNAME=input/event0
+ *   /sys/class/input/{input0,event0}, /sys/dev/char/13:64   links to them
+ */
+static int sysfs_input(struct inode *sys)
+{
+    static const char *const virt[] = { "devices", "virtual", "input", NULL };
+    static const char *const classinput[] = { "class", "input", NULL };
+    static const char *const devchar[] = { "dev", "char", NULL };
+    static const char inputs[EVDEV_COUNT][8] = { "input0", "input1", "input2" };
+    static const char events[EVDEV_COUNT][8] = { "event0", "event1", "event2" };
+    static const char devnos[EVDEV_COUNT][8] = { "13:64", "13:65", "13:66" };
+    struct inode *top = mkdirs(sys, virt), *cls = mkdirs(sys, classinput);
+    struct inode *chr = mkdirs(sys, devchar);
+    if (!top || !cls || !chr)
+        return -ENOMEM;
+    char text[EVDEV_UEVENT_MAX], target[64];
+    int err = 0;
+    for (int n = 0; n < EVDEV_COUNT; n++) {
+        const char *const in[] = { inputs[n], NULL }, *const ev[] = { inputs[n], events[n], NULL };
+        struct inode *dev = mkdirs(top, in), *node = mkdirs(top, ev);
+        if (!dev || !node)
+            return -ENOMEM;
+        evdev_uevent(n, text);
+        err |= text_file(dev, "uevent", text) | sys_link(dev, "subsystem", "../../../../class/input");
+        evdev_node_uevent(n, text);
+        err |= text_file(node, "uevent", text) | text_file(node, "dev", devnos[n]) |
+               sys_link(node, "subsystem", "../../../../../class/input");
+        strcat(strcpy(target, "../../devices/virtual/input/"), inputs[n]);
+        err |= sys_link(cls, inputs[n], target);
+        strcat(strcat(target, "/"), events[n]);
+        err |= sys_link(cls, events[n], target) | sys_link(chr, devnos[n], target);
+    }
+    return err ? -ENOMEM : 0;
+}
+
 static const char thp_text[] = "always madvise [never]\n";
 
 int sysfs_mount(const char *path)
@@ -358,6 +516,11 @@ int sysfs_mount(const char *path)
     fw->data = (const uint8_t *)efi_size;
     fw->size = sizeof efi_size - 1;
 #endif
+    err = sysfs_drm(sys);
+    if (!err)
+        err = sysfs_input(sys);
+    if (err)
+        return err;
     static const char *const graphics[] = { "class", "graphics", NULL };
     struct inode *cls = mkdirs(sys, graphics);
     if (!cls)

@@ -49,4 +49,12 @@ int drm_dev_register(struct drm_device *dev, unsigned long flags);
    Linux does this with module_init and PCI id tables. */
 void drm_init(void);
 
+/* MyOS: /dev/dri/card0's file operations (drm_ioctl.c). */
+struct file_ops;
+const struct file_ops *drm_file_ops(void);
+/* Pages its buffer pool keeps (it never gives them back). */
+uint32_t drm_pool_pages(void);
+/* 1 if /dev/dri/card0 exists; *pdev: its PCI card (NULL: the UEFI screen). */
+int drm_card0(struct pci_dev **pdev);
+
 #endif

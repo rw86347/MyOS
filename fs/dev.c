@@ -23,10 +23,13 @@
  *  13,66 input/event2   touch screens and tablets
  *  29,0  fb0       the screen's pixels (drivers/video/fbmem.c), once a
  *                  display driver has registered one
+ * 226,0  dri/card0 the same screen through DRM/KMS, for Wayland
+ *                  (drivers/gpu/drm/drm_ioctl.c)
  * 116,n  snd/...   sound cards (drivers/sound/core.c): controlC0, pcmC0D0p...
  */
 #include <bcache.h>
 #include <blockdev.h>
+#include <drm/drm_drv.h>
 #include <errno.h>
 #include <evdev.h>
 #include <interrupts.h>
@@ -534,6 +537,8 @@ void dev_attach(struct inode *i)
             i->ops = evdev_ops(i->rdev & 0xFF);     /* input/event0-2 */
         else if ((i->rdev >> 8) == 116)
             i->ops = snd_file_ops(i->rdev & 0xFF);  /* snd/controlC0, pcmC0D0p... */
+        else if (i->rdev == DEV(226, 0))
+            i->ops = drm_file_ops();                /* dri/card0 (open: -ENODEV if no screen) */
         break;                              /* unknown: open() fails */
     }
 }
@@ -556,7 +561,8 @@ static uint32_t node_mode(uint32_t rdev, uint32_t *gid)
     case 4:  *gid = GID_TTY;   return 0620;     /* tty0..tty7 */
     case 5:  return (rdev & 0xFF) == 1 ? 0600 : 0666;  /* console; tty, ptmx */
     case 13: *gid = GID_INPUT; return 0660;     /* input/event* */
-    case 29: *gid = GID_VIDEO; return 0660;     /* fb0 */
+    case 29:                                    /* fb0 */
+    case 226: *gid = GID_VIDEO; return 0660;    /* dri/card0 */
     default: return 0666;
     }
 }
@@ -577,6 +583,13 @@ static void make_node(struct inode *dev, const char *name, uint32_t rdev)
 void dev_make_node(const char *name, uint32_t rdev)
 {
     struct inode *dev = vfs_child(vfs_root(), "dev", 3);
+    const char *slash = strchr(name, '/');
+    if (dev && slash) {                     /* "dri/card0": one directory deep */
+        uint32_t len = (uint32_t)(slash - name);
+        struct inode *sub = vfs_child(dev, name, len);
+        dev = sub ? sub : vfs_add(dev, name, len, S_IFDIR | 0755);
+        name = slash + 1;
+    }
     if (!dev)
         return;
     struct inode *i = vfs_child(dev, name, strlen(name));

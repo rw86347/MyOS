@@ -29,6 +29,9 @@ struct drm_device {
     uint32_t vram_base;                 /* physical */
     uint32_t vram_size;                 /* bytes */
     volatile void *vram;                /* kernel address, write-combined */
+    /* MyOS: 1 while /dev/dri/card0 sets a mode: keep video memory's
+       contents (its buffers live there) instead of clearing it. */
+    int keep_vram;
 };
 
 #endif

@@ -169,6 +169,9 @@
 #define NR_epoll_ctl   255
 #define NR_epoll_wait  256
 #define NR_epoll_pwait 319
+#define NR_timerfd_create 322
+#define NR_timerfd_settime 325
+#define NR_timerfd_gettime 326
 #define NR_eventfd2    328
 #define NR_epoll_create1 329
 #define NR_membarrier  375
@@ -274,6 +277,8 @@
 #define NR_clock_nanosleep_time64 407
 #define NR_timer_gettime64 408
 #define NR_timer_settime64 409
+#define NR_timerfd_gettime64 410
+#define NR_timerfd_settime64 411
 #define NR_utimensat_time64 412
 #define NR_pselect6_time64 413
 #define NR_ppoll_time64 414

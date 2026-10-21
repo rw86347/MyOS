@@ -53,6 +53,7 @@ enum {
 #define DISPI_ID5         0xB0C5
 #define DISPI_ENABLED     0x01
 #define DISPI_LFB_ENABLED 0x40
+#define DISPI_NOCLEARMEM  0x80
 
 /* The VGA attribute controller: bit 5 of its index register ("palette
    address source") switches the picture on. Reading the input status
@@ -154,7 +155,8 @@ static void bochs_pipe_enable(struct drm_simple_display_pipe *pipe,
     struct drm_framebuffer *fb = plane_state->fb;
 
     /* Off while changing, then the new mode, then on with the linear
-       framebuffer. (Enabling also clears VRAM: QEMU does that for us.) */
+       framebuffer. (Enabling also clears VRAM: QEMU does that for us,
+       unless a compositor's buffers are in it: keep_vram.) */
     dispi_write(DISPI_ENABLE, 0);
     dispi_write(DISPI_BPP, 32);
     dispi_write(DISPI_XRES, m->hdisplay);
@@ -165,7 +167,8 @@ static void bochs_pipe_enable(struct drm_simple_display_pipe *pipe,
     dispi_write(DISPI_X_OFFSET, 0);
     dispi_write(DISPI_Y_OFFSET, 0);
     b->x_offset = b->y_offset = 0;
-    dispi_write(DISPI_ENABLE, DISPI_ENABLED | DISPI_LFB_ENABLED);
+    dispi_write(DISPI_ENABLE, DISPI_ENABLED | DISPI_LFB_ENABLED |
+                              (b->dev.keep_vram ? DISPI_NOCLEARMEM : 0));
     bochs_unblank(1);
     bochs_set_offset(b, plane_state);
 }

@@ -32,4 +32,13 @@ void evdev_touch(const struct touch_event *e);      /* event2 */
    other minor. */
 const struct file_ops *evdev_ops(uint32_t minor);
 
+/* For /sys (fs/sysfs.c): how many devices, and device n's uevent texts as
+   Linux writes them — input<n>'s (NAME, PRODUCT and the EV/KEY/REL/ABS
+   bitmaps libudev sorts devices by) and event<n>'s (its node, plus the
+   ID_INPUT_* tags udev would add). out holds EVDEV_UEVENT_MAX bytes. */
+#define EVDEV_COUNT      3
+#define EVDEV_UEVENT_MAX 512
+void evdev_uevent(int n, char *out);
+void evdev_node_uevent(int n, char *out);
+
 #endif

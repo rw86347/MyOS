@@ -238,6 +238,7 @@ void drm_init(void)
     bochs_init();
     if (!fb_get(0))
         simplefb_init();            /* real UEFI hardware: no Bochs card */
+    drm_uapi_init();                /* /dev/dri/card0, for Wayland */
 }
 
 /* --- the simple display pipe --------------------------------------------- */
@@ -302,6 +303,16 @@ void drm_plane_pan(struct drm_device *dev, uint32_t y)
     struct drm_simple_display_pipe *pipe = dev->pipe;
     struct drm_plane_state old = pipe->plane_state;
     pipe->plane_state.src_y = y << 16;
+    if (pipe->funcs->update)
+        pipe->funcs->update(pipe, &old);
+}
+
+void drm_plane_show(struct drm_device *dev, struct drm_framebuffer *fb)
+{
+    struct drm_simple_display_pipe *pipe = dev->pipe;
+    struct drm_plane_state old = pipe->plane_state;
+    pipe->plane_state.fb = fb;
+    pipe->plane_state.src_x = pipe->plane_state.src_y = 0;
     if (pipe->funcs->update)
         pipe->funcs->update(pipe, &old);
 }
