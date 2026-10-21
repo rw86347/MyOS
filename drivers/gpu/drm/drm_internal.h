@@ -25,8 +25,28 @@ int drm_mode_commit(struct drm_device *dev, const struct drm_display_mode *mode,
    write or two, no copying — this is how the console scrolls. */
 void drm_plane_pan(struct drm_device *dev, uint32_t y);
 
+/* Show fb (same mode, same pitch as now) from its offsets[0] on. O(1):
+   a page flip on the Bochs card is this. */
+void drm_plane_show(struct drm_device *dev, struct drm_framebuffer *fb);
+
+/* Show fb from its offsets[0] on, in the mode already set (same pitch).
+   O(1): how a page flip on the Bochs card is done. */
+void drm_plane_show(struct drm_device *dev, struct drm_framebuffer *fb);
+
 /* Blank (1) or unblank (0) the display. */
 void drm_blank(struct drm_device *dev, int blank);
+
+/* The console's mode and framebuffer again (a compositor let go). */
+void drm_fbdev_restore(void);
+
+/* /dev/dri/card0 (drm_ioctl.c): made by drm_init if there is a screen. */
+void drm_uapi_init(void);
+
+/* The console's mode again, after a compositor let go of the screen. */
+void drm_fbdev_restore(void);
+
+/* /dev/dri/card0 (drm_ioctl.c): made by drm_init if there is a screen. */
+void drm_uapi_init(void);
 
 /* The display drivers' entry points, called by drm_init. */
 void bochs_init(void);

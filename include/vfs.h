@@ -522,7 +522,8 @@ static inline void notify_entry(struct inode *dir, struct inode *child, uint32_t
 void initramfs_load(const uint8_t *archive, uint32_t size);   /* initramfs.c */
 void dev_init(void);                            /* dev.c: /dev and its nodes */
 void dev_attach(struct inode *i);               /* give a device node its ops */
-/* A device that appears after boot (/dev/fb0): add its node to /dev. */
+/* A device that appears after boot (/dev/fb0, /dev/dri/card0): add its
+   node to /dev, and its directory if the name has one ("dri/card0"). */
 void dev_make_node(const char *name, uint32_t rdev);
 extern const struct file_ops console_ops;
 extern struct file console_file;                /* the shared open console */

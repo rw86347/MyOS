@@ -142,6 +142,12 @@ static int fbdev_blank(int blank, struct fb_info *info)
     return 0;
 }
 
+void drm_fbdev_restore(void)
+{
+    if (fbdev.dev)
+        fbdev_set_par(&fbdev.info);
+}
+
 static const struct fb_ops fbdev_ops = {
     .fb_check_var = fbdev_check_var,
     .fb_set_par = fbdev_set_par,

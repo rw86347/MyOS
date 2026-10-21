@@ -17,6 +17,7 @@
  * until the program's thread is dead.
  */
 #include <bcache.h>
+#include <drm/drm_drv.h>
 #include <pcache.h>
 #include <elf.h>
 #include <errno.h>
@@ -183,7 +184,7 @@ void user_selftest(void)
     static const char *const args[] = { "args", "one", "two", NULL };
     uint32_t free_before = pmm_free_count(), heap_before = kheap_pages();
     uint32_t cache_before = bcache_pages(), pc_before = pcache_pages();
-    uint32_t stacks_before = thread_stack_pages();
+    uint32_t stacks_before = thread_stack_pages(), drm_before = drm_pool_pages();
     sched_set_preempt(1);               /* programs share the CPU, as for real */
 
     static const char *const files_args[] = { "files", NULL };
@@ -249,6 +250,9 @@ void user_selftest(void)
         static const char *const fb_args[] = { "fbtest", NULL };
         check(run("/bin/fbtest", fb_args) == 0,
               "user: /dev/fb0: screen info, mmap, fork, pan, mode change, KD_GRAPHICS (step 11b)");
+        static const char *const drm_args[] = { "drmtest", NULL };
+        check(run("/bin/drmtest", drm_args) == 0,
+              "user: /dev/dri/card0: master, modes, dumb buffers, page flips, PRIME (Wayland)");
     }
     check(run_fpu_test() == 0, "user: FPU/SSE registers survive thread switches");
     sched_set_preempt(0);
@@ -257,10 +261,10 @@ void user_selftest(void)
     check(vmm_translate(0x08048000) == 0, "user: program memory unmapped");
     /* Every page comes back — exactly. The only pages allowed to stay
        missing are the ones the kernel heap took to grow, the two caches,
-       and the kernel-stack pool (all keep them). */
+       the kernel-stack pool and the display's buffer pool (all keep them). */
     long missing = (long)free_before - (long)(pmm_free_count() + (kheap_pages() - heap_before) +
                    (bcache_pages() - cache_before) + (pcache_pages() - pc_before) +
-                   (thread_stack_pages() - stacks_before));
+                   (thread_stack_pages() - stacks_before) + (drm_pool_pages() - drm_before));
     if (missing)
         kprintf("user: %ld pages missing (free %lu -> %lu, heap +%lu, caches +%lu +%lu, "
                 "stacks +%lu)\n", missing,

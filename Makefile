@@ -1364,6 +1364,7 @@ check-selftests: $(IMG) $(USB)
 	  grep -q "drm: bochs 1234:1111, 16 MiB, 1920x1200" $$L || { echo "FAIL: step 11b Bochs VGA driver"; ok=0; }; \
 	  grep -q "fbcon: 120x37" $$L || { echo "FAIL: step 11b pixel console"; ok=0; }; \
 	  grep -q "fbtest: all [0-9]* checks passed" $$L || { echo "FAIL: step 11b /dev/fb0"; ok=0; }; \
+	  grep -q "drmtest: all [0-9]* checks passed" $$L || { echo "FAIL: /dev/dri/card0 (Wayland)"; ok=0; }; \
 	  python3 tools/check-screen.py $(BUILD)/screen.ppm || { echo "FAIL: step 11b console on the screen"; ok=0; }; \
 	  [ $$ok = 1 ] || { echo "TEST FAILED"; exit 1; }
 	$(call check-test-disk,$(DATA),/persist.txt,written by MyOS)
