@@ -55,7 +55,10 @@
 /* Writing to the console. Never waits for the slow serial port: if its
    queue is nearly full we write what fits and return a smaller count (a
    "short write" — POSIX allows it, and C libraries simply call write()
-   again). So the syscall always finishes quickly. */
+   again). So the syscall always finishes quickly.
+   Screen and serial port both, except /dev/ttyS0 (the serial port alone)
+   and /dev/console once TIOCCONS pointed it at ttyS0: then the screen
+   shows only the boot's steps and what is written to tty0-7. */
 static int32_t console_write_user(struct file *f, const void *user_buf, uint32_t count)
 {
     char chunk[256];                /* copy in pieces via the stack */
@@ -63,6 +66,8 @@ static int32_t console_write_user(struct file *f, const void *user_buf, uint32_t
     int32_t bg = tty_write_check(NULL);     /* a background job, `stty tostop` */
     if (bg)
         return bg;
+    uint32_t rdev = f->inode->rdev;
+    int screen = rdev != TTYS0_RDEV && !(rdev == DEV(5, 1) && tty_console_on_serial());
     while (done < count) {
         uint32_t n = count - done < sizeof chunk ? count - done : sizeof chunk;
         uint32_t room = serial_space() / 2;     /* worst case: all '\n' */
@@ -72,7 +77,10 @@ static int32_t console_write_user(struct file *f, const void *user_buf, uint32_t
             break;                              /* queue full: short write */
         if (file_copy_in(f, chunk, (const char *)user_buf + done, n) < 0)
             return done ? (int32_t)done : -EFAULT;
-        console_write(chunk, n);
+        if (screen)
+            console_write(chunk, n);
+        else
+            serial_write_n(chunk, n);
         done += n;
     }
     return done;
@@ -638,6 +646,7 @@ void dev_init(void)
         "tty0", "tty1", "tty2", "tty3", "tty4", "tty5", "tty6", "tty7" };
     for (int n = 0; n < 8; n++)
         make_node(dev, tty_names[n], DEV(4, n));
+    make_node(dev, "ttyS0", TTYS0_RDEV);
     struct inode *input = vfs_child(dev, "input", 5);
     if (!input)
         input = vfs_add(dev, "input", 5, S_IFDIR | 0755);

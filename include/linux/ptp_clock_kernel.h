@@ -2,7 +2,9 @@
 /* Copyright (c) 2026 Rodger Wilson */
 #ifndef LINUX_PTP_CLOCK_KERNEL_H
 #define LINUX_PTP_CLOCK_KERNEL_H
-/* No PTP clocks: registering one fails, which the driver accepts. */
+/* No PTP clocks: registering one gives NULL, as on a Linux built without
+   them, and the driver goes on quietly (an error pointer made iwlwifi say
+   "Failed to register PHC clock" on the screen at every start). */
 #include <linux/err.h>
 #include <linux/ktime.h>
 #include <linux/time.h>
@@ -31,7 +33,7 @@ struct ptp_clock_info {
     int (*enable)(struct ptp_clock_info *p, struct ptp_clock_request *r, int on);
 };
 static inline struct ptp_clock *ptp_clock_register(struct ptp_clock_info *i, struct device *d)
-{ (void)i; (void)d; return ERR_PTR(-EOPNOTSUPP); }
+{ (void)i; (void)d; return NULL; }
 static inline int ptp_clock_unregister(struct ptp_clock *c) { (void)c; return 0; }
 static inline int ptp_clock_index(struct ptp_clock *c) { (void)c; return -1; }
 static inline long scaled_ppm_to_ppb(long ppm) { return ppm * 125 / 8192; }

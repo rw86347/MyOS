@@ -22,6 +22,13 @@ void tty_set_winsize(int rows, int cols);
 /* Is a program waiting in read()? (For tests that type at it.) */
 int tty_reader_waiting(void);
 
+/* /dev/ttyS0 (major 4, minor 64, as on Linux): the serial port alone. */
+#define TTYS0_RDEV ((4 << 8) | 64)
+
+/* Has /dev/console been pointed at ttyS0 (ioctl TIOCCONS)? Then what
+   programs write to it goes to the serial port, not the screen. */
+int tty_console_on_serial(void);
+
 /* The console's file operations use these. */
 int32_t tty_read(struct file *f, void *user_buf, uint32_t n);
 int32_t tty_ioctl(struct file *f, uint32_t cmd, uintptr_t arg);

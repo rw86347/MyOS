@@ -94,6 +94,7 @@ struct termios {
 #define TIOCGWINSZ  0x5413
 #define TIOCSWINSZ  0x5414
 #define FIONREAD    0x541B
+#define TIOCCONS    0x541D
 #define TIOCNOTTY   0x5422
 #define KDSETMODE   0x4B3A          /* the console: text or graphics */
 #define KDGETMODE   0x4B3B
@@ -630,9 +631,15 @@ int32_t tty_ioctl_on(struct tty *t, uint32_t cmd, uintptr_t arg)
     return r == -ENOIOCTLCMD ? -EINVAL : r;
 }
 
+static int console_serial;              /* TIOCCONS sent /dev/console to ttyS0 */
+
+int tty_console_on_serial(void)
+{
+    return console_serial;
+}
+
 int32_t tty_ioctl(struct file *f, uint32_t cmd, uintptr_t arg)
 {
-    (void)f;
     int32_t r = tty_ioctl_check(&console, cmd);
     if (r)
         return r;
@@ -660,6 +667,19 @@ int32_t tty_ioctl(struct file *f, uint32_t cmd, uintptr_t arg)
         if (console.sid == proc_current()->sid)
             console.sid = 0;
         return 0;
+    /* Point /dev/console at this terminal: the live disk's /sbin/init
+       sends it to ttyS0 so runit's "enter stage" lines and the services'
+       output stay off the boot screen. Asked on the console (or a VT), it
+       comes back. Root only, as on Linux. Other terminals: not supported. */
+    case TIOCCONS: {
+        if (proc_current()->cred.euid != 0)
+            return -EPERM;
+        uint32_t rdev = f->inode ? f->inode->rdev : 0;
+        if (rdev != TTYS0_RDEV && rdev != ((5 << 8) | 1) && (rdev >> 8) != 4)
+            return -EINVAL;
+        console_serial = rdev == TTYS0_RDEV;
+        return 0;
+    }
     /* A program that draws on the screen itself (an X server, a game on
        /dev/fb0) switches the console off with KD_GRAPHICS and back on with
        KD_TEXT, which redraws it. */
