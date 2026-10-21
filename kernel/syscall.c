@@ -1499,6 +1499,8 @@ SYSCALL(sys_membarrier)
 #define PR_GET_PDEATHSIG     2
 #define PR_GET_DUMPABLE      3
 #define PR_SET_DUMPABLE      4
+#define PR_GET_KEEPCAPS      7
+#define PR_SET_KEEPCAPS      8
 #define PR_SET_NAME         15
 #define PR_GET_NAME         16
 #define PR_SET_NO_NEW_PRIVS 38
@@ -1519,6 +1521,14 @@ SYSCALL(sys_prctl)
     case PR_GET_NAME:
         if (copy_to_user((void *)a2, t->name, sizeof t->name) < 0)
             return -EFAULT;
+        return 0;
+    /* Keep capabilities across setuid away from root: iputils ping asks for
+       it around its setuid(getuid()) and stops if refused. Privilege here
+       follows the effective uid (sys_capget), so nothing is kept whatever
+       the flag says, and reading it gives the truth: off. */
+    case PR_SET_KEEPCAPS:
+        return a2 > 1 ? -EINVAL : 0;    /* (musl passes junk in a3..a5) */
+    case PR_GET_KEEPCAPS:
         return 0;
     case PR_SET_PDEATHSIG:
     case PR_GET_PDEATHSIG:
