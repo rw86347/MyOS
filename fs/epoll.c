@@ -47,6 +47,7 @@
 #define EPOLL_CTL_MOD 3
 
 #define EPOLL_MAX 64                /* files per epoll */
+#define NEST_MAX  4                 /* epolls inside epolls, as Linux's EP_MAX_NESTS */
 #define WAIT_MAX  64                /* events returned per call */
 
 /* struct epoll_event on i386: packed, 12 bytes. */
@@ -71,11 +72,12 @@ static struct inode epoll_inode = {
 };
 
 static const struct file_ops epoll_ops;
+static uint32_t ready(struct epoll *ep, int depth);
 
 /* What entry k reports now (0: nothing). An entry whose file was closed
    (or whose fd now names another file) is dropped, as Linux does when the
    file goes away. */
-static uint32_t entry_ready(struct epoll *ep, int k, int consume)
+static uint32_t entry_ready(struct epoll *ep, int k, int consume, int depth)
 {
     struct entry *e = &ep->e[k];
     struct file *f = fd_get(e->fd);
@@ -92,8 +94,13 @@ static uint32_t entry_ready(struct epoll *ep, int k, int consume)
     }
     if (!(e->events & ~(EPOLLET | EPOLLONESHOT)))
         return 0;                   /* a one-shot that fired, not re-armed */
+    /* An epoll inside this one is ready when one of its own entries is.
+       libinput keeps its devices in an epoll that wlroots puts into the
+       Wayland event loop's epoll: without this, myos-wm never woke for a key
+       or a click (2026-10-21). The depth limit bounds the work, and ends a
+       loop of epolls that contain each other. */
     if (f->ops == &epoll_ops)
-        return 0;                   /* nested epolls: not supported */
+        return depth < NEST_MAX ? ready(f->priv, depth + 1) & e->events : 0;
     if ((e->events & EPOLLET) && f->ops->change_count) {
         uint32_t now = f->ops->change_count(f);
         if (now == e->seen)
@@ -110,7 +117,7 @@ static int scan(struct epoll *ep, struct epoll_event *out, int max)
 {
     int got = 0;
     for (int k = 0; k < ep->n && got < max; ) {
-        uint32_t r = entry_ready(ep, k, 1);
+        uint32_t r = entry_ready(ep, k, 1, 0);
         if (r == ~0u)
             continue;
         if (r) {
@@ -132,11 +139,10 @@ static int scan(struct epoll *ep, struct epoll_event *out, int max)
    forever: GLib's "gmain" thread spun at 100% asking libmount for a change
    that never came, and the Save As dialog hung (2026-10-09). Work: one look
    at each entry, like epoll_wait with timeout 0. */
-static uint32_t epoll_poll(struct file *f)
+static uint32_t ready(struct epoll *ep, int depth)
 {
-    struct epoll *ep = f->priv;
     for (int k = 0; k < ep->n; ) {
-        uint32_t r = entry_ready(ep, k, 0);
+        uint32_t r = entry_ready(ep, k, 0, depth);
         if (r == ~0u)
             continue;                   /* dropped: k is the next one now */
         if (r)
@@ -144,6 +150,11 @@ static uint32_t epoll_poll(struct file *f)
         k++;
     }
     return 0;
+}
+
+static uint32_t epoll_poll(struct file *f)
+{
+    return ready(f->priv, 1);
 }
 
 static int32_t epoll_read(struct file *f, void *b, uint32_t n)

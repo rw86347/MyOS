@@ -169,6 +169,11 @@ SYSCALL_DEF(sys_flock);
 SYSCALL_DEF(sys_poll);
 /* fs/epoll.c */
 SYSCALL_DEF(sys_eventfd2);
+SYSCALL_DEF(sys_timerfd_create);
+SYSCALL_DEF(sys_timerfd_settime);
+SYSCALL_DEF(sys_timerfd_settime64);
+SYSCALL_DEF(sys_timerfd_gettime);
+SYSCALL_DEF(sys_timerfd_gettime64);
 SYSCALL_DEF(sys_epoll_create);
 SYSCALL_DEF(sys_epoll_create1);
 SYSCALL_DEF(sys_epoll_ctl);
