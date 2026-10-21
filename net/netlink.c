@@ -18,12 +18,16 @@
  * type; value }, each padded to 4 bytes, so new fields never break old
  * readers.
  *
- * Two protocols so far:
+ * Three protocols so far:
  *   NETLINK_ROUTE ("rtnetlink"): the network links (RTM_GETLINK), their IPv4
  *     addresses (RTM_GETADDR) and the routes (RTM_GETROUTE). Read-only.
  *   NETLINK_GENERIC: a directory of named "families", found by asking its
  *     controller (family 0x10, "nlctrl"). Wi-Fi's nl80211 will be one
  *     (docs/WIFI-PLAN.md, W2).
+ *   NETLINK_KOBJECT_UEVENT: "a device came or went", what udev listens to.
+ *     A Wayland compositor's libudev opens one to hear about new screens
+ *     and keyboards. Ours never says anything (devices are found at boot),
+ *     but the socket has to exist for the compositor to start.
  *
  * The kernel answers inside the sendmsg: a request is small and its answer
  * is built at once into the socket's queue, so a reader that doesn't wait
@@ -83,6 +87,7 @@
 
 /* netlink.h */
 #define NETLINK_ROUTE   0
+#define NETLINK_KOBJECT_UEVENT 15
 #define NETLINK_GENERIC 16
 #define SOL_NETLINK     270
 #define NETLINK_ADD_MEMBERSHIP  1
@@ -228,7 +233,8 @@ int32_t netlink_socket(uint32_t type, uint32_t protocol)
     if (type & ~(SOCK_TYPE_MASK | SOCK_NONBLOCK | SOCK_CLOEXEC) ||
         (t != SOCK_RAW && t != SOCK_DGRAM))
         return -ESOCKTNOSUPPORT;
-    if (protocol != NETLINK_ROUTE && protocol != NETLINK_GENERIC)
+    if (protocol != NETLINK_ROUTE && protocol != NETLINK_GENERIC &&
+        protocol != NETLINK_KOBJECT_UEVENT)
         return -EPROTONOSUPPORT;
     struct nlsock *s = kmalloc(sizeof *s);
     if (!s)
@@ -793,7 +799,7 @@ static int32_t nl_send(struct nlsock *s, struct file *f, const struct user_iovec
         at += (uint32_t)iov[k].len;
     }
     autobind(s);
-    int err = deliver(s, buf, total);
+    int err = s->protocol == NETLINK_KOBJECT_UEVENT ? 0 : deliver(s, buf, total);
     kfree(buf);
     return err ? err : (int32_t)total;
 }

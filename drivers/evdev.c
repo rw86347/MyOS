@@ -67,6 +67,7 @@ struct reader {
     int dev;
     struct input_event q[QLEN];
     uint32_t head, tail;            /* events ever queued / read */
+    uint8_t revoked;                /* EVIOCREVOKE: cut off for good */
 };
 
 struct evdev {
@@ -83,7 +84,7 @@ struct evdev {
     struct wait_queue wq;
 };
 
-#define NDEVS 3
+#define NDEVS EVDEV_COUNT
 static struct evdev devs[NDEVS] = {
     { .name = "AT Translated Set 2 keyboard", .product = 1 },
     { .name = "ImExPS/2 Generic Explorer Mouse", .product = 2 },
@@ -261,6 +262,8 @@ static int32_t ev_read(struct file *f, void *ubuf, uint32_t n)
         return -EINVAL;
     struct evdev *d = &devs[r->dev];
     while (r->head == r->tail) {
+        if (r->revoked)
+            return -ENODEV;
         if (f->flags & O_NONBLOCK)
             return -EAGAIN;
         if (signal_pending())
@@ -289,7 +292,19 @@ static int32_t ev_write(struct file *f, const void *ubuf, uint32_t n)
 static uint32_t ev_poll(struct file *f)
 {
     struct reader *r = reader_of(f);
+    if (r && r->revoked)
+        return 0x018;                               /* POLLERR | POLLHUP */
     return r && r->head != r->tail ? 0x001 : 0;     /* POLLIN */
+}
+
+/* r gets no more events (interrupts off). */
+static void detach(struct evdev *d, struct reader *r)
+{
+    for (int i = 0; i < READERS; i++)
+        if (d->readers[i] == r)
+            d->readers[i] = NULL;
+    if (d->grab == r)
+        d->grab = NULL;
 }
 
 static void ev_release(struct file *f)
@@ -297,13 +312,8 @@ static void ev_release(struct file *f)
     struct reader *r = f->priv;
     if (!r)
         return;
-    struct evdev *d = &devs[r->dev];
     uint32_t flags = irq_save();
-    for (int i = 0; i < READERS; i++)
-        if (d->readers[i] == r)
-            d->readers[i] = NULL;
-    if (d->grab == r)
-        d->grab = NULL;
+    detach(&devs[r->dev], r);
     irq_restore(flags);
     kfree(r);
 }
@@ -322,6 +332,8 @@ static int32_t ev_ioctl(struct file *f, uint32_t cmd, uintptr_t arg)
     if (!r)
         return -EMFILE;
     struct evdev *d = &devs[r->dev];
+    if (r->revoked)
+        return -ENODEV;
     init_bits();
     uint32_t nr = cmd & 0xFF, len = (cmd >> 16) & 0x3FFF, dir = cmd >> 30;
     static const uint8_t zeros[KEY_CNT / 8];
@@ -404,8 +416,19 @@ static int32_t ev_ioctl(struct file *f, uint32_t cmd, uintptr_t arg)
     case 0x03:                                  /* EVIOCSREP */
     case 0xa0:                                  /* EVIOCSCLOCKID */
         return 0;
-    case 0x91:                                  /* EVIOCREVOKE */
+    case 0x91: {                                /* EVIOCREVOKE */
+        /* seatd cuts a session off from the keyboard when its terminal
+           is switched away: no more events, and every later call fails. */
+        if (arg)
+            return -EINVAL;
+        uint32_t flags = irq_save();
+        detach(d, r);
+        r->revoked = 1;
+        irq_restore(flags);
+        wq_wake_all(&d->wq);
+        wq_wake_all(&poll_wait);
         return 0;
+    }
     }
     return -EINVAL;
 }
@@ -414,6 +437,98 @@ static const struct file_ops ev_ops = {
     .read = ev_read, .write = ev_write, .poll = ev_poll,
     .release = ev_release, .ioctl = ev_ioctl,
 };
+
+/* --- /sys/devices/virtual/input ------------------------------------------------- */
+
+static char *put_str(char *s, const char *t)
+{
+    while (*t)
+        *s++ = *t++;
+    *s = 0;
+    return s;
+}
+
+static char *put_hex(char *s, unsigned long v)
+{
+    char b[2 * sizeof v];
+    int i = 0;
+    do
+        b[i++] = "0123456789abcdef"[v & 15];
+    while (v >>= 4);
+    while (i)
+        *s++ = b[--i];
+    *s = 0;
+    return s;
+}
+
+/* A bitmap as Linux shows it in sysfs and uevents: words the size of a
+   long, the highest first, in hex, space-separated, leading zero words
+   left out ("120013"). Userspace reads it back in longs of its own size —
+   ours, since the kernel is built for the same width. */
+static char *put_bitmap(char *s, const uint8_t *bits, uint32_t bytes)
+{
+    const uint32_t wb = sizeof(unsigned long);
+    int top = (int)((bytes + wb - 1) / wb) - 1;
+    unsigned long w[KEY_CNT / 8 / sizeof(unsigned long)];
+    for (int i = 0; i <= top; i++) {
+        w[i] = 0;
+        for (uint32_t b = 0; b < wb && i * wb + b < bytes; b++)
+            w[i] |= (unsigned long)bits[i * wb + b] << (8 * b);
+    }
+    while (top > 0 && !w[top])
+        top--;
+    for (int i = top; i >= 0; i--) {
+        s = put_hex(s, w[i]);
+        if (i)
+            *s++ = ' ';
+    }
+    *s = 0;
+    return s;
+}
+
+static int has(const uint8_t *bits, unsigned n) { return bits[n / 8] >> (n % 8) & 1; }
+
+void evdev_uevent(int n, char *out)
+{
+    static const char *const phys[NDEVS] = {
+        "isa0060/serio0/input0", "isa0060/serio1/input0", "usb-myos/input0" };
+    struct evdev *d = &devs[n];
+    init_bits();
+    char *s = put_str(out, "PRODUCT=");
+    s = put_hex(s, n == 2 ? BUS_USB : BUS_I8042);
+    s = put_str(s, "/1/");
+    s = put_hex(s, d->product);
+    s = put_str(put_str(put_str(put_str(s, "/ab41\nNAME=\""), d->name), "\"\nPHYS=\""), phys[n]);
+    s = put_str(s, "\"\nPROP=0\nEV=");
+    s = put_bitmap(s, d->ev_bits, sizeof d->ev_bits);
+    if (has(d->ev_bits, EV_KEY))
+        s = put_bitmap(put_str(s, "\nKEY="), d->key_bits, sizeof d->key_bits);
+    if (has(d->ev_bits, EV_REL))
+        s = put_bitmap(put_str(s, "\nREL="), d->rel_bits, sizeof d->rel_bits);
+    if (has(d->ev_bits, EV_ABS))
+        s = put_bitmap(put_str(s, "\nABS="), d->abs_bits, sizeof d->abs_bits);
+    if (has(d->ev_bits, EV_LED))
+        s = put_str(s, "\nLED=0");
+    put_str(s, "\n");
+}
+
+void evdev_node_uevent(int n, char *out)
+{
+    /* udev's tags, which libinput sorts devices by. libudev-zero works
+       them out from the bitmaps too, but not for event2: absolute X/Y
+       plus a wheel is an absolute mouse to udev (QEMU's tablet is tagged
+       so on Linux) and nothing to libudev-zero. */
+    static const char *const tags[NDEVS] = {
+        "ID_INPUT=1\nID_INPUT_KEY=1\nID_INPUT_KEYBOARD=1\n",
+        "ID_INPUT=1\nID_INPUT_MOUSE=1\n",
+        "ID_INPUT=1\nID_INPUT_MOUSE=1\n",
+    };
+    char *s = put_str(out, "MAJOR=13\nMINOR=");
+    s = put_str(s, n == 0 ? "64" : n == 1 ? "65" : "66");
+    s = put_str(s, "\nDEVNAME=input/event");
+    *s++ = (char)('0' + n);
+    put_str(put_str(s, "\n"), tags[n]);
+}
 
 const struct file_ops *evdev_ops(uint32_t minor)
 {

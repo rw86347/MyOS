@@ -18,6 +18,7 @@
  *   9. closing the master gives the console back, at its own size
  *  10. /sys shows the card and the input devices the way libdrm, libudev
  *      and libinput look for them
+ *  11. libudev's uevent socket opens; EVIOCREVOKE cuts an input reader off
  *
  * Exits 0 if all is well, else the number of the first failed check.
  */
@@ -41,6 +42,8 @@ static int checks;
 #define SYS_poll   168
 #define SYS_mkdir  39
 #define SYS_mount  21
+#define SYS_socket 359
+#define SYS_bind   361
 #define KDSETMODE  0x4B3A
 #define KDGETMODE  0x4B3B
 #define KD_TEXT    0
@@ -51,6 +54,7 @@ static int checks;
 #define IOW(nr, t)  IOC(1, nr, sizeof(t))
 #define IOR(nr, t)  IOC(2, nr, sizeof(t))
 #define IO(nr)      IOC(0, nr, 0)
+#define EVIOC(dir, nr, size) (((unsigned long)(dir) << 30) | ((unsigned long)(size) << 16) | ('E' << 8) | (nr))
 
 static int streq(const char *a, const char *b)
 {
@@ -324,6 +328,21 @@ int main(void)
     CHECK(slurp("/sys/class/input/input1/uevent", big_text, sizeof big_text) > 0);
     CHECK(has_line(big_text, "EV=7") && has_line(big_text, "KEY=70000 0 0 0 0 0 0 0 0") &&
           has_line(big_text, "REL=103"));
+
+    /* 11. The rest of a Wayland seat: libudev's uevent socket opens (and
+       hears nothing), and seatd's EVIOCREVOKE cuts a reader off. */
+    int nl = (int)syscall3(SYS_socket, 16, 3 | O_NONBLOCK, 15);    /* AF_NETLINK, SOCK_RAW */
+    CHECK(nl >= 0);
+    struct { uint16_t family, pad; uint32_t pid, groups; } sa = { 16, 0, 0, 1 };
+    CHECK(syscall3(SYS_bind, nl, (long)&sa, sizeof sa) == 0);
+    CHECK(read(nl, buf, sizeof buf) == -EAGAIN && close(nl) == 0);
+    int ev1 = open("/dev/input/event1", O_RDONLY | O_NONBLOCK);
+    CHECK(ev1 >= 0);
+    CHECK(read(ev1, buf, sizeof buf) == -EAGAIN);
+    CHECK(ioctl(ev1, EVIOC(1, 0x91, sizeof(int)), 0) == 0);
+    CHECK(read(ev1, buf, sizeof buf) == -19);                       /* ENODEV */
+    CHECK(ioctl(ev1, EVIOC(2, 0x06, 16), buf) == -19);
+    CHECK(close(ev1) == 0);
 
     put("drmtest: all ");
     put_u64(checks);
