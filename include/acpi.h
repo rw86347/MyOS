@@ -38,6 +38,10 @@ void battery_init(void);                /* battery.c: find the batteries and cha
 uint32_t battery_poll(void);            /* read what is due; ms until the next (0: none) */
 void backlight_init(void);              /* backlight.c: find the panel's _BCL and _BCM */
 void backlight_poll(void);              /* run _BCM for a level that was written */
+void acpi_button_init(void);            /* acpi_button.c: the lid, the power button */
+void acpi_button_power(void);           /* the power button was pressed (any context) */
+int  acpi_lid_closed(void);             /* 1: the lid is shut (0: open, or no lid) */
+void fakelid_init(void);                /* SLEEPTEST=1 builds: QEMU's lid (fakelid_test.c) */
 
 /* For /sys/class/backlight/acpi_video0 (sysfs.c): the highest level (-1: no
    panel the firmware can dim), the one asked for last, the one set, and a

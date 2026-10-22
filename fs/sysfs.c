@@ -70,6 +70,11 @@
  * fingers on a touchpad scroll (hid.c). Root's, 0644; the live system's
  * boot gives it to group input, which every account is in, for Settings.
  *
+ * /sys/power/state: "freeze mem" (both are s2idle here); "mem" written puts
+ * the machine to sleep, and the write returns once it is awake again
+ * (kernel/suspend.c). /sys/power/mem_sleep: "[s2idle]", what "mem" means.
+ * Root's, 0644, as on Linux: the power daemon runs as root.
+ *
  * /sys/firmware/acpi/tables/<NAME>: each ACPI table the firmware has
  * (acpi.c names them as Linux does: DSDT, FACP, SSDT1...), root only, as on
  * Linux (MSDM holds a Windows product key). Each file is the table itself,
@@ -92,6 +97,7 @@
 #include <netdevice.h>
 #include <pci.h>
 #include <string.h>
+#include <suspend.h>
 #include <uaccess.h>
 #include <vfs.h>
 
@@ -461,9 +467,9 @@ static int sysfs_input(struct inode *sys)
     static const char *const virt[] = { "devices", "virtual", "input", NULL };
     static const char *const classinput[] = { "class", "input", NULL };
     static const char *const devchar[] = { "dev", "char", NULL };
-    static const char inputs[EVDEV_COUNT][8] = { "input0", "input1", "input2" };
-    static const char events[EVDEV_COUNT][8] = { "event0", "event1", "event2" };
-    static const char devnos[EVDEV_COUNT][8] = { "13:64", "13:65", "13:66" };
+    static const char inputs[EVDEV_COUNT][8] = { "input0", "input1", "input2", "input3", "input4" };
+    static const char events[EVDEV_COUNT][8] = { "event0", "event1", "event2", "event3", "event4" };
+    static const char devnos[EVDEV_COUNT][8] = { "13:64", "13:65", "13:66", "13:67", "13:68" };
     struct inode *top = mkdirs(sys, virt), *cls = mkdirs(sys, classinput);
     struct inode *chr = mkdirs(sys, devchar);
     if (!top || !cls || !chr)
@@ -780,6 +786,64 @@ static int32_t two_finger_write(struct file *f, const void *ubuf, uint32_t n)
 
 static const struct file_ops two_finger_ops = { .read = two_finger_read, .write = two_finger_write };
 
+/* /sys/power/state and mem_sleep (fs_ino 0 and 1). */
+static const char *const sleep_text[] = { "freeze mem\n", "[s2idle]\n" };
+
+static int32_t sleep_read(struct file *f, void *ubuf, uint32_t n)
+{
+    const char *text = sleep_text[f->inode->fs_ino];
+    uint32_t len = (uint32_t)strlen(text);
+    if (f->pos >= len)
+        return 0;
+    uint32_t r = n < len - f->pos ? n : len - f->pos;
+    if (copy_to_user(ubuf, text + f->pos, r) < 0)
+        return -EFAULT;
+    f->pos += r;
+    return (int32_t)r;
+}
+
+/* "mem" or "freeze" to state: sleep, until something wakes the machine
+   (the write returns then). "s2idle" to mem_sleep: the only one there is. */
+static int32_t sleep_write(struct file *f, const void *ubuf, uint32_t n)
+{
+    char text[8];
+    if (n >= sizeof text)
+        return -EINVAL;
+    if (copy_from_user(text, ubuf, n) < 0)
+        return -EFAULT;
+    uint32_t len = n;
+    if (len && text[len - 1] == '\n')
+        len--;
+    if (!len)
+        return (int32_t)n;
+    text[len] = 0;
+    if (f->inode->fs_ino == 1)
+        return strcmp(text, "s2idle") ? -EINVAL : (int32_t)n;
+    if (strcmp(text, "mem") && strcmp(text, "freeze"))
+        return -EINVAL;
+    int err = suspend_enter();
+    return err < 0 ? err : (int32_t)n;
+}
+
+static const struct file_ops sleep_ops = { .read = sleep_read, .write = sleep_write };
+
+static int sysfs_power(struct inode *sys)
+{
+    static const char *const power[] = { "power", NULL };
+    static const char *const names[] = { "state", "mem_sleep" };
+    struct inode *dir = mkdirs(sys, power);
+    for (uint32_t k = 0; k < 2; k++) {
+        struct inode *i = dir ? vfs_add(dir, names[k], (uint32_t)strlen(names[k]),
+                                        S_IFREG | 0644) : NULL;
+        if (!i)
+            return -ENOMEM;
+        i->ops = &sleep_ops;
+        i->fs_ino = k;
+        i->size = 4096;
+    }
+    return 0;
+}
+
 static const char thp_text[] = "always madvise [never]\n";
 
 int sysfs_mount(const char *path)
@@ -835,7 +899,8 @@ int sysfs_mount(const char *path)
     static const char *const cgroup[] = { "fs", "cgroup", NULL };
     static const char *const thp[] = { "kernel", "mm", "transparent_hugepage", NULL };
     struct inode *t = mkdirs(sys, thp);
-    if (!mkdirs(sys, cpu0) || !mkdirs(sys, cgroup) || !t || sysfs_powercap(sys) || sysfs_acpi(sys))
+    if (!mkdirs(sys, cpu0) || !mkdirs(sys, cgroup) || !t || sysfs_powercap(sys) || sysfs_acpi(sys) ||
+        sysfs_power(sys))
         return -ENOMEM;
     struct inode *en = vfs_add(t, "enabled", 7, S_IFREG | 0444);
     if (!en)

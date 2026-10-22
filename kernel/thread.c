@@ -26,7 +26,9 @@
 #include <proc.h>
 #include <sched.h>
 #include <string.h>
+#include <suspend.h>
 #include <thread.h>
+#include <timer.h>
 
 /* In switch.asm / isr.asm */
 void switch_context(uintptr_t *save_esp, uintptr_t new_esp);
@@ -561,13 +563,18 @@ void thread_yield(void)
    The interrupt that wakes the CPU ends the idle time at once (it may
    switch to another thread before the halted one runs again). */
 static uint64_t idle_cycles, idle_since;
-static volatile int idling;
+static volatile int idling, tick_off;
+static int kernel_timer_soon(void);
 
 void cpu_idle_end(void)                 /* first thing in every interrupt */
 {
     if (idling) {
         idling = 0;
         idle_cycles += cycles_now() - idle_since;
+        if (tick_off) {                 /* asleep: whatever woke us needs the tick */
+            tick_off = 0;
+            timer_resume();
+        }
     }
 }
 
@@ -583,6 +590,10 @@ void cpu_idle(void)                     /* interrupts off, and off again after *
 {
     idle_since = cycles_now();
     idling = 1;
+    if (suspend_asleep && !kernel_timer_soon()) {
+        tick_off = 1;                   /* sleep (suspend.c): only a wake-up interrupt */
+        timer_pause();
+    }
     cpu_sleep();                        /* sti; hlt (or mwait); cli: can't miss an IRQ */
     cpu_idle_end();                     /* (the interrupt normally did it) */
 }
@@ -723,4 +734,17 @@ void thread_timer_tick(uint32_t now)
         t->wake_at = 0;                 /* "the deadline passed" */
         thread_wake(t);
     }
+}
+
+/* Asleep, the idle thread stops the tick unless a kernel thread's timed
+   wait ends within 100 ms (an AML Sleep, a disk's last write): let those
+   finish. Programs' deadlines don't count; their clock stands still. The
+   list is sorted, so this looks only at the next 100 ms of it. */
+static int kernel_timer_soon(void)
+{
+    uint32_t now = timer_ms();
+    for (struct thread *t = timer_list; t && (int32_t)(t->wake_at - now) <= 100; t = t->timer_next)
+        if (!t->proc)
+            return 1;
+    return 0;
 }

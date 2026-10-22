@@ -25,6 +25,7 @@
 #include <keyboard.h>
 #include <kprintf.h>
 #include <power.h>
+#include <suspend.h>
 #include <thread.h>
 
 #define KBD_DATA   0x60
@@ -174,6 +175,10 @@ void keyboard_key(uint16_t key, int pressed)
         sysrq = pressed;
     else if (key == K_T && pressed && sysrq && sysrq_alt)
         thread_dump();
+    if (suspend_asleep && pressed) {
+        suspend_input();                /* asleep: it wakes the machine, it isn't typed */
+        return;
+    }
     evdev_key(key, pressed);
     if (!tty_on)                /* the X server has the keyboard */
         return;

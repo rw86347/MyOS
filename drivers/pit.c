@@ -19,9 +19,11 @@
 #include <interrupts.h>
 #include <io.h>
 #include <kprintf.h>
+#include <pic.h>
 #include <sched.h>
 #include <signal.h>
 #include <serial.h>
+#include <suspend.h>
 #include <thread.h>
 #include <timer.h>
 
@@ -66,6 +68,8 @@ static int tick_within(uint64_t limit)
     return 1;
 }
 
+static int on_hpet;                     /* the HPET gives the tick (timer_check) */
+
 /* Does the PIT really tick? On the old PCs it does: the first tick, within
    1 ms, ends the wait. New Intel chipsets may switch its clock off (docs/
    hardware-msi-katana-gf66.md); then the HPET takes over IRQ 0 (hpet.c).
@@ -75,14 +79,15 @@ void timer_check(void)
 {
     if (tick_within(50000000ull))
         return;
-    if (hpet_legacy_start(TIMER_HZ) == 0 && tick_within(50000000ull))
+    if (hpet_legacy_start(TIMER_HZ) == 0 && tick_within(50000000ull)) {
         klog("timer: the PIT does not tick; the HPET gives the 1 ms tick\n");
-    else
+        on_hpet = 1;
+    } else
         kprintf("timer: NO TICK: the PIT does not count and there is no HPET."
                 " Sleeps and time slots will not work.\n");
 }
 
-void timer_init(void)
+static void pit_start(void)
 {
     uint16_t divisor = PIT_FREQ / TIMER_HZ;
 
@@ -91,8 +96,47 @@ void timer_init(void)
     outb(PIT_COMMAND, 0x36);
     outb(PIT_CHANNEL0, divisor & 0xFF);
     outb(PIT_CHANNEL0, divisor >> 8);
+}
 
+void timer_init(void)
+{
+    pit_start();
     irq_install(0, timer_irq);
+}
+
+/* Asleep (kernel/suspend.c), the idle thread stops the tick: IRQ 0 masked
+   and the timer itself stopped, so nothing counts ms that nobody waits
+   for (and QEMU's host CPU rests too). ticks doesn't move meanwhile:
+   CLOCK_MONOTONIC leaves sleep out, as Linux's does; the TSC measures
+   the gap for the wall clock. Interrupts are off in both. */
+static uint64_t paused_at, paused_cycles;
+static uint32_t pauses;
+
+void timer_pause(void)
+{
+    pic_mask(0);
+    if (on_hpet)
+        hpet_legacy_pause(1);
+    else
+        outb(PIT_COMMAND, 0x30);        /* mode 0, no count written: it waits */
+    paused_at = cycles_now();
+    pauses++;
+}
+
+void timer_resume(void)
+{
+    paused_cycles += cycles_now() - paused_at;
+    if (on_hpet)
+        hpet_legacy_pause(0);
+    else
+        pit_start();
+    pic_unmask(0);
+}
+
+uint64_t timer_paused(uint32_t *times)
+{
+    *times = pauses;
+    return paused_cycles;
 }
 
 uint32_t timer_ms(void)

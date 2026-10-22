@@ -37,9 +37,11 @@
 #define TN_32BIT    (1u << 8)
 #define TN_FSB      (1u << 14)  /* deliver as an MSI (not wanted here) */
 
+static volatile uint8_t *h;
+
 int hpet_legacy_start(uint32_t hz)
 {
-    volatile uint8_t *h = ioremap(HPET_BASE, 0x400);
+    h = ioremap(HPET_BASE, 0x400);
     if (!h)
         return -1;
     uint32_t cap = readl(h + GCAP_ID);
@@ -62,4 +64,11 @@ int hpet_legacy_start(uint32_t hz)
                                                    this second write, as Linux does) */
     writel(ENABLE_CNF | LEG_RT_CNF, h + GEN_CONF);
     return 0;
+}
+
+/* Sleep (pit.c timer_pause): the counter stops, and timer 0 with it; it
+   goes on from where it was. */
+void hpet_legacy_pause(int pause)
+{
+    writel(pause ? LEG_RT_CNF : ENABLE_CNF | LEG_RT_CNF, h + GEN_CONF);
 }

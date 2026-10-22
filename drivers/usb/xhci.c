@@ -56,6 +56,7 @@
 #include <pci.h>
 #include <pmm.h>
 #include <string.h>
+#include <suspend.h>
 #include <thread.h>
 #include <timer.h>
 #include <usb.h>
@@ -1176,8 +1177,10 @@ static int hc_start(struct pci_dev *pci)
 
     if (pci_alloc_irq_vectors(pci, 1, 1, PCI_IRQ_MSIX | PCI_IRQ_MSI | PCI_IRQ_INTX) < 0)
         kprintf("xhci: no interrupt: polling\n");
-    else
+    else {
         irq_install(pci_irq_vector(pci, 0), xhci_irq);
+        suspend_keep_irq(pci_irq_vector(pci, 0));  /* a USB keyboard wakes from sleep */
+    }
     nhc++;                              /* the interrupt handler may look at it now */
     wr(hc->op, OP_USBCMD, CMD_RUN | CMD_INTE);
     if (wait_reg(hc->op, OP_USBSTS, STS_HCH, 0, 100) < 0) {

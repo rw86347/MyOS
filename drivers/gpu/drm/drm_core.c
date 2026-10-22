@@ -33,6 +33,7 @@
 #include <linux/fb.h>
 #include <linux/io.h>
 #include <string.h>
+#include <suspend.h>
 #include "drm_internal.h"
 
 struct drm_device *drm_primary;
@@ -328,5 +329,21 @@ void drm_blank(struct drm_device *dev, int blank)
     } else if (!blank && !cs->active && cs->enable) {
         pipe->funcs->enable(pipe, cs, &pipe->plane_state);
         cs->active = true;
+    }
+}
+
+/* Sleep (kernel/suspend.c): the main screen off, and on again only if
+   sleep turned it off (one X had switched off stays off). */
+void drm_suspend(int sleep)
+{
+    static int blanked;
+    if (!drm_primary || !drm_primary->pipe)
+        return;
+    if (sleep) {
+        blanked = drm_primary->pipe->crtc_state.active;
+        drm_blank(drm_primary, 1);
+    } else if (blanked) {
+        drm_blank(drm_primary, 0);
+        blanked = 0;
     }
 }

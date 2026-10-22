@@ -15,6 +15,7 @@
 #include <signal.h>
 #include <rtc.h>
 #include <string.h>
+#include <suspend.h>
 #include <syscalls.h>
 #include <thread.h>
 #include <timer.h>
@@ -317,10 +318,22 @@ SYSCALL_DEF(sys_setgroups)
    resolution for now; a vDSO with nanoseconds is step 11.) Read and written
    with interrupts off: on i386 a 64-bit value is two stores. */
 static int64_t boot_realtime_ns;
+static int64_t slept_ns;                /* time asleep, in CLOCK_BOOTTIME only */
 
 void time_init(void)
 {
     boot_realtime_ns = (int64_t)rtc_read_epoch() * 1000000000;
+}
+
+/* After sleep (kernel/suspend.c): the tick was off, so the wall clock and
+   CLOCK_BOOTTIME jump by the time asleep; CLOCK_MONOTONIC leaves it out,
+   as Linux's does. */
+void time_add_sleep_ns(int64_t ns)
+{
+    uint32_t flags = irq_save();
+    boot_realtime_ns += ns;
+    slept_ns += ns;
+    irq_restore(flags);
 }
 
 static int64_t realtime_ns(void)
@@ -346,15 +359,24 @@ uint32_t time_now(void)
 
 #define CLOCK_REALTIME          0
 #define CLOCK_REALTIME_COARSE   5
+#define CLOCK_BOOTTIME          7
 #define CLOCK_REALTIME_ALARM    8
+#define CLOCK_BOOTTIME_ALARM    9
 #define TIMER_ABSTIME           1
 
-/* Nanoseconds on clock clk: realtime (since 1970) or monotonic (boot). */
+/* Nanoseconds on clock clk: realtime (since 1970), boottime (since boot,
+   sleep included) or monotonic (since boot, awake). */
 int64_t clock_ns(uint32_t clk)
 {
     if (clk == CLOCK_REALTIME || clk == CLOCK_REALTIME_COARSE || clk == CLOCK_REALTIME_ALARM)
         return realtime_ns();
-    return (int64_t)timer_ms() * 1000000;   /* monotonic, boottime, cputime... */
+    if (clk == CLOCK_BOOTTIME || clk == CLOCK_BOOTTIME_ALARM) {
+        uint32_t flags = irq_save();
+        int64_t ns = slept_ns + (int64_t)timer_ms() * 1000000;
+        irq_restore(flags);
+        return ns;
+    }
+    return (int64_t)timer_ms() * 1000000;   /* monotonic, cputime... */
 }
 
 /* time_t time(time_t *t): a long, 32 bits on i386, 64 on x86_64. */

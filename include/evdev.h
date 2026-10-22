@@ -27,16 +27,23 @@ void evdev_key(uint16_t code, int pressed);         /* a key, Linux KEY_* code *
 void evdev_mouse(const struct mouse_event *e);      /* one PS/2 movement */
 void evdev_touch(const struct touch_event *e);      /* event2 */
 
+/* The lid and the power button (acpi_button.c; any context). */
+#define EVDEV_SW_LID     0x00
+#define EVDEV_KEY_POWER  116
+#define EVDEV_KEY_WAKEUP 143
+void evdev_switch(uint16_t code, int on);           /* event3: SW_LID 1, the lid shut */
+void evdev_power(uint16_t code);                    /* event4: a press and its release */
+
 /* For device nodes 13:64 (event0, the keyboard), 13:65 (event1, the
-   mouse) and 13:66 (event2, touch screens and tablets); NULL for any
-   other minor. */
+   mouse), 13:66 (event2, touch screens and tablets), 13:67 (event3, the
+   lid) and 13:68 (event4, the power button); NULL for any other minor. */
 const struct file_ops *evdev_ops(uint32_t minor);
 
 /* For /sys (fs/sysfs.c): how many devices, and device n's uevent texts as
    Linux writes them — input<n>'s (NAME, PRODUCT and the EV/KEY/REL/ABS
    bitmaps libudev sorts devices by) and event<n>'s (its node, plus the
    ID_INPUT_* tags udev would add). out holds EVDEV_UEVENT_MAX bytes. */
-#define EVDEV_COUNT      3
+#define EVDEV_COUNT      5
 #define EVDEV_UEVENT_MAX 512
 void evdev_uevent(int n, char *out);
 void evdev_node_uevent(int n, char *out);

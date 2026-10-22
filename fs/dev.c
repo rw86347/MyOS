@@ -21,6 +21,8 @@
  *  13,64 input/event0   the keyboard as input events (evdev.c)
  *  13,65 input/event1   the mouse
  *  13,66 input/event2   touch screens and tablets
+ *  13,67 input/event3   the lid (acpi_button.c)
+ *  13,68 input/event4   the power button
  *  29,0  fb0       the screen's pixels (drivers/video/fbmem.c), once a
  *                  display driver has registered one
  * 226,0  dri/card0 the same screen through DRM/KMS, for Wayland
@@ -542,7 +544,7 @@ void dev_attach(struct inode *i)
         else if ((i->rdev >> 8) == PTY_SLAVE_MAJOR)
             i->ops = pty_slave_ops();       /* pts/N: open() checks N */
         else if ((i->rdev >> 8) == 13)
-            i->ops = evdev_ops(i->rdev & 0xFF);     /* input/event0-2 */
+            i->ops = evdev_ops(i->rdev & 0xFF);     /* input/event0-4 */
         else if ((i->rdev >> 8) == 116)
             i->ops = snd_file_ops(i->rdev & 0xFF);  /* snd/controlC0, pcmC0D0p... */
         else if (i->rdev == DEV(226, 0))
@@ -654,6 +656,8 @@ void dev_init(void)
         make_node(input, "event0", DEV(13, 64));    /* keyboard (evdev.c) */
         make_node(input, "event1", DEV(13, 65));    /* mouse */
         make_node(input, "event2", DEV(13, 66));    /* touch screens, tablets */
+        make_node(input, "event3", DEV(13, 67));    /* the lid (acpi_button.c) */
+        make_node(input, "event4", DEV(13, 68));    /* the power button */
     }
     for (int k = 0; k < blockdev_count(); k++)     /* disks found before /dev */
         dev_block_add(blockdev_get(k));

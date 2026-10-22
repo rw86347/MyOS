@@ -24,6 +24,7 @@
 #include <signal.h>
 #include <stddef.h>
 #include <string.h>
+#include <suspend.h>
 #include <syscalls.h>
 #include <thread.h>
 #include <timer.h>
@@ -253,6 +254,7 @@ void signal_check(struct regs *r)
     struct process *p = t->proc;
     if (!p || !(r->cs & 3))
         return;
+    suspend_freeze_point();             /* going to sleep: wait here until awake */
     sleep_while_stopped(t, p);          /* a sibling stopped the process */
     for (;;) {
         uint64_t pending = t->sig_pending | p->sig_pending;

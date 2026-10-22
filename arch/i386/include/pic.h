@@ -3,11 +3,15 @@
 #ifndef ARCH_I386_PIC_H
 #define ARCH_I386_PIC_H
 
+#include <stdint.h>
+
 #define PIC_IRQ_BASE 32     /* IRQ n arrives as CPU vector 32 + n */
 
 void pic_init(void);        /* remap to vectors 32-47, mask all IRQs */
 void pic_unmask(int irq);
 void pic_mask(int irq);     /* (Linux's disable_irq) */
+uint16_t pic_masks(void);           /* bit n: IRQ n masked */
+void pic_set_masks(uint16_t masks);
 void pic_set_level(int irq);    /* level-triggered (ACPI's SCI); boot leaves them edge */
 void pic_send_eoi(int irq);
 int  pic_is_spurious(int irq);

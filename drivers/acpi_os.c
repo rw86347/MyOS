@@ -43,6 +43,7 @@
 #include <pic.h>
 #include <pmm.h>
 #include <string.h>
+#include <suspend.h>
 #include <thread.h>
 #include <timer.h>
 
@@ -394,6 +395,7 @@ uacpi_status uacpi_kernel_install_interrupt_handler(uacpi_u32 irq, uacpi_interru
     sci_fn = fn;
     pic_set_level((int)irq);
     irq_install((int)irq, sci_isr);
+    suspend_keep_irq((int)irq);         /* the lid and the power button wake by it */
     *out = &sci_irq;
     return UACPI_STATUS_OK;
 }
@@ -482,7 +484,7 @@ void acpi_poke(void)                    /* also from interrupts */
 static uacpi_interrupt_ret power_button(uacpi_handle ctx)
 {
     (void)ctx;
-    klog("acpi: the power button\n");   /* (nothing listens yet) */
+    acpi_button_power();                /* event4, or a wake-up (acpi_button.c) */
     return UACPI_INTERRUPT_HANDLED;
 }
 
@@ -509,6 +511,7 @@ static void acpi_main(void *arg)
     klog("acpi: the AML is running (%u ms)\n", (unsigned)(timer_ms() - t0));
     battery_init();
     backlight_init();
+    acpi_button_init();
 
     for (;;) {
         run_work();

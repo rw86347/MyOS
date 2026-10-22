@@ -67,6 +67,18 @@ void pic_unmask(int irq)
     outb(port, inb(port) & ~(1 << (irq & 7)));
 }
 
+/* All sixteen masks at once (bit n: IRQ n off), for sleep (kernel/suspend.c). */
+uint16_t pic_masks(void)
+{
+    return (uint16_t)(inb(PIC1_DATA) | inb(PIC2_DATA) << 8);
+}
+
+void pic_set_masks(uint16_t masks)
+{
+    outb(PIC1_DATA, (uint8_t)masks);
+    outb(PIC2_DATA, (uint8_t)(masks >> 8));
+}
+
 /* The ELCR (ports 0x4D0, 0x4D1, one bit per IRQ) says which IRQs are
    level-triggered: the line stays up until the device is answered, and
    the PIC asks again after the EOI while it does. Edge mode would lose an

@@ -1,8 +1,9 @@
 /* SPDX-License-Identifier: BSD-2-Clause */
 /* Copyright (c) 2026 Rodger Wilson */
 /*
- * evdev.c — /dev/input/event0 (keyboard), event1 (mouse) and event2
- * (touch screens and tablets: absolute pointers)
+ * evdev.c — /dev/input/event0 (keyboard), event1 (mouse), event2
+ * (touch screens and tablets: absolute pointers), event3 (the lid) and
+ * event4 (the power button)
  *
  * Linux hands keyboards and mice to programs as streams of small fixed
  * records, "input events", one per change:
@@ -25,6 +26,13 @@
  * knows to re-read the key state instead of seeing half a report.
  * EVIOCGRAB gives one reader all the events (X takes the keyboard so the
  * console doesn't see the keys too).
+ *
+ * The lid and the power button come from ACPI (acpi_button.c) as Linux's
+ * "Lid Switch" (EV_SW SW_LID, 1: shut; EVIOCGSW says how it is now) and
+ * "Power Button" (KEY_POWER, or KEY_WAKEUP when it woke the machine).
+ * X doesn't open them; the power daemon does. Asleep (kernel/suspend.c), a
+ * click wakes the machine and is not passed on (keyboard.c does the same
+ * for keys); a button let go still is, so none stays held down.
  */
 #include <errno.h>
 #include <evdev.h>
@@ -32,6 +40,7 @@
 #include <kheap.h>
 #include <mouse.h>
 #include <string.h>
+#include <suspend.h>
 #include <thread.h>
 #include <timer.h>
 #include <uaccess.h>
@@ -41,6 +50,7 @@
 #define EV_KEY 0x01
 #define EV_REL 0x02
 #define EV_ABS 0x03
+#define EV_SW  0x05
 #define EV_LED 0x11
 #define EV_REP 0x14
 #define SYN_REPORT  0
@@ -54,6 +64,7 @@
 #define KEY_CNT   0x300
 #define BUS_USB   0x03
 #define BUS_I8042 0x11
+#define BUS_HOST  0x19
 
 #define QLEN    128                 /* events per reader */
 #define READERS 4                   /* open files per device */
@@ -71,8 +82,8 @@ struct reader {
 };
 
 struct evdev {
-    const char *name;
-    uint16_t product;
+    const char *name, *phys;
+    uint16_t bus, product;
     struct reader *readers[READERS];
     struct reader *grab;            /* EVIOCGRAB: only this one gets events */
     uint8_t ev_bits[4];             /* EV_* it sends */
@@ -81,19 +92,24 @@ struct evdev {
     uint8_t abs_bits[8];            /* ABS_* it has (event2: X and Y) */
     int32_t abs[2];                 /* where X and Y are now (EVIOCGABS) */
     uint8_t key_down[KEY_CNT / 8];  /* held now (EVIOCGKEY) */
+    uint8_t sw_bits[1], sw_on[1];   /* SW_* it has, and which are on now (EVIOCGSW) */
     struct wait_queue wq;
 };
 
 #define NDEVS EVDEV_COUNT
 static struct evdev devs[NDEVS] = {
-    { .name = "AT Translated Set 2 keyboard", .product = 1 },
-    { .name = "ImExPS/2 Generic Explorer Mouse", .product = 2 },
+    { .name = "AT Translated Set 2 keyboard", .phys = "isa0060/serio0/input0",
+      .bus = BUS_I8042, .product = 1 },
+    { .name = "ImExPS/2 Generic Explorer Mouse", .phys = "isa0060/serio1/input0",
+      .bus = BUS_I8042, .product = 2 },
     /* Every absolute pointer, in one range (EVDEV_ABS_MAX): X maps it
        onto the screen. A touch is the left button: X's evdev driver takes
        a device with BTN_TOUCH *and* buttons for a touchpad, which moves
        the pointer only while a finger is down (UTM's tablet never says
        one is). With the buttons alone it is a touch screen: it points. */
-    { .name = "MyOS touch screen", .product = 3 },
+    { .name = "MyOS touch screen", .phys = "usb-myos/input0", .bus = BUS_USB, .product = 3 },
+    { .name = "Lid Switch", .phys = "PNP0C0D/button/input0", .bus = BUS_HOST, .product = 5 },
+    { .name = "Power Button", .phys = "LNXPWRBN/button/input0", .bus = BUS_HOST, .product = 1 },
 };
 
 static void set_bit(uint8_t *bits, unsigned n) { bits[n / 8] |= 1 << (n % 8); }
@@ -104,7 +120,7 @@ static void init_bits(void)
     if (done)
         return;
     done = 1;
-    struct evdev *k = &devs[0], *m = &devs[1], *t = &devs[2];
+    struct evdev *k = &devs[0], *m = &devs[1], *t = &devs[2], *l = &devs[3], *p = &devs[4];
     set_bit(k->ev_bits, EV_SYN), set_bit(k->ev_bits, EV_KEY);
     set_bit(k->ev_bits, EV_LED), set_bit(k->ev_bits, EV_REP);
     for (unsigned c = 1; c <= 88; c++)
@@ -128,6 +144,9 @@ static void init_bits(void)
         set_bit(t->key_bits, BTN_LEFT + b);     /* a tablet's (or QEMU's) buttons; a touch */
     set_bit(t->abs_bits, ABS_X), set_bit(t->abs_bits, ABS_Y);
     set_bit(t->rel_bits, REL_WHEEL);
+    set_bit(l->ev_bits, EV_SYN), set_bit(l->ev_bits, EV_SW), set_bit(l->sw_bits, EVDEV_SW_LID);
+    set_bit(p->ev_bits, EV_SYN), set_bit(p->ev_bits, EV_KEY);
+    set_bit(p->key_bits, EVDEV_KEY_POWER), set_bit(p->key_bits, EVDEV_KEY_WAKEUP);
 }
 
 /* --- from the interrupt handlers ----------------------------------------------- */
@@ -184,6 +203,12 @@ void evdev_key(uint16_t code, int pressed)
 void evdev_mouse(const struct mouse_event *e)
 {
     struct evdev *d = &devs[1];
+    struct mouse_event up;
+    if (suspend_asleep) {               /* a click wakes; only buttons let go pass */
+        suspend_input();
+        up = (struct mouse_event){ .buttons = e->buttons & (d->key_down[BTN_LEFT / 8] & 7) };
+        e = &up;
+    }
     for (int b = 0; b < 3; b++) {
         uint16_t code = BTN_LEFT + b;
         int now = (e->buttons >> b) & 1;
@@ -215,6 +240,14 @@ static void button(struct evdev *d, uint16_t code, int now)
 void evdev_touch(const struct touch_event *e)
 {
     struct evdev *d = &devs[2];
+    struct touch_event up;
+    if (suspend_asleep) {               /* as for the mouse */
+        suspend_input();
+        up = (struct touch_event){ .x = d->abs[0], .y = d->abs[1],
+                                   .buttons = (e->buttons | (e->touch > 0)) &
+                                              (d->key_down[BTN_LEFT / 8] & 7) };
+        e = &up;
+    }
     if (e->x != d->abs[0])
         emit(d, EV_ABS, ABS_X, d->abs[0] = e->x);
     if (e->y != d->abs[1])
@@ -224,6 +257,29 @@ void evdev_touch(const struct touch_event *e)
     if (e->wheel)
         emit(d, EV_REL, REL_WHEEL, e->wheel);
     report(d);
+}
+
+void evdev_switch(uint16_t code, int on)
+{
+    struct evdev *d = &devs[3];
+    uint32_t f = irq_save();
+    if (((d->sw_on[0] >> code) & 1) != !!on) {
+        d->sw_on[0] ^= (uint8_t)(1 << code);
+        emit(d, EV_SW, code, !!on);
+        report(d);
+    }
+    irq_restore(f);
+}
+
+void evdev_power(uint16_t code)
+{
+    struct evdev *d = &devs[4];
+    uint32_t f = irq_save();
+    emit(d, EV_KEY, code, 1);
+    report(d);
+    emit(d, EV_KEY, code, 0);
+    report(d);
+    irq_restore(f);
 }
 
 /* --- the files ----------------------------------------------------------------------- */
@@ -350,6 +406,7 @@ static int32_t ev_ioctl(struct file *f, uint32_t cmd, uintptr_t arg)
             case EV_KEY: return give(arg, d->key_bits, sizeof d->key_bits, len);
             case EV_REL: return give(arg, d->rel_bits, sizeof d->rel_bits, len);
             case EV_ABS: return give(arg, d->abs_bits, sizeof d->abs_bits, len);
+            case EV_SW:  return give(arg, d->sw_bits, sizeof d->sw_bits, len);
             default:     return give(arg, zeros, sizeof zeros, len);
             }
         }
@@ -367,7 +424,7 @@ static int32_t ev_ioctl(struct file *f, uint32_t cmd, uintptr_t arg)
             return give(arg, &v, 4, len) < 0 ? -EFAULT : 0;
         }
         case 0x02: {                            /* EVIOCGID */
-            uint16_t id[4] = { r->dev == 2 ? BUS_USB : BUS_I8042, 1, d->product, 0xAB41 };
+            uint16_t id[4] = { d->bus, 1, d->product, 0xAB41 };
             return give(arg, id, sizeof id, len) < 0 ? -EFAULT : 0;
         }
         case 0x03: {                            /* EVIOCGREP: delay, period (ms) */
@@ -378,18 +435,18 @@ static int32_t ev_ioctl(struct file *f, uint32_t cmd, uintptr_t arg)
         }
         case 0x06:                              /* EVIOCGNAME */
             return give(arg, d->name, strlen(d->name) + 1, len);
-        case 0x07: {                            /* EVIOCGPHYS */
-            static const char *const phys[NDEVS] = {
-                "isa0060/serio0/input0", "isa0060/serio1/input0", "usb-myos/input0" };
-            return give(arg, phys[r->dev], strlen(phys[r->dev]) + 1, len);
-        }
+        case 0x07:                              /* EVIOCGPHYS */
+            return give(arg, d->phys, strlen(d->phys) + 1, len);
         case 0x08:                              /* EVIOCGUNIQ */
             return -ENOENT;
         case 0x09:                              /* EVIOCGPROP */
         case 0x19:                              /* EVIOCGLED */
         case 0x1a:                              /* EVIOCGSND */
-        case 0x1b:                              /* EVIOCGSW */
             return give(arg, zeros, nr == 0x09 ? 4 : 8, len);
+        case 0x1b: {                            /* EVIOCGSW: the lid, shut or not */
+            uint8_t on[8] = { d->sw_on[0] };
+            return give(arg, on, sizeof on, len);
+        }
         case 0x18: {                            /* EVIOCGKEY */
             uint8_t held[KEY_CNT / 8];
             uint32_t flags = irq_save();
@@ -494,15 +551,13 @@ static int has(const uint8_t *bits, unsigned n) { return bits[n / 8] >> (n % 8) 
 
 void evdev_uevent(int n, char *out)
 {
-    static const char *const phys[NDEVS] = {
-        "isa0060/serio0/input0", "isa0060/serio1/input0", "usb-myos/input0" };
     struct evdev *d = &devs[n];
     init_bits();
     char *s = put_str(out, "PRODUCT=");
-    s = put_hex(s, n == 2 ? BUS_USB : BUS_I8042);
+    s = put_hex(s, d->bus);
     s = put_str(s, "/1/");
     s = put_hex(s, d->product);
-    s = put_str(put_str(put_str(put_str(s, "/ab41\nNAME=\""), d->name), "\"\nPHYS=\""), phys[n]);
+    s = put_str(put_str(put_str(put_str(s, "/ab41\nNAME=\""), d->name), "\"\nPHYS=\""), d->phys);
     s = put_str(s, "\"\nPROP=0\nEV=");
     s = put_bitmap(s, d->ev_bits, sizeof d->ev_bits);
     if (has(d->ev_bits, EV_KEY))
@@ -511,6 +566,8 @@ void evdev_uevent(int n, char *out)
         s = put_bitmap(put_str(s, "\nREL="), d->rel_bits, sizeof d->rel_bits);
     if (has(d->ev_bits, EV_ABS))
         s = put_bitmap(put_str(s, "\nABS="), d->abs_bits, sizeof d->abs_bits);
+    if (has(d->ev_bits, EV_SW))
+        s = put_bitmap(put_str(s, "\nSW="), d->sw_bits, sizeof d->sw_bits);
     if (has(d->ev_bits, EV_LED))
         s = put_str(s, "\nLED=0");
     put_str(s, "\n");
@@ -526,9 +583,11 @@ void evdev_node_uevent(int n, char *out)
         "ID_INPUT=1\nID_INPUT_KEY=1\nID_INPUT_KEYBOARD=1\n",
         "ID_INPUT=1\nID_INPUT_MOUSE=1\n",
         "ID_INPUT=1\nID_INPUT_MOUSE=1\n",
+        "ID_INPUT=1\nID_INPUT_SWITCH=1\n",
+        "ID_INPUT=1\nID_INPUT_KEY=1\n",
     };
-    char *s = put_str(out, "MAJOR=13\nMINOR=");
-    s = put_str(s, n == 0 ? "64" : n == 1 ? "65" : "66");
+    char *s = put_str(out, "MAJOR=13\nMINOR=6");
+    *s++ = (char)('4' + n);
     s = put_str(s, "\nDEVNAME=input/event");
     *s++ = (char)('0' + n);
     put_str(put_str(s, "\n"), tags[n]);

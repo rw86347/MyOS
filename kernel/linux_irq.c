@@ -17,6 +17,7 @@
 #include <linux/kernel.h>
 #include <linux/slab.h>
 #include <pic.h>
+#include <suspend.h>
 #include <thread.h>
 
 struct lirq {
@@ -32,6 +33,7 @@ static struct thread *threads[NR_IRQS];
 static struct wait_queue irq_wake[NR_IRQS];
 static struct wait_queue thread_done[NR_IRQS];
 static volatile uint8_t disabled[NR_IRQS], missed[NR_IRQS], thread_busy[NR_IRQS];
+static volatile uint8_t asleep;         /* sleep (suspend.c): every handler held */
 
 /* Interrupts are off here (an interrupt), as everywhere in this file. */
 static void run_handlers(int irq)
@@ -53,11 +55,29 @@ static void entry(struct regs *r)
     int irq = (int)r->vector - PIC_IRQ_BASE;
     if (irq < 0 || irq >= NR_IRQS)
         return;
-    if (disabled[irq]) {
-        missed[irq] = 1;                /* an MSI: replayed by enable_irq */
+    if (disabled[irq] || (asleep && irq >= IRQ_MSI_FIRST)) {
+        missed[irq] = 1;                /* an MSI: replayed by enable_irq or on waking */
         return;
     }
     run_handlers(irq);
+}
+
+/* Asleep, a Linux driver's device may still interrupt (Wi-Fi hears a
+   beacon); its handlers wait for the wake-up, as Linux's
+   suspend_device_irqs makes them. That is for MSIs: suspend.c masks the
+   8259 lines, and one it leaves on is shared with a wake-up device, where
+   a level-triggered line not answered would come back at once. Interrupts
+   are off. */
+void linux_irq_suspend(int sleep)
+{
+    asleep = (uint8_t)sleep;
+    if (sleep)
+        return;
+    for (int irq = 0; irq < NR_IRQS; irq++)
+        if (missed[irq] && !disabled[irq]) {
+            missed[irq] = 0;
+            run_handlers(irq);
+        }
 }
 
 static void irq_thread(void *arg)
