@@ -71,6 +71,12 @@ void pci_write_config(const struct pci_dev *dev, uint8_t offset, uint32_t value)
    kernel, uncached. The kernel address, or NULL if the window is full (or,
    on i386, `phys` is above 4 GiB). */
 volatile void *pci_map_mmio(phys_addr_t phys, uint32_t bytes);
+/* Firmware RAM (ACPI tables) above the direct map, cached (pci.c). */
+volatile void *ioremap_cache(phys_addr_t phys, uint32_t bytes);
+/* Config space by bus, slot, function: 1, 2 or 4 bytes (ACPI's AML). */
+uint32_t pci_cfg_read(uint8_t bus, uint8_t slot, uint8_t func, uint16_t offset, int width);
+void pci_cfg_write(uint8_t bus, uint8_t slot, uint8_t func, uint16_t offset, int width,
+                   uint32_t value);
 
 /* Where memory BAR n starts (both halves of a 64-bit BAR); 0 for an I/O
    BAR or none. */

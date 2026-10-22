@@ -15,10 +15,13 @@ what they meant).
     python3 tools/kconfig/powerfeatures.py --json       the catalogue, for the mockups
     python3 tools/kconfig/powerfeatures.py --c          the catalogue, for Settings (C)
 
-The three processor families MyOS is built for (CLAUDE.md):
+The processor families MyOS is built for (CLAUDE.md):
     pentium4    old desktop PCs: Pentium 4 (NetBurst), 2000-2006
     pentium-m   old laptops: Pentium M (Banias, Dothan), 2003-2006
     zen         the GPD Pocket 4: AMD Ryzen (Zen 4 / Zen 5), x86-64
+    intel-core  the GPD P2 Max (Core m3-8100Y, Amber Lake) and the MSI
+                Katana (Core i7-11800H, Tiger Lake): Intel Core, Skylake
+                to Tiger Lake, x86-64
 
 Support is "yes", "no", "some" (only some models: the kernel asks CPUID),
 "machine" (depends on the devices in the computer, not the processor) or
@@ -31,11 +34,12 @@ _CST for idle states, NVMe's power-state table for APST).
 import sys
 from dataclasses import dataclass, field
 
-FAMILIES = ("pentium4", "pentium-m", "zen")
+FAMILIES = ("pentium4", "pentium-m", "zen", "intel-core")   # new ones go at the end
 FAMILY_NAMES = {
     "pentium4": "Pentium 4 (old desktop)",
     "pentium-m": "Pentium M (old laptop)",
     "zen": "Ryzen, Zen 4/5 (GPD Pocket 4)",
+    "intel-core": "Intel Core (P2 Max, Katana)",
 }
 
 
@@ -57,122 +61,144 @@ class Feature:
 FEATURES = [
     Feature(0, "cpu_speed", "Change processor speed", "Processor",
             "Runs the processor slower (and at a lower voltage) when there is little to do.",
-            {"pentium4": "some", "pentium-m": "yes", "zen": "yes"},
+            {"pentium4": "some", "pentium-m": "yes", "zen": "yes", "intel-core": "yes"},
             {"pentium4": "Enhanced SpeedStep on late models (Pentium 4 6x0): CPUID.1:ECX bit 7, "
                          "IA32_PERF_CTL (MSR 0x199)",
              "pentium-m": "Enhanced SpeedStep: IA32_MISC_ENABLE (0x1A0) bit 16 on, then "
                           "IA32_PERF_CTL (0x199); IA32_PERF_STATUS (0x198) says where it is",
              "zen": "CPPC (CPUID 0x80000008 EBX bit 27): the CPPC request MSR (0xC00102B3) "
-                    "sets min / max / desired performance and the energy preference"},
+                    "sets min / max / desired performance and the energy preference",
+             "intel-core": "HWP, Speed Shift (CPUID.6:EAX bit 7): IA32_PM_ENABLE (0x770) on, then "
+                           "IA32_HWP_REQUEST (0x774) sets min / max and the energy preference "
+                           "(EPP, CPUID.6:EAX bit 10; else IA32_ENERGY_PERF_BIAS, 0x1B0)"},
             wake_us=10, slows_cpu=True, saves=3, param="cpu_min_pct, cpu_max_pct, epp"),
     Feature(1, "no_boost", "Turn off boost", "Processor",
             "Never runs above the rated speed: less heat, less power, steadier timing.",
-            {"pentium4": "no", "pentium-m": "no", "zen": "yes"},
-            {"zen": "Core Performance Boost off: HWCR (MSR 0xC0010015) bit 25"},
+            {"pentium4": "no", "pentium-m": "no", "zen": "yes", "intel-core": "some"},
+            {"zen": "Core Performance Boost off: HWCR (MSR 0xC0010015) bit 25",
+             "intel-core": "Turbo Boost off: IA32_MISC_ENABLE (0x1A0) bit 38 (CPUID.6:EAX bit 1 "
+                           "says it has it; a Celeron or Pentium has none)"},
             slows_cpu=True, saves=2),
     Feature(2, "deep_idle", "Deep idle states", "Processor",
             "When idle, stops more of the processor than a plain halt does (C2, C3, ...).",
-            {"pentium4": "no", "pentium-m": "yes", "zen": "yes"},
+            {"pentium4": "no", "pentium-m": "yes", "zen": "yes", "intel-core": "yes"},
             {"pentium-m": "ACPI C2/C3 (and C4, Deeper Sleep, on Dothan): an I/O read of P_LVL2 / "
                           "P_LVL3 from the FADT's P_BLK; the local APIC timer stops in C3",
-             "zen": "ACPI _CST: MWAIT hints (C1, C2) and CC6; the APIC timer keeps running (ARAT)"},
+             "zen": "ACPI _CST: MWAIT hints (C1, C2) and CC6; the APIC timer keeps running (ARAT)",
+             "intel-core": "MWAIT with a C-state hint (C3 0x10, C6 0x20, C7 0x33, C8 0x40, C9 0x50, "
+                           "C10 0x60), checked against CPUID leaf 5; the package follows the cores "
+                           "down (package C-states)"},
             wake_us=100, saves=3, param="cstate_max"),
     Feature(3, "c1e", "Enhanced halt (C1E)", "Processor",
             "A halted processor also drops its voltage and clock.",
-            {"pentium4": "some", "pentium-m": "no", "zen": "yes"},
+            {"pentium4": "some", "pentium-m": "no", "zen": "yes", "intel-core": "yes"},
             {"pentium4": "Pentium 4 5x1 / 6xx and Pentium D; usually switched on by the BIOS",
-             "zen": "set up by the firmware; the kernel only leaves it on or asks it off"},
+             "zen": "set up by the firmware; the kernel only leaves it on or asks it off",
+             "intel-core": "MSR_POWER_CTL (0x1FC) bit 1"},
             wake_us=10, saves=2),
     Feature(4, "throttle", "Clock modulation", "Processor",
             "Skips clock cycles to cool down. Saves little energy: the voltage stays the same.",
-            {"pentium4": "yes", "pentium-m": "yes", "zen": "no"},
+            {"pentium4": "yes", "pentium-m": "yes", "zen": "no", "intel-core": "yes"},
             {"pentium4": "on-demand clock modulation: IA32_CLOCK_MODULATION (MSR 0x19A), "
                          "CPUID.1:EDX bit 22",
-             "pentium-m": "IA32_CLOCK_MODULATION (MSR 0x19A)"},
-            slows_cpu=True, saves=1),
+             "pentium-m": "IA32_CLOCK_MODULATION (MSR 0x19A)",
+             "intel-core": "IA32_CLOCK_MODULATION (MSR 0x19A), in 6.25% steps (CPUID.6:EAX bit 5)"},
+            slows_cpu=True, saves=1, param="cpu_max_pct"),
     Feature(5, "tickless", "Skip unneeded timer ticks", "Processor",
             "Wakes the processor only when a timer is due, not 1000 times a second.",
-            {"pentium4": "yes", "pentium-m": "yes", "zen": "yes"},
+            {"pentium4": "yes", "pentium-m": "yes", "zen": "yes", "intel-core": "yes"},
             {"pentium4": "local APIC timer, one-shot mode",
              "pentium-m": "local APIC one-shot; in C3 the APIC timer stops, so the PIT or HPET "
                           "must wake it then",
-             "zen": "local APIC one-shot (ARAT: it runs in every idle state)"},
+             "zen": "local APIC one-shot (ARAT: it runs in every idle state)",
+             "intel-core": "local APIC TSC-deadline mode (ARAT: it runs in every idle state)"},
             saves=2),
     Feature(6, "smt_off", "Turn off second threads", "Processor",
             "Hyper-Threading / SMT off: one thread per core, less power, steadier timing.",
-            {"pentium4": "smp", "pentium-m": "no", "zen": "smp"},
-            {"pentium4": "Hyper-Threading models only", "zen": "SMT siblings stay offline"},
+            {"pentium4": "smp", "pentium-m": "no", "zen": "smp", "intel-core": "smp"},
+            {"pentium4": "Hyper-Threading models only", "zen": "SMT siblings stay offline",
+             "intel-core": "Hyper-Threading siblings stay offline"},
             saves=1),
     Feature(7, "core_park", "Park idle cores", "Processor",
             "Puts whole cores to sleep while the others can do the work.",
-            {"pentium4": "no", "pentium-m": "no", "zen": "smp"},
-            {"zen": "a core with nothing scheduled stays in CC6"},
+            {"pentium4": "no", "pentium-m": "no", "zen": "smp", "intel-core": "smp"},
+            {"zen": "a core with nothing scheduled stays in CC6",
+             "intel-core": "a core with nothing scheduled stays in C6 or deeper"},
             wake_us=400, saves=2),
     Feature(8, "disk_spindown", "Spin down hard disks", "Storage",
             "Stops a hard disk's motor after minutes without use. The next read waits seconds.",
-            {"pentium4": "machine", "pentium-m": "machine", "zen": "machine"},
+            {"pentium4": "machine", "pentium-m": "machine", "zen": "machine", "intel-core": "machine"},
             {"pentium4": "ATA STANDBY timer (IDLE command count); rotating disks only "
                          "(IDENTIFY word 217 is not 1)",
              "pentium-m": "same", "zen": "same (if a SATA hard disk is attached)"},
             saves=3, param="spindown_min"),
     Feature(9, "sata_lpm", "SATA link power management", "Storage",
             "Lets the SATA cable's link sleep between commands.",
-            {"pentium4": "machine", "pentium-m": "machine", "zen": "machine"},
+            {"pentium4": "machine", "pentium-m": "machine", "zen": "machine", "intel-core": "machine"},
             {"pentium4": "AHCI CAP.SALP (ICH6 and later, in AHCI mode)",
              "pentium-m": "AHCI CAP.SALP (ICH6-M and later)", "zen": "AHCI CAP.SALP"},
             saves=1),
     Feature(10, "nvme_apst", "NVMe power states", "Storage",
             "The SSD drops into its own low-power states when idle (APST).",
-            {"pentium4": "no", "pentium-m": "no", "zen": "machine"},
-            {"zen": "Identify Controller APSTA, then Set Features 0x0C with the drive's table"},
+            {"pentium4": "no", "pentium-m": "no", "zen": "machine", "intel-core": "machine"},
+            {"zen": "Identify Controller APSTA, then Set Features 0x0C with the drive's table",
+             "intel-core": "same (the P2 Max's NVMe SSD)"},
             saves=2),
     Feature(11, "pcie_aspm", "PCIe link power management", "Devices",
             "PCI Express links sleep when no data moves (ASPM L0s / L1).",
-            {"pentium4": "machine", "pentium-m": "machine", "zen": "machine"},
+            {"pentium4": "machine", "pentium-m": "machine", "zen": "machine", "intel-core": "machine"},
             {"pentium4": "ICH6 and later have PCIe ports; older PCs have plain PCI (nothing to do)",
              "pentium-m": "ICH6-M and later", "zen": "link control register of each port"},
             saves=2),
     Feature(12, "usb_autosuspend", "Suspend idle USB devices", "Devices",
             "Idle USB devices sleep. Keyboard, mouse and touchscreen never do.",
-            {"pentium4": "machine", "pentium-m": "machine", "zen": "machine"},
+            {"pentium4": "machine", "pentium-m": "machine", "zen": "machine", "intel-core": "machine"},
             {"pentium4": "UHCI / EHCI port suspend", "pentium-m": "UHCI / EHCI port suspend",
              "zen": "xHCI U1/U2 link states and port suspend"},
             saves=2),
     Feature(13, "wifi_ps", "Wi-Fi power save", "Devices",
             "The Wi-Fi radio sleeps between beacons while connected.",
-            {"pentium4": "machine", "pentium-m": "machine", "zen": "machine"},
+            {"pentium4": "machine", "pentium-m": "machine", "zen": "machine", "intel-core": "machine"},
             {"pentium4": "802.11 power-save mode, if the Wi-Fi driver has it (iwlwifi)",
              "pentium-m": "same", "zen": "same"},
             saves=2),
     Feature(14, "audio_pm", "Power down the sound chip", "Devices",
             "The sound chip powers down after a few seconds of silence.",
-            {"pentium4": "machine", "pentium-m": "machine", "zen": "machine"},
+            {"pentium4": "machine", "pentium-m": "machine", "zen": "machine", "intel-core": "machine"},
             {"pentium4": "HD Audio codec D3 (AC'97 chips: nothing to do)",
              "pentium-m": "HD Audio codec D3", "zen": "HD Audio codec D3"},
             saves=1),
     Feature(15, "nic_idle", "Idle unplugged Ethernet", "Devices",
             "A wired network card with no cable plugged in powers down.",
-            {"pentium4": "machine", "pentium-m": "machine", "zen": "machine"},
+            {"pentium4": "machine", "pentium-m": "machine", "zen": "machine", "intel-core": "machine"},
             {"pentium4": "e1000 / RTL8139 power states", "pentium-m": "same", "zen": "same"},
             saves=1),
     Feature(16, "gpu_pm", "Graphics power management", "Devices",
             "Lower graphics clocks and panel self-refresh while the picture doesn't change.",
-            {"pentium4": "no", "pentium-m": "no", "zen": "machine"},
-            {"zen": "amdgpu DPM and PSR, once MyOS has an amdgpu driver"},
+            {"pentium4": "no", "pentium-m": "no", "zen": "machine", "intel-core": "machine"},
+            {"zen": "amdgpu DPM and PSR, once MyOS has an amdgpu driver",
+             "intel-core": "i915 RC6 and PSR, once MyOS has an i915 driver"},
             saves=2),
 ]
 
 BY_KEY = {f.key: f for f in FEATURES}
 BY_BIT = {f.bit: f for f in FEATURES}
 
-# Idle states: what deep_idle's cstate_max can be, with typical wake-up costs.
-# Soft realtime allows the deepest one whose wake-up fits its latency budget.
+# Idle states: what deep_idle's cstate_max can be, with typical wake-up costs,
+# shallowest first. Soft realtime goes down them while each wakes within its
+# latency budget, and stops at the first that doesn't (a shared row carries
+# its slowest family's figure, so a deeper state may list a faster one).
+# The Intel-only ones are Linux's intel_idle figures for Skylake (skl_cstates).
 CSTATES = [  # (number, name, typical wake-up in microseconds, families)
     (1, "C1 (halt)", 1, FAMILIES),
     (2, "C2", 20, ("pentium-m", "zen")),
-    (3, "C3", 100, ("pentium-m", "zen")),
+    (3, "C3", 100, ("pentium-m", "zen", "intel-core")),
     (4, "C4 (Deeper Sleep)", 200, ("pentium-m",)),
-    (6, "C6 (core off)", 400, ("zen",)),
+    (6, "C6 (core off)", 400, ("zen", "intel-core")),
+    (7, "C7", 124, ("intel-core",)),
+    (8, "C8", 200, ("intel-core",)),
+    (9, "C9", 480, ("intel-core",)),
+    (10, "C10 (deepest)", 890, ("intel-core",)),
 ]
 
 
@@ -186,8 +212,11 @@ def soft_realtime_cstate(family, budget_us):
     budget. Nothing else saves power in soft realtime (docs/KERNEL-CONFIG.md)."""
     best = CSTATES[0]
     for c in CSTATES:
-        if family in c[3] and c[2] <= budget_us:
-            best = c
+        if family not in c[3]:
+            continue
+        if c[2] > budget_us:
+            break
+        best = c
     return best
 
 

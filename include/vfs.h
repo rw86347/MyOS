@@ -100,6 +100,12 @@ struct file_ops {
        Epoll reports an edge-triggered entry on it only when the count
        moved, as Linux does. NULL for everything else. */
     uint32_t (*change_count)(struct file *f);
+    /* A file whose length isn't its inode's (/proc's, made when read):
+       its length now, for lseek(SEEK_END). Programs that measure a file
+       before reading it (c-ares reads resolv.conf, a link to /proc/net/dns,
+       with fseek to the end and ftell) see the real contents. NULL: the
+       inode's size. */
+    uint32_t (*size)(struct file *f);
 };
 
 
@@ -538,6 +544,8 @@ int  procfs_readlink(struct inode *link, char *buf, uint32_t size);
 int  sysfs_mount(const char *path);
 struct net_device;
 void sysfs_net_add(struct net_device *d);       /* netdevice.c, as a link is listed */
+void sysfs_power_supply_add(int i);             /* battery.c, once its unit is known */
+void sysfs_backlight_add(void);                 /* backlight.c, once it found the panel */
 /* /proc/<pid>: made with the process, gone when it is reaped (procfs.c). */
 void procfs_pid_add(int pid);
 void procfs_pid_remove(int pid);

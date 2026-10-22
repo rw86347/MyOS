@@ -153,25 +153,38 @@ computer lacks, with the reason ("Not on a Pentium M", "No hard disk",
 "Needs MyOS on more than one core"). The list and the reasons come from
 `tools/kconfig/powerfeatures.py`:
 
-| bit | Saving | Pentium 4 | Pentium M | Ryzen (Pocket 4) | Tuned by |
-|---|---|---|---|---|---|
-| 0 | Change processor speed | some models | yes (SpeedStep) | yes (CPPC) | speed range, energy preference |
-| 1 | Turn off boost | – | – | yes | |
-| 2 | Deep idle states | – | yes (C2–C4) | yes (C2, C3, C6) | deepest state |
-| 3 | Enhanced halt (C1E) | some models | – | yes | |
-| 4 | Clock modulation | yes | yes | – | |
-| 5 | Skip unneeded timer ticks | yes | yes | yes | |
-| 6 | Turn off second threads | needs SMP | – | needs SMP | |
-| 7 | Park idle cores | – | – | needs SMP | |
-| 8 | Spin down hard disks | machine | machine | machine | minutes |
-| 9 | SATA link power management | machine | machine | machine | |
-| 10 | NVMe power states | – | – | machine | |
-| 11 | PCIe link power management | machine | machine | machine | |
-| 12 | Suspend idle USB devices | machine | machine | machine | |
-| 13 | Wi-Fi power save | machine | machine | machine | |
-| 14 | Power down the sound chip | machine | machine | machine | |
-| 15 | Idle unplugged Ethernet | machine | machine | machine | |
-| 16 | Graphics power management | – | – | machine | |
+| bit | Saving | Pentium 4 | Pentium M | Ryzen (Pocket 4) | Intel Core (P2 Max, Katana) | Tuned by |
+|---|---|---|---|---|---|---|
+| 0 | Change processor speed | some models | yes (SpeedStep) | yes (CPPC) | yes (HWP) | speed range, energy preference |
+| 1 | Turn off boost | – | – | yes | most models | |
+| 2 | Deep idle states | – | yes (C2–C4) | yes (C2, C3, C6) | yes (C3, C6–C10) | deepest state |
+| 3 | Enhanced halt (C1E) | some models | – | yes | yes | |
+| 4 | Clock modulation | yes | yes | – | yes | fastest speed |
+| 5 | Skip unneeded timer ticks | yes | yes | yes | yes | |
+| 6 | Turn off second threads | needs SMP | – | needs SMP | needs SMP | |
+| 7 | Park idle cores | – | – | needs SMP | needs SMP | |
+| 8 | Spin down hard disks | machine | machine | machine | machine | minutes |
+| 9 | SATA link power management | machine | machine | machine | machine | |
+| 10 | NVMe power states | – | – | machine | machine | |
+| 11 | PCIe link power management | machine | machine | machine | machine | |
+| 12 | Suspend idle USB devices | machine | machine | machine | machine | |
+| 13 | Wi-Fi power save | machine | machine | machine | machine | |
+| 14 | Power down the sound chip | machine | machine | machine | machine | |
+| 15 | Idle unplugged Ethernet | machine | machine | machine | machine | |
+| 16 | Graphics power management | – | – | machine | machine | |
+
+**What the kernel does with them today** (2026-10-17, `arch/*/cpupower.c`;
+docs/gaps.md has the rest). In power-saving mode: speed (HWP, CPPC), boost,
+C1E, deep idle by MWAIT (Intel Core) and clock modulation are set at boot,
+each MSR checked by reading it back, and the boot log has one line for each:
+
+    cpupower: speed: HWP, levels 4-34 (it has 4-34, rated 11), energy preference 128
+    cpupower: deep idle: MWAIT, down to C10 (hint 60)
+
+(the numbers are an example: a Core m3-8100Y's levels count 100 MHz). The
+processor's energy meter, for before/after numbers, is
+`/sys/class/powercap/intel-rapl:0/energy_uj` (root only), on Intel since
+Sandy Bridge and AMD since Zen.
 
 "machine" means the devices decide: an old laptop has an IDE disk and no
 PCI Express, while the Pocket 4 has an NVMe SSD and no Ethernet port.
@@ -262,7 +275,7 @@ with both `i686-elf-gcc` and `x86_64-elf-gcc`.
 | 0x168 | 1 | cpu_min_pct | slowest speed, % of rated |
 | 0x169 | 1 | cpu_max_pct | fastest speed |
 | 0x16A | 1 | epp | energy preference 0 (speed) – 255 (energy) |
-| 0x16B | 1 | cstate_max | deepest idle state, 1 = C1 … 6 = C6 |
+| 0x16B | 1 | cstate_max | deepest idle state, 1 = C1 … 10 = C10 (C7–C10: Intel Core) |
 | 0x16C | 2 | spindown_min | minutes, 0 never |
 | 0x16E | 146 | reserved | 0, room for later versions |
 
@@ -543,7 +556,10 @@ B's cards yet. They could open inside a card when it is switched on
    helper that writes the partition). A saving's settings sit inside its
    card once it is switched on.
 9. **Each power saving**, one at a time, on hardware that has it, with a
-   before/after number for each in `docs/performance.md`.
+   before/after number for each in `docs/performance.md`. *The processor's
+   started 2026-10-17* (§5: speed, boost, C1E, deep idle, clock modulation;
+   checked in QEMU, which has none of the MSRs: the numbers wait for the
+   P2 Max). Devices, tickless and ACPI's tables still to come.
 10. Later: apply without restarting (the task list first: restart only
     the changed tasks), and SMP (second threads, parking cores).
 

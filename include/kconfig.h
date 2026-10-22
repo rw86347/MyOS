@@ -77,7 +77,7 @@ struct kconfig {
     uint8_t cpu_min_pct;                    /* 0x168 slowest speed, % of the highest non-boost */
     uint8_t cpu_max_pct;                    /* 0x169 fastest speed, same scale */
     uint8_t epp;                            /* 0x16A energy preference: 0 speed .. 255 energy */
-    uint8_t cstate_max;                     /* 0x16B deepest idle state: 1 = C1 ... 6 = C6 */
+    uint8_t cstate_max;                     /* 0x16B deepest idle state: 1 = C1 ... 10 = C10 */
     uint16_t spindown_min;                  /* 0x16C idle minutes before a disk stops (0 never) */
     uint8_t reserved1[2];                   /* 0x16E 0 */
     uint8_t reserved2[144];                 /* 0x170 0: room for later versions */

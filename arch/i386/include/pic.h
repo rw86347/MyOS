@@ -8,6 +8,7 @@
 void pic_init(void);        /* remap to vectors 32-47, mask all IRQs */
 void pic_unmask(int irq);
 void pic_mask(int irq);     /* (Linux's disable_irq) */
+void pic_set_level(int irq);    /* level-triggered (ACPI's SCI); boot leaves them edge */
 void pic_send_eoi(int irq);
 int  pic_is_spurious(int irq);
 

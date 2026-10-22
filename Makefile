@@ -79,6 +79,25 @@ else
   LD      := i686-elf-ld
   NM      := i686-elf-nm
 endif
+# Building on MyOS itself, or on any x86-64 Linux: there is no x86_64-elf
+# cross compiler there, but the system's own gcc and binutils make the same
+# freestanding kernel, with a few flags turning off what a Linux
+# distribution's gcc does by default for programs (position-independent
+# code, stack-clash probes, _FORTIFY_SOURCE, CET marks, a build-id note).
+# The 64-bit kernel only: the 32-bit and ARM64 ones need cross compilers.
+ifeq ($(ARCH),x86_64)
+  ifeq ($(shell command -v $(CC) 2>/dev/null),)
+    ifeq ($(shell uname -sm),Linux x86_64)
+      CC      := gcc
+      OBJCOPY := objcopy
+      LD      := ld
+      NM      := nm
+      NATIVE_CFLAGS  := -fno-pie -fno-pic -fno-stack-clash-protection -U_FORTIFY_SOURCE \
+                        -fcf-protection=none
+      NATIVE_LDFLAGS := -no-pie -Wl,--build-id=none
+    endif
+  endif
+endif
 NASM    := nasm
 QEMU    := qemu-system-i386
 
@@ -201,7 +220,7 @@ endif
 KERNEL_SSP := -fstack-protector-strong -mstack-protector-guard=global
 CFLAGS  := -std=c11 -ffreestanding -O2 -Wall -Wextra -g -march=i686 \
            -fno-tree-loop-distribute-patterns -mgeneral-regs-only $(KERNEL_SSP) \
-           -DARCH_I386 -Iinclude -Iarch/i386/include $(MODE_FLAGS)
+           -DARCH_I386 -Iinclude -Iarch/i386/include -Ithird_party/uacpi/include $(MODE_FLAGS)
 # --no-warn-rwx-segments: the kernel is one read/write/execute blob for now
 # (code isn't write-protected; see docs/gaps.md).
 LDFLAGS := -T arch/i386/linker.ld -nostdlib -ffreestanding -O2 -Wl,--no-warn-rwx-segments
@@ -214,7 +233,8 @@ BENCH_SRCS := kernel/bench.c
 C_SRCS  := $(filter-out $(TEST_SRCS) $(BENCH_SRCS), \
              $(wildcard arch/i386/*.c kernel/*.c drivers/*.c fs/*.c mm/*.c net/*.c \
                         drivers/gpu/drm/*.c drivers/gpu/drm/tiny/*.c drivers/video/*.c \
-                        drivers/usb/*.c drivers/hid/*.c drivers/sound/*.c net/wireless/*.c))
+                        drivers/usb/*.c drivers/hid/*.c drivers/sound/*.c net/wireless/*.c \
+                        third_party/uacpi/source/*.c))
 ifeq ($(MODE),test)
   C_SRCS += $(TEST_SRCS)
 endif
@@ -260,16 +280,18 @@ ifeq ($(ARCH),x86_64)
   CFLAGS  := -std=c11 -ffreestanding -O2 -Wall -Wextra -g \
              -m64 -mno-red-zone -mcmodel=kernel -mgeneral-regs-only \
              -fno-tree-loop-distribute-patterns $(KERNEL_SSP) -DARCH_X86_64 \
-             -Iinclude -Iarch/x86_64/include $(MODE_FLAGS)
+             -Iinclude -Iarch/x86_64/include -Ithird_party/uacpi/include \
+             $(MODE_FLAGS) $(NATIVE_CFLAGS)
   LDFLAGS := -T arch/x86_64/linker.ld -nostdlib -ffreestanding -O2 \
-             -Wl,--no-warn-rwx-segments
+             -Wl,--no-warn-rwx-segments $(NATIVE_LDFLAGS)
   LINKER_SCRIPT := arch/x86_64/linker.ld
   NASM_FMT := elf64
   ifeq ($(X86_64_KERNEL),full)
     C_SRCS  := $(filter-out $(TEST_SRCS) $(BENCH_SRCS) arch/x86_64/early.c kernel/elf.c, \
                $(wildcard arch/x86_64/*.c kernel/*.c drivers/*.c fs/*.c mm/*.c net/*.c \
                           drivers/gpu/drm/*.c drivers/gpu/drm/tiny/*.c drivers/video/*.c \
-                          drivers/usb/*.c drivers/hid/*.c drivers/sound/*.c net/wireless/*.c))
+                          drivers/usb/*.c drivers/hid/*.c drivers/sound/*.c net/wireless/*.c \
+                          third_party/uacpi/source/*.c))
     ifeq ($(MODE),test)
       C_SRCS += $(TEST_SRCS)
     endif
@@ -401,7 +423,7 @@ QEMU_FLAGS = -m 64M -cpu pentium3 \
 # fight over the port.
 HAIRPIN_PORT := 47007
 
-.PHONY: run-uefi test-uefi-shell diskattacks verify-disktests verify-tests attacks all dist utm utm-hd utm-install hd live-root live-extra live-theme live-hd utm-live utm-arm64 run-live run-hd test-hd run run-full run-text debug test check-selftests test-shell bench run-bench usb clean fuzz fuzz-build fuzz-replay diskfuzz diskfuzz-replay verify-racetests uefi run-uefi-text test-uefi live-uefi test-live-uefi test-usb test-usb-hid test-usb-tablet test-install live-login-initrd test-uefi-login test-arm64 test-arm64-fdt test-arm64-cpio test-arm64-apple test-arm64-apple-boot test-arm64-m1n1-payload m1n1-payload
+.PHONY: run-uefi test-uefi-shell diskattacks verify-disktests verify-tests attacks all dist utm utm-hd utm-install hd live-root live-extra live-theme live-hd utm-live utm-arm64 run-live run-hd test-hd run run-full run-text debug test check-selftests test-shell bench run-bench usb clean fuzz fuzz-build fuzz-replay diskfuzz diskfuzz-replay verify-racetests uefi run-uefi-text test-uefi live-uefi test-live-uefi test-usb test-usb-hid test-usb-hub test-hid test-battery test-usb-tablet test-install live-login-initrd test-uefi-login test-arm64 test-arm64-fdt test-arm64-cpio test-arm64-apple test-arm64-apple-boot test-arm64-m1n1-payload m1n1-payload
 
 ifeq ($(ARCH),arm64)
 all: $(BUILD)/kernel.elf $(BUILD)/virt.dtb
@@ -454,6 +476,10 @@ $(BUILD)/user/%.elf: user/%.asm
 $(BUILD)/%.o: %.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
+
+# uACPI (the AML interpreter, drivers/acpi_os.c) as it comes: its log
+# formats say %u for uint32_t, which i686-elf-gcc makes a long.
+$(BUILD)/third_party/%.o: CFLAGS += -Wno-format
 
 $(BUILD)/%.o: %.S
 	@mkdir -p $(dir $@)
@@ -538,6 +564,27 @@ $(BUILD)/kernel.elf: $(OBJS) $(LINKER_SCRIPT)
 # Strip the ELF wrapper: stage 2 just copies raw bytes into memory.
 $(BUILD)/kernel.bin: $(BUILD)/kernel.elf
 	$(OBJCOPY) -O binary $< $@
+
+# --- the kernel's version ------------------------------------------------------
+# YYYYMMDD-g<commit> (the commit's date), "-dirty" when tracked files differ
+# from it. uname -v and /proc/version say it; build/kernel-version records it
+# with kernel.bin's size and SHA-256, for the live disk's release file (the
+# upgrade compares the stick's with the installed disk's: docs/INSTALLER-PLAN.md).
+# version.txt is rewritten only when the version changes, so only the two
+# files that print it are rebuilt.
+MYOS_VERSION := $(shell git log -1 --format=%cd --date=format:%Y%m%d 2>/dev/null)-g$(shell \
+                  git rev-parse --short HEAD 2>/dev/null)$(shell \
+                  git diff-index --quiet HEAD -- 2>/dev/null || echo -dirty)
+$(BUILD)/gen/version.txt: FORCE
+	@mkdir -p $(dir $@)
+	@echo '$(MYOS_VERSION)' | cmp -s - $@ || echo '$(MYOS_VERSION)' > $@
+$(BUILD)/kernel/sys_info.o $(BUILD)/fs/procfs.o $(BUILD)/arch/aarch64/syscall.o: \
+	$(BUILD)/gen/version.txt
+$(BUILD)/kernel/sys_info.o $(BUILD)/fs/procfs.o $(BUILD)/arch/aarch64/syscall.o: \
+	CFLAGS += -DMYOS_VERSION='"$(MYOS_VERSION)"'
+
+$(BUILD)/kernel-version: $(BUILD)/kernel.bin $(BUILD)/gen/version.txt tools/kernel-version.py
+	python3 tools/kernel-version.py --version $(MYOS_VERSION) --arch $(ARCH) $< > $@.tmp && mv $@.tmp $@
 
 # --- Alpine Linux programs ---------------------------------------------------
 # Unmodified 32-bit x86 Linux programs from Alpine (tools/fetch-alpine.sh:
@@ -1102,17 +1149,19 @@ test-usb-tablet: $(UEFI_IMG)
 # polls its USB keyboard through SMM, which hangs once the boot loader has
 # switched to the picture's mode (docs/gaps.md, Boot). docs/USB-PLAN.md U5.
 ifeq ($(ARCH),x86_64)
-test-usb-hid: EV = 24
-test-usb-hid: HID_BOOT = $(QEMU64) -machine q35,i8042=off -m 1G -cpu qemu64 \
+EV = 24
+HID_BOOT = $(QEMU64) -machine q35,i8042=off -m 1G -cpu qemu64 \
     -drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
     -drive if=pflash,format=raw,file=$(BUILD)/ovmf-vars.fd \
     -drive if=none,format=raw,file=$(UEFI_IMG),id=bootdisk,snapshot=on \
     -device ide-hd,drive=bootdisk,bootindex=0
+test-usb-hub: $(UEFI_IMG)
 test-usb-hid: $(UEFI_IMG)
 else
-test-usb-hid: EV = 16
-test-usb-hid: HID_BOOT = $(QEMU) -machine pc,i8042=off,smm=off -m 64M -cpu pentium3 \
+EV = 16
+HID_BOOT = $(QEMU) -machine pc,i8042=off,smm=off -m 64M -cpu pentium3 \
     -drive format=raw,file=$(IMG),index=0,media=disk,snapshot=on
+test-usb-hub: $(IMG)
 test-usb-hid: $(IMG)
 endif
 	@rm -f $(BUILD)/usb-hid.log
@@ -1144,6 +1193,120 @@ endif
 	  grep -q " 1 273 0 0$$" $$E || { echo "FAIL: right button up"; ok=0; }; \
 	  grep -q " 2 8 1 0$$" $$E || { echo "FAIL: wheel up"; ok=0; }; \
 	  [ $$ok = 1 ] && echo "USB HID TEST OK ($(ARCH)): USB keyboard and mouse, no PS/2" || exit 1
+
+# The HID parser on the Mac: a precision touchpad (the GPD P2 Max's) moves the
+# pointer like a mouse, taps click, palms don't (tools/test-hid.c; QEMU has no
+# USB touchpad to try it on).
+test-hid:
+	@mkdir -p $(BUILD)/host
+	cc -std=c11 -Wall -Wextra -Werror -c -Itools/fuzz/shim -Iinclude drivers/hid/hid.c -o $(BUILD)/host/hid.o
+	cc -std=c11 -Wall -Wextra -Werror tools/test-hid.c $(BUILD)/host/hid.o -o $(BUILD)/host/test-hid
+	$(BUILD)/host/test-hid
+
+# The battery (docs/BATTERY-PLAN.md): QEMU has none, so tools/fakebat.py
+# makes an ACPI table with one (50 Wh new, 45 Wh now, discharging at 9 W,
+# running down 0.1 Wh each time it is read) and a charger, unplugged. The
+# AML interpreter must find both, /sys/class/power_supply must show them
+# as Linux does, the numbers must move with the 10-second reading, and
+# /sys/firmware/acpi/platform_profile must switch (and be given to wheel,
+# as the live system's boot does). i386 by BIOS, x86_64 by UEFI.
+ifeq ($(ARCH),x86_64)
+BAT_BOOT = $(QEMU64) -machine q35 -m 1G -cpu qemu64 \
+    -drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
+    -drive if=pflash,format=raw,file=$(BUILD)/ovmf-vars.fd \
+    -drive if=none,format=raw,file=$(UEFI_IMG),id=bootdisk,snapshot=on \
+    -device ide-hd,drive=bootdisk,bootindex=0
+test-battery: $(UEFI_IMG)
+else
+BAT_BOOT = $(QEMU) -m 64M -cpu pentium3 -drive format=raw,file=$(IMG),index=0,media=disk,snapshot=on
+test-battery: $(IMG)
+endif
+	@rm -f $(BUILD)/battery.log
+	@[ ! -f $(OVMF_VARS) ] || cp $(OVMF_VARS) $(BUILD)/ovmf-vars.fd
+	python3 tools/fakebat.py $(BUILD)/fakebat.aml
+	@(for i in $$(seq 60); do sleep 1; \
+	    grep -q "Welcome to MyOS" $(BUILD)/battery.log 2>/dev/null && break; done; sleep 1; \
+	  tools/qemu-type.sh 'mkdir -p /sys; mount -t sysfs none /sys; cd /sys/class/power_supply; grep . */*' \
+	    | while read k; do echo "$$k"; sleep 0.05; done; sleep 1; \
+	  tools/qemu-type.sh 'a=$$(cat BAT0/energy_now); sleep 11; b=$$(cat BAT0/energy_now); [ $$b -lt $$a ] && echo DRAIN"S"' \
+	    | while read k; do echo "$$k"; sleep 0.05; done; sleep 20; \
+	  tools/qemu-type.sh 'cd /sys/firmware/acpi; cat platform_profile_choices; echo low-power > platform_profile; echo NOW $$(cat platform_profile); echo performance > platform_profile; echo balanced > platform_profile; echo THEN $$(cat platform_profile)' \
+	    | while read k; do echo "$$k"; sleep 0.05; done; sleep 1; \
+	  tools/qemu-type.sh 'chgrp 10 platform_profile; chmod 664 platform_profile; ls -ln platform_profile' \
+	    | while read k; do echo "$$k"; sleep 0.05; done; sleep 1; \
+	  tools/qemu-type.sh 'cd /sys/class/backlight/acpi_video0; grep . *; echo 3 > brightness; sleep 1; echo BL $$(cat actual_brightness) $$(cat brightness)' \
+	    | while read k; do echo "$$k"; sleep 0.05; done; sleep 2; echo quit) \
+	  | $(BAT_BOOT) -acpitable file=$(BUILD)/fakebat.aml \
+	    -net none -no-reboot -display none \
+	    -serial file:$(BUILD)/battery.log -monitor stdio >/dev/null || true
+	@perl -pe 's/\e\[[0-9;?]*[A-Za-z]//g; s/\r//g' $(BUILD)/battery.log > $(BUILD)/battery.txt
+	@L=$(BUILD)/battery.txt; ok=1; \
+	  grep -a "acpi\|battery\|BAT0\|AC/\|DRAINS\|NOW\|cpupower: profile\|platform_profile\|backlight\|brightness\|^type:\|^BL" $$L; \
+	  grep -q "^acpi: the AML is running" $$L || { echo "FAIL: the AML interpreter started"; ok=0; }; \
+	  grep -q "^battery BAT0: MyOS FAKE-BAT, 50000 mWh new, 45000 now" $$L || { echo "FAIL: the battery found"; ok=0; }; \
+	  grep -q "^AC/online:0" $$L || { echo "FAIL: the charger, unplugged"; ok=0; }; \
+	  grep -q "^AC/type:Mains" $$L || { echo "FAIL: the charger's type"; ok=0; }; \
+	  grep -q "^BAT0/status:Discharging" $$L || { echo "FAIL: discharging"; ok=0; }; \
+	  grep -q "^BAT0/capacity:6[67]" $$L || { echo "FAIL: capacity (30 of 45 Wh)"; ok=0; }; \
+	  grep -q "^BAT0/energy_full_design:50000000" $$L || { echo "FAIL: design energy, in uWh"; ok=0; }; \
+	  grep -q "^BAT0/energy_full:45000000" $$L || { echo "FAIL: full energy"; ok=0; }; \
+	  grep -q "^BAT0/power_now:9000000" $$L || { echo "FAIL: power, in uW"; ok=0; }; \
+	  grep -q "^BAT0/cycle_count:127" $$L || { echo "FAIL: cycles"; ok=0; }; \
+	  grep -q "^BAT0/technology:Li-ion" $$L || { echo "FAIL: technology"; ok=0; }; \
+	  grep -q "^BAT0/model_name:FAKE-BAT" $$L || { echo "FAIL: model"; ok=0; }; \
+	  grep -q "DRAINS" $$L || { echo "FAIL: read again every 10 seconds"; ok=0; }; \
+	  grep -q "^low-power balanced performance" $$L || { echo "FAIL: the profile choices"; ok=0; }; \
+	  grep -q "^cpupower: profile low-power" $$L || { echo "FAIL: the profile applied"; ok=0; }; \
+	  grep -q "^NOW low-power" $$L || { echo "FAIL: the profile reads back"; ok=0; }; \
+	  grep -q "^THEN balanced" $$L || { echo "FAIL: performance, then balanced"; ok=0; }; \
+	  grep -q "^-rw-rw-r-- *1 0 *10 .*platform_profile" $$L || { echo "FAIL: the profile given to wheel"; ok=0; }; \
+	  grep -q "^backlight: 11 levels, 5% to 100%, now 100%" $$L || { echo "FAIL: the panel's _BCL, sorted"; ok=0; }; \
+	  grep -q "^max_brightness:10" $$L || { echo "FAIL: max_brightness"; ok=0; }; \
+	  grep -q "^type:firmware" $$L || { echo "FAIL: the backlight's type"; ok=0; }; \
+	  grep -q "^BL 3 3" $$L || { echo "FAIL: brightness 3 set through _BCM"; ok=0; }; \
+	  [ $$ok = 1 ] && echo "BATTERY TEST OK ($(ARCH))" || exit 1
+
+# USB hubs (docs/USB-PLAN.md U6), on the same PC with no PS/2: the keyboard
+# and mouse behind a hub, a second hub behind that one with a tablet on it,
+# and a USB stick behind the first. The keyboard is typed at; then a second
+# keyboard is plugged into the hub while MyOS runs, typed at, and pulled out.
+# QEMU's usb-hub is a USB 1.1 hub, so a USB 2 hub's transaction translator
+# (the path a laptop's keyboard often takes) is only tried on real hubs.
+test-usb-hub: $(USB)
+	@rm -f $(BUILD)/usb-hub.log
+	@[ ! -f $(OVMF_VARS) ] || cp $(OVMF_VARS) $(BUILD)/ovmf-vars.fd
+	@(for i in $$(seq 60); do sleep 1; \
+	    grep -q "Welcome to MyOS" $(BUILD)/usb-hub.log 2>/dev/null && break; done; sleep 1; \
+	  tools/qemu-type.sh 'echo HUB-KBD $$((6*7)) ok' | while read k; do echo "$$k"; sleep 0.05; done; \
+	  sleep 1; echo "device_add usb-kbd,bus=xhci.0,port=1.4,id=late"; sleep 3; \
+	  tools/qemu-type.sh 'echo LATE-KBD $$((5*5))' | while read k; do echo "$$k"; sleep 0.05; done; \
+	  sleep 1; echo "device_del late"; sleep 3; \
+	  tools/qemu-type.sh 'cat /proc/partitions; echo END' | while read k; do echo "$$k"; sleep 0.05; done; \
+	  sleep 2; echo quit) \
+	  | $(HID_BOOT) \
+	    -device qemu-xhci,id=xhci -device usb-hub,bus=xhci.0,port=1 \
+	    -device usb-kbd,bus=xhci.0,port=1.1 -device usb-mouse,bus=xhci.0,port=1.2 \
+	    -device usb-hub,bus=xhci.0,port=1.3 -device usb-tablet,bus=xhci.0,port=1.3.1 \
+	    -drive if=none,format=raw,file=$(USB),id=stick,snapshot=on \
+	    -device usb-storage,bus=xhci.0,port=1.5,drive=stick \
+	    -net none -no-reboot -display none \
+	    -serial file:$(BUILD)/usb-hub.log -monitor stdio >/dev/null || true
+	@perl -pe 's/\e\[[0-9;?]*[A-Za-z]//g; s/\r//g' $(BUILD)/usb-hub.log > $(BUILD)/usb-hub.txt
+	@L=$(BUILD)/usb-hub.txt; ok=1; \
+	  grep -a "usb\|KBD" $$L; \
+	  grep -q "^ *usb-hub 1-[0-9]: 8 ports" $$L || { echo "FAIL: the hub found"; ok=0; }; \
+	  grep -q "^ *usb-hub 1-[0-9]\.3: 8 ports" $$L || { echo "FAIL: the hub behind the hub"; ok=0; }; \
+	  grep -q "^ *usb 1-[0-9]\.1: .* Keyboard" $$L || { echo "FAIL: the keyboard behind the hub"; ok=0; }; \
+	  grep -q "^ *usb 1-[0-9]\.2: .* Mouse" $$L || { echo "FAIL: the mouse behind the hub"; ok=0; }; \
+	  grep -q "^ *usb 1-[0-9]\.3\.1: .* Tablet" $$L || { echo "FAIL: the tablet two hubs down"; ok=0; }; \
+	  grep -q "^ *usb-hid: .* Tablet: a touch screen" $$L || { echo "FAIL: the tablet's driver"; ok=0; }; \
+	  grep -q "^ *usb-storage: sd[a-z]: " $$L || { echo "FAIL: the USB stick behind the hub"; ok=0; }; \
+	  grep -q "^HUB-KBD 42 ok" $$L || { echo "FAIL: typing on the keyboard behind the hub"; ok=0; }; \
+	  grep -q "usb 1-[0-9]\.4: .* Keyboard" $$L || { echo "FAIL: a keyboard plugged in later"; ok=0; }; \
+	  grep -q "^LATE-KBD 25" $$L || { echo "FAIL: typing on the keyboard plugged in later"; ok=0; }; \
+	  grep -q "usb 1-[0-9]\.4: unplugged" $$L || { echo "FAIL: the late keyboard pulled out"; ok=0; }; \
+	  grep -q "^END" $$L || { echo "FAIL: the first keyboard after the second was pulled out"; ok=0; }; \
+	  [ $$ok = 1 ] && echo "USB HUB TEST OK ($(ARCH)): two hubs deep, plugged and pulled while running" || exit 1
 
 # --- a package to share ------------------------------------------------------
 # The normal boot image is a complete disk: written byte for byte to a USB

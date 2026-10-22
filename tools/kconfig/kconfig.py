@@ -128,7 +128,7 @@ LAYOUT = [
     (0x168, "cpu_min_pct", "B", "uint8_t", "slowest speed, % of the highest non-boost"),
     (0x169, "cpu_max_pct", "B", "uint8_t", "fastest speed, same scale"),
     (0x16A, "epp", "B", "uint8_t", "energy preference: 0 speed .. 255 energy"),
-    (0x16B, "cstate_max", "B", "uint8_t", "deepest idle state: 1 = C1 ... 6 = C6"),
+    (0x16B, "cstate_max", "B", "uint8_t", "deepest idle state: 1 = C1 ... 10 = C10"),
     (0x16C, "spindown_min", "H", "uint16_t", "idle minutes before a disk stops (0 never)"),
     (0x16E, "reserved1", "2s", "uint8_t", "0"),
     (0x170, "reserved2", "144s", "uint8_t", "0: room for later versions"),
@@ -402,11 +402,13 @@ def check(cfg, family=None, root=None, boot_only=False):
     if cfg.mode == MODES["power-saving"] and tasks and not boot_only:
         notes.append("the tasks still start, as ordinary programs: there are no slots in this mode")
 
-    # Power features: only real ones, and only what this processor can have.
+    # Power features: only real ones, and (at Save, not in the block checks
+    # the kernel shares: it skips what the processor lacks) only what this
+    # processor can have.
     for key in sorted(cfg.power_on | cfg.power_seen):
         if key not in pf.BY_KEY:
             errors.append(f"'{key}' is not a power feature")
-    for key in sorted(cfg.power_on):
+    for key in ([] if boot_only else sorted(cfg.power_on)):
         f = pf.BY_KEY.get(key)
         if f and f.support.get(family, "no") == "no":
             errors.append(f"{f.label}: a {pf.FAMILY_NAMES[family]} doesn't have it")
@@ -419,7 +421,10 @@ def check(cfg, family=None, root=None, boot_only=False):
             errors.append("processor speed: 10% <= slowest <= fastest <= 100%")
         if not 0 <= cfg.epp <= 255:
             errors.append("the energy preference is 0 to 255")
-        if cfg.cstate_max not in [c[0] for c in pf.CSTATES if family in c[3]]:
+        if boot_only:
+            if not 1 <= cfg.cstate_max <= 10:
+                errors.append("an idle state outside C1-C10")
+        elif cfg.cstate_max not in [c[0] for c in pf.CSTATES if family in c[3]]:
             errors.append(f"C{cfg.cstate_max} isn't an idle state of a {pf.FAMILY_NAMES[family]}")
         if "disk_spindown" in cfg.power_on:
             if not 1 <= cfg.spindown_min <= 600:
@@ -452,10 +457,11 @@ def _keys(bits):
     return {f.key for f in pf.FEATURES if bits >> f.bit & 1}
 
 
-def encode(cfg, generation=None):
+def encode(cfg, generation=None, family=None):
     """KConfig -> the 512-byte boot block, in the target's byte order.
-    Refuses a config that fails the checks: a bad block is never written."""
-    errors, _, _ = check(cfg, boot_only=True)
+    Refuses a config that fails the checks: a bad block is never written.
+    family: the processor it is for (None: the arch's usual one)."""
+    errors, _, _ = check(cfg, family, boot_only=True)
     if errors:
         raise ValueError("; ".join(errors))
     tasks = cfg.tasks()
@@ -591,17 +597,17 @@ def decode_tasks(table, boot):
 
 # --- both parts, on the partition ---------------------------------------------
 
-def save(cfg, image, copy, generation, root=None):
+def save(cfg, image, copy, generation, root=None, family=None):
     """Save, as Settings (through the kernel) does it: the full checks, then
     the task table, then the boot block, both into `copy` of the image."""
-    errors, _, _ = check(cfg, root=root)
+    errors, _, _ = check(cfg, family, root=root)
     if errors:
         raise ValueError("; ".join(errors))
     image = bytearray(image)
     boot_at, tasks_at = PLACES[copy]
     image[tasks_at * SECTOR:tasks_at * SECTOR + TASK_TABLE] = encode_tasks(cfg, generation)
     # (flush the drive here: the table is on the disk before the block that points to it)
-    image[boot_at * SECTOR:(boot_at + 1) * SECTOR] = encode(cfg, generation)
+    image[boot_at * SECTOR:(boot_at + 1) * SECTOR] = encode(cfg, generation, family)
     return bytes(image)
 
 
@@ -896,7 +902,8 @@ def main(argv):
         _show_checks(errors, warnings, notes, "")
         if cmd == "partition" and not errors:
             out = opt.get("-o", "myos-config.img")
-            image = save(cfg, bytes(PARTITION_USED), "A", int(opt.get("--generation", "1")), opt.get("--root"))
+            image = save(cfg, bytes(PARTITION_USED), "A", int(opt.get("--generation", "1")), opt.get("--root"),
+                         opt.get("--cpu"))
             with open(out, "wb") as f:
                 f.write(image)
                 f.truncate(1 << 20)         # the whole 1 MiB partition

@@ -52,6 +52,60 @@ static inline uint64_t rdmsr(uint32_t msr)
     return ((uint64_t)hi << 32) | lo;
 }
 
+/* The same for an MSR that may not be there: a processor (or a virtual
+   machine) without it raises a general-protection fault, and interrupts.c
+   finds the instruction in the exception table and continues after it, as
+   it does for a bad user pointer in copy_from_user. 0, or -1 (*value = 0)
+   if the MSR is missing. For MSRs CPUID doesn't promise (power settings
+   whose MSRs vary by model). The xor that says "no fault" is skipped by a
+   fault, so no separate fixup code is needed. */
+#define EX_TABLE_ENTRY(insn, fixup) \
+    ".pushsection __ex_table, \"a\"\n\t" \
+    ".quad " insn ", " fixup "\n\t" \
+    ".popsection\n\t"
+static inline int rdmsr_safe(uint32_t msr, uint64_t *value)
+{
+    uint32_t lo = 0, hi = 0;
+    int err = -1;
+    __asm__ volatile ("1: rdmsr\n\t"
+                      "xor %[err], %[err]\n"
+                      "2:\n\t"
+                      EX_TABLE_ENTRY("1b", "2b")
+                      : [err] "+r"(err), "+a"(lo), "+d"(hi) : "c"(msr));
+    *value = ((uint64_t)hi << 32) | lo;
+    return err;
+}
+
+static inline int wrmsr_safe(uint32_t msr, uint64_t value)
+{
+    int err = -1;
+    __asm__ volatile ("1: wrmsr\n\t"
+                      "xor %[err], %[err]\n"
+                      "2:\n\t"
+                      EX_TABLE_ENTRY("1b", "2b")
+                      : [err] "+r"(err)
+                      : "c"(msr), "a"((uint32_t)value), "d"((uint32_t)(value >> 32))
+                      : "memory");
+    return err;
+}
+
+/* The kernel config's processor power savings (cpupower.c): once, when the
+   config is final (after storage_init). */
+void cpupower_init(void);
+
+/* The platform profile: 0 low-power, 1 balanced, 2 performance (cpupower.c;
+   /sys/firmware/acpi/platform_profile). Setting one: 0, or -1. */
+int cpupower_profile(void);
+int cpupower_set_profile(int p);
+
+/* Sleep until an interrupt: interrupts off on entry, and off again after.
+   HLT, or MWAIT into a deeper idle state if the config asked for one. */
+void cpu_sleep(void);
+
+/* The processor's energy meter (RAPL): joules used so far, in microjoules,
+   wrapping at *range_uj. 0, or -1: there is none. */
+int cpu_energy_uj(uint64_t *uj, uint64_t *range_uj);
+
 /* Page attribute table (pat.c): make write-combining available to page
    tables. Called by cpu_init. */
 void pat_init(void);

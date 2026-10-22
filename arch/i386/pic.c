@@ -67,6 +67,18 @@ void pic_unmask(int irq)
     outb(port, inb(port) & ~(1 << (irq & 7)));
 }
 
+/* The ELCR (ports 0x4D0, 0x4D1, one bit per IRQ) says which IRQs are
+   level-triggered: the line stays up until the device is answered, and
+   the PIC asks again after the EOI while it does. Edge mode would lose an
+   event that comes while the line is still up. Never 0, 1, 2, 8 or 13. */
+void pic_set_level(int irq)
+{
+    if (irq < 3 || irq > 15 || irq == 8 || irq == 13)
+        return;
+    uint16_t port = irq < 8 ? 0x4D0 : 0x4D1;
+    outb(port, inb(port) | (1 << (irq & 7)));
+}
+
 void pic_send_eoi(int irq)
 {
     if (irq >= 8)

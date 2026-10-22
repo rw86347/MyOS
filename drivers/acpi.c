@@ -25,6 +25,12 @@
  * power off then only writes two ports. A board where this finds nothing
  * keeps the old behaviour: QEMU's own switch, or halt with a message.
  *
+ * Every table found is also kept (acpi_table_at), and /sys/firmware/acpi/
+ * tables shows them as Linux does, root only (MSDM holds a Windows key):
+ * for looking at a new machine's, and for the AML interpreter (acpi_os.c,
+ * the battery: docs/BATTERY-PLAN.md), which finds them mapped already
+ * (acpi_mapped).
+ *
  * Not yet: "hardware-reduced" ACPI (some tablets: no PM1 ports, a sleep
  * register instead), _PTS (the "prepare to sleep" method some boards want
  * run first), and any other sleep state.
@@ -33,8 +39,8 @@
 #include <bootinfo.h>
 #include <io.h>
 #include <kprintf.h>
-#include <linux/io.h>
 #include <memlayout.h>
+#include <pci.h>
 #include <pmm.h>
 #include <string.h>
 
@@ -51,22 +57,51 @@ struct sdt {                            /* every table's header, 36 bytes */
     uint32_t oem_rev, creator, creator_rev;
 } __attribute__((packed));
 
+#define MAX_TABLES   64
+
+static struct {
+    const struct sdt *t;
+    char name[8];                       /* "DSDT", "SSDT3" */
+} tables[MAX_TABLES];
+static int ntables;
+
+/* Every mapping made here (the RSDP, the RSDT/XSDT, each table): the AML
+   interpreter asks for the same memory again, and gets these. */
+#define MAX_MAPS     (MAX_TABLES + 8)
+static struct { uint64_t phys; uint32_t len; const uint8_t *virt; } maps[MAX_MAPS];
+static int nmaps;
+static uint64_t rsdp_phys;
+
 static uint16_t pm1a_cnt, pm1b_cnt;     /* I/O ports; 0 = none */
 static uint16_t slp_typ_a, slp_typ_b;
 static uint32_t smi_cmd;
 static uint8_t acpi_enable;
 static int ready;
 
-/* Physical memory to read: the direct map when it covers it (cached, and
-   no window space used), else an uncached mapping of its own. Tables sit
-   in firmware-reserved RAM, below 4 GiB on every PC we know. */
+const void *acpi_mapped(uint64_t phys, uint32_t len)
+{
+    for (int i = 0; i < nmaps; i++)
+        if (phys >= maps[i].phys && phys - maps[i].phys + len <= maps[i].len)
+            return maps[i].virt + (phys - maps[i].phys);
+    return NULL;
+}
+
+/* Physical memory to read: the direct map when it covers it (no window
+   space used), else a cached mapping of its own (tables are RAM the
+   firmware keeps), made once. Tables sit below 4 GiB on every PC we know. */
 static const void *map(uint64_t phys, uint32_t len)
 {
     if (!phys || len > MAX_TABLE || phys > 0xFFFFFFFFull - len)
         return NULL;
     if (phys + len <= pmm_end())
         return P2V(phys);
-    return (const void *)ioremap((uint32_t)phys, len);
+    const void *v = acpi_mapped(phys, len);
+    if (v)
+        return v;
+    v = (const void *)ioremap_cache(phys, len);
+    if (v && nmaps < MAX_MAPS)
+        maps[nmaps].phys = phys, maps[nmaps].len = len, maps[nmaps++].virt = v;
+    return v;
 }
 
 static int sum_ok(const void *p, uint32_t n)
@@ -87,6 +122,60 @@ static const struct sdt *table(uint64_t phys, const char *sig)
         return NULL;
     const struct sdt *t = map(phys, h->len);
     return t && sum_ok(t, t->len) ? t : NULL;
+}
+
+/* Keep a table that passed its checks (once, even if listed twice). */
+static void keep(const struct sdt *t)
+{
+    if (!t || ntables == MAX_TABLES)
+        return;
+    for (int i = 0; i < ntables; i++)
+        if (tables[i].t == t)
+            return;
+    tables[ntables].t = t;
+    memcpy(tables[ntables].name, t->sig, 4);
+    tables[ntables].name[4] = 0;
+    ntables++;
+}
+
+/* Linux's names: a signature that occurs more than once is numbered from 1
+   ("SSDT1", "SSDT2"...); one that occurs once keeps its four letters. */
+static void name_tables(void)
+{
+    for (int i = 0; i < ntables; i++) {
+        int seen = 0, total = 0;
+        for (int j = 0; j < ntables; j++) {
+            if (memcmp(tables[j].t->sig, tables[i].t->sig, 4))
+                continue;
+            total++;
+            if (j <= i)
+                seen++;
+        }
+        if (total > 1) {
+            tables[i].name[4] = (char)(seen >= 10 ? '0' + seen / 10 : '0' + seen);
+            tables[i].name[5] = seen >= 10 ? (char)('0' + seen % 10) : 0;
+            tables[i].name[6] = 0;
+        }
+    }
+}
+
+const void *acpi_table_at(int i, const char **name, uint32_t *len)
+{
+    if (i < 0 || i >= ntables)
+        return NULL;
+    *name = tables[i].name;
+    *len = tables[i].t->len;
+    return tables[i].t;
+}
+
+const void *acpi_table_find(const char *sig, int n, uint32_t *len)
+{
+    for (int i = 0; i < ntables; i++)
+        if (!memcmp(tables[i].t->sig, sig, 4) && --n == 0) {
+            *len = tables[i].t->len;
+            return tables[i].t;
+        }
+    return NULL;
 }
 
 /* "RSD PTR " on a 16-byte boundary, with a good checksum (20 bytes). */
@@ -181,9 +270,15 @@ static uint16_t port(const uint8_t *f, uint32_t flen, uint32_t old_at, uint32_t 
     return 0;
 }
 
+uint64_t acpi_rsdp(void)
+{
+    return rsdp_phys;
+}
+
 void acpi_init(void)
 {
     uint64_t rp = find_rsdp();
+    rsdp_phys = rp;
     const uint8_t *r = rp ? map(rp, 36) : NULL;
     if (!r) {
         klog("acpi: no RSDP: power off is a halt\n");
@@ -205,12 +300,22 @@ void acpi_init(void)
     }
     const uint8_t *fadt = NULL;
     uint32_t n = (root->len - sizeof *root) / (wide ? 8 : 4);
-    for (uint32_t k = 0; k < n && !fadt; k++) {
+    for (uint32_t k = 0; k < n; k++) {
         uint64_t at = 0;
         memcpy(&at, (const uint8_t *)root + sizeof *root + k * (wide ? 8 : 4), wide ? 8 : 4);
-        fadt = (const uint8_t *)table(at, "FACP");
+        const struct sdt *h = map(at, sizeof *h);
+        if (!h)
+            continue;
+        char sig[5];
+        memcpy(sig, h->sig, 4);
+        sig[4] = 0;
+        const struct sdt *t = table(at, sig);  /* its length and checksum */
+        keep(t);
+        if (!fadt && t && !memcmp(sig, "FACP", 4))
+            fadt = (const uint8_t *)t;
     }
     if (!fadt) {
+        name_tables();
         klog("acpi: no FADT\n");
         return;
     }
@@ -219,6 +324,7 @@ void acpi_init(void)
     if (flen >= 116)
         memcpy(&flags, fadt + 112, 4);
     if (flags & (1u << 20)) {
+        name_tables();
         klog("acpi: hardware-reduced ACPI: power off is not written for it yet\n");
         return;
     }
@@ -230,6 +336,9 @@ void acpi_init(void)
     if (flen >= 148)
         memcpy(&dsdt, fadt + 140, 8);
     const struct sdt *d = table(dsdt ? dsdt : dsdt32, "DSDT");
+    keep(d);
+    name_tables();
+    klog("acpi: %d tables (/sys/firmware/acpi/tables)\n", ntables);
     if (!pm1a_cnt || !d || !find_s5((const uint8_t *)d + sizeof *d, d->len - sizeof *d)) {
         klog("acpi: %s: power off is a halt\n", !pm1a_cnt ? "no PM1a control port"
                                                : !d ? "no DSDT" : "no _S5 in the DSDT");

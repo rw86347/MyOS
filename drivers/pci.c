@@ -23,6 +23,7 @@
  */
 #include <apic.h>
 #include <errno.h>
+#include <interrupts.h>
 #include <io.h>
 #include <kprintf.h>
 #include <memlayout.h>
@@ -192,12 +193,11 @@ struct pci_dev *pci_dev_at(int index)
 }
 
 /* Device registers live in a window of kernel addresses after the e1000's
-   (MMIO_BASE, 128 KiB; memlayout.h). Mappings are made once, at boot, and
-   never undone. */
+   (MMIO_BASE, 128 KiB; memlayout.h). Mappings are never undone. */
 #define MMIO_WINDOW     (MMIO_BASE + 0x100000)
 #define MMIO_WINDOW_END MMIO_END
 
-volatile void *pci_map_mmio(phys_addr_t phys, uint32_t bytes)
+static volatile void *map_window(phys_addr_t phys, uint32_t bytes, uint32_t flags)
 {
     static uintptr_t next = MMIO_WINDOW;
     uint32_t off = (uint32_t)phys & (PAGE_SIZE - 1);
@@ -208,13 +208,64 @@ volatile void *pci_map_mmio(phys_addr_t phys, uint32_t bytes)
     if (phys + (uint64_t)pages * PAGE_SIZE > 0x100000000ull)
         return NULL;                    /* a 4 KiB i386 page can't reach it */
 #endif
+    uint32_t f = irq_save();            /* (the ACPI thread maps too) */
     uintptr_t va = next;
-    for (uint32_t i = 0; i < pages; i++)
-        if (vmm_map(va + i * PAGE_SIZE, (phys - off) + (phys_addr_t)i * PAGE_SIZE,
-                    PTE_WRITABLE | PTE_PCD) < 0)
-            return NULL;
     next += pages * PAGE_SIZE;
+    irq_restore(f);
+    for (uint32_t i = 0; i < pages; i++)
+        if (vmm_map(va + i * PAGE_SIZE, (phys - off) + (phys_addr_t)i * PAGE_SIZE, flags) < 0)
+            return NULL;
     return (volatile void *)(va + off);
+}
+
+volatile void *pci_map_mmio(phys_addr_t phys, uint32_t bytes)
+{
+    return map_window(phys, bytes, PTE_WRITABLE | PTE_PCD);
+}
+
+/* RAM the firmware keeps for itself (ACPI tables) above the direct map:
+   cached, like the rest of RAM. The AML interpreter reads the tables a
+   byte at a time; through an uncached mapping each byte would be a trip
+   to memory. Never device registers. */
+volatile void *ioremap_cache(phys_addr_t phys, uint32_t bytes)
+{
+    return map_window(phys, bytes, PTE_WRITABLE);
+}
+
+/* Config space by address, 1, 2 or 4 bytes at an offset aligned to its
+   size (the ACPI interpreter's PCI accesses: AML names a device by bus,
+   slot and function). Port 0xCFC takes a byte or a word at 0xCFC +
+   (offset & 3), so a narrow write changes only its own bytes, not the
+   status bits next to it. The first 256 bytes only (no MCFG yet). */
+uint32_t pci_cfg_read(uint8_t bus, uint8_t slot, uint8_t func, uint16_t offset, int width)
+{
+    if (offset >= 256)
+        return 0xFFFFFFFFu;
+    uint32_t f = irq_save(), v;         /* the address and data ports are one pair */
+    outl(PCI_ADDR, 0x80000000u | (uint32_t)bus << 16 | (uint32_t)slot << 11 |
+                   (uint32_t)func << 8 | (offset & 0xFC));
+    uint16_t port = (uint16_t)(PCI_DATA + (offset & 3));
+    v = width == 1 ? inb(port) : width == 2 ? inw(port) : inl(PCI_DATA);
+    irq_restore(f);
+    return v;
+}
+
+void pci_cfg_write(uint8_t bus, uint8_t slot, uint8_t func, uint16_t offset, int width,
+                   uint32_t value)
+{
+    if (offset >= 256)
+        return;
+    uint32_t f = irq_save();
+    outl(PCI_ADDR, 0x80000000u | (uint32_t)bus << 16 | (uint32_t)slot << 11 |
+                   (uint32_t)func << 8 | (offset & 0xFC));
+    uint16_t port = (uint16_t)(PCI_DATA + (offset & 3));
+    if (width == 1)
+        outb(port, (uint8_t)value);
+    else if (width == 2)
+        outw(port, (uint16_t)value);
+    else
+        outl(PCI_DATA, value);
+    irq_restore(f);
 }
 
 phys_addr_t pci_bar_phys(const struct pci_dev *dev, int n)

@@ -148,8 +148,8 @@ const char *kconfig_check_boot(const struct kconfig *b)
     if (b->mode == KCFG_POWER_SAVING) {
         if (b->cpu_min_pct < 10 || b->cpu_min_pct > b->cpu_max_pct || b->cpu_max_pct > 100)
             return "processor speeds outside 10% <= slowest <= fastest <= 100%";
-        if (b->cstate_max < 1 || b->cstate_max > 6)
-            return "an idle state outside C1-C6";
+        if (b->cstate_max < 1 || b->cstate_max > 10)
+            return "an idle state outside C1-C10";
         if ((b->power_on & KCFG_PM_DISK_SPINDOWN) &&
             (b->spindown_min < 1 || b->spindown_min > 600))
             return "a disk spin-down outside 1-600 minutes";
@@ -260,19 +260,21 @@ const char *kconfig_slot_owner(int s)
     return o == KCFG_OWNER_FREE ? NULL : boot.task_name[o - 1];
 }
 
-/* One line: where it came from, the mode, and each task's slots. */
+/* One line for the log, under the current step: where the config came
+   from, the mode, and each task's slots. Not the screen — a normal boot
+   shows the steps and nothing else. */
 static void say(void)
 {
     static const char *const modes[] = { "realtime", "soft realtime", "power saving" };
-    kprintf("kconfig: %s, generation %lu: %s", source, (unsigned long)boot.generation,
-            modes[boot.mode]);
+    klog("kconfig: %s, generation %lu: %s", source, (unsigned long)boot.generation,
+         modes[boot.mode]);
     for (int i = 0; i < boot.ntasks; i++) {
-        kprintf(i ? "; %s" : ": %s", boot.task_name[i]);
+        klog(i ? "; %s" : ": %s", boot.task_name[i]);
         for (int s = 0; s < KCFG_SLOTS; s++)
             if (boot.slot_owner[s] == i + 1)
-                kprintf(" %d", s);
+                klog(" %d", s);
     }
-    kprintf("\n");
+    klog("\n");
 }
 
 static void use(const struct kconfig *b, const struct kconfig_tasks *t)
@@ -333,11 +335,13 @@ static int try_partition(struct blockdev *d)
         memcpy(source + n, which == 'A' ? " copy A" : " copy B", 8);
         say();
         if (why[which == 'A'])          /* the other one: worth knowing */
-            kprintf("kconfig: (%s copy %c: %s)\n", d->name, which == 'A' ? 'B' : 'A',
-                    why[which == 'A']);
+            klog("kconfig: (%s copy %c: %s)\n", d->name, which == 'A' ? 'B' : 'A',
+                 why[which == 'A']);
     } else {
-        kprintf("kconfig: %s: no good copy (A: %s; B: %s): keeping the %s config\n",
-                d->name, why[0], why[1], source);
+        /* An empty or foreign 0xDA partition: the built-in config stands.
+           The log keeps why; the screen stays on the steps. */
+        klog("kconfig: %s: no good copy (A: %s; B: %s): keeping the %s config\n",
+             d->name, why[0], why[1], source);
     }
     kfree(image);
     return which != 0;
@@ -355,5 +359,5 @@ void kconfig_from_disk(const struct blockdev *disk)
             return;                     /* the first good one: the root disk's */
     }
     if (!seen && disk)
-        kprintf("kconfig: no myos-config partition on %s: the %s config\n", disk->name, source);
+        klog("kconfig: no myos-config partition on %s: the %s config\n", disk->name, source);
 }

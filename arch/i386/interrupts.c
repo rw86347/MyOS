@@ -170,12 +170,12 @@ static __attribute__((noinline)) int user_exception(struct regs *r, uint32_t cr2
     return 0;
 }
 
-/* The exception table (uaccess.asm): instructions that touch user memory,
-   and where to continue if they fault. */
+/* The exception table (uaccess.asm; cpu.h's rdmsr_safe): instructions that
+   may fault, and where to continue if they do. */
 struct ex_entry { uint32_t insn, fixup; };
 extern const struct ex_entry __start_ex_table[], __stop_ex_table[];
 
-static int fixup_user_access(struct regs *r)
+static int fixup_exception(struct regs *r)
 {
     for (const struct ex_entry *e = __start_ex_table; e < __stop_ex_table; e++) {
         if (e->insn == r->eip) {
@@ -242,8 +242,9 @@ static void exception(struct regs *r)
         user_exception(r, cr2);     /* kills it, or queues its handler */
         return;
     }
-    if (r->vector == 14 && fixup_user_access(r))
-        return;                     /* a bad user pointer, not a kernel bug */
+    if ((r->vector == 14 || r->vector == 13) && fixup_exception(r))
+        return;                     /* a bad user pointer (page fault), or an MSR
+                                       this CPU lacks (#GP): not a kernel bug */
 
     kprintf("\n*** CPU EXCEPTION %lu: %s (error code %lx) ***\n",
             r->vector, exception_names[r->vector], r->err_code);

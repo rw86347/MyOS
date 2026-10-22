@@ -14,6 +14,7 @@
  * registers. When we switch back to it later, it finishes the interrupt with
  * `iret` and carries on as if nothing happened.
  */
+#include <cpu.h>
 #include <cycles.h>
 #include <gdt.h>
 #include <interrupts.h>
@@ -582,7 +583,7 @@ void cpu_idle(void)                     /* interrupts off, and off again after *
 {
     idle_since = cycles_now();
     idling = 1;
-    __asm__ volatile ("sti; hlt; cli");     /* `sti; hlt` can't miss an IRQ */
+    cpu_sleep();                        /* sti; hlt (or mwait); cli: can't miss an IRQ */
     cpu_idle_end();                     /* (the interrupt normally did it) */
 }
 

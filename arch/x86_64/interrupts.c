@@ -90,10 +90,10 @@ static const char *const exception_names[32] = {
     "Reserved",
 };
 
-struct ex_entry { uint64_t insn, fixup; };      /* uaccess.asm EX_ENTRY */
+struct ex_entry { uint64_t insn, fixup; };      /* uaccess.asm EX_ENTRY, cpu.h rdmsr_safe */
 extern const struct ex_entry __start_ex_table[], __stop_ex_table[];
 
-static int fixup_user_access(struct regs *r)
+static int fixup_exception(struct regs *r)
 {
     uint64_t rip = regs_ip(r);
     for (const struct ex_entry *e = __start_ex_table; e < __stop_ex_table; e++) {
@@ -265,8 +265,9 @@ static void exception(struct regs *r)
         user_exception(r, cr2);
         return;
     }
-    if (r->vector == 14 && fixup_user_access(r))
-        return;
+    if ((r->vector == 14 || r->vector == 13) && fixup_exception(r))
+        return;                     /* a bad user pointer (page fault), or an MSR
+                                       this CPU lacks (#GP): not a kernel bug */
     kprintf("\n*** CPU EXCEPTION %lu: %s ***\n", r->vector,
             exception_names[r->vector < 32 ? r->vector : 0]);
     kprintf("RIP=%016lx CR2=%016lx error code %lx\n", regs_ip(r), cr2, r->err_code);

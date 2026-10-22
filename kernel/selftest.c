@@ -32,6 +32,7 @@ void shim_selftest(void);
 void shim_pci_selftest(void);
 void shim_net_selftest(void);
 void wifi_selftest(void);
+void cpupower_selftest(void);
 
 void check(int ok, const char *what)
 {
@@ -70,6 +71,7 @@ void run_selftests(void)
     firmware_selftest();    /* request_firmware, from the archive */
     mem_selftest();         /* first: it checks the heap is back to empty */
     random_selftest();      /* ChaCha20 against the RFC vector */
+    cpupower_selftest();    /* an MSR that isn't there: an error, not a crash */
     drm_selftest();         /* display modes, the Bochs VGA, fbdev, fbcon */
     disk_demo();
     bcache_selftest();      /* the block cache, on the test disk */

@@ -345,6 +345,8 @@ void kernel_main(void)
     hda_intel_init();       /* HD Audio: the sound card, /dev/snd (before the
                                root disk: its nodes go in the boot /dev) */
     storage_init();         /* "Disks and USB", then "File systems" */
+    cpupower_init();        /* the config's processor power savings (it's final now) */
+    acpi_start();           /* the AML interpreter's thread: the battery, the charger */
     boot_step("Network");
     net_init();             /* loopback, then the e1000 and IPv4 if the card is there */
 #if defined(WIFI_SIM) && !defined(SELFTEST)
