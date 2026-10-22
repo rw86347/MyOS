@@ -202,6 +202,15 @@ ifeq ($(WIFISIM),1)
   BUILD := $(BUILD)/wifisim
 endif
 
+# make SLEEPTEST=1 <target>: QEMU has no lid; tools/fakelid.py's ACPI table
+# gives it one, and this kernel opens and shuts it when a CPU is added in
+# QEMU's monitor (kernel/fakelid_test.c), for make test-sleep. Test code: a
+# build folder of its own, never a normal boot.
+ifeq ($(SLEEPTEST),1)
+  MODE_FLAGS += -DSLEEP_TEST
+  BUILD := $(BUILD)/sleeptest
+endif
+
 # Freestanding: no host OS, no C library. Only compiler-provided headers like
 # <stdint.h> and <stddef.h> are available.
 # -fno-tree-loop-distribute-patterns: stop GCC from turning our memcpy/memset
@@ -383,6 +392,12 @@ ifeq ($(WIFISIM),1)
     C_OBJS   += $(SIM_OBJS)
   endif
 endif
+ifeq ($(SLEEPTEST),1)
+  ifneq ($(MODE),test)
+    OBJS   += $(BUILD)/kernel/fakelid_test.o
+    C_OBJS += $(BUILD)/kernel/fakelid_test.o
+  endif
+endif
 
 IMG     := $(BUILD)/myos.img
 INITRD  := $(BUILD)/initrd.cpio
@@ -423,7 +438,7 @@ QEMU_FLAGS = -m 64M -cpu pentium3 \
 # fight over the port.
 HAIRPIN_PORT := 47007
 
-.PHONY: run-uefi test-uefi-shell diskattacks verify-disktests verify-tests attacks all dist utm utm-hd utm-install hd live-root live-extra live-theme live-hd utm-live utm-arm64 run-live run-hd test-hd run run-full run-text debug test check-selftests test-shell bench run-bench usb clean fuzz fuzz-build fuzz-replay diskfuzz diskfuzz-replay verify-racetests uefi run-uefi-text test-uefi live-uefi test-live-uefi test-usb test-usb-hid test-usb-hub test-hid test-battery test-usb-tablet test-install live-login-initrd test-uefi-login test-arm64 test-arm64-fdt test-arm64-cpio test-arm64-apple test-arm64-apple-boot test-arm64-m1n1-payload m1n1-payload
+.PHONY: run-uefi test-uefi-shell diskattacks verify-disktests verify-tests attacks all dist utm utm-hd utm-install hd live-root live-extra live-theme live-hd utm-live utm-arm64 run-live run-hd test-hd run run-full run-text debug test check-selftests test-shell bench run-bench usb clean fuzz fuzz-build fuzz-replay diskfuzz diskfuzz-replay verify-racetests uefi run-uefi-text test-uefi live-uefi test-live-uefi test-usb test-usb-hid test-usb-hub test-hid test-battery test-sleep check-sleep test-usb-tablet test-install live-login-initrd test-uefi-login test-arm64 test-arm64-fdt test-arm64-cpio test-arm64-apple test-arm64-apple-boot test-arm64-m1n1-payload m1n1-payload
 
 ifeq ($(ARCH),arm64)
 all: $(BUILD)/kernel.elf $(BUILD)/virt.dtb
@@ -1265,6 +1280,34 @@ endif
 	  grep -q "^type:firmware" $$L || { echo "FAIL: the backlight's type"; ok=0; }; \
 	  grep -q "^BL 3 3" $$L || { echo "FAIL: brightness 3 set through _BCM"; ok=0; }; \
 	  [ $$ok = 1 ] && echo "BATTERY TEST OK ($(ARCH))" || exit 1
+
+# Sleep (docs/SLEEP-PLAN.md): QEMU has no lid, so tools/fakelid.py makes an
+# ACPI table with one, and a SLEEPTEST=1 kernel (a build folder of its own)
+# opens and shuts it when a CPU is added (device_add). tools/test-sleep.py
+# plays the power daemon from the host: the lid shuts -> sleep; a key with
+# the lid shut -> still asleep; the lid opens -> awake; then a key and the
+# power button wake it. A busy loop must stop while asleep (QEMU's CPU time
+# drops), the wall clock must jump and the uptime not, and the lid and the
+# power button must reach /dev/input/event3 and event4. i386 by BIOS,
+# x86_64 by UEFI.
+test-sleep:
+	@$(MAKE) --no-print-directory SLEEPTEST=1 check-sleep
+ifeq ($(ARCH),x86_64)
+SLEEP_BOOT = $(QEMU64) -machine q35 -m 1G -cpu qemu64 \
+    -drive if=pflash,format=raw,readonly=on,file=$(OVMF_CODE) \
+    -drive if=pflash,format=raw,file=$(BUILD)/ovmf-vars.fd \
+    -drive if=none,format=raw,file=$(UEFI_IMG),id=bootdisk,snapshot=on \
+    -device ide-hd,drive=bootdisk,bootindex=0
+check-sleep: $(UEFI_IMG)
+else
+SLEEP_BOOT = $(QEMU) -m 64M -cpu pentium3 -drive format=raw,file=$(IMG),index=0,media=disk,snapshot=on
+check-sleep: $(IMG)
+endif
+	@[ ! -f $(OVMF_VARS) ] || cp $(OVMF_VARS) $(BUILD)/ovmf-vars.fd
+	python3 tools/fakelid.py $(BUILD)/fakelid.aml
+	python3 tools/test-sleep.py $(ARCH) $(BUILD)/sleep.log $(SLEEP_BOOT) \
+	    -acpitable file=$(BUILD)/fakelid.aml -smp 1,maxcpus=4 \
+	    -net none -no-reboot -display none
 
 # USB hubs (docs/USB-PLAN.md U6), on the same PC with no PS/2: the keyboard
 # and mouse behind a hub, a second hub behind that one with a tablet on it,
