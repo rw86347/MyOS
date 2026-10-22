@@ -29,8 +29,8 @@
  * Waking undoes it in reverse. The wall clock (CLOCK_REALTIME) and
  * CLOCK_BOOTTIME jump by the time the tick was off: the TSC measures it,
  * and the battery-backed CMOS clock, read on both sides, overrules it to
- * the second when they differ by more than 2 s (a TSC that slows when
- * idle). The log gives both.
+ * the second when they disagree by a second or more (a TSC that slows
+ * when idle). The log gives both.
  *
  * What wakes it: the lid opening, the power button (reported as KEY_WAKEUP,
  * as Linux does, so it isn't taken for "sleep" again), a key or a click
@@ -196,14 +196,17 @@ int suspend_enter(void)
     pic_set_masks(pic_masks() & ~forced);
     irq_restore(f);
 
-    /* How long it slept: the TSC's count, unless the CMOS clock (whole
-       seconds) differs by more than 2 s, as when the TSC slows in idle or
-       was calibrated on late ticks (QEMU's busy boot). The clocks jump by
-       what the tick didn't count. */
+    /* How long it slept: the TSC's count, if the CMOS clock allows it. That
+       clock is read in whole seconds, so the time between its two readings
+       is within a second of rtc_s; a count outside that is wrong (a TSC
+       that slows in idle, or was calibrated on late ticks: QEMU's busy
+       boot), and rtc_s is the better guess. The readings sit just outside
+       s0..s1: 50 ms of slack below. The clocks jump by what the tick
+       didn't count. */
     int64_t rtc_s = (int64_t)rtc_read_epoch() - rtc0;
     uint64_t off = (c1 - c0) / cycles_per_us(), tsc = (s1 - s0) / cycles_per_us(), all = tsc;
-    if (rtc_s >= 0 && ((uint64_t)rtc_s * 1000000 > tsc + 2000000 ||
-                       tsc > (uint64_t)rtc_s * 1000000 + 2000000))
+    if (rtc_s >= 0 && (tsc + 1050000 <= (uint64_t)rtc_s * 1000000 ||
+                       tsc >= (uint64_t)rtc_s * 1000000 + 1000000))
         all = (uint64_t)rtc_s * 1000000;
     uint64_t ticked = (uint64_t)(ms1 - ms0) * 1000;
     if (all > ticked)

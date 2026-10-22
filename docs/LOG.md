@@ -4854,5 +4854,8 @@ the uptime unchanged across it, and it says so, with the kernel's line under
 it. The kernel now reads the CMOS clock on both sides of a sleep, and that
 caught QEMU's TSC counting only 40–65% of the time asleep (2.6 s of 6.3 s):
 the wall clock came back short. The CMOS clock now overrules the TSC when
-they differ by more than 2 s, and `make test-sleep` checks the kernel's
-time asleep against the Mac's clock (6.0 s and 7.0 s against 6.3 s).
+they differ by a second or more, and `make test-sleep` checks the kernel's
+time asleep against the Mac's clock (6.0 s and 7.0 s against 6.3 s). A
+first try allowed 2 s; the check caught it on a rerun before the merge
+(a TSC count of 4.4 s for 6.3 s, the CMOS clock 6 s): whole seconds on both
+sides already put the true time within a second of the CMOS count.

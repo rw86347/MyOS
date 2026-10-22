@@ -1177,9 +1177,11 @@ timer wakes it. A whole sleep, from the lid to the kernel, also waits for
 The time asleep is counted with the TSC and checked against the CMOS clock,
 read on both sides. In QEMU the TSC counted 2.6 s of a sleep the CMOS clock
 put at 6 s (i386) and 6.4 s of one it put at 10 s (the desktop), so the
-CMOS clock overrules it when they differ by more than 2 s, and `make
-test-sleep` now checks the kernel's time asleep against the Mac's own clock:
-6.0 s and 7.0 s by the kernel, 6.3 s by the Mac. The two CMOS reads cost up
+CMOS clock overrules it when they differ by a second or more (whole seconds
+on both sides leave the true time within a second of the CMOS count; the
+first try allowed 2 s, which let a TSC count of 4.4 s for 6.3 s through),
+and `make test-sleep` now checks the kernel's time asleep against the Mac's
+own clock: 6.0 s and 7.0 s by the kernel, 6.3 s by the Mac. The two CMOS reads cost up
 to 2 ms each (the chip may be mid-update), with interrupts on; the one on
 waking is inside "awake in".
 

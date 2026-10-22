@@ -63,7 +63,7 @@ myos-powerd: SIGUSR2 ──► myos-idle: the screen saver reset, myos-lock redr
 | The freezer: one flag at the user-mode edge (`signal_check`) | `kernel/signal.c`, `kernel/suspend.c` | done |
 | Wake-up lines only: the 8259 masks, Linux drivers' MSIs held and replayed | `arch/*/pic.c`, `kernel/linux_irq.c` | done |
 | The tick off while asleep (PIT or HPET), back on at any interrupt | `kernel/thread.c`, `drivers/pit.c`, `drivers/hpet.c` | done |
-| The clock jump: REALTIME and BOOTTIME, by the TSC, overruled by the CMOS clock when they differ by over 2 s | `kernel/sys_info.c`, `kernel/suspend.c` | done |
+| The clock jump: REALTIME and BOOTTIME, by the TSC, overruled by the CMOS clock when they differ by a second or more | `kernel/sys_info.c`, `kernel/suspend.c` | done |
 | `myos-sleepcheck`: did the lid really sleep? A line a second to `~/sleep-check.txt`; a gap with the uptime standing still is a sleep | `live/overlay/usr/bin/myos-sleepcheck` | done |
 | The screen off and on again | `drivers/gpu/drm/drm_core.c`, `drivers/backlight.c` | done |
 | A key or a click wakes (with the lid open), and isn't typed | `drivers/keyboard.c`, `drivers/evdev.c`, `drivers/usb/xhci.c` | done |

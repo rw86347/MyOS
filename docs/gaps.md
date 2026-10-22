@@ -1521,7 +1521,7 @@ own, `cld` on every entry and page-table checks are in (docs/LOG.md,
   stops with the tick. Only a key wakes it there.
 - **The time asleep is right to about a second.** The TSC measures it, and the
   CMOS clock (whole seconds, read on both sides) overrules it when they differ
-  by more than 2 s: a TSC that slows or stops when idle (the Pentium M with
+  by a second or more: a TSC that slows or stops when idle (the Pentium M with
   SpeedStep), or QEMU's, which counts only 40–65% of a sleep. Reading the CMOS
   clock costs up to 2 ms each way (it may be mid-update).
 - **Timers on CLOCK_REALTIME and CLOCK_BOOTTIME count the tick**, so one that
