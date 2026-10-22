@@ -37,8 +37,17 @@
  * the interrupt, hands the data to the class driver and queues the next
  * transfer (usb_intr_start).
  *
- * Not done (docs/USB-PLAN.md): hubs, unplugging (a gone device just stops
- * answering), isochronous endpoints, streams.
+ * Hubs (usb_hub.c drives them): the controller does the hub's work on the
+ * wire, but must be told where a device behind one is, in its slot
+ * context: the root port, and a "route string" of the hub ports on the
+ * way, 4 bits each, nearest the root first (xHCI 4.3.3, 8.9). A low- or
+ * full-speed device behind a high-speed hub also names that hub's
+ * "transaction translator" (its slot and port), which turns the fast bus's
+ * traffic into slow traffic for it. A hub's own slot says it is a hub,
+ * how many ports it has and its TT's think time (usb_hub_set).
+ *
+ * Not done (docs/USB-PLAN.md): USB 3 hubs' USB 3 side, unplugging (a gone
+ * device just stops answering), isochronous endpoints, streams.
  */
 #include <interrupts.h>
 #include <kheap.h>
@@ -186,7 +195,15 @@ struct ep {
 struct xhci;
 struct usb_device {
     struct xhci *hc;
-    uint8_t slot, port, speed;
+    uint8_t slot, port, speed;          /* port: the root port it is behind */
+    uint8_t depth;                      /* hubs between it and the root port */
+    uint32_t route;                     /* their ports, 4 bits each (xHCI 8.9) */
+    uint8_t tt_slot, tt_port;           /* slow behind a high-speed hub: that hub's TT */
+    uint8_t hub_ports, hub_ttt;         /* a hub: its ports, its TT's think time */
+    volatile uint8_t work;              /* usb_work: run work_fn in the usb thread */
+    void (*work_fn)(void *arg);
+    void *work_arg;
+    char path[24];                      /* "1-2.3": bus, root port, hub ports */
     volatile uint8_t failed;            /* a transfer failed: its completion code */
     uint8_t gone;                       /* unplugged */
     void *out;                          /* the device context (the controller's) */
@@ -218,6 +235,7 @@ struct xhci {
     struct wait_queue cmd_turn;
     volatile uint8_t port_change;
     volatile uint8_t ep_fix;            /* an interrupt endpoint is broken */
+    volatile uint8_t work;              /* a device asked for usb_work */
     struct usb_device *dev[MAX_SLOTS + 1];
     struct usb_device *port_dev[MAX_PORTS + 1];
     uint8_t port_tried[MAX_PORTS + 1];
@@ -477,8 +495,7 @@ static int wait_ep(struct usb_device *d, struct ep *ep, uint32_t ms)
     if (wait_flag(d->hc, &ep->done, &d->failed, ms) < 0) {
         if (d->failed)
             return d->failed;
-        kprintf("usb %d-%d: no answer in %lu ms\n", (int)(d->hc - hcs) + 1, d->port,
-                (unsigned long)ms);
+        kprintf("usb %s: no answer in %lu ms\n", d->path, (unsigned long)ms);
         return -1;
     }
     return 0;
@@ -706,7 +723,14 @@ int usb_configure(struct usb_device *d, uint8_t config, const struct usb_ep_want
     }
     ctx(hc, hc->in, 0)[1] = add;
     memcpy(ctx(hc, hc->in, 1), ctx(hc, d->out, 0), 16);       /* the slot as it is, */
-    ctx(hc, hc->in, 1)[0] = (ctx(hc, hc->in, 1)[0] & ~(0x1Fu << 27)) | last << 27;  /* more entries */
+    uint32_t *s = ctx(hc, hc->in, 1);
+    s[0] = (s[0] & ~(0x1Fu << 27)) | last << 27;                /* more entries */
+    if (d->hub_ports) {                 /* a hub (usb_hub_set): say so, its ports, its TT */
+        s[0] |= 1u << 26;
+        s[1] = (s[1] & 0x00FFFFFFu) | (uint32_t)d->hub_ports << 24;
+        if (d->speed == USB_SPEED_HIGH)
+            s[2] = (s[2] & ~(3u << 16)) | (uint32_t)d->hub_ttt << 16;
+    }
     if (command(hc, hc->in_phys, T_TYPE(TRB_CONFIG_EP) | T_SLOT(d->slot), NULL) != CC_SUCCESS)
         return -1;
     return usb_control(d, 0x00, USB_REQ_SET_CONFIGURATION, config, 0, NULL, 0) < 0 ? -1 : 0;
@@ -779,12 +803,25 @@ static void device_free(struct usb_device *d)
     kfree(d);
 }
 
-/* A device on root port p, just reset: give it a slot and an address,
-   read what it is, and find it a driver. */
-static struct usb_device *attach(struct xhci *hc, int p)
+/* Append ".n" (or "-n", or with sep 0 just n) to a device's path. */
+static void path_add(char *s, char sep, int n)
 {
-    int bus = (int)(hc - hcs) + 1;
-    uint8_t speed = PS_SPEED(rd(hc->op, OP_PORTSC(p)));
+    int len = (int)strlen(s);
+    if (sep)
+        s[len++] = sep;
+    if (n >= 10)
+        s[len++] = (char)('0' + n / 10);
+    s[len++] = (char)('0' + n % 10);
+    s[len] = 0;
+}
+
+/* A device just reset, on root port `root` or behind hubs (route, depth,
+   and the TT it goes through, if any): give it a slot and an address,
+   read what it is, and find it a driver. */
+static struct usb_device *enumerate(struct xhci *hc, int root, uint8_t speed, uint32_t route,
+                                    uint8_t depth, uint8_t tt_slot, uint8_t tt_port,
+                                    const char *path)
+{
     uint8_t slot = 0;
     if (command(hc, 0, T_TYPE(TRB_ENABLE_SLOT), &slot) != CC_SUCCESS || !slot || slot > hc->slots)
         return NULL;
@@ -794,8 +831,13 @@ static struct usb_device *attach(struct xhci *hc, int p)
     memset(d, 0, sizeof *d);
     d->hc = hc;
     d->slot = slot;
-    d->port = (uint8_t)p;
+    d->port = (uint8_t)root;
     d->speed = speed;
+    d->route = route;
+    d->depth = depth;
+    d->tt_slot = tt_slot;
+    d->tt_port = tt_port;
+    strcpy(d->path, path);
     /* Endpoint 0's packet size: fixed by the speed, except that a
        full-speed device may use 8 to 64 (64 is the guess; fixed below). */
     uint16_t mps = speed >= USB_SPEED_SUPER ? 512 : speed == USB_SPEED_LOW ? 8 : 64;
@@ -807,8 +849,9 @@ static struct usb_device *attach(struct xhci *hc, int p)
     memset(hc->in, 0, PAGE_SIZE);
     ctx(hc, hc->in, 0)[1] = 3;          /* add: the slot and endpoint 0 */
     uint32_t *s = ctx(hc, hc->in, 1);
-    s[0] = (1u << 27) | ((uint32_t)speed << 20);   /* one endpoint context; the speed */
-    s[1] = (uint32_t)p << 16;                      /* its root port */
+    s[0] = (1u << 27) | ((uint32_t)speed << 20) | route;   /* one endpoint context; speed; hubs */
+    s[1] = (uint32_t)root << 16;                           /* its root port */
+    s[2] = tt_slot | (uint32_t)tt_port << 8;               /* its TT, if slow behind a fast hub */
     uint32_t *e = ctx(hc, hc->in, 2);
     e[1] = (3u << 1) | (4u << 3) | ((uint32_t)mps << 16);  /* 3 retries, control, packet size */
     e[2] = d->ep[1]->ring.phys | 1;
@@ -850,22 +893,83 @@ static struct usb_device *attach(struct xhci *hc, int p)
     for (int o = 0; !cls && o + 9 <= len && cfg[o]; o += cfg[o])
         if (cfg[o + 1] == USB_DT_INTERFACE)
             cls = cfg[o + 5];
-    klog("usb %d-%d: %04x:%04x %s%s(USB %x.%x, %s), class %d\n", bus, p,
+    klog("usb %s: %04x:%04x %s%s(USB %x.%x, %s), class %d\n", d->path,
             d->desc.idVendor, d->desc.idProduct, d->name, *d->name ? " " : "",
             d->desc.bcdUSB >> 8, (d->desc.bcdUSB >> 4) & 0xF, speed_name(speed), cls);
-    if (usb_storage_probe(d, cfg, len) < 0 && usb_hid_probe(d, cfg, len) < 0) {
-        if (cls == 9)
-            kprintf("usb %d-%d: a hub: not supported yet\n", bus, p);
-    }
+    if (usb_storage_probe(d, cfg, len) < 0 && usb_hid_probe(d, cfg, len) < 0)
+        usb_hub_probe(d, cfg, len);
     kfree(cfg);
     return d;
 fail:
-    kprintf("usb %d-%d: the device did not answer (%s)\n", bus, p, speed_name(speed));
+    kprintf("usb %s: the device did not answer (%s)\n", path, speed_name(speed));
     hc->dev[slot] = NULL;
     hc->dcbaa[slot] = 0;
     device_free(d);
     return NULL;
 }
+
+/* A device on root port p, just reset. */
+static struct usb_device *attach(struct xhci *hc, int p)
+{
+    char path[24] = "";
+    path_add(path, 0, (int)(hc - hcs) + 1);
+    path_add(path, '-', p);
+    return enumerate(hc, p, PS_SPEED(rd(hc->op, OP_PORTSC(p))), 0, 0, 0, 0, path);
+}
+
+struct usb_device *usb_hub_attach(struct usb_device *hub, int port, int speed)
+{
+    char path[24];
+    strcpy(path, hub->path);
+    path_add(path, '.', port);
+    if (hub->depth >= 5 || port < 1 || port > 15) {     /* 5 tiers of 4 bits */
+        kprintf("usb %s: too many hubs in a row (USB allows 5)\n", path);
+        return NULL;
+    }
+    uint8_t tt_slot = hub->tt_slot, tt_port = hub->tt_port;
+    if (hub->speed == USB_SPEED_HIGH && speed != USB_SPEED_HIGH) {
+        tt_slot = hub->slot;            /* this hub's TT speaks to it */
+        tt_port = (uint8_t)port;
+    }
+    return enumerate(hub->hc, hub->port, (uint8_t)speed,
+                     hub->route | (uint32_t)port << (4 * hub->depth), hub->depth + 1,
+                     tt_slot, tt_port, path);
+}
+
+void usb_hub_set(struct usb_device *d, int ports, int ttt)
+{
+    d->hub_ports = (uint8_t)ports;
+    d->hub_ttt = (uint8_t)ttt;
+}
+
+/* d is unplugged, and so is everything behind it (a hub's devices: the
+   same root port, routes that start with d's). */
+void usb_unplugged(struct usb_device *d)
+{
+    struct xhci *hc = d->hc;
+    uint32_t mask = (1u << (4 * d->depth)) - 1;
+    for (int s = 1; s <= hc->slots; s++) {
+        struct usb_device *c = hc->dev[s];
+        if (c && c->port == d->port && c->depth >= d->depth && (c->route & mask) == d->route)
+            c->gone = 1;
+    }
+}
+
+void usb_set_work(struct usb_device *d, void (*fn)(void *arg), void *arg)
+{
+    d->work_arg = arg;
+    d->work_fn = fn;
+}
+
+void usb_work(struct usb_device *d)
+{
+    d->work = 1;
+    d->hc->work = 1;
+    if (boot_done)
+        wq_wake_all(&port_wq);
+}
+
+const char *usb_path(struct usb_device *d) { return d->path; }
 
 /* Reset port p: a USB 2 port is enabled by it; a USB 3 port is up
    already, but the reset puts the device in a known state. A USB 3 link
@@ -896,7 +1000,7 @@ static void ports_scan(struct xhci *hc, int debounce)
         if (!(sc & PS_CCS)) {
             if (hc->port_dev[p]) {
                 kprintf("usb %d-%d: unplugged (the kernel can't let go of it yet)\n", bus, p);
-                hc->port_dev[p]->gone = 1;
+                usb_unplugged(hc->port_dev[p]);
             }
             hc->port_dev[p] = NULL;
             hc->port_tried[p] = 0;
@@ -1117,8 +1221,7 @@ static void ep_fix(struct xhci *hc)
             if (!(rd(hc->op, OP_PORTSC(d->port)) & PS_CCS))
                 continue;               /* unplugged (ports_scan says so) */
             if (++ep->fails > 3) {
-                kprintf("usb %d-%d: endpoint %02x keeps failing: stopped\n",
-                        (int)(hc - hcs) + 1, d->port, epa);
+                kprintf("usb %s: endpoint %02x keeps failing: stopped\n", d->path, epa);
                 continue;
             }
             usb_sleep(10u << ep->fails);
@@ -1131,6 +1234,20 @@ static void ep_fix(struct xhci *hc)
             intr_queue(d, ep, dci);
             irq_restore(flags);
         }
+    }
+}
+
+/* What devices asked for with usb_work (a hub: its ports changed). The
+   usb thread, interrupts on. */
+static void run_work(struct xhci *hc)
+{
+    for (int s = 1; s <= hc->slots; s++) {
+        struct usb_device *d = hc->dev[s];
+        if (!d || !d->work)
+            continue;
+        d->work = 0;                    /* (a new request after this runs it again) */
+        if (!d->gone && d->work_fn)
+            d->work_fn(d->work_arg);
     }
 }
 
@@ -1156,19 +1273,21 @@ static void usb_thread(void *arg)
     wq_wake_all(&boot_wq);
     for (;;) {                  /* then: something plugged in later, or a fix */
         int i;
-        for (i = 0; i < nhc && !hcs[i].port_change && !hcs[i].ep_fix; i++)
+        for (i = 0; i < nhc && !hcs[i].port_change && !hcs[i].ep_fix && !hcs[i].work; i++)
             ;
         if (i == nhc) {
             wq_sleep(&port_wq);         /* (interrupts are off: no wake-up is missed) */
             continue;
         }
-        int ports = hcs[i].port_change, fix = hcs[i].ep_fix;
-        hcs[i].port_change = hcs[i].ep_fix = 0;
+        int ports = hcs[i].port_change, fix = hcs[i].ep_fix, work = hcs[i].work;
+        hcs[i].port_change = hcs[i].ep_fix = hcs[i].work = 0;
         irq_restore(flags);
         if (ports)
             ports_scan(&hcs[i], 1);
         if (fix)
             ep_fix(&hcs[i]);
+        if (work)
+            run_work(&hcs[i]);
         flags = irq_save();
     }
 }

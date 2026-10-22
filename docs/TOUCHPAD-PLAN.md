@@ -1,6 +1,20 @@
 # Touchpad plan: two-finger scrolling and palm rejection
 
-Status: **plan** (2026-10-10). WORKLIST B52. Nothing below exists yet.
+Status: **plan** (2026-10-10). WORKLIST B52. Nothing below exists yet,
+except one piece (2026-10-21): a **USB** precision touchpad (the GPD P2
+Max's, inside its HAILUCK keyboard) moves the pointer. `drivers/hid/hid.c`
+follows its first finger and sends the movement as a mouse's, a quick
+still touch is a left click, the pad's button clicks, and a finger the pad
+calls a palm is ignored. Since the same day, in the kernel as a stopgap
+(the shortcut §3 weighs): two fingers scroll in wheel clicks ("natural";
+Settings > Mouse & Keyboard turns it off through
+`/sys/module/hid/parameters/two_finger_scroll`), a two-finger tap is a
+right click, and with the pad pressed any finger that moves drags (a thumb
+holds the click in a corner). Since 2026-10-22, three fingers sliding one
+way send one key per touch (F14-F17), which the X11 desktop turns into a
+change of desktop or Mission Control. The P2 Max's pad sends one finger per
+report (hybrid mode, contact IDs 0-7). Smooth scrolling and gestures that
+follow the fingers are still §3's design (every finger to libinput).
 
 ## 1. The goal
 

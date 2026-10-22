@@ -99,7 +99,7 @@ int usb_hid_probe(struct usb_device *d, const uint8_t *cfg, int len)
     uint8_t *desc = kmalloc(DESC_MAX);
     if (!desc)
         return 0;
-    int keyboards = 0, mice = 0, touch = 0;
+    int keyboards = 0, mice = 0, touch = 0, pads = 0;
     for (int k = 0; k < n; k++) {
         usb_control(d, 0x21, HID_SET_IDLE, 0, f[k].num, NULL, 0);  /* (a mouse may refuse) */
         int got = usb_control(d, 0x81, USB_REQ_GET_DESCRIPTOR, USB_DT_REPORT << 8, f[k].num,
@@ -125,20 +125,40 @@ int usb_hid_probe(struct usb_device *d, const uint8_t *cfg, int len)
             continue;
         }
         keyboards += h->hid.keyboard;
-        mice += h->hid.mouse;
+        mice += h->hid.mouse && !h->hid.touchpad;   /* (a touchpad's mouse mode is the touchpad) */
         touch += h->hid.touch;
+        pads += h->hid.touchpad;
+        /* A pointer that knows where it is: its descriptor, to dmesg, for
+           working out a new pad or screen from a boot log. */
+        if (h->hid.touch || h->hid.touchpad) {
+            static const char hex[] = "0123456789abcdef";
+            for (int o = 0; o < got; o += 32) {
+                char line[3 * 32 + 1];
+                int m = 0;
+                for (int b = o; b < got && b < o + 32; b++) {
+                    line[m++] = hex[desc[b] >> 4];
+                    line[m++] = hex[desc[b] & 15];
+                    line[m++] = ' ';
+                }
+                line[m ? m - 1 : 0] = 0;
+                klog("usb-hid: %s if %d desc %03x: %s\n", name, f[k].num, o, line);
+            }
+        }
     }
     kfree(desc);
-    const char *what[3];
+    const char *what[4];
     int nw = 0;
     if (keyboards)
         what[nw++] = "a keyboard";
     if (mice)
         what[nw++] = "a mouse";
+    if (pads)
+        what[nw++] = "a touchpad";
     if (touch)
         what[nw++] = "a touch screen or tablet";
-    klog("usb-hid: %s: %s%s%s%s%s\n", name, nw ? what[0] : "nothing MyOS uses yet",
+    klog("usb-hid: %s: %s%s%s%s%s%s%s\n", name, nw ? what[0] : "nothing MyOS uses yet",
          nw > 1 ? (nw > 2 ? ", " : " and ") : "", nw > 1 ? what[1] : "",
-         nw > 2 ? " and " : "", nw > 2 ? what[2] : "");
+         nw > 2 ? (nw > 3 ? ", " : " and ") : "", nw > 2 ? what[2] : "",
+         nw > 3 ? " and " : "", nw > 3 ? what[3] : "");
     return 0;
 }

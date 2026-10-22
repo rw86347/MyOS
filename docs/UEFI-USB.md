@@ -17,6 +17,21 @@ The 32-bit live desktop image is still
 `build/myos-live-uefi.img` (~1.5 GiB). `make test` (Pentium BIOS)
 is a separate image.
 
+## The live stick: write-stick.py keeps your files
+
+For the live disk, write the stick with this, not `dd`:
+
+    sudo live/tools/write-stick.py              (build/x86_64/myos-live-uefi.img)
+
+It finds the one USB stick (or `--disk disk6`), asks, writes the image,
+reads it back, and ejects. The stick gets a fourth partition, myos-data,
+from 8 GiB to its end: `/home` (the desktop's settings in `~/.config`,
+WritePerfect's, the Desktop's files) and the saved Wi-Fi networks live
+there. The first time it is made empty, and the image's home is copied
+onto it at the first boot. After that each new build replaces only the
+system and keeps myos-data. A plain `dd` doesn't erase myos-data, but it
+drops it from the partition table until `write-stick.py` runs again.
+
 ## Do not use BalenaEtcher
 
 Etcher fails on this file (`requestMetadata is not a function`).

@@ -69,6 +69,19 @@ Steps (each ends with something visible in QEMU):
   with `usb-kbd` and `usb-mouse` at 12 and 480 Mb/s, on i386 and x86_64,
   and with no PS/2 controller at all (`-machine q35,i8042=off`).
 
-Later (not needed for the stick): hubs, unplugging, UAS (faster USB 3
-disks), EHCI/UHCI for the old PCs, and Linux's USB driver API
-(`usb_driver`, URBs) for drivers like `btusb`.
+- [x] **U6** Hubs (2026-10-18; a keyboard behind a hub, a laptop whose
+  keyboard sits behind an internal one): `usb_hub.c` powers the hub's
+  ports, resets what is on them and has `xhci.c` address it behind the hub
+  (the slot context's route string, and for a slow device behind a
+  high-speed hub, that hub's transaction translator). The hub's
+  interrupt endpoint says which port changed, so devices plugged in and
+  pulled out later are seen. Hubs behind hubs, up to USB's 5. `make
+  test-usb-hub` (both arches): keyboard, mouse, a USB stick and a second
+  hub with a tablet behind QEMU's usb-hub, and a keyboard plugged in and
+  out while running. Not yet: the USB 3 side of a USB 3 hub (its USB 2
+  side works: keyboards, mice, USB 2 sticks), and the translator has only
+  met real hubs in theory (QEMU's hub is USB 1.1).
+
+Later (not needed for the stick): USB 3 hubs, unplugging (giving back a
+gone device), UAS (faster USB 3 disks), EHCI/UHCI for the old PCs, and
+Linux's USB driver API (`usb_driver`, URBs) for drivers like `btusb`.

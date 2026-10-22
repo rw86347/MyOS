@@ -36,6 +36,7 @@
 
 #define USB_CLASS_HID          3
 #define USB_CLASS_MASS_STORAGE 8
+#define USB_CLASS_HUB          9
 
 /* Speeds, as xHCI numbers them (PORTSC, the slot context). */
 #define USB_SPEED_FULL   1              /* 12 Mb/s, USB 1.1 */
@@ -95,6 +96,7 @@ struct usb_device;                      /* the host controller's (xhci.c) */
 const struct usb_device_descriptor *usb_desc(struct usb_device *d);
 int usb_speed(struct usb_device *d);
 const char *usb_name(struct usb_device *d);   /* "SanDisk Ultra Fit", or "" */
+const char *usb_path(struct usb_device *d);   /* where it is: "1-2", "1-2.3" (bus-port.hub port) */
 
 /* A control request on endpoint 0, with up to 1024 bytes of data in or
    out. The bytes moved, or -1 (an error, a stall: the request was
@@ -148,9 +150,30 @@ int usb_intr_start(struct usb_device *d, uint8_t ep, uint32_t phys, uint16_t len
 /* Sleep (a kernel thread, interrupts on). */
 void usb_sleep(uint32_t ms);
 
+/*
+ * For the hub driver (usb_hub.c). The host controller does the hub's work
+ * on the wire; it needs to know which devices are hubs, and where each
+ * device behind one is.
+ *   usb_hub_set     d is a hub with this many ports and this TT think time
+ *                   (its descriptor's): call before usb_configure, which
+ *                   tells the controller.
+ *   usb_hub_attach  a device was just reset on the hub's port: address it,
+ *                   find its driver (it may be a hub too). NULL if it failed.
+ *   usb_unplugged   it is gone, and everything behind it.
+ *   usb_set_work, usb_work: have fn(arg) run in the usb thread soon (it may
+ *                   sleep and send control requests there); usb_work may be
+ *                   called from the controller's interrupt.
+ */
+void usb_hub_set(struct usb_device *d, int ports, int ttt);
+struct usb_device *usb_hub_attach(struct usb_device *hub, int port, int speed);
+void usb_unplugged(struct usb_device *d);
+void usb_set_work(struct usb_device *d, void (*fn)(void *arg), void *arg);
+void usb_work(struct usb_device *d);
+
 /* The class drivers: 0 if this one takes the device. */
 int usb_storage_probe(struct usb_device *d, const uint8_t *config, int len);
 int usb_hid_probe(struct usb_device *d, const uint8_t *config, int len);
+int usb_hub_probe(struct usb_device *d, const uint8_t *config, int len);
 
 /* Boot: start the controllers and their thread; then wait (at most ms) for
    the devices already plugged in to be found. */

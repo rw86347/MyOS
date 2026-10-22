@@ -114,6 +114,10 @@ static void init_bits(void)
             set_bit(k->key_bits, c);
     for (unsigned c = 125; c <= 127; c++)
         set_bit(k->key_bits, c);
+    /* F13-F24: USB keyboards', and a touchpad's swipes (HID_SWIPE_*, F14-F17).
+       Readers through libevdev (X, libinput) drop keys that aren't listed. */
+    for (unsigned c = 183; c <= 194; c++)
+        set_bit(k->key_bits, c);
     set_bit(m->ev_bits, EV_SYN), set_bit(m->ev_bits, EV_KEY), set_bit(m->ev_bits, EV_REL);
     for (unsigned b = 0; b < 3; b++)
         set_bit(m->key_bits, BTN_LEFT + b);     /* left, right, middle */
