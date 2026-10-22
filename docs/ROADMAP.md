@@ -258,6 +258,11 @@ Mark a step `[x]` only when its "Done when" check works.
     queues, and x86_64's own layouts (statfs, select, shm*, ...). `user/sys/systest.c`.
   - [ ] Next: the live desktop (`myos-login`, X) on the x86_64 kernel, then the
     GPD Pocket 4 itself (ACPI, MSI, NVMe, xHCI).
+  - [ ] Sleep, as on a Mac (`docs/SLEEP-PLAN.md`): the lid, the power button or
+    the Start menu's Sleep suspends to idle (s2idle) behind the lock screen, and
+    it wakes locked. Done in QEMU, both kernels (2026-10-22: `make test-sleep`,
+    `make ARCH=x86_64 SLEEPTEST=1 test-sleep-desktop`). Next: the P2 Max's lid;
+    then S3 where the firmware has it.
 - [ ] **13. WiFi** — the MSI Katana's Intel AX201: our own 802.11 stack with Linux's
   interfaces (nl80211 up, mac80211's driver API down), Intel's `iwlwifi` through the
   shim, `wpa_supplicant` in user space, a Windows-style tray icon. Steps W0-W8 in

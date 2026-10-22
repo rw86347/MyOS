@@ -1500,3 +1500,40 @@ own, `cld` on every entry and page-table checks are in (docs/LOG.md,
   input for Chinese" doesn't copy `[input]` yet.
 - **`pidfd_open` (434) is missing**: GLib falls back to SIGCHLD to watch IBus's
   children, so it costs nothing visible.
+
+## Sleep (2026-10-22, docs/SLEEP-PLAN.md)
+- **Tested only in QEMU, with a made-up lid** (`tools/fakelid.py`, moved by a CPU
+  added in QEMU's monitor). A real lid's path (the embedded controller's GPE, its
+  `_Qxx` query, the notify) has not run yet; the P2 Max is next.
+- **Suspend to idle only: no S3, no hibernate.** Every device stays powered (D0):
+  no PCIe link power saving, no device low-power states, so the chipset may not
+  reach its deepest idle (S0ix) and the battery drains faster asleep than under
+  Linux. Nothing wakes it to check the battery either (no dark wake, no
+  hibernate when it runs low).
+- **The panel goes dark only through DRM and `_BCM`.** Where the firmware's
+  `_BCM` needs a graphics driver (above) and DRM has no hold on the panel, its
+  backlight stays on asleep.
+- **Wi-Fi isn't told.** iwlwifi's interrupts are held while asleep and run on
+  waking; the access point may have dropped us meanwhile, and wpa_supplicant
+  has to notice and join again. Not tried on a real card.
+- **The lid and the power button wake through ACPI's interrupt.** A board whose
+  SCI isn't wired to the 8259 (polled, above) can't be woken by them: polling
+  stops with the tick. Only a key wakes it there.
+- **The time asleep comes from the TSC.** A CPU whose TSC slows or stops when
+  idle (the Pentium M with SpeedStep, before "constant TSC") puts the wall clock
+  behind after a sleep; reading the CMOS clock on waking would fix it.
+- **Timers on CLOCK_REALTIME and CLOCK_BOOTTIME count the tick**, so one that
+  comes due during sleep fires late by the time asleep; Linux fires it on
+  waking. No RTC alarm wakes the machine either (`CLOCK_*_ALARM`).
+- **`/proc/uptime` leaves sleep out**; Linux's is CLOCK_BOOTTIME and counts it.
+- **event3 and event4 ("Lid Switch", "Power Button") exist on every machine**,
+  even one without a lid; Linux makes them only for devices the firmware has.
+- **Woken with the lid still shut** (the power button), it stays awake; a Mac
+  goes back to sleep. Deliberate for now: a lid sensor that reads wrong would
+  otherwise leave a machine that can't stay awake.
+- **A program busy in the kernel for over 200 ms stops the sleep** (`-EBUSY`, the
+  log says how many threads), and myos-powerd doesn't try again: the lock screen
+  is up, the machine awake.
+- **The lock screen is X's only**: not in the Wayland preview (myos-wm), not on
+  a text console. If another program holds the keyboard when it starts, it
+  shows and keeps trying to take it every 100 ms.

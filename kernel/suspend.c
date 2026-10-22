@@ -4,10 +4,12 @@
  * suspend.c — sleep: suspend to idle (Linux's "s2idle", Intel's S0ix)
  *
  * A Mac sleeps when its lid shuts and wakes, locked, when it opens. New
- * laptops (the GPD P2 Max among them) do it the same way from the OS's
- * side: no S3 ("suspend to RAM") any more, only S0 with the CPU and the
- * chipset idling as deeply as they can ("modern standby"). The OS's part
- * is to make the machine quiet enough for that:
+ * laptops (the GPD Pocket 4, the MSI Katana) do it the same way from the
+ * OS's side: no S3 ("suspend to RAM") any more, only S0 with the CPU and
+ * the chipset idling as deeply as they can ("modern standby"). Older ones
+ * that still offer S3 can do this too (the boot log says which they
+ * have: acpi_button.c). The OS's part is to make the machine quiet
+ * enough for that:
  *
  *   1. stop every program at its next return to user mode (the freezer):
  *      programs that wait keep waiting, ones that run stop within a slot

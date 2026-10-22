@@ -4798,3 +4798,50 @@ and EN/中 waits in the panel that grows out of it under the mouse. Without
 a battery the language takes the battery's place. Checked in QEMU with
 tools/fakebat.py's battery: the panel grows on hover, the bubble shows on
 the first press, and pinyin types 你好 in xterm.
+
+## 2026-10-22 — Sleep, as on a Mac: the lid, the power button, the lock screen
+
+On a branch of its own (`sleep`, worktree `../MyOS-sleep`), so main's work
+went on beside it. Closing the lid puts the machine to sleep and opening it
+wakes it to the lock screen; so do the power button and the Start menu's new
+Sleep (docs/SLEEP-PLAN.md).
+
+The kernel sleeps the way new laptops do, suspend to idle ("s2idle"): writing
+`mem` to `/sys/power/state` stops every program at its next return to user
+mode (one flag, already tested there for signals), writes the disks' changed
+blocks, turns the screen and backlight off, masks every 8259 line but the
+wake-up ones, holds Linux drivers' MSIs, and lets the idle thread stop the
+1 ms tick (the PIT, or the HPET where the PIT is dead). The CPU halts until
+the lid opens, the power button or a key or click (a key only with the lid
+open). Waking undoes it, and CLOCK_REALTIME and CLOCK_BOOTTIME jump by the
+time asleep, measured with the TSC; CLOCK_MONOTONIC leaves it out, as on
+Linux. The lid (PNP0C0D) and the power button (fixed, or PNP0C0C) come from
+ACPI in `drivers/acpi_button.c`, and appear as Linux names them: "Lid Switch"
+(SW_LID, event3) and "Power Button" (KEY_POWER, event4; KEY_WAKEUP for the
+press that woke it, so it isn't taken for another "sleep"). The boot log says
+what the firmware offers: s2idle, S3, where the lid is and what wakes it,
+for the P2 Max's first stick.
+
+QEMU has no lid, so `tools/fakelid.py` writes an SSDT with one, and a
+SLEEPTEST=1 kernel moves it when a CPU is added in QEMU's monitor: a real
+GPE, QEMU's own AML, then our notify handler. (QEMU 11 wouldn't let the
+first idea, the vmgenid device's guid, change while running.) `make
+test-sleep` passes on both kernels: 1 ms to stop, awake in 0 ms, the tick
+off 99% of the time asleep, QEMU's host CPU at 0% asleep against 83–96%
+awake with a busy loop, the wall clock jumped and the uptime didn't.
+
+On the live disk, `myos-powerd` (root, runit) reads the lid, the button and
+`/run/myos/power` (the Start menu's Sleep writes there) and does what
+`/etc/myos/power.conf` says. Before sleeping it asks the session's myos-idle
+to lock, and waits up to a second for `myos-lock` to say it holds the
+keyboard, so waking never shows the desktop. myos-lock looks like the login
+screen (the photograph, the bands, the clock and date, your name) and checks
+the password through PAM; an account with none gets "Press Enter or click to
+unlock". myos-idle also locks when the screen goes off, and on battery
+sleeps a minute after that. The Start menu's footer has Sleep with a moon
+next to Log off and Turn off. `make ARCH=x86_64 SLEEPTEST=1
+test-sleep-desktop` closes and opens the lid on the whole desktop, sleeps
+from the Start menu and wakes by a key, sleeps and wakes by the power
+button, and unlocks each time (no password, then a wrong one and the right
+one). `make bench` unchanged (docs/performance.md); the gaps are in
+docs/gaps.md. Next: the P2 Max's lid, then S3.

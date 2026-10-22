@@ -1127,3 +1127,64 @@ The speed row matters for builds as well as for power: with no P-state
 driver an Intel processor stays where the firmware left it (often its rated
 speed, 1.1 GHz on the m3-8100Y, whose boost goes to 3.4 GHz), and HWP is
 what lets it climb.
+
+## Sleep: nothing added awake; QEMU stops in 1 ms and is awake in under 1 (2026-10-22)
+
+Sleep (docs/SLEEP-PLAN.md) touches hot paths: the return to user mode (the
+freezer), the idle thread, every interrupt (`cpu_idle_end`), Linux drivers'
+interrupt entry, the keyboard and mouse. Each costs one flag test while
+awake, and the freezer's stop isn't on the way back from a system call at
+all: `signal_check` runs only for a thread whose `sig_check` is set, and
+the freezer sets it. `make bench` (i386, `-icount`), the commit before
+sleep (e15b77c) against the `sleep` branch, three runs each (two for the
+exec line):
+
+| i386, QEMU `-icount` (cycles) | before | after |
+|---|---|---|
+| null syscall, `int 0x80` / `sysenter` | 129 / 160 | 129 / 160 |
+| thread switch | 98 | 98 |
+| open + close; lseek + read 4 KiB; statx | 1701; 1624; 1375 | 1701; 1624; 1375 |
+| fork + exit + wait | 55 392 | 55 392 (one run 72 929, see below) |
+| fork + exec + exit + wait | 93 306–93 410 | 93 463–93 484 (one run 110 923) |
+| exec + exit (ELF `true`) | 38 351–38 425 | 38 609–38 876 |
+| page fault, file / zero | 1590 / 1383 | 1590 / 1383 |
+| slot start jitter (worst) | 4 µs | 4 µs |
+
+Unchanged. The exec lines move between runs of the same kernel by a few
+hundred cycles: they read the disk, and QEMU completes disk commands on the
+host's time, not the counted instructions'. The one run at 72 929 was the
+first, with the other build compiling beside it (a loaded host moves those
+disk completions, and probably an interrupt into the timed loop); the two
+runs after it gave 55 392 exactly, as before.
+
+Sleeping and waking, `make test-sleep` (a busy loop running) and `make
+ARCH=x86_64 SLEEPTEST=1 test-sleep-desktop` (the whole desktop):
+
+| QEMU | i386 | x86_64 | x86_64 desktop |
+|---|---|---|---|
+| lid shut → asleep (programs stopped, disks written, screen off) | 1 ms | 1 ms | 1 ms |
+| the wake-up interrupt → programs running again | 0 ms | 0 ms | 0 ms |
+| the tick off, of the time asleep | 99% | 99% | 99% |
+| the CPU woke, in 4–5 s asleep | 4 times | 4 times | — |
+| QEMU's host CPU, awake (busy loop) → asleep | 96% → 0% | 83% → 0% | — |
+
+The times are the kernel's 1 ms tick: under a millisecond each way. The
+CPU's wake-ups asleep are interrupts that don't wake the machine (the test
+presses a key with the lid shut: down and up) and the one that does; no
+timer wakes it. A whole sleep, from the lid to the kernel, also waits for
+`myos-lock` to be up: myos-powerd gives it at most 1 s.
+
+The time asleep is counted with the TSC, which QEMU's kernel calibrates
+against the PIT once at boot, so QEMU's seconds asleep are approximate. On
+real hardware the TSC is the CPU's own (docs/gaps.md: one that slows when
+idle).
+
+To come from the P2 Max (docs/SLEEP-PLAN.md): the wake time as you see it
+(the lid open → the lock screen's picture), and the battery over 30 minutes
+asleep against 30 minutes on the idle desktop.
+
+| P2 Max (Core m3-8100Y) | value |
+|---|---|
+| lid open → lock screen | |
+| battery, 30 min asleep (mWh) | |
+| battery, 30 min idle desktop (mWh) | |
