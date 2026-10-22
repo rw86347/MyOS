@@ -478,9 +478,15 @@ static void ap_rx_data(struct sim_priv *sim, const struct sim_ap *ap, struct sk_
     const struct ieee80211_hdr *h = (const void *)skb->data;
     if (sim->assoc != ap || !ieee80211_has_tods(h->frame_control))
         return;
-    if (ieee80211_has_protected(h->frame_control) ? !pairwise_ok(sim, ap) : ap->wpa2 && sim->hs[ap - sim_aps].step == 4)
+    bool prot = ieee80211_has_protected(h->frame_control);
+    if (prot ? !pairwise_ok(sim, ap) : ap->wpa2 && sim->hs[ap - sim_aps].step == 4)
         return;                         /* wrong key, or plain text on a protected link */
     unsigned int hl = ieee80211_hdrlen(h->frame_control);
+    if (prot) {                         /* the CCMP header first (ExtIV is always set) */
+        if (skb->len < hl + IEEE80211_CCMP_HDR_LEN || !(skb->data[hl + 3] & 0x20))
+            return;
+        hl += IEEE80211_CCMP_HDR_LEN;
+    }
     if (skb->len < hl + 8 || memcmp(skb->data + hl, rfc1042_header, 6))
         return;
     const u8 *from = h->addr2, *p = skb->data + hl + 8;
@@ -619,7 +625,26 @@ static void sim_tx(struct ieee80211_hw *hw, struct ieee80211_tx_control *control
     struct sim_priv *sim = hw->priv;
     struct ieee80211_tx_info *info = IEEE80211_SKB_CB(skb);
     const struct ieee80211_hdr *h = (const void *)skb->data;
+    struct ieee80211_key_conf *k = info->control.hw_key;
     (void)control;
+    if (skb->len >= 24 && ieee80211_has_protected(h->frame_control) && k &&
+        (k->flags & IEEE80211_KEY_FLAG_PUT_IV_SPACE)) {
+        /* The CCMP header in the room the core left (iwlwifi:
+           iwl_mvm_set_tx_cmd_pn): packet number, ExtIV, key id. */
+        unsigned int hl = ieee80211_hdrlen(h->frame_control);
+        if (skb->len < hl + IEEE80211_CCMP_HDR_LEN) {
+            ieee80211_tx_status_skb(hw, skb);
+            return;
+        }
+        u8 *ccmp = skb->data + hl;
+        u64 pn = (u64)atomic64_inc_return(&k->tx_pn);
+        ccmp[0] = (u8)pn;
+        ccmp[1] = (u8)(pn >> 8);
+        ccmp[2] = 0;
+        ccmp[3] = (u8)(0x20 | (k->keyidx << 6));
+        for (int i = 0; i < 4; i++)
+            ccmp[4 + i] = (u8)(pn >> (16 + 8 * i));
+    }
     for (size_t a = 0; skb->len >= 24 && sim->chan && a < ARRAY_SIZE(sim_aps); a++)
         if (sim_aps[a].freq == sim->chan->center_freq && ether_addr_equal(h->addr1, sim_aps[a].bssid)) {
             ap_rx(sim, &sim_aps[a], skb);
@@ -784,7 +809,10 @@ static int sim_conf_tx(struct ieee80211_hw *hw, struct ieee80211_vif *vif, unsig
     return 0;
 }
 
-/* Keys for "the hardware": kept, compared with what the AP uses. */
+/* Keys for "the hardware": kept, compared with what the AP uses. Like
+   iwlwifi on cards older than the 22000 family (the 7265), it asks the core
+   to leave room for the CCMP header after the 802.11 header, and fills it
+   in itself (sim_tx). */
 static int sim_set_key(struct ieee80211_hw *hw, enum set_key_cmd cmd, struct ieee80211_vif *vif,
                        struct ieee80211_sta *sta, struct ieee80211_key_conf *key)
 {
@@ -792,6 +820,7 @@ static int sim_set_key(struct ieee80211_hw *hw, enum set_key_cmd cmd, struct iee
     (void)vif; (void)sta;
     if (key->cipher != WLAN_CIPHER_SUITE_CCMP || key->keylen != 16 || key->keyidx > 3)
         return -EOPNOTSUPP;
+    key->flags |= IEEE80211_KEY_FLAG_PUT_IV_SPACE;
     bool on = cmd == SET_KEY;
     if (key->flags & IEEE80211_KEY_FLAG_PAIRWISE) {
         memcpy(sim->sta_tk, key->key, 16);

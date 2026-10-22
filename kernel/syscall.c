@@ -410,8 +410,9 @@ static int64_t do_seek(uint32_t fd, int64_t off, uint32_t whence)
         vfs_dir_rewind(f);
         return 0;
     }
+    int64_t end = f->ops && f->ops->size ? (int64_t)f->ops->size(f) : (int64_t)f->inode->size;
     int64_t base = whence == SEEK_SET ? 0 : whence == SEEK_CUR ? (int64_t)f->pos
-                 : whence == SEEK_END ? (int64_t)f->inode->size : -1;
+                 : whence == SEEK_END ? end : -1;
     if (base < 0)
         return -EINVAL;
     int64_t pos = base + off;

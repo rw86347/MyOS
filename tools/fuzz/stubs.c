@@ -3,8 +3,9 @@
 /*
  * stubs.c — the rest of the kernel, as far as the net sources can tell.
  *
- * The five net sources reference exactly 20 symbols they do not
- * define (i686-elf-nm -u says so). Everything below is one of those. The
+ * The kernel sources in FUZZ_KSRCS reference 22 symbols they do not define
+ * (nm -u on the host objects says so): memcmp and strlen come from the C
+ * library, and the other 20 are below, beside a few the targets use. The
  * real net sources are compiled unmodified: whatever the fuzzer finds is a
  * bug in the kernel, not in a rewritten copy of it.
  *
@@ -21,6 +22,7 @@
  *                   reachable without actually waiting.
  */
 
+#include <kheap.h>
 #include <kprintf.h>
 #include <netdevice.h>
 #include <skbuff.h>
@@ -29,6 +31,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <thread.h>
 
 #include "stubs.h"
 
@@ -39,6 +42,11 @@
 
 void *kmalloc(size_t size) { return malloc(size ? size : 1); }
 void  kfree(void *ptr)     { free(ptr); }
+
+/* Packets over 1 KiB. "Physically contiguous" means nothing here; the size
+   is exact rather than rounded to pages, so an overrun past the end of a big
+   packet is caught too. kfree frees it, as in the kernel. */
+void *kmalloc_contig(size_t size) { return malloc(size ? size : 1); }
 
 /* --- clock ----------------------------------------------------------------
    A fake clock the fuzzer owns. Real time would make runs non-reproducible,
@@ -112,6 +120,7 @@ static struct net_device fake_dev = {
     .dev_addr    = { 0x52, 0x54, 0x00, 0x12, 0x34, 0x56 },
     .flags       = IFF_UP | IFF_RUNNING | IFF_BROADCAST,
     .mtu         = ETH_DATA_LEN,
+    .ifindex     = 1,
     .netdev_ops  = &fake_ops,
     .napi        = NULL,
 };
@@ -119,6 +128,11 @@ static struct net_device fake_dev = {
 struct net_device *dev_get_by_name(const char *name)
 {
     return strcmp(name, "eth0") == 0 ? &fake_dev : NULL;
+}
+
+struct net_device *dev_get_by_index(int ifindex)
+{
+    return ifindex == fake_dev.ifindex ? &fake_dev : NULL;
 }
 
 struct net_device *fuzz_dev(void) { return &fake_dev; }
@@ -213,6 +227,12 @@ void net_rx_action(void)
         inject();
 }
 
+/* Nothing sleeps on a wait queue here (net_sleep above is the only wait),
+   so waking one has nobody to wake. */
+struct wait_queue net_wait, poll_wait;
+
+void wq_wake_all(struct wait_queue *q) { (void)q; }
+
 /* --- odds and ends -------------------------------------------------------- */
 
 /* ping(8) reads ICMP through raw sockets. Reading every byte matters: if the
@@ -228,3 +248,29 @@ void raw_icmp_input(const uint8_t *ip, uint32_t len)
 
 /* No signals in a fuzz run; a pending one would just abort the operation. */
 int signal_pending(void) { return 0; }
+
+/* Only linked, never reached: nothing in these sources adds page frags to an
+   skb, and the one thread they start (the DHCP lease after a link change)
+   is never started here. Reaching any of these means something is badly
+   wrong. thread_create has to be here even though the link works without
+   it: libSystem exports a Mach thread_create, and the kernel's call would
+   quietly bind to that instead. */
+void put_page(struct page *page)
+{
+    (void)page;
+    fprintf(stderr, "stubs: put_page on an skb frag nothing here creates\n");
+    abort();
+}
+
+struct thread *thread_create(const char *name, void (*fn)(void *), void *arg)
+{
+    (void)fn; (void)arg;
+    fprintf(stderr, "stubs: thread_create(\"%s\") with no scheduler\n", name);
+    abort();
+}
+
+void thread_exit(void)
+{
+    fprintf(stderr, "stubs: thread_exit with no threads\n");
+    abort();
+}

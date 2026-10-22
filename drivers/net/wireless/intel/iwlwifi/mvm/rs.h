@@ -2,11 +2,11 @@
 /*
  * mvm/rs.h — MyOS's own version. Rate scaling picks how fast to send to
  * each station. Old Intel cards did it in the driver (Linux's rs.c, a big
- * GPL-only file we don't take). Every card our copy supports (22000 family
- * and later, the AX201 among them) does it in firmware ("TLC offload",
- * rs-fw.c): the driver only says what the station can do and listens for
- * the firmware's notes. So this header declares that path, plus the few
- * names the shared code mentions for the old one (rs-myos.c).
+ * GPL-only file we don't take). Cards from the 22000 family on (the AX201
+ * among them) do it in firmware ("TLC offload", rs-fw.c): the driver only
+ * says what the station can do and listens for the firmware's notes. The
+ * older ones we load (the 7265) get one fixed rate table instead
+ * (rs-myos.c), kept in struct iwl_lq_sta below.
  */
 #ifndef __rs__
 #define __rs__
@@ -52,8 +52,8 @@ struct iwl_lq_sta_rs_fw {
 	} pers;
 };
 
-/* The driver-side rate scaling's state: only the parts sta.c touches when
-   it sets up an old card's aggregation limits. Never live on our cards. */
+/* An old card's rate state: the fixed table rs-myos.c sends, and the
+   aggregation limit sta.c keeps in it. */
 struct iwl_lq_sta {
 	struct iwl_lq_cmd lq;
 	struct {

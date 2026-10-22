@@ -45,8 +45,12 @@ int wifi_xmit(struct sk_buff *skb, struct net_device *dev)
     if (ap->state < IEEE80211_STA_AUTHORIZED && !eapol)
         goto drop;                      /* the port is closed: EAPOL only */
 
+    /* Room in front for the 802.11 header and LLC/SNAP in place of the
+       Ethernet header, and for the CCMP header once there is a key: some
+       drivers want it from us (iwlwifi on the 7265, key.c). */
     unsigned int hdrlen = ap->sta.wme ? 26 : 24;
-    if (headroom(skb, local->hw.extra_tx_headroom + hdrlen + 8 - ETH_HLEN))
+    unsigned int iv = c->ptk ? c->ptk->conf.iv_len : 0;
+    if (headroom(skb, local->hw.extra_tx_headroom + hdrlen + 8 + iv - ETH_HLEN))
         goto drop;
     skb_pull(skb, ETH_HLEN);
     u8 *llc = skb_push(skb, 8);

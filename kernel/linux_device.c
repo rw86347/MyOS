@@ -119,7 +119,9 @@ char *devm_kasprintf(struct device *dev, gfp_t gfp, const char *fmt, ...)
 
 /* A driver's probe asks for its firmware and returns; the file is read
    and handed over on a work thread (iwlwifi then tries older versions
-   from the callback, one request at a time). */
+   from the callback, one request at a time). A miss is quiet: the driver
+   is walking a list of names, and says once, in the log, if none exists.
+   request_firmware() itself still reports a single missing file. */
 struct fw_later {
     struct work_struct work;
     struct device *dev;
@@ -132,7 +134,7 @@ static void fw_later_run(struct work_struct *w)
 {
     struct fw_later *l = container_of(w, struct fw_later, work);
     const struct firmware *fw;
-    if (request_firmware(&fw, l->name, l->dev))
+    if (firmware_request_nowarn(&fw, l->name, l->dev))
         fw = NULL;
     l->cont(fw, l->context);
     kfree(l);

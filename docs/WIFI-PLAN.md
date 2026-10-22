@@ -278,6 +278,8 @@ Each step ends with something visible in QEMU, except W7.
   test-uefi-shell` boots with it and prints "wifi: iwlwifi built in".
 - [ ] **W7. iwlwifi on the MSI.** Firmware loads, scan, join the home
   network. Real hardware only.
+  The GPD Pocket 4's AX210 (8086:2725, `iwlwifi-ty-a0-gf-a0-89.ucode` +
+  `.pnvm`) is on the live disk too (2026-10-21); not yet run.
 - [ ] **W8. Remote control over Wi-Fi.** A small agent on MyOS connects out
   to the Mac: commands, kernel log, screenshots from `/dev/fb0`. Then
   network boot, so a new kernel needs no USB stick.

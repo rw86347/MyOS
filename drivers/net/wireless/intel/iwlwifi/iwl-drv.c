@@ -355,22 +355,24 @@ static int iwl_request_firmware(struct iwl_drv *drv, bool first)
 		drv->fw_index--;
 
 	if (drv->fw_index < ucode_api_min) {
-		IWL_ERR(drv, "no suitable firmware found!\n");
+		/* No file in /lib/firmware for this card. The boot screen
+		   is the step list; the versions we looked for are in the log. */
+		IWL_INFO(drv, "no suitable firmware found!\n");
 
 		if (ucode_api_min == ucode_api_max) {
-			IWL_ERR(drv, "%s-" FW_API_FMT " is required\n",
-				fw_name_pre, FW_API_ARG(ucode_api_max));
+			IWL_INFO(drv, "%s-" FW_API_FMT " is required\n",
+				 fw_name_pre, FW_API_ARG(ucode_api_max));
 		} else {
-			IWL_ERR(drv,
-				"minimum version required: %s-" FW_API_FMT "\n",
-				fw_name_pre, FW_API_ARG(ucode_api_min));
-			IWL_ERR(drv,
-				"maximum version supported: %s-" FW_API_FMT "\n",
-				fw_name_pre, FW_API_ARG(ucode_api_max));
+			IWL_INFO(drv,
+				 "minimum version required: %s-" FW_API_FMT "\n",
+				 fw_name_pre, FW_API_ARG(ucode_api_min));
+			IWL_INFO(drv,
+				 "maximum version supported: %s-" FW_API_FMT "\n",
+				 fw_name_pre, FW_API_ARG(ucode_api_max));
 		}
 
-		IWL_ERR(drv,
-			"check git://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git\n");
+		IWL_INFO(drv,
+			 "check git://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git\n");
 		return -ENOENT;
 	}
 

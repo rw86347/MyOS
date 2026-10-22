@@ -4,7 +4,10 @@
 # fetch-firmware.sh — the firmware files MyOS's drivers load at run time,
 # from Linux's linux-firmware collection (kernel.org): the programs the
 # devices run themselves. Today: Intel's Wi-Fi (iwlwifi) for the AX201 in
-# the MSI laptop, all three chip revisions it may be (docs/WIFI-PLAN.md).
+# the MSI laptop, all three chip revisions it may be (docs/WIFI-PLAN.md),
+# the AX210 in the GPD Pocket 4 (its .ucode and its .pnvm, the
+# per-platform settings iwlwifi loads with it), and the Wireless-AC 7265
+# in the GPD P2 Max.
 #
 #   tools/fetch-firmware.sh DIR     puts them in DIR (the image's /lib/firmware)
 #
@@ -21,6 +24,9 @@ FILES="
 intel/iwlwifi/iwlwifi-Qu-b0-hr-b0-77.ucode      2d3dd82853e1f5859de168fc4c3e2078703cb5c62c38ae39658c28ca5b664443
 intel/iwlwifi/iwlwifi-Qu-c0-hr-b0-77.ucode      73b622e56919f0e8707448458b1ac44c5bdb19cdec40cf64f1afda030411ed17
 intel/iwlwifi/iwlwifi-QuZ-a0-hr-b0-77.ucode     8e80445e8b4871492c6b690d30118cbef548cd9e0518f70e73a6f3875b7e9602
+intel/iwlwifi/iwlwifi-ty-a0-gf-a0-89.ucode      cd4f8fe2242c115cf8687878c2534fbb436fbaa7172f49a1f69952a23c686ac9
+intel/iwlwifi/iwlwifi-ty-a0-gf-a0.pnvm          cc4c0de4593292490459f1aa8c1606ea370a0307f5be9089ef99a0aa8e36be7a
+intel/iwlwifi/iwlwifi-7265D-29.ucode            c52bcaa0595f64d5fb32b7db3dd4b832ea7bf78f1037bcafc19d9c0f5c5c617e
 LICENSES/LICENCE.iwlwifi_firmware               16d5040c7cf851fc693b7542e20870935b99802533ea1bfd231c377a2305e5c5
 "
 

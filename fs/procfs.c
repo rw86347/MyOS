@@ -530,10 +530,12 @@ static void netdev(struct gen *g)
         if (!d)
             continue;
         put(g, "  "), put(g, d->name), put(g, ": ");
-        put_ul(g, d->stats.rx_bytes), put(g, " "), put_ul(g, d->stats.rx_packets);
-        put(g, " 0 0 0 0 0 0 ");
-        put_ul(g, d->stats.tx_bytes), put(g, " "), put_ul(g, d->stats.tx_packets);
-        put(g, " 0 0 0 0 0 0\n");
+        put_ul(g, d->stats.rx_bytes), put(g, " "), put_ul(g, d->stats.rx_packets), put(g, " ");
+        put_ul(g, d->stats.rx_errors), put(g, " "), put_ul(g, d->stats.rx_dropped);
+        put(g, " 0 0 0 "), put_ul(g, d->stats.multicast), put(g, " ");
+        put_ul(g, d->stats.tx_bytes), put(g, " "), put_ul(g, d->stats.tx_packets), put(g, " ");
+        put_ul(g, d->stats.tx_errors), put(g, " "), put_ul(g, d->stats.tx_dropped);
+        put(g, " 0 0 0 0\n");
     }
 }
 
@@ -695,7 +697,8 @@ static void mounts(struct gen *g, int info)
     }
 }
 
-static int32_t gen_read(struct file *f, void *ubuf, uint32_t n)
+/* The file's contents now, in a kmalloc'd *buf of *len bytes; -errno. */
+static int gen_fill(struct file *f, char **bufp, uint32_t *len)
 {
     uint32_t kind = f->inode->fs_ino % PID_STEP, pid = f->inode->fs_ino / PID_STEP;
     struct process *p = NULL;
@@ -745,9 +748,21 @@ static int32_t gen_read(struct file *f, void *ubuf, uint32_t n)
                                  "write_bytes: 0\ncancelled_write_bytes: 0\n"); break;
     case P_WCHAN:        put(&g, "0"); break;
     }
+    *bufp = buf;
+    *len = g.n;
+    return 0;
+}
+
+static int32_t gen_read(struct file *f, void *ubuf, uint32_t n)
+{
+    char *buf;
+    uint32_t len;
+    int err = gen_fill(f, &buf, &len);
+    if (err)
+        return err;
     int32_t r = 0;
-    if (f->pos < g.n) {
-        r = (int32_t)(n < g.n - f->pos ? n : g.n - f->pos);
+    if (f->pos < len) {
+        r = (int32_t)(n < len - f->pos ? n : len - f->pos);
         if (copy_to_user(ubuf, buf + f->pos, (uint32_t)r) < 0)
             r = -EFAULT;
         else
@@ -755,6 +770,17 @@ static int32_t gen_read(struct file *f, void *ubuf, uint32_t n)
     }
     kfree(buf);
     return r;
+}
+
+/* Its length if it were read now (stat still says 0, as on Linux). */
+static uint32_t gen_size(struct file *f)
+{
+    char *buf;
+    uint32_t len;
+    if (gen_fill(f, &buf, &len))
+        return 0;
+    kfree(buf);
+    return len;
 }
 
 /* The mount tables are pollable as on Linux: always readable, and
@@ -812,7 +838,7 @@ static int32_t gen_write(struct file *f, const void *ubuf, uint32_t n)
 }
 
 static const struct file_ops gen_ops = {
-    .read = gen_read, .write = gen_write, .open = gen_open, .poll = gen_poll,
+    .read = gen_read, .write = gen_write, .open = gen_open, .poll = gen_poll, .size = gen_size,
     .change_count = gen_change_count,
 };
 
@@ -837,7 +863,10 @@ static const char watches_text[] = "4096\n", instances_text[] = "128\n", queued_
 /* /proc/version, in Linux's words and with uname's release (sys_info.c).
    LibreOffice's launcher (oosplash) reads it to see that /proc is there,
    and stops with "/proc not mounted" if it isn't. */
-static const char version_text[] = "Linux version 6.1.0-MyOS (myos@myos) (gcc) #1 MyOS\n";
+#ifndef MYOS_VERSION
+#define MYOS_VERSION "unknown"
+#endif
+static const char version_text[] = "Linux version 6.1.0-MyOS (myos@myos) (gcc) #1 MyOS " MYOS_VERSION "\n";
 
 /* A read-only file whose bytes are `text` (no copy). */
 static struct inode *fixed(struct inode *dir, const char *name, const char *text, uint32_t len)
