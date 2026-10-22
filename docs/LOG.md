@@ -2,6 +2,269 @@
 
 Short dated notes after each work session: what was done, what broke, what was learned.
 
+## 2026-10-22 — Three fingers change desktop, and one taskbar for all of them
+
+As on a Mac: three fingers sliding left on the touchpad bring the desktop on
+the right (right brings the one on the left, no wrapping round), up opens
+Mission Control, down closes it. The kernel's touchpad code (`hid.c`) decides
+it: once a third finger is down, the touch is a swipe until every finger is
+up, moves and clicks nothing, and sends one key when the fingers have gone a
+fifth of the pad one way (`SWIPE_COUNTS`, a guess until the P2 Max tries it).
+The keys are F14-F17 (`HID_SWIPE_*`), which no keyboard here has; myos-menu
+grabs them and sends `_NET_CURRENT_DESKTOP` to IceWM or starts myos-mission,
+which closes on F17 itself (it has the keyboard while open). Two things had
+to change on the way: the USB keyboard table stopped at 0x67, so F13-F24 now
+map too, and event0 now lists 183-194 (F13-F24) in its key bits, because
+libevdev (X's evdev driver) throws away keys a device doesn't list. IceWM's
+`TaskBarShowAllWindows=1` puts every desktop's windows on the taskbar, like
+the Dock: a click goes to the window's desktop, Shift+click brings the window
+here. `make test-hid` has six new swipe checks (32 pass); `make test` and
+both `test-usb-hid` pass. In QEMU, through its USB keyboard and the same
+kernel path, left twice went 0 to 1 to 2, right came back and stopped at 0,
+up and down opened and closed Mission Control, twice. Two traps for the
+next test: QEMU's usb-kbd sends F13 and up 4 usages too far (its `f13` is
+F17; `f20`, `lf` and `0x5c` give F14, F15 and F16), and in that VM only the
+first XTest press of a grabbed key arrives, while real ones always do.
+
+## 2026-10-22 — Chromium and Firefox get the theme's title bar
+
+Chromium drew its own title bar (tabs and buttons in it), so it didn't look
+like WritePerfect and the rest, which IceWM frames with Golden Hour. Now
+`browser.custom_chrome_frame` is false for new profiles
+(`/usr/lib/chromium/initial_preferences`) and, once, for older ones
+(`/etc/myos/xsession`; a marker in `~/.config/chromium` keeps it to once, so
+a later change in Chromium stays). Firefox on the 32-bit disk:
+`browser.tabs.inTitlebar` 0 (`/usr/lib/firefox/defaults/pref/myos.js`).
+Checked by a screenshot of both windows in QEMU; the Firefox one is not
+tried yet.
+
+## 2026-10-22 — Pushing into the corner opens Mission Control over any window
+
+WritePerfect opens maximized (`gtk_window_maximize`, as a program should), and
+then nothing reaches the curl: it is a desktop-type window, under every window
+by design, and IceWM hides a maximized window's border, so its close button is
+in that very corner and the curl can't simply go on top. Now pushing the mouse
+into the corner opens Mission Control, as on the Mac, whatever covers it.
+myos-menu puts two XFixes pointer barriers along the top and right edges for
+the curl's length (the right one just off the screen, so the last column is
+still reachable) and reads XInput 2.3's barrier events, which come only while
+the pointer is pressed against them. Pressure is counted as GNOME's hot corner
+does: at most 15 px an event, leaking 100 px a second, 100 px opens it, once
+per push. Sliding along an edge, a flick, and pushing while a button is held
+or a menu has the pointer don't count. The sysroot has libXi and libXfixes and
+their protocol headers (the constants) but not the libraries' headers, so the
+few calls and structs are written out, as myos-mission does for Composite. Tried on Xvfb with a harness that runs the real code (the
+functions cut out of myos-menu.c) against XTest relative motion: all of the
+above, a two-second push opening it once, and again after leaving or a
+second's rest. Not yet tried on a touchpad.
+
+## 2026-10-22 — The P2 Max's Wi-Fi: every encrypted frame was dropped
+
+With the fixed rate table in, the P2 Max still had no address: COMPLETED,
+2607 frames in, 3 out, all three the handshake's (437 bytes: message 2
+twice, message 4). DHCP's DISCOVER never reached the driver. The 7265's
+iwlwifi asks the stack to leave 8 bytes after the 802.11 header for the
+CCMP header (`IEEE80211_KEY_FLAG_PUT_IV_SPACE`; the AX201 writes it
+itself). `ip_frame` leaves 2 bytes in front of a packet, `wifi_xmit` grew
+it by exactly the 802.11 header and LLC, and `wifi_key_protect` then found
+no room and dropped the frame. The handshake got through because it is
+sent before there is a key. Now `wifi_xmit` makes room for the CCMP header
+too. The simulated radio in `make test` had the AX201's behaviour, so the
+test never went this way; it now asks for the room as the 7265 does and
+writes the header as iwlwifi does. Before the fix the WPA2 test failed with
+"TX: 284 bytes (2 packets)", the same two frames as the P2 Max's first
+photo; after it, 235 passed. `/proc/net/dev` (so `ifconfig` and Network
+Check) shows the errors and drops each device counts, where it showed 0.
+Only a P2 Max stick can show the rate table and this together on air.
+
+## 2026-10-22 — Mission Control glides, and four desktops on smoked glass
+
+On the stick, the curl's Mission Control jumped into place and had no desktops.
+Now `myos-mission` glides every window from where it is to its place in 250 ms
+with myos-wm's cubic ease-out, dims the desktop as it goes, and drops the Spaces
+bar in from the top; going back glides them home, the chosen window on top.
+The bar is a slightly gray tint over the wallpaper, like smoked glass, with a
+miniature of each of IceWM's four desktops (now set in `prefoverride`), the
+current one ringed in white; a click on another one switches to it
+(`_NET_CURRENT_DESKTOP`). The taskbar and icons are drawn where they are under
+the dimming, so the first frame is the screen as it was. "Reduce motion"
+skips the glide. The Wayland session starts with four desktops too, and its bar
+has the same glass. Tried on the Mac's Xvfb with twm: frames between the desktop
+and the layout both ways, the first one the desktop itself, the bar's desktops,
+and both clicks. myos-wm only compiles here; it is not tried.
+
+Dragging a window toward another desktop closed Mission Control: a press was
+taken as a click at once. Now a press waits. Let go without moving and it is
+the click it was; move past 6 pixels and the window follows the mouse. Over
+another desktop's miniature it shrinks to that size and the miniature gets a
+blue ring; dropped there, IceWM moves it (`_NET_WM_DESKTOP`, source 2), the
+miniature shows it, and the windows left glide to a new layout. Dropped
+anywhere else, or on this desktop, it glides back. When the drag starts,
+everything but the dragged window is drawn once into a second pixmap, so
+each move of the mouse costs one copy and one window, not the whole screen.
+Tried on Xvfb with twm: a 3-pixel wiggle stays a click, the follow, the
+shrink and ring, the request naming the right window and desktop, the
+relayout, the glide back, Escape in the middle of a drag, and a click still
+going to its window.
+
+## 2026-10-21 — The page curl opens Mission Control on the X11 desktop
+
+A click on the curl runs `live/myos-mission`: this desktop's windows spread
+out with myos-wm's `layout.c`, over the wallpaper dimmed 32%. The one under
+the mouse gets myos-wm's blue ring and its title. A click goes to it
+(`_NET_ACTIVE_WINDOW`, as a pager); Escape or the background goes back.
+The pictures come from the Composite extension, which keeps each child of
+the root in a pixmap of its own. Under IceWM those children are the frames,
+so the frame is asked for; a program's own window has no pixmap (BadMatch).
+The first version did not compile, asked for the programs' windows, read
+the background after covering the screen in black, and grabbed F3, which
+took it from every program (WritePerfect's Help); no key opens it now.
+Tried on the Mac's Xvfb with twm: the layout, covered parts drawn whole,
+ring and title following the mouse, the click naming the right window,
+Escape and the background closing it. Not yet tried under IceWM on a stick.
+
+Checked the merge below: both kernels link with no new warnings, and
+`make test` passes (235, drmtest 113). The i386 `packages.lock` had its
+`world` line set by hand at the merge, so the build stopped noticing that
+the lock has no IBus; it is back, and the i386 live build asks for
+`fetch-live.py --arch x86 --update` again. myos-wm on i386 also needs a new
+sysroot (delete `build/live/sysroot/.done`): the old one has no wlroots.
+
+## 2026-10-21 — The login screen: a live-disk note, and no X cursor
+
+The bottom of the login screen now says only "No password is needed on the
+Live Disk: just press Enter" (shown while `/usr/bin/myos-install` is there,
+which the installer removes from the system it installs). The "add or
+change users" lines and the desktop chooser are gone; the Wayland preview
+is now picked by hand: `echo wayland > /var/lib/myos-login/session`. X starts
+with `-nocursor`, and myos-login puts the arrow on the root window too, so
+X's big X cursor never shows: not before the login screen, not between a
+login and IceWM. Checked by screenshots in QEMU (login, 0 s and 2 s after
+Enter, the desktop).
+
+## 2026-10-21 — Why the P2 Max joined Wi-Fi but couldn't get online
+
+Network Check on the P2 Max: wpa_supplicant COMPLETED, but wlan0 had no
+address, 2074 frames in and 2 out. The 2 were the 4-way handshake replies.
+The card is a Wireless-AC 7265 (`7265D-29.ucode`), whose firmware doesn't
+choose rates: the driver gives it a table per station (LINK_QUALITY).
+`rs-myos.c` only had the newer cards' firmware path, so it warned and sent
+nothing. After the link is authorized, every data frame says "use the
+station's table" (`TX_CMD_FLG_STA_RATE`, `mvm/tx.c`), so DHCP's DISCOVER
+never went out; the handshake frames carry their own rate. Now an old card
+gets one fixed table: the AP's legacy rates, fastest first, the slowest
+filling the rest. The firmware steps down it on retries. Not real rate
+scaling (docs/gaps.md). Compiles for x86_64; only a P2 Max stick can test it.
+
+## 2026-10-21 — Network Check on the desktop
+
+Wi-Fi joins on real hardware but nothing loads. `live/overlay/usr/bin/
+myos-netcheck` walks the steps a web page needs, in order: the link
+(`wpa_cli`, `iw`), the address and packet counts, the default route, the
+nameserver, ping to the gateway and to 1.1.1.1 / 8.8.8.8 by number, a DNS
+question sent straight to the DHCP nameserver and to public ones (python, past
+resolv.conf), lookups through musl, HTTP by number, a login-page check, and
+HTTPS. The first FAIL is the answer. It fits one xterm screen for a photo and
+is saved in `~/network-check.txt`. `/etc/icewm/startup` links it onto every
+Desktop as `Network Check.command`. Desktop names with an unknown extension
+run when double-clicked, as `.command` files do on the Mac. Take it out once
+Wi-Fi is online.
+
+## 2026-10-21 — Mission Control merged onto main
+
+The Wayland window server (`live/myos-wm`, Mission Control) and the kernel
+it needs (DRM/KMS, the input seat, timerfd, epolls inside epolls) are on
+`main` in both repos. The login screen offers "MyOS (Wayland, preview)"
+beside the X11 desktop, and still makes the runtime folder IBus's pinyin
+needs. The commits from just before the merge are
+`backup/main-before-mission-control` (kernel `6911958`, live `d4dfb57`).
+To undo the merge and keep this history: `git revert -m 1 78863ee` in the
+kernel repo and `git revert -m 1 9bc938c` in `live`. To put `main` back
+where it was: `git reset --hard backup/main-before-mission-control` in
+each repo. Either one after stashing, so uncommitted work stays. Not on
+a stick yet.
+
+## 2026-10-21 — Boot screen is the step list again
+
+The laptop screen had grown extra lines under the steps: the kernel config
+("built-in, generation 1", "no good copy" on an empty myos-config
+partition), one "not in /lib/firmware" per iwlwifi version it tried, the
+"no suitable firmware" report, then runit's "enter stage" and "MyOS is
+up." Those are status, so they stay in the log. `kconfig` reports with
+`klog`. The async firmware loader uses `firmware_request_nowarn` (iwlwifi
+walks several names, then says once with `IWL_INFO`). A bad built-in
+config is still a `kprintf` on the screen. (`/sbin/init` first sent
+runit's output to `/var/log/init.log`; that did nothing, because runit
+opens `/dev/console` again itself. `myos-console` pointing `/dev/console`
+at the serial port, with TIOCCONS, is what keeps runit off the screen.)
+
+## 2026-10-21 — The screen dims, then goes off, sooner on battery
+
+The power-saving slider now also sets how long the screen stays on without
+input: 1, 5 or 15 minutes on battery (Best battery life, Balanced, Best
+performance), twice that plugged in or without a battery. 20 s before, it
+dims to 30%. The kernel has the panel's backlight from ACPI
+(`drivers/backlight.c`: `_BCL` levels, `_BCM` to set, `_BQC` to read) as
+Linux's `/sys/class/backlight/acpi_video0`, set only in the acpi thread;
+`live/myos-idle` sleeps on X's SYNC IDLETIME alarms and reads the slider
+when one fires. `make test-battery` (both kernels) checks the backlight
+with a fake panel in `tools/fakebat.py`; `live/tools/idle-desktop.qs` checks
+dim, off, back and the slider's times on the live desktop. Learned: in a
+busy QEMU the guest clock ran at about 0.65x, so the test's waits are
+`sleep` in the machine, not on the Mac.
+
+## 2026-10-21 — Wi-Fi and Sound menus match the Mac
+
+The speaker and the Wi-Fi icon open the same kind of bubble as the battery
+card: a rounded menu with a point on the tray icon. Sound is the Mac's
+menu (slider, then the playback devices, then Sound Settings). Wi-Fi is
+the Mac's menu (the switch, a phone's hotspot when one is nearby, known
+networks, Other Networks, Wi-Fi Settings). Choosing an output writes
+`~/.asoundrc`, which new programs open. Both i386 and x86_64 tray programs
+compile. Not tried on a desktop yet.
+
+## 2026-10-21 — Battery pop-up on the live disk
+
+The tray battery card is the Golden Hour synthesis: a large percent, time
+to empty or to full beside it, and a line that says whether the machine is
+plugged in. The picture is `live/assets/themes/golden-hour/battery-popup.png`
+(tray on the bottom). `myos-battery` is on both live extras and in
+`build/x86_64/myos-live-uefi.img`.
+
+## 2026-10-21 — Two-finger scrolling and Mac-style dragging on the touchpad
+
+`drivers/hid/hid.c` now keeps each touchpad finger by its contact ID (the
+P2 Max's pad sends one finger per report). Two fingers scroll in wheel
+clicks, natural direction, about 25 per swipe the length of the pad; a quick
+two-finger tap is a right click; while the pad is pressed, any finger that
+moves more than 12 counts from where it was at the press drags, so a thumb
+can hold the click in a corner while another finger moves. Settings > Mouse
+& Keyboard has "Scroll with two fingers" (mouse.conf `scroll=`), written to
+`/sys/module/hid/parameters/two_finger_scroll` (Y/N, group input) by
+Settings and at each login by myos-xsettings. `make test-hid`: 24 checks
+(hybrid-mode drag with a wobbling thumb, scroll off); the switch checked as
+the live user in QEMU. Not yet tried on the P2 Max itself.
+
+## 2026-10-21 — Upgrade from the USB stick
+
+An installed MyOS can be replaced from a newer (or older) live stick without
+partitioning and without formatting. `myos-install` asks first when it finds
+`myos-root` and `myos-data` on a disk it can upgrade. The helper's new
+`mode=upgrade` saves `/etc` and locally changed programs onto `myos-data`,
+rsyncs the stick onto `myos-root` (`--delete-after`, a keep-list from the
+checksum manifest), puts the people back, and writes the boot files last.
+`/usr/lib/myos/release` and `/usr/lib/myos/manifest` record the stick; the
+kernel's `uname -v` carries the same date-gitid. Space is checked on root,
+data and the boot area before anything is written. `make ARCH=x86_64
+test-upgrade` passed on one built image (q35 + NVMe, 184 s): install, plant
+a home file, an edited `/etc/motd` and a changed `/usr/bin/ldd`, `--probe`,
+the helper stopped after copy and run again (16 s + 17 s), the upgraded disk
+boots with all of them right, wheel kept, no stick ssh keys. The manifest
+adds about 85 s to the image's build-time first boot (12 s to 97 s: hashing
+35180 files under TCG). Not run yet: i386 BIOS (`pc:ide`), the window's
+pages, a stick of a newer build. Extra apk packages, a shared Windows EFI
+partition, and a previous system to boot back into are later.
+
 - 2026-10-01: Project created. Plan in ROADMAP.md. Next: Step 0 (toolchain).
 - 2026-10-01: Steps 0 + 1 done. Toolchain via Homebrew (brew downloads from ghcr.io kept hanging —
   Ctrl-C and re-run fixes it; skipped GRUB since we boot with our own MBR). Wrote MBR bootloader
@@ -4244,6 +4507,128 @@ arm64 build and `make ARCH=arm64 test`. All pass. The clean build found one
 thing: WritePerfect's C++ include path was worked out before a clean build
 had unpacked the sysroot (fixed in myos-live).
 
+
+## 2026-10-17 (night) — MyOS builds its own kernel; the processor's power savings
+
+Worked in a MyOS VM (QEMU, `-cpu max`, the live stick's image as its disk
+and a second disk holding this tree), driven over its serial console:
+- **MyOS compiles its own kernel.** With the live disk's gcc 13.2, NASM 2.16
+  and binutils, `make ARCH=x86_64` builds `kernel.bin` inside MyOS (the
+  Makefile now falls back to the native `gcc`/`ld` on an x86_64 Linux-like
+  system without `x86_64-elf-gcc`, with the flags Alpine's gcc needs turned
+  off: PIE, stack-clash protection, CET, _FORTIFY_SOURCE). NASM 2.16 refused
+  `arch/x86_64/switch.asm`'s `extern` of a symbol it also defines; gone.
+  The self-built kernel went onto the VM's ESP (`myos-mkesp`, the
+  installer's FAT writer), and the VM booted it.
+- **A bug found from inside: `/proc` files measured 0 bytes.** curl couldn't
+  resolve names in MyOS: its resolver (c-ares) reads `/etc/resolv.conf`
+  (a link to `/proc/net/dns`) by seeking to the end to learn its size, and a
+  file made when it is read has no size until then. `lseek(SEEK_END)` now
+  asks the file (`file_ops.size`); `/proc`'s made-when-read files answer by
+  making their text. `stat` still says 0, as on Linux. On the self-built
+  kernel `curl https://github.com` works.
+- **Claude Code starts in MyOS**: `claude --version` in 1.7 s, and the full
+  screen program draws, passes its connectivity check and reaches "Select
+  login method" (not logged in: that is Rodger's account). It asks for
+  `epoll_pwait2` (441) and falls back.
+- **The processor's power savings** (KERNEL-CONFIG.md §10 step 9, the
+  processor's part): `arch/*/cpupower.c` (one file, twice) sets them at
+  boot in power-saving mode: speed by Intel HWP or AMD CPPC, boost off, C1E,
+  idle by MWAIT down to the config's deepest state (Intel Core), clock
+  modulation. MSRs that may be missing go through `rdmsr_safe` /
+  `wrmsr_safe` (a #GP now finds the exception table, as page faults do; a
+  self-test makes one), and each write is read back. The kernel config
+  gained the Intel Core family (the P2 Max, the Katana) with C7-C10;
+  Settings knows it. The energy meter (RAPL) is at
+  `/sys/class/powercap/intel-rapl:0/energy_uj`. Checked in QEMU with
+  Intel, AMD and Skylake CPU models; the real numbers need the P2 Max
+  (docs/performance.md).
+- Found, not fixed: the clock loses the timer ticks an emulator drops (the
+  VM's clock ran at 0.6x real time; docs/gaps.md has the proposed fix).
+
+Tests: i386 `make test` (234 self-tests, 0 failed), x86_64 `make test`
+(UEFI boot), the x86_64 self-test build (the new MSR checks pass).
+
+## 2026-10-18 — USB hubs
+
+A keyboard, mouse or stick behind a hub used to be ignored ("a hub: not
+supported yet"); a laptop's built-in keyboard and touchpad can sit behind
+an internal hub, and the P2 Max has few ports. Now `drivers/usb/usb_hub.c`
+runs USB 2 hubs:
+- It reads the hub descriptor (ports, power-on time, its transaction
+  translator's think time), powers each port, and for each one that has
+  something: reset, speed from the port status, and `usb_hub_attach`.
+- `xhci.c` addresses a device behind hubs with a route string (the hub
+  ports on the way, 4 bits each) and its root port; a low- or full-speed
+  one behind a high-speed hub also names that hub's translator. A hub's
+  own slot says it is a hub (ports, think time). Root ports and hub ports
+  share one `enumerate()`. Devices are named by where they are: `usb 1-5.3.1`
+  is port 1 of the hub on port 3 of the hub on root port 5.
+- The hub's interrupt endpoint reports which ports changed; the report
+  (in the interrupt) only asks the usb thread to look (`usb_work`), which
+  then sends the hub's requests. So a keyboard plugged into a hub later
+  works, and a pulled-out one is reported (and, as on a root port, its
+  memory not yet given back).
+`make test-usb-hub` (i386 by BIOS, x86_64 by UEFI, no PS/2 controller):
+two hubs deep, a keyboard, mouse, tablet and USB stick behind them, a
+keyboard plugged in and pulled out while running. Passes on both;
+test-usb-hid and test-usb still pass. Not yet: a USB 3 hub's USB 3 side,
+and a USB 2 hub's translator on real hardware (QEMU's hub is USB 1.1).
+
+## 2026-10-21 — The P2 Max boots MyOS; its touchpad moves like a mouse
+
+The live stick started on the GPD P2 Max (once the stick held the live
+image: the "MYOSDEBUG" stick boots a UEFI shell on purpose). Keyboard and
+touchpad worked, but the touchpad pointed where the finger was, like a
+touch screen, and clicking failed: the pad is a Windows precision touchpad
+(Digitizer page, Touch Pad collection), which reports finger positions,
+and every absolute pointer went to the touch screen path, where a finger
+down is a held left button. Now `hid.c` tells a Touch Pad collection from
+a touch screen or tablet: it follows the first finger by contact ID, sends
+the difference between its reports as mouse movement (a swipe across the
+pad is 1500 counts; remainders carried), treats a touch under 180 ms that
+moved under 40 counts as a left click, passes the pad's button through,
+and ignores fingers the pad marks as not confident (palms). QEMU has no
+USB touchpad, so `make test-hid` compiles `hid.c` for the Mac and feeds it
+a precision touchpad's descriptor and reports (14 checks). A touch screen
+or tablet's report descriptor, and a touchpad's, now go to dmesg, for the
+next device. Also: `test-usb-hub` had picked up `test-usb-hid`'s recipe as
+well as its own (a Makefile slip); fixed.
+
+## 2026-10-21 — A slower touchpad, mouse speed in Settings, bigger desktop scales
+
+On the P2 Max the touchpad was far too fast: a swipe across the pad is now
+600 counts (it was 1500), and a tap may move 16 (it was 40). Settings >
+Mouse & Keyboard has two new sliders, Speed (Slow to Fast) and Acceleration
+(None to Most), kept in the same file as the pointer size; `myos-xsettings`
+applies them at once to X's acceleration and to each pointer's constant
+deceleration (XInput2), and at every login. Settings > Displays' five
+buttons are now one slider from Larger Text to More Space, 100% to 300% in
+25% steps (it was 200% at most, too small on a 7-inch 2560x1600 screen),
+with a drawing of the screen at the chosen scale before it is set; the
+slider stops where less than 800x500 would be left. GTK scales windows only
+by whole numbers, so above 200% its windows stay at 2x and the fonts grow;
+IceWM's themes and the Start menu are drawn at all nine steps.
+
+## 2026-10-21 — The battery in the tray, and the power-saving slider
+
+MyOS runs the firmware's ACPI code now: uACPI 6.1.1 (MIT, `third_party/uacpi`)
+with the kernel's side in `drivers/acpi_os.c`, all AML in one kernel thread,
+the SCI on IRQ 9, and an embedded-controller driver (`drivers/acpi_ec.c`) for
+the methods that read the laptop's EC. QEMU's tables load in about 20 ms on
+both kernels. `drivers/battery.c` runs the battery's `_BIX`/`_BIF` and `_BST`
+and the charger's `_PSR` every 10 seconds (and on the firmware's Notify) and
+keeps a copy, which `/sys/class/power_supply/BAT0` and `AC` show in Linux's
+files and units. `/sys/firmware/acpi/platform_profile` (low-power, balanced,
+performance) switches the processor's speed range, boost and energy preference
+at once; at boot `/etc/runit/1` lets wheel write it. In the tray, `myos-menu`
+draws a battery filled to the charge (green on the charger, red at 10%), and a
+click opens `myos-battery`: the percent, the time until empty or full, the
+health (full now over full when new, and the charge cycles), and the
+three-step slider. `make test-battery` (both kernels) checks it all against a
+made-up battery in an SSDT (`tools/fakebat.py`), `make test-power-supply` the
+tray's sums. Not yet run on a real laptop. Plan: docs/BATTERY-PLAN.md.
+
 ## 2026-10-21 — Typing Chinese: IBus pinyin on the 64-bit live disk
 
 Ctrl+Space switches between English and 中文 (pinyin) in every GTK program and,
@@ -4261,3 +4646,155 @@ a disk file open for writing (B13). Linux keeps that file in RAM under
 `myos-live-uefi.img` with real keystrokes: Ctrl+Space, `nihao`, Space, Ctrl+Space,
 ` ok` saves `你好 ok` from Geany. A language model to rank the candidates (passage,
 history, typos) can come later as an IBus engine on top of this.
+
+## 2026-10-21 — The GPD Pocket 4's Wi-Fi firmware on the live disk
+
+The GPD's Wi-Fi card is an Intel AX210 (8086:2725), not the MSI's AX201, and
+the live disk carried only the AX201's firmware, so iwlwifi found the card but
+could not start it: no `wlan0`. `tools/fetch-firmware.sh` now also fetches
+`iwlwifi-ty-a0-gf-a0-89.ucode` (API 89, the only one this iwlwifi takes for
+the AX210) and `iwlwifi-ty-a0-gf-a0.pnvm` (its platform settings) from the
+same linux-firmware tag, pinned by SHA-256. Both are copied into the card's
+RAM at every boot; nothing is written to the card or the laptop. Rebuilt
+`make ARCH=x86_64 live-uefi` (same kernel): QEMU boots it from a USB stick to
+the login screen. Not yet run on the GPD. Also seen there: Fn+O (the GPD's
+minus) types nothing.
+
+Reading a machine's log without typing on it: a `bootlog` runit service on the
+live disk writes each boot's kernel log (and `/proc/net/wireless`) to
+`/var/log/boot/N.txt` on the stick's ext2, every 10 s for 5 minutes, then every
+minute, with a sync each time. With the stick back in the Mac,
+`sudo tools/stick-logs.sh` copies the stick's `/var/log` into
+`build/stick-logs/<date-time>/` with e2fsprogs' debugfs (read-only, no mount).
+Checked in QEMU: boots 1-3 left 1.txt-3.txt, read back on the Mac.
+
+## 2026-10-21 — The P2 Max: a corrupt stick, the missing Wi-Fi icon, its Wi-Fi firmware
+
+The P2 Max stopped after runit's stage 2. The stick's myos-root was damaged:
+`e2fsck -fn` found VS Code's files (inodes 15934-16003) with block lists
+overwritten by JavaScript and `/var` unreadable, while the image on the Mac
+was clean. Rewritten and read back (SHA-256 of all 4373 MiB matched), it
+booted to the desktop, and after that boot `e2fsck -fn` on the stick was
+clean: the earlier write was bad, not MyOS. A stick is now always read back
+after writing.
+
+The Wi-Fi icon was missing from the tray: myos-menu's tray has one slot,
+and the first program to dock takes it. IBus (added today) puts its own
+icon in the tray, and on the P2 Max it docked first. IBus's tray icon is
+off now (`show-icon-on-systray=false` in the IBus override); Ctrl+Space
+still switches. The P2 Max's card is an Intel Wireless-AC 7265 (not the
+AX210 above): `iwlwifi-7265D-29.ucode` is in `tools/fetch-firmware.sh`
+too. `tools/stick-logs.sh` also copies each user's `~/.xsession-errors`.
+
+## 2026-10-21 — The live stick keeps your settings and files across rewrites
+
+Settings saved on the stick (the desktop's scale and mouse speed in
+`~/.config/myos/`, WritePerfect's font size in `~/.config/writeperfect/`,
+files on the Desktop) did reach the stick: its myos-root is `/`, read-write,
+and the kernel writes changes within a second. They were lost when the next
+build was written over the whole stick with `dd`, `/home` included.
+
+Now the stick has a fourth partition, myos-data, from 8 GiB to the end (the
+image is 4.4 GB; the stick 60 GB). `live/tools/write-stick.py` (run on the
+Mac with sudo) writes the image, puts myos-data into both partition tables
+(the image's hybrid MBR, which MyOS's kernel reads, and the GPT, rewritten
+with its backup at the stick's real end), makes the ext2 file system only
+the first time, and reads everything back. It always starts at 8 GiB, so
+after a plain `dd` the script finds its superblock there and lists it again.
+The kernel already mounted the root disk's myos-data at `/data`. At every
+start `/etc/myos/stick-data.sh` (from `/etc/runit/1`, only when `/` is on a
+removable disk) copies the image's homes onto `/data/home` once and makes
+`/home` a link to it, as the installer does on a hard disk. Wi-Fi networks
+are in `/data/stick/wpa_supplicant.conf`, which the wpa_supplicant service
+reads on the stick. The installer reads and copies them from there, and
+makes `/home` a folder again when the new disk has no myos-data.
+
+Also: the live user's `~/Documents` was root's (the tar had no entry for the
+folder, so it was made as root), so nothing could be saved there.
+`fetch-live.py` now adds the skel's folders, owned by the user, and the
+rootfs tar is rebuilt when `fetch-live.py` changes.
+
+Checked on macOS and in QEMU with a 12 GiB disk image as the stick (attached
+raw with hdiutil): first write made myos-data; boot moved `/home` onto it;
+a file there survived a plain `dd` plus `write-stick.py`, and another
+rewrite and boot; `e2fsck -fn` found myos-data clean after the kernel's
+writes. Not yet run on a real stick.
+
+## 2026-10-21 — The tray: four places, the rest above it under the mouse; the battery card's point
+
+On the P2 Max the Wi-Fi icon was missing even with IBus's icon off. Seen
+again in QEMU by setting the scale to 200% after login: myos-menu starts
+itself over for a new scale, and the X server gives each docked icon to the
+nearest window that wasn't myos-menu's, which was IceWM's taskbar. IceWM
+restarts for the scale too, and its taskbar took the icon with it
+("GdkWindow unexpectedly destroyed" in `~/.xsession-errors`). The tray is
+now a window of the root, kept just above the taskbar's in the stacking
+order. The icon goes back to the root, and GTK docks it again when the new
+tray says it's there. The tray also outlives an IceWM restart now.
+
+The tray is still four places wide: the Wi-Fi icon (it always gets the
+first place, whenever it docks), the speaker, the battery and the time. A
+machine without a battery gives that place to a second icon. Any other icon
+(IBus's, which is on again) is in a panel that grows up out of the tray
+while the mouse is over it, in rows of the tray's own colour. Clicking the
+battery or the speaker closes the panel, so the pop-up isn't hidden behind it.
+
+The battery card is drawn as a speech bubble now (cairo, `myos-battery`): a
+rounded card with a point under the battery icon, its tip just above the
+tray. With no compositor, X windows can't be see-through, which is why the
+CSS round corners were black. Now the window is cut to the bubble's shape
+(the X shape extension), with a real transparent window when a compositor
+is running. At 200% the card and the volume pop-up were placed at twice
+their position (bottom right, over the taskbar): myos-menu gives screen
+pixels, and GTK places windows in its own, two screen pixels each at 200%.
+Both now divide by GTK's scale.
+
+Checked in QEMU with `tools/fakebat.py`'s battery, at 100% and 200%: the
+Wi-Fi icon is there before and after the scale change, IBus's icon is in
+the panel on hover, and the battery card's point is on the icon.
+
+Later the same evening: the tray grows instead. Under the mouse the tray
+rises for half a second (easing out, a frame every 15 ms) to show its other
+rows, in its own teal, lighter toward the top, covering the tray's
+highlight line so the two read as one piece, and folds back down in a
+quarter second. A window that grows (panel_win) holds the whole panel
+(panel_inner) with its bottom on the tray, so the rows rise into view. A
+pop-up opened from a grown tray sits on top of it. myos-menu writes the
+tray's top edge to `_MYOS_TRAY_TOP` on the root window each frame, and the
+battery and volume pop-ups follow it (`live/common/tray_follow.h`), so
+their point stays on the tray as it grows and folds. Checked in QEMU at
+100% and 200%. At 200% QEMU's 800x600 screen has no room above the grown
+tray for the battery card, so there the card overlaps it.
+
+Then the language in the tray, always in sight: the tray is five places
+wide. The theme's tray picture has room for one docked icon, so myos-menu
+widens it by one icon step when it loads it (the slot's stretch is plain
+background, copied once more) and moves the speaker, battery and time over.
+Wi-Fi gets the first place, IBus's icon the second (by WM_CLASS), and the
+rest come in the order they docked. IBus writes the language itself: "EN",
+and for pinyin its input mode, 中 (the engine's `icon_prop_key`), now in
+white (`xkb-icon-rgba` in the IBus override) instead of a blue that could
+hardly be read on the teal. Checked in QEMU at 100% and 200%, switching
+with Ctrl+Space (myos-input).
+
+## 2026-10-21 — Ctrl+Space shows one bubble; the tray back to four places
+
+IBus's own switcher (a plain GTK window, sometimes three of them) is gone:
+the IBus override has no `triggers`, and the new `live/myos-input` takes
+Ctrl+Space (an X key grab on the root). Each press moves to the next
+keyboard and shows the list in the Sound menu's bubble (common/menu_bubble.h)
+with the chosen one in blue, its point on the language icon, or on the
+tray's middle when the icon is folded away. A press asks IBus nothing: the
+keyboards and the current one are kept from IBus's signals, and the switch
+is sent only after the bubble is drawn. The first switch to pinyin starts
+its engine, and on QEMU's one core the X server drew nothing until it had
+loaded its dictionary, the bubble included. libibus is linked by file name,
+its calls declared in the program (the sysroot has no ibus-dev); x86_64 only,
+where IBus is.
+
+The tray is four places wide again (the widening for the language icon is
+undone): with a battery, Wi-Fi, speaker, battery and time are on the bar,
+and EN/中 waits in the panel that grows out of it under the mouse. Without
+a battery the language takes the battery's place. Checked in QEMU with
+tools/fakebat.py's battery: the panel grows on hover, the bubble shows on
+the first press, and pinyin types 你好 in xterm.

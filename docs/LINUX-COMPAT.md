@@ -36,7 +36,7 @@ instead of by their slot in the table (`sda2` could have meant Linux's `sda3`).
 
 | What | Who needs it |
 |---|---|
-| `/sys/class/power_supply` (battery, AC) | a battery icon on the MSI |
+| `/sys/class/power_supply` (battery, AC) | a battery icon on the MSI — **done 2026-10-21** (with `/sys/firmware/acpi/platform_profile`; docs/BATTERY-PLAN.md) |
 | `/sys/class/backlight` | screen brightness keys |
 | `/sys/class/net/<if>/` (operstate, address, carrier) | network tools, Chromium's "are we online" |
 | `/sys/class/input`, `/sys/class/sound`, `/sys/class/drm`, `/dev/dri/card0` | device listings; GPU drivers later |

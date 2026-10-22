@@ -28,12 +28,17 @@
    name, because programs (and C libraries) check it to decide what the
    kernel can do — and MyOS speaks Linux's system call language. The
    release string says what it really is. The second field, the host's
-   name, is set by sethostname() (from /etc/hostname at boot). */
+   name, is set by sethostname() (from /etc/hostname at boot). The release
+   stays 6.1.0 (programs read it to know which calls exist); the version
+   field (uname -v) names this build, from the Makefile. */
+#ifndef MYOS_VERSION
+#define MYOS_VERSION "unknown"
+#endif
 static char uts[6][65] = {
 #ifdef ARCH_X86_64
-    "Linux", "myos", "6.1.0-MyOS", "#1 MyOS", "x86_64", "(none)",
+    "Linux", "myos", "6.1.0-MyOS", "#1 MyOS " MYOS_VERSION, "x86_64", "(none)",
 #else
-    "Linux", "myos", "6.1.0-MyOS", "#1 MyOS", "i686", "(none)",
+    "Linux", "myos", "6.1.0-MyOS", "#1 MyOS " MYOS_VERSION, "i686", "(none)",
 #endif
 };
 

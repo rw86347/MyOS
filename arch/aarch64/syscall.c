@@ -649,10 +649,13 @@ static uint64_t sys_mmap(struct el0_regs *regs)
     return addr;
 }
 
+#ifndef MYOS_VERSION
+#define MYOS_VERSION "unknown"
+#endif
 static uint64_t sys_uname(struct el0_regs *regs)
 {
     static const char uts[6][65] = {
-        "Linux", "myos", "6.1.0-MyOS", "#1 MyOS", "aarch64", "(none)",
+        "Linux", "myos", "6.1.0-MyOS", "#1 MyOS " MYOS_VERSION, "aarch64", "(none)",
     };
 
     if (copy_to_user((void *)(uintptr_t)regs->x[0], uts, sizeof uts) < 0)

@@ -1093,3 +1093,37 @@ doesn't wake the CPU every millisecond.
 
 The "no interrupt" column is the fallback forced on in a scratch build (no
 handler installed); it is what a machine with broken interrupt routing gets.
+
+## Processor power savings: the meter is in, the numbers wait for the P2 Max (2026-10-17)
+
+`arch/*/cpupower.c` now sets the processor's savings at boot when the
+kernel config is in power-saving mode (docs/KERNEL-CONFIG.md §5). There is
+no number here yet, on purpose: QEMU has none of the machinery (no HWP, no
+CPPC, no C-states below C1, no energy meter, and its CPU ignores the MSR
+writes), so a QEMU run can only show that each lever is detected, skipped
+or refused correctly, which it does (`cpupower:` lines, docs/LOG.md).
+
+What measures it on real hardware is the processor's own energy meter,
+RAPL, now at `/sys/class/powercap/intel-rapl:0/energy_uj` as on Linux
+(root only). Watts over a quiet minute:
+
+    e1=$(doas cat /sys/class/powercap/intel-rapl:0/energy_uj); sleep 60
+    e2=$(doas cat /sys/class/powercap/intel-rapl:0/energy_uj)
+    printf '%d.%03d W\n' $(( (e2 - e1) / 60000000 )) $(( (e2 - e1) / 60000 % 1000 ))
+
+(it wraps at `max_energy_range_uj`: take another minute if e2 < e1). The
+plan for the P2 Max, one row per saving, each against the same idle desktop
+and the same kernel build (`make ARCH=x86_64`, timed):
+
+| P2 Max (Core m3-8100Y), package watts | idle desktop | kernel build: time, energy |
+|---|---|---|
+| realtime (the firmware's speed, HLT) | | |
+| power saving, speed only (HWP 30–100%, EPP 128) | | |
+| + deep idle (MWAIT to C10) | | |
+| + C1E | | |
+| + boost off | | |
+
+The speed row matters for builds as well as for power: with no P-state
+driver an Intel processor stays where the firmware left it (often its rated
+speed, 1.1 GHz on the m3-8100Y, whose boost goes to 3.4 GHz), and HWP is
+what lets it climb.

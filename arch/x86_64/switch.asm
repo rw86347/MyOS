@@ -3,7 +3,6 @@
 ; switch.asm — x86_64 kernel thread switch (cdecl64: rdi, rsi)
 [bits 64]
 
-extern thread_trampoline
 extern thread_exit
 
 global switch_context

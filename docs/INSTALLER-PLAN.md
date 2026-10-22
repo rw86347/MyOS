@@ -177,6 +177,72 @@ helper with a written plan, restarts from the new disk without the stick, and
 checks the login screen comes up and the account works. The same plan file
 makes an unattended install possible.
 
+## Upgrading from the stick
+
+An installed disk can be upgraded without partitioning and without formatting.
+The same two programs do it: `myos-install` notices a disk that already has
+`myos-root` and `myos-data` (same architecture, MyOS's own EFI partition) and
+asks first: **Upgrade** or **Install from the start**. Upgrade skips language,
+keyboard, time zone, partitions and the account, and goes to a short summary.
+`--text` asks the same question.
+
+What is kept: files on `myos-data`, accounts, the computer name, language,
+keyboard, time zone, Wi-Fi, `desktop.conf`, and `myos-config`. What is
+replaced: the system on `myos-root` and the boot files. The partition table
+is not touched.
+
+**The record.** Every root has `/usr/lib/myos/release` (the stick's build,
+the kernel's date-gitid and SHA-256) and `/usr/lib/myos/manifest` (one line
+per file the stick shipped, with SHA-256, size and mode). The image's first
+boot writes the manifest (`myos-manifest write`). The installer copies both
+onto the disk unchanged, so the account and the computer name show up later
+as local changes. `uname -v` and `/proc/version` carry the same kernel
+version; `uname -r` stays `6.1.0-MyOS`.
+
+**What is kept, file by file.** `myos-manifest diff` sorts each file of the
+disk against the disk's manifest and the stick's. A file whose size and
+mtime still match its line is taken as unchanged without being read (the
+install copies with mtimes kept); only the rest are hashed. A file that
+still matches is the system's: the stick replaces it (`replace`). A change
+under `/etc`, `/usr/local`, `/opt`, `/root`, `/srv`, `/var/mail` or
+`/var/spool` is kept (`keep`); if the stick's copy also moved on since, it
+is written beside the kept file as `NAME.myos-new` (`sidecar`). A file this
+machine removed from those places stays removed (`deleted`: the stick's ssh
+keys, which install takes off). A changed program or library, or one added
+outside them (an extra `apk` package's files), is saved under
+`/data/.myos-upgrade/<date>/replaced/` and then replaced or removed
+(`changed`); such packages must be added again. `passwd`, `group`, `shadow`
+and `gshadow` are rebuilt: system accounts and groups from the stick, people
+(uid 1000 and up) and their group memberships from the disk; the live user
+`myos` is left out. `/var/log` and the live session's own files (its ssh
+keys, machine id, Wi-Fi list, root's history) are never copied.
+
+**Space.** Before any write, the helper measures `myos-root` (`statfs`:
+free blocks and inodes must cover the diff's `BYTES` and `INODES` plus
+128 MiB), `myos-data` (room for the backup, `BACKUP`), and the boot area
+(`BLKGETSIZE64`: the EFI partition, or the BIOS type `0x7F` area, must hold
+the stick's boot files). The window offers Upgrade only for a disk
+`myos-install-helper --probe` calls upgradable (MyOS on it, same
+architecture, no Windows on its EFI partition); the space check is the
+helper's, at check time.
+
+**The helper's steps:** check (the diff, into `/run/myos-upgrade.diff`),
+save (`/etc`, the diff, the changed files, then a marker: a second try
+reuses this folder and its diff), copy (`rsync -ax --inplace
+--delete-after` with the kept files excluded), merge, boot files last
+(`myos-mkesp --without` on UEFI; the stick's boot area and MBR *code* on
+BIOS), finish (remove the marker). A power cut leaves `myos-data` whole:
+boot the stick and run the upgrade again.
+
+`make test-upgrade` installs onto an empty disk, boots it, plants a home
+file, an edited `/etc/motd` and a changed `/usr/bin/ldd` (debugfs, from the
+Mac), boots the stick, checks `--probe`, stops the helper after copy, runs
+it again, and boots the upgraded disk. x86_64, q35 + NVMe (2026-10-21):
+OK in 184 s, the upgrade itself 16 s + 17 s in QEMU; its diff on that disk
+was keep 13, changed 4, replace 32444, add 4, deleted 2 (35180 files on
+the stick). The stick is the same build as the installed system, so the
+`sidecar` case and a real version change are not in it yet.
+
 The steps:
 
 1. **Partition**: write the new table (util-linux's `sfdisk`, already on the

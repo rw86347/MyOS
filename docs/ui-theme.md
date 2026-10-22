@@ -25,6 +25,7 @@ generated files by hand.
 | `settings.svg`, `settings.png` | Settings open on Users (create account) |
 | `settings-wifi.svg`, `settings-wifi.png` | Settings open on Wi-Fi |
 | `settings-general.svg`, `settings-general.png` | Settings open on General |
+| `battery-popup.svg`, `battery-popup.png` | the tray battery pop-up, above the bottom tray |
 
 The color tables under "Elements and states" are written by the script too, from the
 same table it draws with. Change a color in the script, not in this file.

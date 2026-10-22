@@ -25,7 +25,9 @@ most likely to trip over, each item checked in the source on the date above.
   programs use: `ptrace`, `timerfd_*`, `signalfd*`, `sendmmsg`/`recvmmsg`,
   `splice`/`tee`/`vmsplice`, `sync_file_range`, POSIX message queues (`mq_*`),
   `clone3`, `openat2`, `execveat`, `pidfd_*`, `rseq`, `io_uring`, AIO, the new
-  mount API (`fsopen`, util-linux `mount` asks for it), `get_mempolicy`/`mbind`,
+  mount API (`fsopen`, util-linux `mount` asks for it), `get_mempolicy`/`mbind`
+  (Linux without NUMA says ENOSYS too; procps asks), `epoll_pwait2` (Claude Code's
+  Bun runtime asks, then uses `epoll_pwait`),
   `settimeofday`, `seccomp`, landlock. i386 implements 264 of Linux's 442; most
   of the 176 it lacks are legacy calls left out on purpose (`docs/DESIGN.md`).
 - **Memory**: the x86_64 kernel uses all RAM, but only programs' private pages
@@ -79,9 +81,11 @@ most likely to trip over, each item checked in the source on the date above.
     to send), open to every user (no CAP_NET_RAW check).
   - No `sendmmsg`/`recvmmsg`, no packet filter (netfilter), one rate-limit bucket.
 - **Devices**: serial input reaches the console, but there is no `/dev/ttyS0`.
-  One CPU (no SMP), the 8259 PIC plus the local APIC for MSI only (no IOAPIC), no
-  ACPI tables read but the power-off numbers (drivers/acpi.c). USB: xHCI, mass storage
-  and HID keyboards/mice only, no hubs; no I2C touchpad (I2C HID,
+  One CPU (no SMP), the 8259 PIC plus the local APIC for MSI only (no IOAPIC). ACPI's
+  AML runs (uACPI, 2026-10-21) for the battery, the charger, the power button
+  and the panel's backlight only: no lid, sleep or thermal zones yet (docs/BATTERY-PLAN.md). USB: xHCI, mass storage,
+  HID keyboards/mice, USB precision touchpads (one finger: move, tap, click; no
+  two-finger scrolling yet) and USB 2 hubs only (a USB 3 hub's USB 3 side isn't); no I2C touchpad (I2C HID,
   `docs/TOUCHPAD-PLAN.md`); sound is HD Audio, one program at a time; graphics is
   the firmware framebuffer or QEMU's Bochs card, no DRM/KMS.
 - **Programs**: Chromium (x86_64) is the Start menu's browser; it runs without
@@ -152,6 +156,14 @@ most likely to trip over, each item checked in the source on the date above.
   typed for such an account without asking. `myos-adduser` and the login screen
   (since 2026-10-13) refuse a typed password for an account whose password is empty;
   `su` doesn't. The installer gives both real passwords (and locks root's).
+- **The stick's home folders survive a rewrite only through `write-stick.py`**
+  (2026-10-21): myos-data starts at 8 GiB, so an image must stay below that (the
+  script refuses a bigger one), and a stick under 9 GiB gets none. After a plain `dd`
+  the files are still there, but the partition tables no longer list them: that boot
+  keeps its homes on the system partition until `write-stick.py` is run again. Homes
+  made once are not updated from a newer image's `/etc/skel`, and the Wi-Fi networks
+  are taken from the image (with `overlay.local`'s) only the first time. Only the
+  x86_64 UEFI stick has been tried; the i386 BIOS image has its own MBR layout.
 - **Settings' Wi-Fi pane only shows the state** (since 2026-10-14: `/proc/net/wireless`):
   the card, connected or not, and the signal. Choosing a network is still the tray
   icon's job (myos-wifi); the pane has no network list of its own. The kernel's
@@ -194,7 +206,8 @@ most likely to trip over, each item checked in the source on the date above.
   proc mounts don't show in `vfs_mount_count` (`df` misses them).
 - **Power off reads only what it needs from ACPI** (`drivers/acpi.c`, since
   2026-10-13): the PM1a/PM1b ports from the FADT and `_S5`'s two sleep types, found
-  as bytes in the DSDT (no AML interpreter). A board whose `_S5` is computed, not a
+  as bytes in the DSDT (the AML interpreter that came for the battery, 2026-10-21,
+  isn't used for this yet). A board whose `_S5` is computed, not a
   constant package, a "hardware-reduced" one (no PM1 ports), or one that needs
   `_PTS` run first still just halts with "safe to turn off". QEMU's own switch stays
   as the fallback. Not yet tried on the MSI. No other sleep state (suspend). Restart
@@ -351,6 +364,20 @@ most likely to trip over, each item checked in the source on the date above.
   scroll regions, no line drawing).
 - **`poll`/`select`**: every waiter is woken on any terminal/pipe change (fine for a few
   waiters).
+- **The clock counts timer interrupts, so a lost tick is lost time** (found
+  2026-10-17 in the dev VM). `timer_ms()` is the tick count, and the date is
+  the boot's CMOS time plus it. An emulator drops ticks whenever its CPU thread
+  falls behind, and the 8259 latches only one: in QEMU on the Mac the VM's
+  clock ran at 0.6x real time idle at the login screen, and about 0.1x during
+  a kernel build. Real hardware loses a tick only when interrupts stay off for
+  over 1 ms (syscalls run with them off). Linux keeps time from a counter
+  (TSC, HPET) and only uses the tick to look at it. The fix proposed: on each
+  tick, compare the TSC (calibrated, `cycles_per_us`) with where the tick count
+  says we are, and add the ticks that were missed (one rdtsc and a compare per
+  tick; a division only when behind). Not done: it changes what the slot
+  scheduler and every timeout see, so it needs Rodger's design call. Also:
+  `timer_ms()` is 32 bits and wraps after 49.7 days, and the date jumps back
+  with it (`realtime_ns`, `kernel/sys_info.c`).
 - **Time**: millisecond resolution; the CMOS clock is assumed to be UTC; no
   `settimeofday`. `alarm` and `setitimer` do ITIMER_REAL only, in whole ms; arming one
   walks the sorted list of armed processes (at most PROC_MAX), the tick checks only its head.
@@ -702,9 +729,17 @@ most likely to trip over, each item checked in the source on the date above.
     wlan0's interface number and starts over instead.
   - RTM_SETLINK (link mode "dormant") is answered with an error that
     wpa_supplicant ignores; there is no `/dev/rfkill`.
-- The tray (myos-menu, 2026-10-06) has one slot: the first program to dock
-  gets it (the Wi-Fi icon); a second one isn't shown. The volume icon is
-  still a picture.
+- The tray (myos-menu; five places wide since 2026-10-21): the Wi-Fi icon,
+  the language (IBus: EN, 中), the speaker, the battery, the time, and a
+  third docked icon in the battery's place on a machine without one. Other
+  icons wait in a panel that grows out of the tray only while the mouse is
+  over it, so they can't be reached from the keyboard. The theme's tray
+  picture has room for one docked icon; myos-menu widens it by one icon
+  step at start, which IceWM doesn't know about: the tray covers more of
+  the bar than IceWM's hidden clock keeps free, so on a narrow screen
+  (QEMU's 800 px at 200%) it covers the last task buttons. At most 8 docked icons; one that
+  hides itself (XEmbed's "mapped" flag) still keeps its place. The volume
+  icon is still a picture.
 - Unix datagram sockets (2026-10-06): at most 16 datagrams / 64 KiB wait
   for one socket and a datagram is at most 16 KiB (Linux allows ~200 KiB);
   no autobind (an unbound sender is nameless, so it can't be answered);
@@ -716,6 +751,23 @@ most likely to trip over, each item checked in the source on the date above.
     (we don't use the AP's WMM parameters yet).
   - No block-ack sessions: we never start one and ignore the AP's ADDBA,
     so no A-MPDU aggregation — Wi-Fi 6 works, but well below its speed.
+  - Cards older than the 22000 family (the P2 Max's Wireless-AC 7265,
+    2026-10-21) choose rates in the driver, and we don't have Linux's
+    algorithm (rs.c). `mvm/rs-myos.c` sends one fixed table instead: the
+    AP's legacy rates, fastest first. The firmware steps down it on each
+    retry, but never climbs back or uses HT/MIMO, so 54 Mbps at most and
+    every frame starts at the top. Real rate scaling would watch each
+    frame's result.
+  - `iw dev wlan0 link` says "Not connected" while wpa_supplicant is
+    COMPLETED (seen on the P2 Max): our nl80211 doesn't give `iw` the link
+    the way it wants it.
+  - Every IP frame sent over Wi-Fi is copied once: `ip_frame` (net/ipv4.c)
+    leaves 2 bytes in front, not the device's `needed_headroom`, so
+    `wifi_xmit` grows each one (`pskb_expand_head`) to fit the 802.11,
+    LLC and CCMP headers. Ethernet needs no room and isn't copied.
+  - The simulated radio (`sim.c`) asks for room for the CCMP header, as
+    iwlwifi does on the 7265, so `make test` covers that way of sending; the
+    AX201's (the card writes the header itself) is tried on hardware only.
   - Signal-quality (CQM) events aren't sent to wpa_supplicant (no roaming
     by signal); beacon loss waits for the driver's connection loss.
   - No channel-switch handling: an AP that changes channel is lost and
@@ -731,11 +783,20 @@ most likely to trip over, each item checked in the source on the date above.
     only, no IGMP). mDNS or IPv6 would need the real list.
 - USB (`drivers/usb/`, 2026-10-07; `docs/USB-PLAN.md`): enough to run from
   a USB stick. Missing:
-  - Hubs: a device behind a hub (or a laptop whose ports sit behind an
-    internal one) is listed as "a hub: not supported yet". QEMU adds a hub
-    by itself when a controller is down to its last free port: UTM's USB 3
-    controller has 4 ports and UTM puts 4 devices on it, so
-    `tools/mkutm.sh --usb-stick` gives it 8 (`-global nec-usb-xhci.p2=8`).
+  - Hubs (`usb_hub.c`, 2026-10-18): USB 2 hubs only. A USB 3 hub's USB 3
+    side says "not supported yet", so a USB 3 stick plugged into one isn't
+    seen (its keyboards, mice and USB 2 sticks are, through its USB 2 side;
+    it needs SET_HUB_DEPTH and USB 3's port status). A high-speed hub's
+    transaction translator (slow devices behind a USB 2 hub) is set up as
+    xHCI says but untested: QEMU's usb-hub is USB 1.1. Multi-TT hubs run as
+    single-TT ones. Over-current switches a port off for good (it is
+    reported, not powered again). Ports past 15 are left unused (a route
+    string's 4 bits). `tools/mkutm.sh --usb-stick` still gives UTM's USB 3
+    controller 8 ports (`-global nec-usb-xhci.p2=8`), from before hubs worked:
+    QEMU adds a hub of its own on a controller's last free port.
+  - Each device plugged in takes one of the controller's 32 slots, and an
+    unplugged one never gives it back (below): 32 plugs and the controller
+    takes no more until the next start.
   - Unplugging: the kernel says so but keeps the disk; its I/O then times
     out (10 s per command). Its memory is not given back.
   - Only xHCI. Old PCs (the Pentium 4 / M targets) have UHCI + EHCI, so
@@ -750,6 +811,9 @@ most likely to trip over, each item checked in the source on the date above.
     buttons, relative X/Y and the wheel, into the PS/2 paths (event0/event1);
     absolute pointers (USB touch screens, pen tablets, QEMU's `usb-tablet`)
     into event2, scaled to 0..32767, a touch as the left button. Missing:
+    - The GPD P2 Max's Fn+O (its only minus key) types nothing (seen
+      2026-10-21). Both minus usages (0x2D, keypad 0x56) are in the key
+      table, so the keyboard likely sends it some other way; not looked at.
     - Multi-touch: a touch screen's first finger points and taps; the others
       are ignored (no pinch or two-finger scroll), and there is no
       `ABS_MT_*` (docs/TOUCHPAD-PLAN.md).
@@ -766,6 +830,13 @@ most likely to trip over, each item checked in the source on the date above.
       itself, so the desktop is fine; Linux does it in its input core.
     - Touchpads' finger reports (precision-touchpad mode,
       `docs/TOUCHPAD-PLAN.md`): a USB touchpad works as a mouse.
+    - Three-finger swipes (2026-10-22) are decided in the kernel too: one key
+      per touch (F14-F17, `HID_SWIPE_*` in `include/hid.h`) once the fingers
+      have gone a fifth of the pad (`SWIPE_COUNTS`, a guess not yet tried on
+      the P2 Max). So the desktop jumps instead of sliding with the fingers.
+      Only the X11 desktop acts on them (myos-menu, myos-mission); the
+      Wayland session takes swipes from libinput, which the pad doesn't
+      reach. A USB keyboard that has F14-F17 (Apple's long ones) swipes too.
     - The parser keeps 24 fields and 8 report IDs per interface and reads
       descriptors up to 1024 bytes (a cut one loses its last fields); 4 HID
       interfaces per device. No boot-protocol fallback for a descriptor it
@@ -1058,21 +1129,26 @@ All of these are fixed; what is left is the testing gap and the capability one.
 - **`FBIOPUTCMAP` fails** (`-EINVAL`), and the fbdev driver calls it even on a
   TrueColor screen: ten "(EE) FBIOPUTCMAP: Invalid argument" lines in `Xorg.0.log`
   that mean nothing. Gamma is not adjustable.
-- **The desktop scale comes in five steps.** Settings >
-  Displays picks one scale for the session (100-200%, automatic: 150% at
-  1920x1200). `myos-xsettings` gives it to GTK (XSETTINGS, live) and Xft programs
+- **The desktop scale comes in nine steps.** Settings >
+  Displays has a slider from Larger Text to More Space (100-300% in 25% steps,
+  automatic: 150% at 1920x1200), as far as leaves 800x500 to work in, and a
+  drawing of the screen at the scale under the slider before it is set.
+  `myos-xsettings` gives it to GTK (XSETTINGS, live) and Xft programs
   (`Xft.dpi`), and points IceWM at the theme drawn for it (`~/.icewm/theme`):
-  `make-live-theme.py` draws IceWM's pictures and the Start menu at 100, 125, 150,
-  175 and 200% (`GoldenHour`, `GoldenHour-125`...; `/usr/share/myos/menu/<scale>/`,
-  2.3 MiB in all), and a scale between those is rounded to the nearest. IceWM's
-  own theme menu lists all five. The login screen scales by itself (it measures
-  the screen).
+  `make-live-theme.py` draws IceWM's pictures and the Start menu at each step
+  (`GoldenHour`, `GoldenHour-125`...; `/usr/share/myos/menu/<scale>/`), and a
+  scale between those is rounded to the nearest. GTK scales whole windows only
+  by whole numbers, so past 200% windows stay at 2x and the fonts grow; icons
+  and spacing in GTK programs stop growing at 200%. IceWM's own theme menu lists
+  all nine. The login screen scales by itself (it measures the screen).
 - **The taskbar tray is drawn over IceWM's clock.** The mockup's tray is the
   last 150 px of the bar: its own top-to-bottom color (`#2d7c8f` to `#16546a`),
   a 1.5 px `#0b2346` line on its left, the network and volume icons, and the
   time. IceWM's clock is one flat color, only as wide as the text, and it
   stretches one taskbar picture across the whole bar, so that band can't be a
-  fixed 150 px. `myos-menu` paints the tray in a window on the taskbar. The
+  fixed 150 px. `myos-menu` paints the tray in a window of its own, kept just
+  above the taskbar in the stacking order (a child of the bar died with it
+  when IceWM restarted, and took the docked icons along). The
   bar's own name isn't visible to `XFetchName` (IceWM sets it with
   `XSetWMProperties`), so the window is found by climbing from the Start
   button, or the clock, to the first wide strip. IceWM's clock stays, hidden
@@ -1085,6 +1161,12 @@ All of these are fixed; what is left is the testing gap and the capability one.
   bit, so it can leave a hole where the wallpaper shows through, and it cannot
   darken what is behind the window. The blur waits for the compositor
   (`docs/DESIGN.md`).
+- **The pointer's speed is one setting for every mouse and touchpad.** Settings >
+  Mouse & Keyboard has Speed (Slow to Fast) and Acceleration (None to Most);
+  `myos-xsettings` sets X's acceleration (`XChangePointerControl`) and each
+  pointer's "Device Accel Constant Deceleration" (XInput2), live. A touchpad and
+  a mouse plugged in together can't have their own speeds, and a pointer
+  plugged in after login gets X's default until the setting is moved again.
 - **The pointer's size reaches open programs only when they reopen.** Settings >
   Mouse & Keyboard sets it (Normal to Largest, times the desktop scale; Adwaita's
   pointers, 24-96 px, X picks the nearest). GTK programs and IceWM (restarted)
@@ -1102,7 +1184,7 @@ All of these are fixed; what is left is the testing gap and the capability one.
   (`/etc/icewm/keys`); Win+I needs the menu to open on key *release*.
 - **Settings is mostly read-only.** Displays changes the scale, Wallpaper the
   desktop picture (the theme landscape, plus the twenty scenes in
-  `/usr/share/myos/wallpapers`), Mouse & Keyboard the pointer's size, Users & Groups
+  `/usr/share/myos/wallpapers`), Mouse & Keyboard the pointer's size and speed, Users & Groups
   can add a user, and Kernel saves the kernel config (which the kernel doesn't read
   yet); Network, About, Storage and Date & Time only show. The network page shows
   only the address the system routes from (UDP connect + getsockname) and the DNS
@@ -1187,9 +1269,29 @@ All of these are fixed; what is left is the testing gap and the capability one.
   not the full Mac window, and the pinyin there needs `node`, which isn't on the
   disk. Its `agent.c` leaves out `<sys/select.h>`, which musl needs; the Makefile
   adds it with `-include` rather than editing WP's tree.
-- **The hot corner only curls.** `myos-menu` draws the curl (24 px, 40 px under the
-  mouse) in a desktop-type window below all windows, but the window overview it should
-  open isn't written (ROADMAP 11b), and it grows at once instead of over 120 ms.
+- **X11 Mission Control (`myos-mission`) is a smaller copy of the Wayland one.** The
+  four desktops along the top show only the current one's windows as pictures:
+  IceWM unmaps the windows of the others, and an unmapped window has no pixmap, so
+  they are pale panes, and a window dragged onto one becomes a pale pane there (where
+  it was on this desktop, not where IceWM puts it). There is no + to add a desktop,
+  no dragging a window out of a miniature or reordering desktops, no slide between
+  desktops, no App Exposé or Quick Look; those are the Wayland session (`myos-wm`).
+  The drag was tested on Xvfb with twm (which ignores the move); with IceWM, focus
+  leaving the moved window might raise another over Mission Control, so it raises
+  itself again once the windows have glided. No key opens it: F3, the Mac's key, is WritePerfect's
+  Help, and a key grabbed on the root is taken from every program. The pictures are
+  drawn again only at 300 and 700 ms (programs repaint after the redirect), not
+  live, and the miniatures are shrunk in one bilinear step, so their text is noise.
+  Without the Composite extension each window is a gray pane with its title. The
+  curl still grows at once instead of over 120 ms, and it sits under other windows,
+  so a window in the corner covers it; pushing the mouse into the corner opens
+  Mission Control anyway (myos-menu's pointer barriers). The push's numbers are
+  GNOME's (100 px within a second, at most 15 a step), tried on Xvfb with XTest,
+  not yet on a touchpad, so a flick at a maximized window's close button may still
+  open it. The barriers stay where the screen ended at start-up (a resolution
+  change needs myos-menu restarted), and a touch screen can't push (barriers stop
+  only relative motion). Three fingers left or right while it is open do nothing
+  (on the Mac they change desktop inside it).
 - **Run... can't tell you a program doesn't exist**: it hands the line to `sh -c` and
   the error goes to `~/.xsession-errors`.
 - **myos-menu leans on two IceWM details**: the Start button's window is named
@@ -1282,14 +1384,51 @@ own, `cld` on every entry and page-table checks are in (docs/LOG.md,
   plan, then starts the result and logs in (UEFI: NVMe, SATA, USB and the
   P2 Max's shape; BIOS: IDE and SATA). The window's pages themselves are
   only tried by hand.
+- **Upgrade from the stick (2026-10-21):** extra `apk` packages are not
+  reinstalled (their files are saved in the backup and removed; `/etc/apk/world`
+  still names them); `make test-upgrade` has run on x86_64 UEFI only, with a
+  stick of the same build, and the window's Upgrade pages have not been tried;
+  a file in `/etc` the live session changed at run time is copied as it is
+  now, not as the image shipped it; a disk whose EFI partition holds Windows is refused
+  (`myos-mkesp` rewrites the whole FAT); there is no previous system kept
+  to boot back into; ext2 has no journal, so a power cut means running the
+  upgrade again. A disk without `/usr/lib/myos/manifest` can still be
+  upgraded: every change under `/etc` is treated as local.
 
 ## Kernel config (2026-10-10)
 
-- **The kernel reads the config, but uses only its slot owners** (since
-  2026-10-13: docs/KERNEL-CONFIG.md §10 steps 1–3). The mode, the latency
-  budget and the power savings are read, checked and logged, and do nothing
-  yet (steps 6 and 9); a new config takes effect at the next start. With no
-  good copy the kernel runs its built-in one (`config/slots.conf`, realtime).
+- **The kernel reads the config, and uses its slot owners and (since
+  2026-10-17) the processor's power savings** (docs/KERNEL-CONFIG.md §10
+  steps 1–3, and step 9's processor part: `arch/*/cpupower.c`). The mode
+  and the latency budget are read, checked and logged, and do nothing yet
+  (step 6); a new config takes effect at the next start. With no good copy
+  the kernel runs its built-in one (`config/slots.conf`, realtime).
+- **The processor's savings, in power-saving mode only** (`cpupower.c`). Done:
+  speed range and energy preference by Intel HWP or AMD CPPC, boost off,
+  Intel C1E, MWAIT idle down to `cstate_max` (Intel Core, Skylake to Tiger
+  Lake, by CPUID leaf 5), clock modulation. Each MSR write is read back, and
+  the boot log says what took and what didn't. Not yet:
+  - **SpeedStep without HWP** (Pentium M, Pentium 4 6x0): the speeds and
+    their voltages are in ACPI's _PSS, which needs an AML interpreter (or
+    per-model tables, as Linux's speedstep-centrino has), plus a governor.
+  - **ACPI idle states** (Pentium M's C2-C4, Zen's CC6): ACPI's _CST, the
+    same problem. Zen and other Intel models idle with HLT, or MWAIT C1.
+  - **Tickless**: the 1 ms PIT tick stays (the APIC one-shot timer, below).
+  - **The realtime modes leave the firmware's settings alone.** KERNEL-CONFIG.md
+    §2 says both run at the rated speed with no boost, and realtime idles in
+    C1 only; that comes with step 6, and needs §11 question 2 answered first
+    (the built-in default is realtime: forcing boost off would slow every
+    machine with no saved config).
+  - **Only the boot CPU.** The other cores were never started and get none of
+    it; whether a core left waiting for its start-up signal holds the
+    package out of its deep idle states needs measuring on the P2 Max.
+  - **Untested on real hardware.** QEMU has no HWP, CPPC, RAPL or C-states
+    below C1, and its emulated CPU reads 0 from an unknown MSR and ignores
+    writes to it (the read-back reports that). The HWP, CPPC and energy-meter
+    paths were last read against the SDM, Linux's intel_pstate / amd-pstate /
+    intel_rapl, and run only on the P2 Max or the Katana.
+  - **The main thread still halts with HLT** when it waits in its own slots
+    (`cpu_wait`); only the idle thread uses the deeper state.
 - **No `myos-taskd`, no binding at `execve`, no OS class yet.** Slots
   still go to a thread with the right name (docs/TIME-SLOTS.md).
 - **Behind a hybrid MBR (no 0xEE entry) the kernel never reads the GPT**,
@@ -1308,6 +1447,42 @@ own, `cld` on every entry and page-table checks are in (docs/LOG.md,
 - **MyOS's /proc/cpuinfo leaves out flags** such as `est`, `acpi` and `tm`,
   so Settings reads CPUID itself.
 
+## The battery and the power-saving slider (2026-10-21, docs/BATTERY-PLAN.md)
+- **Tested only in QEMU, with a made-up battery** (`tools/fakebat.py`). QEMU has
+  no embedded controller, so the EC handshake (`drivers/acpi_ec.c`), its GPE and
+  the `_Qxx` news that tell the kernel a charger was plugged in have never run.
+  Until they do, a change shows within the 10-second reading, not at once.
+- **One battery is shown in the tray** (the first `type` Battery); a laptop with
+  two shows both in `/sys` but only the first in the pop-up.
+- **The times are the firmware's present rate**, not an average: they jump when
+  the load changes (upower smooths; we don't yet). Charging time doesn't allow
+  for the slow last 20%.
+- **Low-power on old CPUs is clock modulation**, which saves less than
+  SpeedStep's lower voltage. SpeedStep's steps come from ACPI's `_PSS`, now
+  readable.
+- **The profile is forgotten at restart** (it starts at balanced: the kernel
+  config's settings) and is the same on battery and on the charger; the On
+  battery / Plugged in profiles of docs/power-performance-settings.md aren't
+  here yet, nor the low-battery action.
+- **The SCI goes through the 8259.** The FADT's `SCI_INT` is used when it is an
+  ISA IRQ (3–15, usually 9); a board that puts it above 15 (an IOAPIC line, which
+  we don't drive) gets polling only.
+- **The backlight is the firmware's `_BCM` only** (`drivers/backlight.c`). On
+  many Intel and AMD laptops of the last ten years `_BCM` asks the graphics
+  driver to do it (Linux's i915/amdgpu, through OpRegion), and without one it
+  does nothing: there the dim step does nothing, the screen just goes off. Only
+  the first panel is used; there are no brightness keys or slider yet.
+- **Nothing keeps the screen on** for a video or a presentation (no inhibit,
+  as `xdg-screensaver suspend` / D-Bus's ScreenSaver would give): it dims and
+  goes off on the slider's time all the same.
+- **The brightness file is handed to group video in runit's stage 1**, but the
+  acpi thread may not have found the panel yet (it runs in parallel); then the
+  file stays root's and myos-idle falls back to the dark window (or none, with
+  no compositor). Not seen in QEMU. A udev-like rule when the device appears
+  would fix it.
+- **Idle times run on the machine's clock**, so in QEMU on the Mac they stretch
+  (the clock counts timer interrupts, above).
+
 ## Chinese input (2026-10-21)
 - **dconf works only because of `$XDG_RUNTIME_DIR`.** dconf maps a one-byte file
   `MAP_SHARED`; a disk file opened for writing can't be mapped shared here (worklist
@@ -1316,8 +1491,9 @@ own, `cld` on every entry and page-table checks are in (docs/LOG.md,
   `/run/user/UID` in RAM, as logind does. A console or ssh login gets none, so
   GSettings programs started from there still abort until B13 or a PAM module
   makes it.
-- **No IBus icon in the tray**: `ibus-ui-gtk3` runs, but IceWM's tray shows nothing
-  for it. English / 中文 is told only by the candidate window.
+- **The language in the tray is IBus's own icon** (EN, or pinyin's input mode,
+  中 or 英), in white (`xkb-icon-rgba`). It is text IBus draws, not a picture
+  from the theme.
 - **The 32-bit disk doesn't have it yet**: `live/packages.lock` needs
   `live/tools/fetch-live.py --add` (about 20 MB of i386 packages), and until then a
   32-bit build needs `LIVE_STALE_LOCK=1`. The installer's "Also install fonts and

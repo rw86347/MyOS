@@ -77,6 +77,9 @@ Mark a step `[x]` only when its "Done when" check works.
     - [x] The installer installs, for UEFI (2026-10-10) and BIOS (2026-10-17), and
       `make test-install` checks it in QEMU end to end: install from the stick, start
       the new disk alone, log in (docs/INSTALLER-PLAN.md).
+    - [x] Upgrade from the stick (2026-10-21): same helper, no partition, no format;
+      a checksum manifest tells a local change from the system's file; the installer
+      asks first when it finds a MyOS it can upgrade. `make test-upgrade`.
     - [x] The live disk's software: `make live-root` gathers `live/packages.txt`
       (IceWM desktop, logins, AbiWord, gcc/make/python3/adb, apk) as pinned Alpine
       packages plus the MyOS source into `build/live/rootfs.tar`.
@@ -134,6 +137,9 @@ Mark a step `[x]` only when its "Done when" check works.
   - [x] USB keyboards and mice (HID, 2026-10-17): interrupt endpoints and a
     report-descriptor parser; they reach the console and X as PS/2 ones do.
     A PC with no PS/2 controller boots now (it used to hang).
+  - [x] USB hubs (2026-10-18): devices behind USB 2 hubs, hubs behind hubs,
+    plugged in and pulled out while running (`make test-usb-hub`). A USB 3
+    hub's USB 3 side: later.
   - Later: ext4 read, exFAT, ext4 write (needs a journal). NTFS is out of scope.
 
 ## Phase 3 — Networking & beyond
