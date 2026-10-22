@@ -1163,7 +1163,7 @@ ARCH=x86_64 SLEEPTEST=1 test-sleep-desktop` (the whole desktop):
 | QEMU | i386 | x86_64 | x86_64 desktop |
 |---|---|---|---|
 | lid shut → asleep (programs stopped, disks written, screen off) | 1 ms | 1 ms | 1 ms |
-| the wake-up interrupt → programs running again | 0 ms | 0 ms | 0 ms |
+| the wake-up interrupt → programs running again | 0–1 ms | 0–1 ms | 0 ms |
 | the tick off, of the time asleep | 99% | 99% | 99% |
 | the CPU woke, in 4–5 s asleep | 4 times | 4 times | — |
 | QEMU's host CPU, awake (busy loop) → asleep | 96% → 0% | 83% → 0% | — |
@@ -1174,14 +1174,20 @@ presses a key with the lid shut: down and up) and the one that does; no
 timer wakes it. A whole sleep, from the lid to the kernel, also waits for
 `myos-lock` to be up: myos-powerd gives it at most 1 s.
 
-The time asleep is counted with the TSC, which QEMU's kernel calibrates
-against the PIT once at boot, so QEMU's seconds asleep are approximate. On
-real hardware the TSC is the CPU's own (docs/gaps.md: one that slows when
-idle).
+The time asleep is counted with the TSC and checked against the CMOS clock,
+read on both sides. In QEMU the TSC counted 2.6 s of a sleep the CMOS clock
+put at 6 s (i386) and 6.4 s of one it put at 10 s (the desktop), so the
+CMOS clock overrules it when they differ by more than 2 s, and `make
+test-sleep` now checks the kernel's time asleep against the Mac's own clock:
+6.0 s and 7.0 s by the kernel, 6.3 s by the Mac. The two CMOS reads cost up
+to 2 ms each (the chip may be mid-update), with interrupts on; the one on
+waking is inside "awake in".
 
 To come from the P2 Max (docs/SLEEP-PLAN.md): the wake time as you see it
 (the lid open → the lock screen's picture), and the battery over 30 minutes
-asleep against 30 minutes on the idle desktop.
+asleep against 30 minutes on the idle desktop. `myos-sleepcheck` on the stick
+shows whether a lid close really slept, and the kernel's line with both
+clocks.
 
 | P2 Max (Core m3-8100Y) | value |
 |---|---|

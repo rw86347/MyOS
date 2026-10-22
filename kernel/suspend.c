@@ -27,7 +27,10 @@
  *      asleep, as on Linux.
  *
  * Waking undoes it in reverse. The wall clock (CLOCK_REALTIME) and
- * CLOCK_BOOTTIME jump by the time the tick was off.
+ * CLOCK_BOOTTIME jump by the time the tick was off: the TSC measures it,
+ * and the battery-backed CMOS clock, read on both sides, overrules it to
+ * the second when they differ by more than 2 s (a TSC that slows when
+ * idle). The log gives both.
  *
  * What wakes it: the lid opening, the power button (reported as KEY_WAKEUP,
  * as Linux does, so it isn't taken for "sleep" again), a key or a click
@@ -45,6 +48,7 @@
 #include <kprintf.h>
 #include <pcache.h>
 #include <pic.h>
+#include <rtc.h>
 #include <suspend.h>
 #include <thread.h>
 #include <timer.h>
@@ -172,6 +176,7 @@ int suspend_enter(void)
     int level = backlight_get();
     if (level > 0)
         backlight_set(0);
+    uint32_t rtc0 = rtc_read_epoch();   /* up to 2 ms (an update in progress): with interrupts on */
 
     f = irq_save();
     uint16_t forced = (uint16_t)(~pic_masks() & ~keep_irqs & ~1u);
@@ -179,26 +184,40 @@ int suspend_enter(void)
     linux_irq_suspend(1);
     uint32_t n0, n1;
     uint64_t c0 = timer_paused(&n0), s0 = cycles_now();
+    uint32_t ms0 = timer_ms();
     suspend_asleep = 1;
     klog("sleep: asleep (%u ms to stop)\n", (unsigned)(timer_ms() - t0));
     while (wake_reason == WAKE_NONE)
         wq_sleep(&wake_wq);
     suspend_asleep = 0;
     uint64_t c1 = timer_paused(&n1), s1 = cycles_now();
+    uint32_t ms1 = timer_ms();
     linux_irq_suspend(0);
     pic_set_masks(pic_masks() & ~forced);
     irq_restore(f);
 
-    uint64_t off = (c1 - c0) / cycles_per_us(), all = (s1 - s0) / cycles_per_us();
-    time_add_sleep_ns((int64_t)off * 1000);     /* ticks counted the rest */
+    /* How long it slept: the TSC's count, unless the CMOS clock (whole
+       seconds) differs by more than 2 s, as when the TSC slows in idle or
+       was calibrated on late ticks (QEMU's busy boot). The clocks jump by
+       what the tick didn't count. */
+    int64_t rtc_s = (int64_t)rtc_read_epoch() - rtc0;
+    uint64_t off = (c1 - c0) / cycles_per_us(), tsc = (s1 - s0) / cycles_per_us(), all = tsc;
+    if (rtc_s >= 0 && ((uint64_t)rtc_s * 1000000 > tsc + 2000000 ||
+                       tsc > (uint64_t)rtc_s * 1000000 + 2000000))
+        all = (uint64_t)rtc_s * 1000000;
+    uint64_t ticked = (uint64_t)(ms1 - ms0) * 1000;
+    if (all > ticked)
+        time_add_sleep_ns((int64_t)(all - ticked) * 1000);
     if (level > 0)
         backlight_set(level);
     drm_suspend(0);
     thaw();
-    klog("sleep: woken by %s after %u.%u s asleep (the tick off %u%% of it, the CPU woke"
-         " %u times), awake in %u ms\n", reasons[wake_reason], (unsigned)(all / 1000000),
-         (unsigned)(all / 100000 % 10), (unsigned)(all ? off * 100 / all : 0),
-         (unsigned)(n1 - n0), (unsigned)(timer_ms() - woke_ms));
+    klog("sleep: woken by %s after %u.%u s asleep (the CMOS clock moved %d s, the TSC counted"
+         " %u.%u s; the tick off %u%% of it, the CPU woke %u times), awake in %u ms\n",
+         reasons[wake_reason], (unsigned)(all / 1000000), (unsigned)(all / 100000 % 10),
+         (int)rtc_s, (unsigned)(tsc / 1000000), (unsigned)(tsc / 100000 % 10),
+         (unsigned)(tsc ? off * 100 / tsc : 0), (unsigned)(n1 - n0),
+         (unsigned)(timer_ms() - woke_ms));
     sleeping = 0;
     return 0;
 }

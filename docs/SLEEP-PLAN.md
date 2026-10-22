@@ -63,7 +63,8 @@ myos-powerd: SIGUSR2 ──► myos-idle: the screen saver reset, myos-lock redr
 | The freezer: one flag at the user-mode edge (`signal_check`) | `kernel/signal.c`, `kernel/suspend.c` | done |
 | Wake-up lines only: the 8259 masks, Linux drivers' MSIs held and replayed | `arch/*/pic.c`, `kernel/linux_irq.c` | done |
 | The tick off while asleep (PIT or HPET), back on at any interrupt | `kernel/thread.c`, `drivers/pit.c`, `drivers/hpet.c` | done |
-| The clock jump: REALTIME and BOOTTIME, by the TSC | `kernel/sys_info.c` | done |
+| The clock jump: REALTIME and BOOTTIME, by the TSC, overruled by the CMOS clock when they differ by over 2 s | `kernel/sys_info.c`, `kernel/suspend.c` | done |
+| `myos-sleepcheck`: did the lid really sleep? A line a second to `~/sleep-check.txt`; a gap with the uptime standing still is a sleep | `live/overlay/usr/bin/myos-sleepcheck` | done |
 | The screen off and on again | `drivers/gpu/drm/drm_core.c`, `drivers/backlight.c` | done |
 | A key or a click wakes (with the lid open), and isn't typed | `drivers/keyboard.c`, `drivers/evdev.c`, `drivers/usb/xhci.c` | done |
 | `myos-powerd`: the lid, the button, the FIFO; the lock handshake | `live/myos-powerd`, `live/overlay/etc/sv/myos-powerd` | done |
@@ -107,25 +108,33 @@ its guid once it runs.)
 - `make test-sleep`, i386 by BIOS and x86_64 by UEFI: the host plays
   `myos-powerd`. The lid shuts, a busy loop stops (QEMU's CPU time falls to
   0%), a key with the lid shut leaves it asleep, the lid opens it, the
-  wall clock jumped and the uptime didn't; a key and the power button wake
-  it; event3 and event4 report what happened.
+  wall clock jumped and the uptime didn't, and the kernel's time asleep is
+  the Mac's within 1.5 s; a key and the power button wake it; event3 and
+  event4 report what happened.
 - `make ARCH=x86_64 SLEEPTEST=1 test-sleep-desktop`: the whole live
   desktop. The lid, the Start menu's Sleep and the power button each put it
   to sleep behind the lock screen; it is unlocked after each wake, first
-  with no password, then with a wrong one and the right one. Screenshots in
+  with no password, then with a wrong one and the right one, and
+  `myos-sleepcheck` must find the lid's 8 s asleep. Screenshots in
   `build/x86_64/sleeptest/sleep-*.png`.
 
 ## On the P2 Max (next)
 
-1. Boot this branch's stick, close the lid for a minute, open it, and read
-   the logs back with `tools/stick-logs.sh`. The boot log's `acpi: sleep:`,
-   `acpi: lid:` and `acpi: power button:` lines say what the firmware
-   offers; `lid: shut` / `lid: open` say whether the lid reaches us; the
-   `sleep: woken by ...` line gives the time asleep and the time to wake.
-2. Wake time, and the battery over 30 minutes asleep against 30 awake on
+1. Boot this branch's stick, run `myos-sleepcheck` in a terminal, close
+   the lid for a minute, open it and unlock. "ASLEEP for about N s" with
+   the uptime nearly still is a real sleep; lines going on every second
+   mean the lid only turned the screen off; a gap with the uptime moving
+   means it hung. Under it, the kernel's line: what woke it, the time
+   asleep by the CMOS clock and by the TSC, and the time to wake. Compare
+   the clock with a phone too.
+2. Read the logs back on the Mac with `tools/stick-logs.sh` (the bootlog
+   service saves the kernel log every minute). The boot log's `acpi:
+   sleep:`, `acpi: lid:` and `acpi: power button:` lines say what the
+   firmware offers; `lid: shut` / `lid: open` say whether the lid reaches us.
+3. Wake time, and the battery over 30 minutes asleep against 30 awake on
    the desktop (`/sys/class/power_supply/BAT0/energy_now`), into
    `docs/performance.md`.
-3. If the lid never notifies: its `_PRW` GPE and the embedded controller's
+4. If the lid never notifies: its `_PRW` GPE and the embedded controller's
    queries in the boot log, then the DSDT (`/sys/firmware/acpi/tables`).
 
 ## Phase 2: S3, deep sleep

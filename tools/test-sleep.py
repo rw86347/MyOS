@@ -12,7 +12,8 @@ for the shell, and plays the power daemon (myos-powerd) from the host:
   2. the lid shuts (a CPU added: kernel/fakelid_test.c) ->
      echo mem > /sys/power/state; QEMU's CPU time over 4 s, asleep
   3. a key with the lid shut: it stays asleep
-  4. the lid opens: awake. The wall clock jumped, the uptime did not.
+  4. the lid opens: awake. The wall clock jumped, the uptime did not; the
+     kernel's time asleep is the one this Mac saw (within 1.5 s)
   5. asleep again, a key wakes it; again, the power button does
   6. the lid's and the power button's events, as /dev/input gave them
 
@@ -122,7 +123,9 @@ try:
     move_lid()
     check(wait_for(r'lid: shut \(notify 0x80\)', 10, mark), 'the lid shuts (Notify 0x80)')
     type_line('echo mem > /sys/power/state; echo T1 $(date +%s) $(cut -d" " -f1 /proc/uptime)')
+    host_asleep = None
     if sleep_round(mark, 'the lid shut, a busy loop running'):
+        host_asleep = time.time()
         asleep = cpu_share(4)
         check(asleep < max(0.25, awake / 3),
               'QEMU rests: %.0f%% of a CPU asleep, %.0f%% awake' % (asleep * 100, awake * 100))
@@ -131,7 +134,12 @@ try:
         time.sleep(2)
         check(not re.search('sleep: woken', log()[key_mark:]), 'a key with the lid shut: still asleep')
     move_lid()
-    check(wait_for(r'sleep: woken by the lid after', 10, mark), 'the lid opens: awake')
+    woke = wait_for(r'sleep: woken by the lid after ([\d.]+) s asleep', 10, mark)
+    check(woke, 'the lid opens: awake')
+    if woke and host_asleep:
+        host = time.time() - host_asleep
+        check(abs(float(woke[1]) - host) <= 1.5,
+              'asleep %s s by the kernel, %.1f s by this Mac' % (woke[1], host))
     t0 = wait_for(r'^T0 (\d+) ([\d.]+)', 1, mark)
     t1 = wait_for(r'^T1 (\d+) ([\d.]+)', 10, mark)
     if t0 and t1:
@@ -179,10 +187,11 @@ try:
     check(re.search(r'^freeze mem$', L, re.M) and re.search(r'^\[s2idle\]$', L, re.M),
           '/sys/power/state and mem_sleep')
     check('NAME="Lid Switch"' in L and 'NAME="Power Button"' in L, 'input3 and input4: their names')
-    for m in re.finditer(r'sleep: woken by (.*?) after ([\d.]+) s asleep \(the tick off (\d+)% of it, '
-                         r'the CPU woke (\d+) times\), awake in (\d+) ms', L):
-        print('      woken by %s after %s s; the tick off %s%%; the CPU woke %s times; awake in %s ms'
-              % m.groups())
+    for m in re.finditer(r'sleep: woken by (.*?) after ([\d.]+) s asleep \(the CMOS clock moved (-?\d+) s, '
+                         r'the TSC counted ([\d.]+) s; the tick off (\d+)% of it, the CPU woke (\d+) '
+                         r'times\), awake in (\d+) ms', L):
+        print('      woken by %s after %s s (CMOS %s s, TSC %s s); the tick off %s%%; the CPU woke %s'
+              ' times; awake in %s ms' % m.groups())
 finally:
     monitor('quit')
     try:

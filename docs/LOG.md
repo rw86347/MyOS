@@ -4845,3 +4845,14 @@ from the Start menu and wakes by a key, sleeps and wakes by the power
 button, and unlocks each time (no password, then a wrong one and the right
 one). `make bench` unchanged (docs/performance.md); the gaps are in
 docs/gaps.md. Next: the P2 Max's lid, then S3.
+
+Later the same day: how to tell on the laptop that closing the lid really
+slept. `myos-sleepcheck` writes the time and the uptime to
+`~/sleep-check.txt` every second, with a sync; asleep it stops like every
+program and the uptime stands still, so a sleep is a gap in its lines with
+the uptime unchanged across it, and it says so, with the kernel's line under
+it. The kernel now reads the CMOS clock on both sides of a sleep, and that
+caught QEMU's TSC counting only 40–65% of the time asleep (2.6 s of 6.3 s):
+the wall clock came back short. The CMOS clock now overrules the TSC when
+they differ by more than 2 s, and `make test-sleep` checks the kernel's
+time asleep against the Mac's clock (6.0 s and 7.0 s against 6.3 s).

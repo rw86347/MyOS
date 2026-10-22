@@ -1519,9 +1519,11 @@ own, `cld` on every entry and page-table checks are in (docs/LOG.md,
 - **The lid and the power button wake through ACPI's interrupt.** A board whose
   SCI isn't wired to the 8259 (polled, above) can't be woken by them: polling
   stops with the tick. Only a key wakes it there.
-- **The time asleep comes from the TSC.** A CPU whose TSC slows or stops when
-  idle (the Pentium M with SpeedStep, before "constant TSC") puts the wall clock
-  behind after a sleep; reading the CMOS clock on waking would fix it.
+- **The time asleep is right to about a second.** The TSC measures it, and the
+  CMOS clock (whole seconds, read on both sides) overrules it when they differ
+  by more than 2 s: a TSC that slows or stops when idle (the Pentium M with
+  SpeedStep), or QEMU's, which counts only 40–65% of a sleep. Reading the CMOS
+  clock costs up to 2 ms each way (it may be mid-update).
 - **Timers on CLOCK_REALTIME and CLOCK_BOOTTIME count the tick**, so one that
   comes due during sleep fires late by the time asleep; Linux fires it on
   waking. No RTC alarm wakes the machine either (`CLOCK_*_ALARM`).
