@@ -1902,7 +1902,7 @@ dropbox-ignore:
 # live/live.mk. Without it, its targets say where to get it.
 LIVE_TARGETS := live-root live-extra live-theme live-hd live-uefi live-login-initrd \
                 test-live-uefi test-usb test-install test-uefi-login test-wifi-desktop \
-                utm-live utm-install run-live
+                test-sleep-desktop utm-live utm-install run-live
 ifneq ($(wildcard live/live.mk),)
 include live/live.mk
 else
